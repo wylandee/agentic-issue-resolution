@@ -35,6 +35,7 @@ from remediation_engine.contracts.solver_models import (
     PackageResolutionStatus,
     SolverRuntimeFingerprint,
     SolverStatus,
+    SolverTaskDecision,
 )
 from remediation_engine.orchestration.portfolio_orchestrator import (
     apply_portfolio_plan,
@@ -50,6 +51,7 @@ from remediation_engine.orchestration.portfolio_solver import (
     _candidate_domains,
     _fetch_candidate_packuments,
     _issue_identity,
+    _scope_coupling_enabled,
 )
 from remediation_engine.orchestration.qa_test_parsing import parse_peer_conflict_evidence
 from remediation_engine.orchestration.state import initial_orchestrator_state
@@ -62,6 +64,8 @@ from remediation_engine.orchestration.supervisor_portfolio import _portfolio_cer
 from remediation_engine.orchestration.supervisor_routing import _portfolio_cluster_targets
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
+from remediation_engine.solver.graph import cluster_packages
+from remediation_engine.solver.subgraph import extract_solver_subgraph
 from remediation_engine.tools.npm_graph import load_npm_graph_snapshot, make_occurrence_id
 from remediation_engine.tools.registry_cache import RegistryPackumentCache
 from remediation_engine.triage.grouper import group_issues
@@ -1020,7 +1024,7 @@ def test_scoped_angular_mutation_closure_stays_at_nine_packages(tmp_path: Path):
         {"name": "app", "lockfileVersion": 3, "packages": lock_packages},
     )
     groups = [
-        _group(package, "package.json", fixed_version="21.2.17")
+        _group(package, "package.json", package_version=exact_peer, fixed_version="21.2.17")
         for package in sorted(target_packages)
     ]
 
@@ -1046,7 +1050,47 @@ def test_scoped_angular_mutation_closure_stays_at_nine_packages(tmp_path: Path):
     assert {task.target_package_name for task in queue.values() if task.target_package_name} == {
         group.vulnerable_component for group in prepared_groups
     }
-    assert {task.selected_version for task in queue.values()} == {"21.2.17"}
+    # Closure discovery is not version selection; the Supervisor fills this
+    # field only after candidate lookup and portfolio planning.
+    assert all(task.selected_version is None for task in queue.values())
+    snapshot = load_npm_graph_snapshot(tmp_path)
+    targets, findings, target_diagnostics = _build_targets_and_findings(
+        snapshot,
+        prepared_groups,
+        queue,
+    )
+    assert target_diagnostics == []
+    subgraph = extract_solver_subgraph(snapshot, targets, findings)
+    scope_coupling = _scope_coupling_enabled(
+        SimpleNamespace(target_packages=sorted(target_packages), subgraph=subgraph)
+    )
+    assert scope_coupling
+    batches, _, _ = cluster_packages(
+        subgraph,
+        [
+            SolverTaskDecision(task_id=target.task_id, selected_version="21.2.17")
+            for target in targets
+        ],
+        scope_coupling=scope_coupling,
+    )
+    assert len(batches) == 1
+    assert batches[0].atomic
+    assert batches[0].dispatchable
+    assert set(batches[0].task_ids) == set(queue)
+
+
+def test_scoped_coupling_does_not_enable_non_angular_namespaces():
+    prepared = SimpleNamespace(
+        target_packages=["@nestjs/core"],
+        subgraph=SimpleNamespace(
+            targets=[
+                SimpleNamespace(target_package_name="@nestjs/core"),
+                SimpleNamespace(target_package_name="@nestjs/common"),
+            ]
+        ),
+    )
+
+    assert _scope_coupling_enabled(prepared) is False
 
 
 def test_all_exact_direct_dependencies_are_materialized_without_finding_groups(tmp_path: Path):

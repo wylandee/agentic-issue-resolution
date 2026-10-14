@@ -35,6 +35,7 @@ from remediation_engine.settings import AppSettings
 from remediation_engine.solver.cpsat import _trace_solver_inputs, solve_portfolio
 from remediation_engine.solver.graph import build_dependency_dag, cluster_packages, schedule_batches
 from remediation_engine.solver.subgraph import (
+    _build_ancestry_edges,
     _child_target,
     expand_candidate_relations,
     extract_solver_subgraph,
@@ -719,6 +720,74 @@ def test_forced_singleton_and_phase_budget_are_preserved():
     phases, phase_diagnostics = schedule_batches(dag, phase_budget=1)
     assert phase_diagnostics == []
     assert len(phases) == 2
+
+
+@pytest.mark.parametrize(
+    ("edge_kind", "base64url_finding_backed", "expected_batch_sizes", "expected_atomic"),
+    [
+        ("dependency_ancestry", True, [2], True),
+        ("dependency_ancestry", False, [1, 1], False),
+        ("runtime", True, [1, 1], False),
+    ],
+)
+def test_jws_base64url_finding_ancestry_batching(
+    edge_kind: str,
+    base64url_finding_backed: bool,
+    expected_batch_sizes: list[int],
+    expected_atomic: bool,
+):
+    jws = _target("task-jws", "package.json::jws").model_copy(
+        update={
+            "package_name": "jws",
+            "target_package_name": "jws",
+            "lockfile_package_key": "node_modules/jws",
+            "finding_ids": ["GHSA-JWS"],
+        }
+    )
+    base64url = _target("task-base64url", "package.json::base64url").model_copy(
+        update={
+            "package_name": "base64url",
+            "target_package_name": "base64url",
+            "lockfile_package_key": "node_modules/jws/node_modules/base64url",
+            "dependency_ancestry": ["jws", "base64url"],
+            "finding_ids": ["GHSA-BASE64URL"] if base64url_finding_backed else [],
+            "is_finding_backed": base64url_finding_backed,
+        }
+    )
+    ancestry_edges = _build_ancestry_edges([jws, base64url])
+    assert len(ancestry_edges) == 1
+    edge = ancestry_edges[0].model_copy(update={"edge_kind": edge_kind})
+    findings = [_finding_for_target(jws, "GHSA-JWS", "3.2.3")]
+    if base64url_finding_backed:
+        findings.append(_finding_for_target(base64url, "GHSA-BASE64URL", "3.0.0"))
+    subgraph = _solver_subgraph([jws, base64url], findings, edges=[edge])
+
+    batches, edges, diagnostics = cluster_packages(
+        subgraph,
+        [
+            SolverTaskDecision(task_id=jws.task_id, selected_version="3.2.3"),
+            SolverTaskDecision(task_id=base64url.task_id, selected_version="3.0.0"),
+        ],
+        forced_singleton_task_ids=(),
+        peer_conflict_pairs=(),
+    )
+
+    assert diagnostics == []
+    assert sorted(len(batch.task_ids) for batch in batches) == expected_batch_sizes
+    assert all(batch.atomic is expected_atomic for batch in batches)
+    dag = build_dependency_dag(subgraph, batches, edges)
+    assert dag.valid
+    if expected_atomic:
+        assert dag.batch_edges == []
+        phases, phase_diagnostics = schedule_batches(dag, phase_budget=1)
+        assert phase_diagnostics == []
+        assert len(phases) == 1
+        assert set(batches[0].task_ids) == {"task-jws", "task-base64url"}
+        assert batches[0].dispatchable
+        assert {mutation.package_name for mutation in batches[0].mutations} == {
+            "jws",
+            "base64url",
+        }
 
 
 def test_dependency_dag_rejects_unknown_occurrence_edges():

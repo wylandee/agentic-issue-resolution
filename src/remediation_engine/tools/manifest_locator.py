@@ -50,6 +50,7 @@ from remediation_engine.runtime.path_policy import (
     repository_relative_path,
     resolve_repository_path,
 )
+from remediation_engine.tools.npm_graph import _normalize_npm_operator_whitespace
 from remediation_engine.tools.package_identity import package_name_from_purl
 
 log = logging.getLogger(__name__)
@@ -473,11 +474,49 @@ def _lockfile_package_candidate_keys(parent_key: str, package_name: str) -> list
     return keys
 
 
+def _lockfile_override_requirement(
+    overrides: dict[str, Any] | None,
+    package_name: str,
+    candidate_version: str,
+) -> str | None:
+    """Return one simple npm override applicable to a locked package version."""
+    if not isinstance(overrides, dict):
+        return None
+
+    replacements: set[str] = set()
+    versioned_prefix = f"{package_name}@"
+    for raw_selector, raw_replacement in overrides.items():
+        if not isinstance(raw_selector, str) or not isinstance(raw_replacement, str):
+            continue
+        selector = raw_selector.strip()
+        replacement = raw_replacement.strip()
+        if not selector or not replacement:
+            continue
+        if selector == package_name:
+            replacements.add(replacement)
+            continue
+        if not selector.startswith(versioned_prefix):
+            continue
+        selector_range = selector[len(versioned_prefix) :].strip()
+        if not selector_range:
+            continue
+        try:
+            applies = NpmSpec(_normalize_npm_operator_whitespace(selector_range)).match(
+                Version(candidate_version)
+            )
+        except (TypeError, ValueError):
+            continue
+        if applies:
+            replacements.add(replacement)
+    return next(iter(replacements)) if len(replacements) == 1 else None
+
+
 def _lockfile_package_candidates(
     packages: dict[str, Any],
     parent_key: str,
     package_name: str,
     requirement: str,
+    overrides: dict[str, Any] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Resolve one dependency from an npm lockfile ``packages`` graph.
 
@@ -503,14 +542,18 @@ def _lockfile_package_candidates(
         version_text = str(metadata.get("version") or "").strip()
         if not version_text:
             continue
+        effective_requirement = (
+            _lockfile_override_requirement(overrides, package_name, version_text) or requirement
+        )
+        normalized_requirement = _normalize_npm_operator_whitespace(effective_requirement)
         try:
-            if not NpmSpec(requirement).match(Version(version_text)):
+            if not NpmSpec(normalized_requirement).match(Version(version_text)):
                 continue
         except (TypeError, ValueError):
             # Non-semver specs such as aliases and workspace ranges cannot be
             # evaluated safely here. Keep an exact resolved-version match but
             # otherwise leave the scanner path unchanged.
-            if requirement.strip() != version_text:
+            if effective_requirement.strip() != version_text:
                 continue
         candidates.append((key, metadata))
     return candidates

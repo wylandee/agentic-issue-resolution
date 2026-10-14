@@ -72,6 +72,7 @@ def _is_hard_kind(kind: str) -> bool:
         "peer_coupling",
         "workspace",
         "workspace_coupling",
+        "dependency_ancestry",
         "pinned",
         "pinned_dependency",
         "exact_pinned",
@@ -538,9 +539,9 @@ def cluster_packages(
             hard.union(left, right)
             hard_relations.append((left, right, kind))
         else:
-            soft_relations.append((left, right, kind))
-            # Runtime, ancestry, ordinary dependency, and loose peer edges
-            # describe ordering/compatibility evidence, not one atomic edit.
+            # Runtime, generic ancestry, ordinary dependency, and loose peer
+            # edges describe ordering/compatibility evidence, not one atomic
+            # edit. Finding-backed dependency ancestry is hard above.
             if kind != "scope":
                 return
         soft.union(left, right)
@@ -571,11 +572,15 @@ def cluster_packages(
         left, right, kind = edge.source_occurrence_id, edge.target_occurrence_id, _edge_kind(edge)
         if not scope_coupling and kind == "scope":
             continue
-        if left not in by_occurrence or right not in by_occurrence:
-            continue
         hard_relation = (
             not edge.is_optional
             and _is_hard_kind(kind)
+            and (
+                kind != "dependency_ancestry"
+                or (
+                    by_occurrence[left].is_finding_backed and by_occurrence[right].is_finding_backed
+                )
+            )
             and (
                 kind not in {"pinned", "pinned_dependency", "exact_pinned"}
                 or _is_exact_range(edge.version_range)

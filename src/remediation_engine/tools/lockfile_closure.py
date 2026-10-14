@@ -48,6 +48,8 @@ class DependencyClosure:
     complete: bool
     fallback_reason: str | None = None
     lockfile_version: int = 3
+    failure_detail: str | None = None
+    npm_overrides: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -84,13 +86,45 @@ def _selected_candidate_key(
     package_name: str,
     requirement: str,
     selected_keys: set[str],
+    overrides: Mapping[str, Any] | None = None,
 ) -> str | None:
     """Resolve an edge while restricting the result to selected closure nodes."""
-    candidates = _lockfile_package_candidates(dict(packages), parent_key, package_name, requirement)
+    candidates = _lockfile_package_candidates(
+        dict(packages),
+        parent_key,
+        package_name,
+        requirement,
+        overrides=dict(overrides or {}),
+    )
     for candidate_key, _metadata in candidates:
         if candidate_key in selected_keys:
             return candidate_key
     return None
+
+
+def _unresolved_dependency_edge_detail(
+    packages: Mapping[str, Any],
+    *,
+    parent_key: str,
+    parent: LockfilePackageNode,
+    package_name: str,
+    requirement: str,
+    category: str,
+) -> str:
+    """Describe a required dependency edge that has no matching lockfile node."""
+    lookup_keys = _lockfile_package_candidate_keys(parent_key, package_name)
+    present_candidates = []
+    for key in lookup_keys:
+        metadata = packages.get(key)
+        if isinstance(metadata, Mapping):
+            version = str(metadata.get("version") or "<missing version>")
+            present_candidates.append(f"{key}@{version}")
+    return (
+        f"Unresolved {category} edge from "
+        f"{parent.package_name}@{parent.version} at {parent_key or '<root>'}: "
+        f"{package_name}@{requirement}; npm lookup order={lookup_keys!r}; "
+        f"present candidates={present_candidates or '<none>'}."
+    )
 
 
 def _closure_failure(
@@ -102,6 +136,7 @@ def _closure_failure(
     includes_peer: bool,
     reason: str,
     lockfile_version: int,
+    failure_detail: str | None = None,
 ) -> DependencyClosure:
     """Build a failed closure result while retaining useful diagnostic nodes."""
     return DependencyClosure(
@@ -113,6 +148,7 @@ def _closure_failure(
         complete=False,
         fallback_reason=reason,
         lockfile_version=lockfile_version,
+        failure_detail=failure_detail,
     )
 
 
@@ -274,6 +310,7 @@ def resolve_dependency_closure_for_target(
     *,
     include_optional: bool = True,
     include_peer: bool = True,
+    npm_overrides: Mapping[str, Any] | None = None,
 ) -> DependencyClosure:
     """Resolve dependencies starting from one already-selected physical node.
 
@@ -291,6 +328,7 @@ def resolve_dependency_closure_for_target(
     source_lockfile = resolution.source_lockfile
     lockfile_version = resolution.lockfile_version
     target_node = resolution.target_node
+    override_rules = dict(npm_overrides or {})
     if (
         not resolution.complete
         or target_node is None
@@ -310,6 +348,9 @@ def resolve_dependency_closure_for_target(
             includes_peer=include_peer,
             reason=resolution.fallback_reason or "invalid_lockfile",
             lockfile_version=lockfile_version,
+            failure_detail=(
+                "Invalid closure input: target resolution or lockfile metadata is invalid."
+            ),
         )
 
     target_key = target_node.lockfile_key
@@ -322,6 +363,7 @@ def resolve_dependency_closure_for_target(
             includes_peer=include_peer,
             reason="incomplete_closure",
             lockfile_version=lockfile_version,
+            failure_detail=f"Selected target lockfile key {target_key!r} is absent from the packages map.",
         )
 
     node_map: dict[str, LockfilePackageNode] = {target_key: target_node}
@@ -347,6 +389,7 @@ def resolve_dependency_closure_for_target(
                 package_name,
                 requirement,
                 set(node_map),
+                overrides=override_rules,
             )
             if child_key is None:
                 all_candidates = _lockfile_package_candidates(
@@ -354,6 +397,7 @@ def resolve_dependency_closure_for_target(
                     current_key,
                     package_name,
                     requirement,
+                    overrides=override_rules,
                 )
                 if not all_candidates:
                     peer_meta = current.metadata.get("peerDependenciesMeta", {})
@@ -373,6 +417,14 @@ def resolve_dependency_closure_for_target(
                         includes_peer=include_peer,
                         reason="incomplete_closure",
                         lockfile_version=lockfile_version,
+                        failure_detail=_unresolved_dependency_edge_detail(
+                            packages,
+                            parent_key=current_key,
+                            parent=current,
+                            package_name=package_name,
+                            requirement=requirement,
+                            category=category,
+                        ),
                     )
                 child_key, child_metadata = all_candidates[0]
                 node_map[child_key] = LockfilePackageNode(
@@ -392,6 +444,7 @@ def resolve_dependency_closure_for_target(
         includes_peer=include_peer,
         complete=True,
         lockfile_version=lockfile_version,
+        npm_overrides=override_rules or None,
     )
 
 
@@ -405,6 +458,7 @@ def resolve_dependency_closure(
     include_optional: bool = True,
     include_peer: bool = True,
     lockfile_version: int = 3,
+    npm_overrides: Mapping[str, Any] | None = None,
 ) -> DependencyClosure:
     """Resolve a transitive npm dependency closure from a decoded lockfile.
 
@@ -417,6 +471,7 @@ def resolve_dependency_closure(
         include_optional: Traverse optional dependency edges.
         include_peer: Traverse peer dependency edges.
         lockfile_version: Original package-lock format version.
+        npm_overrides: Root package npm overrides for this lockfile.
 
     Returns:
         A complete closure or a result with ``complete=False`` and a stable
@@ -436,6 +491,7 @@ def resolve_dependency_closure(
         resolution,
         include_optional=include_optional,
         include_peer=include_peer,
+        npm_overrides=npm_overrides,
     )
 
 
@@ -481,7 +537,10 @@ def build_sliced_lockfile_artifacts(
             cannot be represented without changing npm's nearest resolution.
     """
     if not closure.complete:
-        raise ClosureResolutionError(closure.fallback_reason or "incomplete_closure")
+        reason = closure.fallback_reason or "incomplete_closure"
+        if closure.failure_detail:
+            raise ClosureResolutionError(f"{reason}: {closure.failure_detail}")
+        raise ClosureResolutionError(reason)
     if not closure.nodes or not closure.root_keys:
         raise ClosureResolutionError("empty_closure")
 
@@ -494,6 +553,7 @@ def build_sliced_lockfile_artifacts(
         node.lockfile_key: dict(node.metadata)
         for node in closure.nodes
     }
+    npm_overrides = closure.npm_overrides or {}
     edge_categories = ("dependencies", "optionalDependencies", "peerDependencies")
     retained_edges: dict[tuple[str, str], dict[str, str]] = {}
     edges_by_parent: dict[str, list[tuple[str, str, str, str]]] = {
@@ -525,6 +585,7 @@ def build_sliced_lockfile_artifacts(
                     node.lockfile_key,
                     package_name,
                     requirement,
+                    overrides=npm_overrides,
                 )
                 if not candidates:
                     peer_optional = (
@@ -589,6 +650,7 @@ def build_sliced_lockfile_artifacts(
                     parent_synthetic_key,
                     package_name,
                     requirement,
+                    overrides=npm_overrides,
                 )
                 if not resolved or resolved[0][0] != child_synthetic_key:
                     raise ClosureResolutionError("incomplete_closure")
@@ -608,6 +670,7 @@ def build_sliced_lockfile_artifacts(
                         parent_synthetic_key,
                         package_name,
                         requirement,
+                        overrides=npm_overrides,
                     )
                     if resolved and resolved[0][0] == candidate_key:
                         child_synthetic_key = candidate_key
@@ -637,6 +700,7 @@ def build_sliced_lockfile_artifacts(
                 "version": root_version,
                 "private": True,
                 "dependencies": dict(root_dependencies),
+                "overrides": dict(npm_overrides),
             },
             indent=2,
             sort_keys=True,
@@ -695,6 +759,7 @@ def build_sliced_lockfile_artifacts(
                 parent_synthetic_key,
                 package_name,
                 requirement,
+                overrides=npm_overrides,
             )
             if (
                 not resolved

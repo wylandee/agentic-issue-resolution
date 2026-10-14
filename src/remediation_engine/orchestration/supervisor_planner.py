@@ -34,7 +34,7 @@ from remediation_engine.tools.registry_tools import (
 logger = logging.getLogger(__name__)
 
 UPDATE_DISPATCH_LIMIT: int = 1
-QA_DISPATCH_LIMIT: int = 1
+QA_DISPATCH_LIMIT: int = 30
 _SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.OSV_MINIMUM: 0,
     SCARemediationStage.NPM_SAME_MAJOR: 1,

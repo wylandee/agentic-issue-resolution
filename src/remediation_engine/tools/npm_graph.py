@@ -48,6 +48,11 @@ _NPM_OPERATOR_SPACE_RE = re.compile(r"([<>=~^])\s+(?=[vV]?\d)")
 _NODE_MODULES = "node_modules/"
 
 
+def _normalize_npm_operator_whitespace(value: str) -> str:
+    """Normalize npm-legal spaces between range operators and versions."""
+    return _NPM_OPERATOR_SPACE_RE.sub(r"\1", value.strip())
+
+
 def _freeze(value: Any) -> Any:
     """Recursively freeze JSON values for use in frozen records."""
     if isinstance(value, Mapping):
@@ -161,8 +166,7 @@ class NpmRangeCheck:
 
 def check_npm_range(version_range: str | None, version: str | None) -> NpmRangeCheck:
     """Check an npm range and return an explicit diagnostic for invalid input."""
-    requested = str(version_range or "").strip()
-    requested = _NPM_OPERATOR_SPACE_RE.sub(r"\1", requested)
+    requested = _normalize_npm_operator_whitespace(str(version_range or ""))
     candidate = str(version or "").strip().lstrip("vV")
     if not requested or requested in {"*", "latest"}:
         return NpmRangeCheck(True)

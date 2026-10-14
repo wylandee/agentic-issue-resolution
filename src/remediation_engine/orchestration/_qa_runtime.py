@@ -821,6 +821,23 @@ def _collect_non_npm_input_projects(
     return projects, failures, tuple(sorted(staged_input_paths))
 
 
+def _load_npm_overrides(sandbox: DockerSandbox, lockfile_path: str) -> dict[str, Any]:
+    """Read root npm overrides for the package-lock input, if present."""
+    manifest_path = _validate_qa_path(str(Path(lockfile_path).with_name("package.json")))
+    try:
+        raw_manifest = sandbox.read_file(manifest_path)
+    except (OSError, RuntimeError, ValueError):
+        return {}
+    if not isinstance(raw_manifest, str) or not raw_manifest.strip():
+        return {}
+    try:
+        manifest = json.loads(raw_manifest)
+    except (TypeError, ValueError):
+        return {}
+    overrides = manifest.get("overrides") if isinstance(manifest, Mapping) else None
+    return dict(overrides) if isinstance(overrides, Mapping) else {}
+
+
 def _changed_package_lock_inputs(
     state: OrchestratorState | None,
     targets: Sequence[QAScanTarget],
@@ -828,6 +845,7 @@ def _changed_package_lock_inputs(
         [str],
         tuple[Mapping[str, Any] | None, int | None, ScanFallbackReason | None, str | None],
     ],
+    overrides_loader: Callable[[str], Mapping[str, Any] | None] | None = None,
 ) -> _PackageLockChangeBatch:
     """Compare every relevant live package-lock inventory with accepted state."""
     if state is None:
@@ -958,6 +976,9 @@ def _changed_package_lock_inputs(
     closures_by_task: dict[str, list[DependencyClosure]] = {}
     changed_resolutions: dict[tuple[str, str], TargetPackageResolution] = {}
     for source_input_path, changed_keys in sorted(changed_keys_by_path.items()):
+        npm_overrides = (
+            dict(overrides_loader(source_input_path) or {}) if overrides_loader is not None else {}
+        )
         packages, lockfile_version = current_lockfiles[source_input_path]
         if lockfile_version not in {2, 3}:
             mark_failure(
@@ -1033,7 +1054,11 @@ def _changed_package_lock_inputs(
                 )
                 continue
 
-            closure = resolve_dependency_closure_for_target(packages, resolution)
+            closure = resolve_dependency_closure_for_target(
+                packages,
+                resolution,
+                npm_overrides=npm_overrides,
+            )
             if not closure.complete:
                 path_complete = False
                 mark_failure(
@@ -1041,7 +1066,8 @@ def _changed_package_lock_inputs(
                     _target_resolution_fallback_reason(closure.fallback_reason),
                     (
                         f"Changed package occurrence {occurrence_key!r} has an incomplete "
-                        f"dependency closure: {closure.fallback_reason or 'unknown reason'}."
+                        f"dependency closure: {closure.fallback_reason or 'unknown reason'}"
+                        f"{'; ' + closure.failure_detail if closure.failure_detail else ''}."
                     ),
                 )
                 continue
@@ -2179,6 +2205,7 @@ def _resolve_targeted_packages(
         str,
         tuple[Mapping[str, Any] | None, int | None, ScanFallbackReason | None, str | None],
     ] = {}
+    overrides_cache: dict[str, dict[str, Any]] = {}
 
     def load_lockfile(
         source_lockfile: str,
@@ -2227,7 +2254,21 @@ def _resolve_targeted_packages(
         lockfile_cache[source_lockfile] = result
         return result
 
-    change_batch = _changed_package_lock_inputs(state, targets, load_lockfile)
+    def load_overrides(source_lockfile: str) -> dict[str, Any]:
+        """Read root npm overrides once per source lockfile."""
+        if source_lockfile not in overrides_cache:
+            overrides_cache[source_lockfile] = _load_npm_overrides(
+                sandbox,
+                source_lockfile,
+            )
+        return overrides_cache[source_lockfile]
+
+    change_batch = _changed_package_lock_inputs(
+        state,
+        targets,
+        load_lockfile,
+        load_overrides,
+    )
 
     resolved_packages: list[TargetPackageResolution] = list(change_batch.target_packages)
     resolved_identities = {
@@ -2360,7 +2401,11 @@ def _resolve_targeted_packages(
 
             lockfile_closures: list[DependencyClosure] = []
             for resolution in resolutions:
-                closure = resolve_dependency_closure_for_target(packages, resolution)
+                closure = resolve_dependency_closure_for_target(
+                    packages,
+                    resolution,
+                    npm_overrides=load_overrides(source_lockfile),
+                )
                 if not closure.complete:
                     task_failure = _TargetedPackageResolutionFailure(
                         _target_resolution_fallback_reason(closure.fallback_reason),
@@ -2368,6 +2413,7 @@ def _resolve_targeted_packages(
                             f"Task {target.task_id} dependency closure failed for "
                             f"{source_lockfile}:{resolution.target_node.lockfile_key if resolution.target_node else ''}: "
                             f"{closure.fallback_reason or 'incomplete_closure'}"
+                            f"{'; ' + closure.failure_detail if closure.failure_detail else ''}"
                         ),
                     )
                     break

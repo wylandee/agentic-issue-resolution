@@ -474,25 +474,23 @@ def _peer_requires_synchronized_target(
     lockfile_packages: dict[tuple[str, str], dict[str, Any]],
     target_versions: dict[tuple[str, str], set[str]],
 ) -> bool:
-    """Return whether a peer edge requires a second mutation target.
+    """Return whether a peer edge may require a second mutation target.
 
-    A direct peer is coordination-relevant only when a known selected version
-    falls outside the peer range.  This deliberately treats optional peers as
-    installed compatibility constraints without recursively expanding their
-    optional dependency universe.  A peer whose current version already
-    satisfies the selected target remains validation-only and is not promoted
-    into the development mutation scope.
+    A direct peer is coordination-relevant when any known selected or
+    candidate target version falls outside its declared peer range. Optional
+    peers remain validation evidence and do not expand the scoped mutation
+    graph.
 
     Args:
         left: One manifest/package occurrence in the relationship graph.
         right: The other occurrence in the relationship graph.
         records: Direct manifest dependency records keyed by occurrence.
         lockfile_packages: Lockfile metadata keyed by occurrence.
-        target_versions: Selected versions already known for scoped occurrences.
+        target_versions: Selected versions or candidate hints for scoped
+            occurrences. Hints are used only to discover closure.
 
     Returns:
-        ``True`` when one endpoint's selected target is outside the other
-        endpoint's declared peer range; otherwise ``False``.
+        ``True`` when a possible target version is outside the peer range.
     """
     for source_key, peer_key in ((left, right), (right, left)):
         versions = target_versions.get(peer_key, set())
@@ -516,26 +514,44 @@ def _peer_requires_synchronized_target(
     return False
 
 
+def _scoped_peer_version_hints(group: VulnerabilityGroup) -> set[str]:
+    """Return triage version candidates used only to discover peer closure.
+
+    These candidates identify peers that could become incompatible with a
+    requested upgrade. They are not committed task selections; the portfolio
+    solver and Supervisor still choose the version.
+    """
+    plans = [group.fix_plan]
+    plans.extend(candidate.plan for candidate in group.fix_plan_candidates or ())
+    return {
+        version
+        for plan in plans
+        if plan is not None and plan.status == FixPlanStatus.VERSION_FOUND
+        if (version := (plan.fixed_version or "").strip())
+    }
+
+
 def _scoped_dependency_keys(
     records: dict[tuple[str, str], _DependencyRecord],
     relationships: dict[tuple[str, str], dict[tuple[str, str], set[str]]],
     lockfile_packages: dict[tuple[str, str], dict[str, Any]],
     target_packages: set[str],
-    seed_versions: dict[tuple[str, str], set[str]],
+    peer_version_hints: dict[tuple[str, str], set[str]],
 ) -> set[tuple[str, str]]:
     """Return the mutation closure for a development package scope.
 
-    The closure starts at explicitly requested direct dependencies.  It keeps
-    workspace coordination and adds peer occurrences only when a selected
-    target version is outside the peer's declared range.  Namespace membership
-    and already-compatible peers remain outside the mutation graph.
+    The closure starts at explicitly requested direct dependencies. It keeps
+    workspace coordination and adds peers when a possible target version
+    falls outside the peer's declared range. Namespace membership and already
+    compatible peers remain outside the mutation graph.
 
     Args:
         records: Direct manifest dependency records keyed by occurrence.
         relationships: Undirected occurrence relationship graph.
         lockfile_packages: Lockfile metadata keyed by occurrence.
         target_packages: Explicit development package allowlist.
-        seed_versions: Supervisor-selected versions for finding-backed seeds.
+        peer_version_hints: Candidate versions used to detect possible peer
+            incompatibility. These hints do not select a task version.
 
     Returns:
         Direct occurrence keys allowed to become finding or coordination tasks.
@@ -543,7 +559,9 @@ def _scoped_dependency_keys(
     seeds = {key for key, record in records.items() if record.package_name in target_packages}
     allowed = set(seeds)
     known_versions = {
-        key: set(versions) for key, versions in seed_versions.items() if key in seeds and versions
+        key: set(versions)
+        for key, versions in peer_version_hints.items()
+        if key in seeds and versions
     }
     pending = list(sorted(seeds))
     while pending:
@@ -782,6 +800,7 @@ def materialize_synthetic_dependency_tasks(
     }
 
     seed_versions: dict[tuple[str, str], set[str]] = defaultdict(set)
+    peer_version_hints: dict[tuple[str, str], set[str]] = defaultdict(set)
     seed_keys = {
         key for key, record in records_by_key.items() if record.package_name in scoped_packages
     }
@@ -789,12 +808,22 @@ def materialize_synthetic_dependency_tasks(
         group = initial_groups_by_id.get(task.parent_group_id)
         if group is None or group.is_synthetic or task.strategy != RoutingStrategy.VERSION_BUMP:
             continue
-        target_version = (task.selected_version or "").strip()
         package_name = (group.vulnerable_component or "").strip()
         manifest_path = _group_manifest_path(group, root)
         key = (manifest_path, package_name)
-        if (not scoped_packages or key in seed_keys) and target_version:
-            seed_versions[key].add(target_version)
+        if scoped_packages and key not in seed_keys:
+            continue
+        selected_version = (task.selected_version or "").strip()
+        if selected_version:
+            seed_versions[key].add(selected_version)
+            peer_version_hints[key].add(selected_version)
+        elif scoped_packages:
+            peer_version_hints[key].update(_scoped_peer_version_hints(group))
+            peer_version_hints[key].update(
+                version.strip()
+                for version in task.allowed_target_versions
+                if isinstance(version, str) and version.strip()
+            )
 
     if scoped_packages:
         all_keys = sorted(
@@ -803,7 +832,7 @@ def materialize_synthetic_dependency_tasks(
                 relationships,
                 lockfile_packages,
                 scoped_packages,
-                seed_versions,
+                peer_version_hints,
             )
         )
     else:

@@ -4278,6 +4278,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             active_target_task_ids=active_target_task_ids,
             current_status=str(state.get("status") or ""),
             triage_required=bool(state.get("triage_required")),
+            portfolio_plan=state.get("portfolio_plan"),
         )
         target_task_id = (
             deterministic_target_decision.target_task_ids[0]
@@ -4786,7 +4787,8 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             and requested_target_count > QA_DISPATCH_LIMIT
         ):
             logger.warning(
-                "supervisor: qa_critic current policy allows exactly 1 target, got %d â€” falling back.",
+                "supervisor: qa_critic current policy allows at most %d targets, got %d — falling back.",
+                QA_DISPATCH_LIMIT,
                 requested_target_count,
             )
             needs_fallback = True

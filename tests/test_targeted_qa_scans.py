@@ -377,6 +377,67 @@ def test_modified_root_dependency_edges_build_root_and_dependency_closures() -> 
     }
 
 
+def test_targeted_resolution_uses_root_npm_override_for_lockfile_closure() -> None:
+    source_path = "frontend/package-lock.json"
+    packages = {
+        "": {
+            "name": "frontend",
+            "version": "20.0.0",
+            "dependencies": {"jsdom": "29.1.1"},
+        },
+        "node_modules/jsdom": {
+            "version": "29.1.1",
+            "dependencies": {"lru-cache": "^11.3.5"},
+        },
+        "node_modules/jsdom/node_modules/lru-cache": {"version": "11.2.7"},
+        "node_modules/lru-cache": {"version": "5.1.1"},
+    }
+    package_lock = json.dumps({"lockfileVersion": 3, "packages": packages})
+    package_json = json.dumps(
+        {
+            "name": "frontend",
+            "version": "20.0.0",
+            "overrides": {"lru-cache@^11": "~11.2.7"},
+        }
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.side_effect = lambda path: {
+        source_path: package_lock,
+        "frontend/package.json": package_json,
+    }.get(path)
+    target = QAScanTarget(
+        task_id="task-jsdom",
+        group_id="group-jsdom",
+        target_package="jsdom",
+        expected_version="29.1.1",
+        manifest_paths=(source_path,),
+        dependency_ancestry=(),
+        target_identifiers=frozenset(),
+    )
+
+    batch = _resolve_targeted_packages(
+        sandbox,
+        [target],
+        {
+            "active_target_task_ids": [target.task_id],
+            "accepted_package_inventory_by_lockfile": {},
+            "task_queue": {},
+            "worker_results_by_attempt": {},
+            "attempt_snapshots_by_id": {},
+        },
+    )
+
+    assert batch.failures_by_task == {}
+    assert target.task_id in batch.covered_task_ids
+    assert source_path in batch.covered_input_paths
+    closure_nodes = {
+        (node.lockfile_key, node.version)
+        for closure in batch.closures_by_task[target.task_id]
+        for node in closure.nodes
+    }
+    assert ("node_modules/jsdom/node_modules/lru-cache", "11.2.7") in closure_nodes
+
+
 def test_retained_pivot_parent_lockfile_is_scanned_for_active_child() -> None:
     root_lockfile = {
         "lockfileVersion": 3,

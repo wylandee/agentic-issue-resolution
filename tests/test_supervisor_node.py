@@ -912,7 +912,7 @@ class TestRunSupervisorNodeToQA:
         assert result["next_routing_step"] == "qa_critic"
         assert "task-1" in result["active_target_task_ids"]
 
-    def test_all_optimistically_fixed_tasks_route_to_qa_one_at_a_time(self):
+    def test_all_optimistically_fixed_tasks_route_to_qa_within_limit(self):
         g1 = _sca_group("g1")
         g2 = _sca_group("g2")
         task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -926,7 +926,7 @@ class TestRunSupervisorNodeToQA:
 
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "qa_critic"
-        assert result["active_target_task_ids"] == ["task-1"]
+        assert result["active_target_task_ids"] == ["task-1", "task-2"]
 
     def test_current_task_routes_to_qa_before_more_updates(self):
         # 12 groups: first 10 are optimistically fixed, 2 are pending.
@@ -948,7 +948,7 @@ class TestRunSupervisorNodeToQA:
         result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "qa_critic"
-        assert result["active_target_task_ids"] == ["task-1"]
+        assert result["active_target_task_ids"] == [f"task-{index}" for index in range(1, 11)]
 
     def test_mixed_update_results_route_successful_subset_to_qa(self):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(5)]
@@ -994,7 +994,7 @@ class TestRunSupervisorNodeToQA:
         result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "qa_critic"
-        assert result["active_target_task_ids"] == ["task-1"]
+        assert result["active_target_task_ids"] == ["task-1", "task-2", "task-3"]
         assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
         assert result["task_queue"]["task-2"].status == TaskStatus.OPTIMISTICALLY_FIXED
         assert result["task_queue"]["task-3"].status == TaskStatus.OPTIMISTICALLY_FIXED
@@ -2636,6 +2636,19 @@ class TestRunSupervisorNodeTargetGuardrails:
             ["task-1", "task-2"],
             {"task-1": task1, "task-2": task2},
         ) == ["task-1"]
+
+    def test_qa_normalization_accepts_nine_ready_tasks_under_limit(self):
+        task_ids = [f"task-{index}" for index in range(1, 10)]
+        task_queue = {
+            task_id: _make_task(
+                task_id,
+                f"group-{index}",
+                status=TaskStatus.OPTIMISTICALLY_FIXED,
+            )
+            for index, task_id in enumerate(task_ids, start=1)
+        }
+
+        assert _normalize_target_task_ids_for_node("qa_critic", task_ids, task_queue) == task_ids
 
 
 class TestRunSupervisorMaxRetries:

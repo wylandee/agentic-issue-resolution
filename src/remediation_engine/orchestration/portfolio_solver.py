@@ -1951,6 +1951,26 @@ def _empty_solver_plan(
     )
 
 
+def _scope_coupling_enabled(prepared: _PreparedPortfolioProblem) -> bool:
+    """Enable Angular lockstep grouping only for a pure Angular namespace scope.
+
+    Scoped plans normally avoid grouping packages by namespace alone. Angular
+    peer-closure materialization is the exception: only requested or required
+    Angular mutation targets are present, and those targets must be dispatched
+    together to preserve the framework's version lockstep.
+    """
+    if not prepared.target_packages:
+        return True
+    if not any(package.startswith("@angular/") for package in prepared.target_packages):
+        return False
+    namespaces = {
+        target.target_package_name.split("/", 1)[0]
+        for target in prepared.subgraph.targets
+        if target.target_package_name.startswith("@") and "/" in target.target_package_name
+    }
+    return namespaces == {"@angular"}
+
+
 def _project_prepared_portfolio_plan(
     prepared: _PreparedPortfolioProblem,
     solver_plan: SolverRemediationPlan,
@@ -1975,7 +1995,7 @@ def _project_prepared_portfolio_plan(
         decisions,
         forced_singleton_task_ids=forced,
         peer_conflict_pairs=explicit_pairs,
-        scope_coupling=not bool(prepared.target_packages),
+        scope_coupling=_scope_coupling_enabled(prepared),
     )
     diagnostics.extend(cluster_diagnostics)
     dag = build_dependency_dag(subgraph, batches, edges)

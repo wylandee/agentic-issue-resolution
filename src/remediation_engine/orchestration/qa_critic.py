@@ -71,6 +71,7 @@ from ._qa_runtime import (
     _collect_target_identifiers,
     _derive_qa_task_policies,
     _derive_qa_task_strategies,
+    _load_npm_overrides,
     _parse_package_occurrence_key,
     _resolve_action_summary_task_ids,
     _resolve_targeted_packages,
@@ -1381,6 +1382,10 @@ def run_workspace_setup_scan_node(state: OrchestratorState) -> dict[str, Any]:
                     )
                 return packages, lockfile_version, None, None
 
+            def load_overrides(source_path: str) -> dict[str, Any]:
+                """Read root npm overrides for one installed lockfile."""
+                return _load_npm_overrides(sandbox, source_path)
+
             if _targeted_extra_args_conflict():
                 failure_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
                 failure_details.append("ODC_EXTRA_ARGS conflicts with safe incremental scan scope.")
@@ -1389,6 +1394,7 @@ def run_workspace_setup_scan_node(state: OrchestratorState) -> dict[str, Any]:
                     scan_state,
                     targets,
                     load_lockfile,
+                    load_overrides,
                 )
                 if change_batch.failures_by_task:
                     first_failure = next(iter(change_batch.failures_by_task.values()))
