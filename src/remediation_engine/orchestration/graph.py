@@ -820,39 +820,72 @@ def run_orchestrator(
         inputs=initial_state,
     )
     result: OrchestratorState | None = None
+    run_error_message: str | None = None
     run_error: BaseException | None = None
     trace_url: str | None = None
     try:
         with use_runtime_settings(settings), use_trajectory_recorder(recorder):
-            result = orchestrator_engine.invoke(initial_state, runnable_config)
-        if langsmith_enabled and run_id is not None:
+            for snapshot in orchestrator_engine.stream(
+                initial_state,
+                runnable_config,
+                stream_mode="values",
+            ):
+                if isinstance(snapshot, dict):
+                    result = dict(snapshot)
+        if langsmith_enabled and run_id is not None and result is not None:
             result["langsmith_run_id"] = str(run_id)
             trace_url = resolve_phase5_trace_url(run_id)
             if trace_url:
                 result["langsmith_trace_url"] = trace_url
     except BaseException as exc:
         run_error = exc
+        run_error_message = (
+            "orchestrator interrupted by KeyboardInterrupt"
+            if isinstance(exc, KeyboardInterrupt)
+            else f"orchestrator failed before report phase: {exc}"
+        )
         raise
     finally:
+        missing_result = result is None
         if result is None:
-            fallback_errors = list(initial_state.get("errors", []) or [])
-            if run_error is not None:
-                fallback_errors.append(f"orchestrator failed before report phase: {run_error}")
-            else:
-                fallback_errors.append("orchestrator produced no final state before report phase")
-            result = {
-                **initial_state,
-                "status": "completed_with_errors",
-                "errors": fallback_errors,
-            }
+            result = dict(initial_state)
+        if run_error is not None or missing_result:
+            failure_message = run_error_message or (
+                "orchestrator produced no final state before report phase"
+            )
+            result_errors = list(result.get("errors", []) or [])
+            if failure_message not in result_errors:
+                result_errors.append(failure_message)
+            result["errors"] = result_errors
+            result["status"] = "completed_with_errors"
+
+            if result.get("workspace_volume"):
+                log.warning(
+                    "run_orchestrator: preserving partial state and cleaning workspace after %s",
+                    type(run_error).__name__ if run_error is not None else "missing graph state",
+                )
+                try:
+                    with use_runtime_settings(settings), use_trajectory_recorder(recorder):
+                        teardown_update = run_teardown_node(result)
+                    teardown_errors = list(teardown_update.pop("errors", []) or [])
+                    result.update(teardown_update)
+                    result["errors"] = list(dict.fromkeys([*result_errors, *teardown_errors]))
+                except BaseException as cleanup_error:  # noqa: BLE001 - preserve primary failure
+                    log.exception("run_orchestrator: emergency teardown failed")
+                    result.setdefault("errors", []).append(
+                        f"emergency teardown failed: {cleanup_error or type(cleanup_error).__name__}"
+                    )
+
             try:
-                with use_runtime_settings(settings):
-                    with use_trajectory_recorder(recorder):
-                        report_update = run_report_node(result)
-                    report_errors = list(report_update.pop("errors", []) or [])
-                    result.update(report_update)
-                    if report_errors:
-                        result["errors"] = fallback_errors + report_errors
+                with use_runtime_settings(settings), use_trajectory_recorder(recorder):
+                    report_update = run_report_node(result)
+                report_errors = list(report_update.pop("errors", []) or [])
+                result.update(report_update)
+                if report_errors:
+                    result["errors"] = list(
+                        dict.fromkeys([*result.get("errors", []), *report_errors])
+                    )
+                result["status"] = "completed_with_errors"
             except Exception as report_node_error:  # noqa: BLE001
                 log.exception("run_orchestrator: fallback report node failed")
                 result.setdefault("errors", []).append(
@@ -897,10 +930,8 @@ def run_orchestrator(
         recorder.record_manual(
             name="phase5.root_output",
             run_type="state",
-            inputs={"error": str(run_error)} if run_error else None,
-            outputs=result
-            if result is not None
-            else {"error": str(run_error) if run_error else "no result"},
+            inputs={"error": run_error_message} if run_error else None,
+            outputs=result if result is not None else {"error": run_error_message or "no result"},
             error=run_error,
         )
         try:

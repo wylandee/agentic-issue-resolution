@@ -43,6 +43,7 @@ from remediation_engine.contracts.schemas import (
     QAFailureEvidence,
     QAPolicy,
     ScanFallbackReason,
+    ScannerExecutionStatus,
     ScanScope,
     VulnerabilityGroup,
 )
@@ -70,12 +71,14 @@ from ._qa_runtime import (
     _derive_qa_task_policies,
     _derive_qa_task_strategies,
     _resolve_action_summary_task_ids,
+    _resolve_python_targeted_closures,
     _resolve_targeted_closures,
     _scan_evidence,
     _scan_state_projection,
     _store_scan_outcome,
     _targeted_extra_args_conflict,
     _workspace_remediation_fingerprint,
+    _write_python_targeted_artifacts,
     _write_targeted_artifacts,
 )
 from .qa_policy_engine import (
@@ -180,11 +183,17 @@ def _run_global_execution(
     elif not skip_scan:
         baseline = baseline_identifiers or target_identifiers
         closures: list[DependencyClosure] = []
+        python_closures = []
         targeted_subdir: str | None = None
         fallback_reason: ScanFallbackReason | None = None
+        resolution_detail: str | None = None
         try:
             if project_language == ProjectLanguage.PYTHON:
-                fallback_reason = ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER
+                (
+                    python_closures,
+                    fallback_reason,
+                    resolution_detail,
+                ) = _resolve_python_targeted_closures(sandbox, scan_targets)
             elif _targeted_extra_args_conflict():
                 fallback_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
             else:
@@ -192,29 +201,52 @@ def _run_global_execution(
                     sandbox,
                     scan_targets,
                 )
-                if resolution_detail:
-                    logger.info("qa_critic: targeted scan fallback: %s", resolution_detail)
+            if resolution_detail:
+                logger.info("qa_critic: targeted scan fallback: %s", resolution_detail)
             if fallback_reason is None:
                 targeted_subdir = ".odc-targeted"
-                _write_targeted_artifacts(sandbox, closures)
+                if project_language == ProjectLanguage.PYTHON:
+                    _write_python_targeted_artifacts(sandbox, python_closures)
+                else:
+                    _write_targeted_artifacts(sandbox, closures)
                 targeted_result = _qa_odc_module._run_targeted_security_scan(
                     sandbox,
                     workspace_volume,
                     target_identifiers,
                     baseline,
                     targeted_subdir,
+                    project_language=project_language,
                 )
+                missing_python_packages: list[str] = []
+                if project_language == ProjectLanguage.PYTHON:
+                    expected_python_packages = {
+                        package_spec
+                        for closure in python_closures
+                        for package_spec in closure.package_specs
+                    }
+                    missing_python_packages = sorted(
+                        expected_python_packages - targeted_result.scanned_packages
+                    )
                 if (
-                    not targeted_result.ok
-                    and not targeted_result.found_identifiers
-                    and not targeted_result.remaining_identifiers
+                    targeted_result.execution_status != ScannerExecutionStatus.SUCCESS
+                    or missing_python_packages
                 ):
                     _append_qa_log_records(results, "scan", targeted_result.scan_records)
-                    fallback_reason = (
-                        ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
-                        if "report" in targeted_result.summary.lower()
-                        else ScanFallbackReason.TARGETED_SCAN_FAILED
-                    )
+                    if targeted_result.execution_status != ScannerExecutionStatus.SUCCESS:
+                        fallback_reason = (
+                            ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
+                            if "report" in targeted_result.summary.lower()
+                            else ScanFallbackReason.TARGETED_SCAN_FAILED
+                        )
+                        resolution_detail = targeted_result.summary
+                    else:
+                        fallback_reason = ScanFallbackReason.INCOMPLETE_CLOSURE
+                        resolution_detail = (
+                            "ODC did not report every expected Python package: "
+                            + ", ".join(
+                                f"{name}=={version}" for name, version in missing_python_packages
+                            )
+                        )
                 else:
                     _store_scan_outcome(results, targeted_result, label="odc:targeted")
                     results.scan_evidence = _scan_evidence(
@@ -223,6 +255,7 @@ def _run_global_execution(
                         effective_scope=ScanScope.TARGETED,
                         complete=True,
                         closures=closures,
+                        python_closures=python_closures,
                     )
         except (ClosureResolutionError, OSError, RuntimeError, ValueError) as exc:
             logger.warning("qa_critic: targeted scan setup failed — %s", exc)
@@ -271,6 +304,7 @@ def _run_global_execution(
                 complete=False,
                 fallback_reason=fallback_reason,
                 closures=closures,
+                python_closures=python_closures,
             )
 
     if results.scan_skipped:

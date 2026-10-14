@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import (
     ODCScanEvidence,
     ScanFallbackReason,
+    ScannerExecutionStatus,
     ScanScope,
 )
 from remediation_engine.language import ProjectLanguage
@@ -33,6 +35,73 @@ def _target() -> QAScanTarget:
         manifest_paths=("package-lock.json",),
         dependency_ancestry=(),
         target_identifiers=frozenset({"CVE-2026-0001"}),
+    )
+
+
+def _python_target(
+    package: str = "demo-root",
+    version: str = "2.0.0",
+) -> QAScanTarget:
+    """Build one task-owned Python target with no lockfile requirement."""
+    return QAScanTarget(
+        task_id="task-1",
+        group_id="group-1",
+        target_package=package,
+        expected_version=version,
+        manifest_paths=(),
+        dependency_ancestry=(),
+        target_identifiers=frozenset({"CVE-2026-0001"}),
+    )
+
+
+def _pip_inspect_report(*, missing_leaf: bool = False) -> str:
+    """Return a deterministic pip-inspect graph for targeted-scan tests."""
+    installed = [
+        {
+            "metadata": {
+                "name": "demo-root",
+                "version": "2.0.0",
+                "requires_dist": ["leaf>=1; python_version >= '3.10'"],
+                "provides_extra": [],
+            }
+        },
+        {
+            "metadata": {
+                "name": "unrelated",
+                "version": "9.0.0",
+                "requires_dist": [],
+                "provides_extra": [],
+            }
+        },
+    ]
+    if not missing_leaf:
+        installed.insert(
+            1,
+            {
+                "metadata": {
+                    "name": "leaf",
+                    "version": "1.5.0",
+                    "requires_dist": [],
+                    "provides_extra": [],
+                }
+            },
+        )
+    return json.dumps(
+        {
+            "version": "1",
+            "pip_version": "26.2.1",
+            "environment": {
+                "implementation_name": "cpython",
+                "implementation_version": "3.11.8",
+                "os_name": "posix",
+                "platform_machine": "x86_64",
+                "platform_python_implementation": "CPython",
+                "python_full_version": "3.11.8",
+                "python_version": "3.11",
+                "sys_platform": "linux",
+            },
+            "installed": installed,
+        }
     )
 
 
@@ -99,6 +168,7 @@ def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
         {"CVE-2026-0001"},
         set(),
         [],
+        execution_status=ScannerExecutionStatus.SUCCESS,
     )
     with (
         patch(
@@ -188,23 +258,91 @@ def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
     sandbox.run.assert_not_called()
 
 
-def test_python_targeted_request_uses_unsupported_manager_full_scan_fallback() -> None:
+def test_python_targeted_request_scans_installed_dependency_closure() -> None:
     sandbox = MagicMock()
-    full_result = _SecurityScanResult(
+    sandbox.run.side_effect = [
+        SimpleNamespace(
+            exit_code=0,
+            stdout=_pip_inspect_report(),
+            stderr="",
+        ),
+        SimpleNamespace(exit_code=0, stdout="", stderr=""),
+    ]
+    targeted_result = _SecurityScanResult(
         True,
-        "python full scan",
+        "python targeted scan",
         set(),
-        {"CVE-2026-0001"},
         set(),
+        set(),
+        [],
+        execution_status=ScannerExecutionStatus.SUCCESS,
+        scanned_packages={("demo-root", "2.0.0"), ("leaf", "1.5.0")},
     )
+
     with (
         patch(
             "remediation_engine.orchestration.qa_test_parsing._run_install",
             return_value=_install_outcome(),
         ),
         patch(
-            "remediation_engine.orchestration._qa_runtime._resolve_targeted_closures"
-        ) as resolve_closures,
+            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan",
+            return_value=targeted_result,
+        ) as targeted_scan,
+        patch("remediation_engine.orchestration.qa_odc._run_security_scan") as full_scan,
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_unit_tests",
+            return_value=_test_outcome(),
+        ),
+    ):
+        results = _run_global_execution(
+            sandbox,
+            "workspace-volume",
+            {"CVE-2026-0001"},
+            {"CVE-2026-0001"},
+            scan_targets=[_python_target()],
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+    full_scan.assert_not_called()
+    targeted_scan.assert_called_once()
+    assert targeted_scan.call_args.kwargs["project_language"] == ProjectLanguage.PYTHON
+    assert sandbox.run.call_args_list[0].args[0] == (".venv/bin/python -m pip inspect --local")
+    sandbox.write_file.assert_called_once_with(
+        ".odc-targeted/000/requirements.txt",
+        "demo-root==2.0.0\nleaf==1.5.0\n",
+    )
+    assert results.scan_evidence is not None
+    assert results.scan_evidence.effective_scope == ScanScope.TARGETED
+    assert results.scan_evidence.complete is True
+    assert results.scan_evidence.closure_package_names == ["demo-root", "leaf"]
+    assert results.scan_evidence.scanned_package_specs == [
+        "demo-root==2.0.0",
+        "leaf==1.5.0",
+    ]
+
+
+def test_python_targeted_scan_falls_back_for_unresolved_dependency() -> None:
+    sandbox = MagicMock()
+    sandbox.run.return_value = SimpleNamespace(
+        exit_code=0,
+        stdout=_pip_inspect_report(missing_leaf=True),
+        stderr="",
+    )
+    full_result = _SecurityScanResult(
+        True,
+        "full fallback",
+        set(),
+        set(),
+        set(),
+        [],
+        execution_status=ScannerExecutionStatus.SUCCESS,
+    )
+
+    with (
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_install",
+            return_value=_install_outcome(),
+        ),
         patch(
             "remediation_engine.orchestration.qa_odc._run_targeted_security_scan"
         ) as targeted_scan,
@@ -222,17 +360,139 @@ def test_python_targeted_request_uses_unsupported_manager_full_scan_fallback() -
             "workspace-volume",
             {"CVE-2026-0001"},
             {"CVE-2026-0001"},
-            scan_targets=[_target()],
+            scan_targets=[_python_target()],
             project_language=ProjectLanguage.PYTHON,
         )
 
-    resolve_closures.assert_not_called()
     targeted_scan.assert_not_called()
     full_scan.assert_called_once()
-    assert full_scan.call_args.kwargs["project_language"] == ProjectLanguage.PYTHON
+    sandbox.write_file.assert_not_called()
     assert results.scan_evidence is not None
     assert results.scan_evidence.effective_scope == ScanScope.FULL
-    assert results.scan_evidence.fallback_reason == ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER
-    assert full_scan.call_args.args[2] == {"CVE-2026-0001"}
-    assert full_scan.call_args.args[3] == {"CVE-2026-0001"}
+    assert results.scan_evidence.fallback_reason == ScanFallbackReason.INCOMPLETE_CLOSURE
+    assert results.scan_evidence.complete is False
+
+
+def test_python_targeted_scan_falls_back_when_odc_misses_closure_packages() -> None:
+    sandbox = MagicMock()
+    sandbox.run.side_effect = [
+        SimpleNamespace(
+            exit_code=0,
+            stdout=_pip_inspect_report(),
+            stderr="",
+        ),
+        SimpleNamespace(exit_code=0, stdout="", stderr=""),
+    ]
+    targeted_result = _SecurityScanResult(
+        True,
+        "python scan omitted a dependency",
+        set(),
+        set(),
+        set(),
+        [],
+        execution_status=ScannerExecutionStatus.SUCCESS,
+        scanned_packages={("demo-root", "2.0.0")},
+    )
+    full_result = _SecurityScanResult(
+        True,
+        "full fallback",
+        set(),
+        set(),
+        set(),
+        [],
+        execution_status=ScannerExecutionStatus.SUCCESS,
+    )
+
+    with (
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_install",
+            return_value=_install_outcome(),
+        ),
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan",
+            return_value=targeted_result,
+        ) as targeted_scan,
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_security_scan",
+            return_value=full_result,
+        ) as full_scan,
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_unit_tests",
+            return_value=_test_outcome(),
+        ),
+    ):
+        results = _run_global_execution(
+            sandbox,
+            "workspace-volume",
+            {"CVE-2026-0001"},
+            {"CVE-2026-0001"},
+            scan_targets=[_python_target()],
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+    targeted_scan.assert_called_once()
+    full_scan.assert_called_once()
+    assert results.scan_evidence is not None
+    assert results.scan_evidence.effective_scope == ScanScope.FULL
+    assert results.scan_evidence.fallback_reason == ScanFallbackReason.INCOMPLETE_CLOSURE
+    assert results.scan_evidence.complete is False
+
+
+def test_unparseable_targeted_scan_is_not_misclassified_as_incomplete_closure() -> None:
+    sandbox = MagicMock()
+    sandbox.run.side_effect = [
+        SimpleNamespace(exit_code=0, stdout=_pip_inspect_report(), stderr=""),
+        SimpleNamespace(exit_code=0, stdout="", stderr=""),
+    ]
+    targeted_result = _SecurityScanResult(
+        False,
+        "FAILURE: targeted Dependency-Check exited 14.",
+        set(),
+        set(),
+        set(),
+        [],
+        execution_status=ScannerExecutionStatus.UNPARSEABLE,
+        scanned_packages=set(),
+    )
+    full_result = _SecurityScanResult(
+        True,
+        "full fallback",
+        set(),
+        set(),
+        set(),
+        [],
+        execution_status=ScannerExecutionStatus.SUCCESS,
+    )
+
+    with (
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_install",
+            return_value=_install_outcome(),
+        ),
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan",
+            return_value=targeted_result,
+        ) as targeted_scan,
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_security_scan",
+            return_value=full_result,
+        ) as full_scan,
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_unit_tests",
+            return_value=_test_outcome(),
+        ),
+    ):
+        results = _run_global_execution(
+            sandbox,
+            "workspace-volume",
+            {"CVE-2026-0001"},
+            {"CVE-2026-0001"},
+            scan_targets=[_python_target()],
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+    targeted_scan.assert_called_once()
+    full_scan.assert_called_once()
+    assert results.scan_evidence is not None
+    assert results.scan_evidence.fallback_reason == ScanFallbackReason.TARGETED_SCAN_FAILED
     assert results.scan_evidence.complete is False

@@ -1135,6 +1135,104 @@ class TestRunSupervisorNodeQAUpdates:
         assert result["processed_qa_attempt_ids"] == []
         assert result["next_routing_step"] == "qa_critic"
 
+    @pytest.mark.parametrize(
+        ("qa_status", "evaluation_kwargs"),
+        [
+            pytest.param(
+                "qa_completed",
+                {
+                    "failure_category": FailureCategory.SECURITY_FLAG,
+                    "retry_feedback": "Dependency evidence was unavailable.",
+                    "evidence_inconclusive": True,
+                },
+                id="inconclusive-evidence",
+            ),
+            pytest.param(
+                "qa_failed",
+                {
+                    "failure_category": FailureCategory.SECURITY_FLAG,
+                    "retry_feedback": "QA could not establish an outcome.",
+                    "contract_error": True,
+                    "contract_error_reason": "Structured evaluator output was missing.",
+                },
+                id="qa-contract-error",
+            ),
+        ],
+    )
+    def test_qa_recheck_limit_terminalizes_same_attempt(self, qa_status, evaluation_kwargs):
+        group = _sca_group("g1")
+        attempt_id = "attempt-qa-bounded"
+        instruction = "Pin test-pkg through the package manager."
+        snapshot = TaskAttemptSnapshot(
+            attempt_id=attempt_id,
+            task_id="task-1",
+            task_revision=1,
+            strategy_stage=SCARemediationStage.NPM_LATEST,
+            selected_version="1.2.3",
+            target_package_name="test-pkg",
+            instruction=instruction,
+            instruction_digest=instruction_digest(instruction),
+            dispatch_node="update_subagent",
+            qa_policy=QAPolicy.VERSION_BUMP,
+        )
+        task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": attempt_id,
+                "strategy_stage": snapshot.strategy_stage,
+                "selected_version": snapshot.selected_version,
+                "target_package_name": snapshot.target_package_name,
+                "instruction": instruction,
+                "qa_policy": QAPolicy.VERSION_BUMP,
+            }
+        )
+        evaluation = QAEvaluation(
+            task_id="task-1",
+            passed=False,
+            **evaluation_kwargs,
+        )
+
+        def attempt_result():
+            return QAAttemptResult(
+                attempt_id=attempt_id,
+                task_id="task-1",
+                task_revision=1,
+                qa_policy=QAPolicy.VERSION_BUMP,
+                qa_policy_source="attempt_snapshot",
+                evaluation=evaluation,
+            )
+
+        initial = _base_state(
+            [group],
+            status=qa_status,
+            task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
+            attempt_snapshots_by_id={attempt_id: snapshot},
+            qa_results_by_attempt={attempt_id: attempt_result()},
+        )
+
+        first = run_supervisor_node(initial)
+        assert first["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+        assert first["qa_rechecks_by_attempt"] == {attempt_id: 1}
+        assert first["processed_qa_attempt_ids"] == []
+
+        second = run_supervisor_node(
+            {
+                **initial,
+                **first,
+                "status": qa_status,
+                "qa_results_by_attempt": {attempt_id: attempt_result()},
+            }
+        )
+
+        terminal = second["task_queue"]["task-1"]
+        assert terminal.status == TaskStatus.INCONCLUSIVE
+        assert terminal.current_attempt_id is None
+        assert terminal.retry_count == 0
+        assert second["processed_qa_attempt_ids"] == [attempt_id]
+        assert second["next_routing_step"] != "qa_critic"
+        assert any("recheck limit reached" in error for error in second["errors"])
+
     def test_qa_completed_passed_adds_constraint(self):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)

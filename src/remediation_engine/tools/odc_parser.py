@@ -33,7 +33,10 @@ from remediation_engine.contracts import (
     Severity,
     VulnerabilityIssue,
 )
-from remediation_engine.tools.package_identity import package_name_from_purl
+from remediation_engine.tools.package_identity import (
+    normalize_python_package_name,
+    package_name_from_purl,
+)
 
 try:
     from packageurl import PackageURL
@@ -295,6 +298,37 @@ def parse_vulnerabilities(
             issues.append(issue)
 
     return issues
+
+
+def parse_python_packages(report: dict[str, Any]) -> set[tuple[str, str]]:
+    """Return normalized PyPI package/version pairs observed by ODC.
+
+    The dependency inventory is independent of vulnerability entries, so an
+    empty vulnerability list does not imply that ODC recognized no packages.
+    """
+    dependencies = report.get("dependencies") or []
+    if not isinstance(dependencies, list):
+        return set()
+
+    packages: set[tuple[str, str]] = set()
+    for dependency in dependencies:
+        if not isinstance(dependency, dict):
+            continue
+        package_entries = dependency.get("packages") or []
+        if not isinstance(package_entries, list):
+            continue
+        for package in package_entries:
+            if not isinstance(package, dict):
+                continue
+            purl = package.get("id")
+            if not isinstance(purl, str) or _ecosystem_from_purl(purl) != "pypi":
+                continue
+            package_name = _package_name_from_purl(purl)
+            version = _version_from_purl(purl)
+            normalized_name = normalize_python_package_name(package_name or "")
+            if normalized_name and version:
+                packages.add((normalized_name, version))
+    return packages
 
 
 def export_to_jsonl(issues: list[VulnerabilityIssue], output_path: Path) -> None:

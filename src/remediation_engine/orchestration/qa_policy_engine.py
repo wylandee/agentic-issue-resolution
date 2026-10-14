@@ -199,6 +199,10 @@ def _evaluate_policy_gates(
             else ScannerExecutionStatus.UNPARSEABLE
         )
 
+    scan_evidence_complete = (
+        results.scan_evidence.complete if results.scan_evidence is not None else None
+    )
+
     for context in task_contexts:
         task_id = context.task_id
         group = context.group
@@ -211,8 +215,13 @@ def _evaluate_policy_gates(
         remaining = sorted(group_target_identifiers(group) & remaining_global)
         package_state = results.package_state_by_task.get(task_id, _QAPackageState())
         dependency_evidence = package_state.dependency_evidence
+        scan_evidence_incomplete = scan_evidence_complete is False
         target_cleared = (
-            effective_scanner_status == ScannerExecutionStatus.SUCCESS and not remaining
+            False
+            if remaining
+            else None
+            if scan_evidence_incomplete
+            else effective_scanner_status == ScannerExecutionStatus.SUCCESS
         )
         diagnostics: list[str] = []
         if not install_passed:
@@ -223,6 +232,10 @@ def _evaluate_policy_gates(
                 f"{_scan_result_value(results.scan, 'summary', 'scanner did not run')}"
             )
         diagnostics.extend(package_state.diagnostics)
+        if scan_evidence_incomplete:
+            diagnostics.append(
+                "ODC scan evidence was incomplete; target clearance is inconclusive."
+            )
         if policy == QAPolicy.VERSION_BUMP and dependency_evidence is None:
             diagnostics.append("Deterministic dependency evidence was not collected.")
         if policy is None:
@@ -233,7 +246,7 @@ def _evaluate_policy_gates(
 
         deterministic_pass = policy is not None and install_passed
         if policy in _STRICT_SCANNER_QA_POLICIES:
-            deterministic_pass = deterministic_pass and target_cleared
+            deterministic_pass = deterministic_pass and target_cleared is True
         if policy in _HARD_TEST_QA_POLICIES:
             deterministic_pass = deterministic_pass and tests_passed is True
         if policy == QAPolicy.VERSION_BUMP:
@@ -241,6 +254,7 @@ def _evaluate_policy_gates(
                 deterministic_pass
                 and dependency_evidence is not None
                 and dependency_evidence.status == DependencyEvidenceStatus.VERIFIED
+                and scan_evidence_complete is not False
             )
         if policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
             deterministic_pass = deterministic_pass and package_state.manifest_state == "absent"
@@ -260,6 +274,7 @@ def _evaluate_policy_gates(
             package_manifest_state=package_state.manifest_state,
             package_graph_state=package_state.graph_state,
             diagnostics=diagnostics,
+            scan_evidence_complete=scan_evidence_complete,
         )
     return gates_by_task, errors
 
@@ -525,6 +540,7 @@ def _apply_policy_decision(
             gates.dependency_evidence is None
             or gates.dependency_evidence.status == DependencyEvidenceStatus.INCONCLUSIVE
         )
+        scan_evidence_inconclusive = gates.scan_evidence_complete is False
         if policy == QAPolicy.VERSION_BUMP:
             if _version_bump_llm_failure_is_relevant(
                 current,
@@ -670,17 +686,23 @@ def _apply_policy_decision(
                 )
             )
 
-        # An unavailable dependency graph is a QA-only rerun when it is the
-        # sole blocker. Preserve actionable install, scanner, test, and
-        # semantic failures so the Supervisor can repair the candidate.
-        if dependency_evidence_inconclusive and not failures:
+        # Unavailable dependency or scanner evidence is a QA-only rerun when
+        # it is the sole blocker; it must not consume a remediation attempt.
+        if (dependency_evidence_inconclusive or scan_evidence_inconclusive) and not failures:
+            inconclusive_reasons: list[str] = []
+            if dependency_evidence_inconclusive:
+                inconclusive_reasons.append(
+                    "Deterministic dependency evidence was unavailable or incomplete."
+                )
+            if scan_evidence_inconclusive:
+                inconclusive_reasons.append("ODC scan evidence was incomplete.")
             final[task_id] = QAEvaluation(
                 task_id=task_id,
                 passed=False,
                 failure_category=FailureCategory.SECURITY_FLAG,
                 retry_feedback=(
-                    "Deterministic dependency evidence was unavailable or incomplete. "
-                    "Re-run QA evidence collection; no remediation retry should be consumed."
+                    " ".join(inconclusive_reasons)
+                    + " Re-run QA evidence collection; no remediation retry should be consumed."
                 ),
                 failure_evidence=current.failure_evidence,
                 deterministic_gates=gates,

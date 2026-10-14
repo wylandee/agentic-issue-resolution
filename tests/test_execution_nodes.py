@@ -45,6 +45,7 @@ class TestStateDefaults:
         assert state["qa_evaluations"] == {}
         assert state["action_summaries"] == []
         assert state["changed_files"] == []
+        assert state["qa_rechecks_by_attempt"] == {}
         assert state["workspace_volume"] is None
         assert state["status"] == "pending"
         assert "messages" not in state

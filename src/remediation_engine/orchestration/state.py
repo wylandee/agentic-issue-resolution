@@ -348,6 +348,7 @@ class OrchestratorState(TypedDict, total=False):
     worker_results_by_attempt: Annotated[dict[str, WorkerAttemptResult], merge_dict_reducer]
     qa_results_by_attempt: Annotated[dict[str, QAAttemptResult], merge_dict_reducer]
     scan_evidence_by_task: Annotated[dict[str, ODCScanEvidence], merge_dict_reducer]
+    qa_rechecks_by_attempt: Annotated[dict[str, int], merge_dict_reducer]
     processed_worker_attempt_ids: Annotated[list[str], operator.add]
     processed_qa_attempt_ids: Annotated[list[str], operator.add]
     consistency_events: Annotated[list[StateConsistencyEvent], operator.add]
@@ -472,6 +473,7 @@ def initial_orchestrator_state(
         "worker_results_by_attempt": {},
         "qa_results_by_attempt": {},
         "scan_evidence_by_task": {},
+        "qa_rechecks_by_attempt": {},
         "processed_worker_attempt_ids": [],
         "processed_qa_attempt_ids": [],
         "consistency_events": [],

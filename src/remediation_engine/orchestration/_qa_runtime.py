@@ -16,10 +16,11 @@ import re
 import shlex
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from packaging.markers import default_environment
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
@@ -2115,6 +2116,314 @@ def _resolve_targeted_closures(
     return merged, None, None
 
 
+@dataclass(frozen=True, slots=True)
+class _PythonTargetedClosure:
+    """Exact installed distributions reachable from one Python scan target."""
+
+    package_specs: tuple[tuple[str, str], ...]
+
+
+def _python_targeted_closure_from_inspect(
+    report: Mapping[str, Any],
+    target: QAScanTarget,
+) -> tuple[_PythonTargetedClosure | None, ScanFallbackReason | None, str | None]:
+    """Resolve a conservative installed-Python closure from ``pip inspect`` JSON.
+
+    The environment is inspected after dependency installation, so every emitted
+    requirement is pinned to an exact installed version. Optional dependencies
+    are included when their distribution is installed, which keeps the scan
+    conservative when pip does not record which extras were requested.
+    """
+    if report.get("version") != "1":
+        return (
+            None,
+            ScanFallbackReason.INCOMPLETE_CLOSURE,
+            "pip inspect returned an unsupported report version.",
+        )
+
+    installed = report.get("installed")
+    environment = report.get("environment")
+    if not isinstance(installed, list) or not isinstance(environment, Mapping):
+        return (
+            None,
+            ScanFallbackReason.INCOMPLETE_CLOSURE,
+            "pip inspect omitted its installed distributions or marker environment.",
+        )
+
+    if not {"python_version", "sys_platform"}.issubset(environment):
+        return (
+            None,
+            ScanFallbackReason.INCOMPLETE_CLOSURE,
+            ("pip inspect omitted required environment markers."),
+        )
+
+    marker_environment = default_environment()
+    marker_environment.update(
+        {
+            key: value
+            for key, value in environment.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+    )
+    records: dict[str, dict[str, Any]] = {}
+    for item in installed:
+        if not isinstance(item, Mapping):
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                "pip inspect contained an invalid distribution record.",
+            )
+        metadata = item.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                "pip inspect omitted distribution metadata.",
+            )
+        name = metadata.get("name")
+        version = _python_version(metadata.get("version"))
+        if not isinstance(name, str) or not name.strip() or version is None:
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                "pip inspect contained an invalid distribution name or version.",
+            )
+        canonical_name = _python_package_name(name)
+        if not canonical_name:
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                "pip inspect contained an invalid distribution name.",
+            )
+        try:
+            Requirement(f"{name.strip()}=={version}")
+        except InvalidRequirement:
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                ("pip inspect contained a distribution name that cannot be scanned safely."),
+            )
+        requirements = metadata.get("requires_dist") or []
+        extras = metadata.get("provides_extra") or []
+        if not isinstance(requirements, list) or any(
+            not isinstance(requirement, str) for requirement in requirements
+        ):
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                (f"pip inspect returned invalid dependency metadata for '{name}'."),
+            )
+        if not isinstance(extras, list) or any(not isinstance(extra, str) for extra in extras):
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                (f"pip inspect returned invalid extra metadata for '{name}'."),
+            )
+        record = {
+            "name": name.strip(),
+            "version": version,
+            "requires_dist": tuple(requirements),
+            "provides_extra": tuple(extras),
+        }
+        previous = records.get(canonical_name)
+        if previous is not None:
+            if previous["version"] != version:
+                return (
+                    None,
+                    ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    (f"Multiple installed versions of '{name}' make the Python closure ambiguous."),
+                )
+            record["requires_dist"] = tuple(
+                sorted(set(previous["requires_dist"]) | set(record["requires_dist"]))
+            )
+            record["provides_extra"] = tuple(
+                sorted(set(previous["provides_extra"]) | set(record["provides_extra"]))
+            )
+        records[canonical_name] = record
+
+    target_name = _python_package_name(target.target_package)
+    if not target_name:
+        return (
+            None,
+            ScanFallbackReason.NO_MATCHING_TARGET,
+            (f"Task {target.task_id} has no valid Python target package."),
+        )
+    root = records.get(target_name)
+    if root is None:
+        return (
+            None,
+            ScanFallbackReason.NO_MATCHING_TARGET,
+            (f"Target distribution '{target.target_package}' was not installed in .venv."),
+        )
+    expected_version = _python_version(target.expected_version)
+    if target.expected_version and expected_version is None:
+        return (
+            None,
+            ScanFallbackReason.NO_MATCHING_TARGET,
+            (
+                f"Supervisor target version for '{target.target_package}' is not a valid PEP 440 version."
+            ),
+        )
+    if expected_version is not None and root["version"] != expected_version:
+        return (
+            None,
+            ScanFallbackReason.NO_MATCHING_TARGET,
+            (
+                f"Installed '{root['name']}' version {root['version']} does not match "
+                f"the committed target {expected_version}."
+            ),
+        )
+
+    resolved: set[str] = set()
+    pending = [target_name]
+    while pending:
+        package_name = pending.pop()
+        if package_name in resolved:
+            continue
+        record = records.get(package_name)
+        if record is None:
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                (f"Installed Python dependency '{package_name}' disappeared from pip inspect."),
+            )
+        resolved.add(package_name)
+        for raw_requirement in record["requires_dist"]:
+            try:
+                requirement = Requirement(raw_requirement)
+            except InvalidRequirement:
+                return (
+                    None,
+                    ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    (f"Distribution '{record['name']}' has an invalid dependency declaration."),
+                )
+
+            dependency_name = _python_package_name(requirement.name)
+            extra_marker = bool(requirement.marker and "extra" in str(requirement.marker))
+            marker_extras = ["", *record["provides_extra"]] if extra_marker else [""]
+            if requirement.marker is not None:
+                try:
+                    active = any(
+                        requirement.marker.evaluate({**marker_environment, "extra": extra})
+                        for extra in marker_extras
+                    )
+                except (KeyError, TypeError, ValueError):
+                    return (
+                        None,
+                        ScanFallbackReason.INCOMPLETE_CLOSURE,
+                        (f"Could not evaluate a dependency marker for '{record['name']}'."),
+                    )
+                if not active:
+                    continue
+
+            dependency = records.get(dependency_name)
+            if dependency is None:
+                if extra_marker:
+                    # Extras may not have been requested in this environment.
+                    continue
+                return (
+                    None,
+                    ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    (
+                        f"Required dependency '{requirement.name}' of '{record['name']}' "
+                        "was not present in pip inspect."
+                    ),
+                )
+            try:
+                dependency_version = Version(dependency["version"])
+            except InvalidVersion:
+                return (
+                    None,
+                    ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    (f"Installed version for '{dependency['name']}' is not valid PEP 440."),
+                )
+            if requirement.specifier and not requirement.specifier.contains(
+                dependency_version,
+                prereleases=True,
+            ):
+                if extra_marker:
+                    # The distribution may be installed independently of this
+                    # unrequested extra; do not treat that as a broken closure.
+                    continue
+                return (
+                    None,
+                    ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    (
+                        f"Installed '{dependency['name']}' version {dependency['version']} "
+                        f"does not satisfy '{raw_requirement}'."
+                    ),
+                )
+            pending.append(dependency_name)
+
+    package_specs = tuple(
+        sorted(
+            ((name, records[name]["version"]) for name in resolved),
+            key=lambda item: item[0],
+        )
+    )
+    return _PythonTargetedClosure(package_specs), None, None
+
+
+def _resolve_python_targeted_closures(
+    sandbox: DockerSandbox,
+    targets: Sequence[QAScanTarget],
+) -> tuple[list[_PythonTargetedClosure], ScanFallbackReason | None, str | None]:
+    """Resolve Python task closures from the installed venv without registry access."""
+    if not targets:
+        return [], ScanFallbackReason.MISSING_LOCKFILE, "No active task scan targets were supplied."
+    try:
+        result = _run_readonly(
+            sandbox,
+            ".venv/bin/python -m pip inspect --local",
+            timeout=60,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return (
+            [],
+            ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
+            (f"pip inspect could not read the installed Python graph: {exc}"),
+        )
+
+    stdout = getattr(result, "stdout", None)
+    if getattr(result, "exit_code", None) != 0 or not isinstance(stdout, str):
+        return (
+            [],
+            ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
+            ("pip inspect did not return a successful JSON report."),
+        )
+    try:
+        report = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        return (
+            [],
+            ScanFallbackReason.INCOMPLETE_CLOSURE,
+            (f"pip inspect returned invalid JSON: {exc}"),
+        )
+    if not isinstance(report, Mapping):
+        return (
+            [],
+            ScanFallbackReason.INCOMPLETE_CLOSURE,
+            ("pip inspect returned a non-object report."),
+        )
+
+    closures: list[_PythonTargetedClosure] = []
+    for target in targets:
+        closure, fallback_reason, detail = _python_targeted_closure_from_inspect(
+            report,
+            target,
+        )
+        if fallback_reason is not None:
+            return [], fallback_reason, detail
+        if closure is None:
+            return (
+                [],
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                (f"Task {target.task_id} did not produce a Python dependency closure."),
+            )
+        closures.append(closure)
+    return closures, None, None
+
+
 def _write_targeted_artifacts(
     sandbox: DockerSandbox,
     closures: Sequence[DependencyClosure],
@@ -2133,6 +2442,24 @@ def _write_targeted_artifacts(
     return targeted_subdir, sorted(package_names), sorted(lockfile_keys)
 
 
+def _write_python_targeted_artifacts(
+    sandbox: DockerSandbox,
+    closures: Sequence[_PythonTargetedClosure],
+) -> str:
+    """Write exact Python closures as isolated requirements manifests."""
+    if not closures:
+        raise ValueError("Python targeted scan requires at least one resolved closure.")
+
+    targeted_subdir = ".odc-targeted"
+    for index, closure in enumerate(closures):
+        if not closure.package_specs:
+            raise ValueError("Python targeted scan closure cannot be empty.")
+        requirements = "\n".join(f"{name}=={version}" for name, version in closure.package_specs)
+        artifact_path = _validate_qa_path(f"{targeted_subdir}/{index:03d}/requirements.txt")
+        sandbox.write_file(artifact_path, requirements + "\n")
+    return targeted_subdir
+
+
 def _cleanup_targeted_artifacts(sandbox: DockerSandbox) -> None:
     """Remove the fixed temporary targeted-scan directory from the workspace."""
     try:
@@ -2149,19 +2476,26 @@ def _scan_evidence(
     complete: bool,
     fallback_reason: ScanFallbackReason | None = None,
     closures: Sequence[DependencyClosure] = (),
+    python_closures: Sequence[_PythonTargetedClosure] = (),
 ) -> ODCScanEvidence:
     """Build typed, attempt-local ODC evidence from a scan result."""
+    closure_package_names = {node.package_name for closure in closures for node in closure.nodes}
+    closure_package_names.update(
+        name for closure in python_closures for name, _version in closure.package_specs
+    )
+
+    scanned_packages = _scan_result_value(scan_result, "scanned_packages", set()) or set()
+    scanned_package_specs = sorted(f"{name}=={version}" for name, version in scanned_packages)
     return ODCScanEvidence(
         requested_scope=ScanScope.TARGETED,
         effective_scope=effective_scope,
         authoritative=False,
         covered_task_ids=sorted({target.task_id for target in targets}),
-        closure_package_names=sorted(
-            {node.package_name for closure in closures for node in closure.nodes}
-        ),
+        closure_package_names=sorted(closure_package_names),
         closure_lockfile_keys=sorted(
             {node.lockfile_key for closure in closures for node in closure.nodes}
         ),
+        scanned_package_specs=scanned_package_specs,
         found_identifiers=sorted(
             _scan_result_value(scan_result, "found_identifiers", set()) or set()
         ),

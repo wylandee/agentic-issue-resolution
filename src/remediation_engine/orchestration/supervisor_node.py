@@ -142,6 +142,8 @@ from remediation_engine.tools.package_identity import normalize_python_package_n
 
 logger = logging.getLogger(__name__)
 
+MAX_QA_EVIDENCE_RERUNS_PER_ATTEMPT = 1
+
 # Supervisor dispatch commits one task attempt at a time. Worker and QA
 # boundaries consume only the typed task/attempt envelopes.
 
@@ -1627,6 +1629,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         state.get("worker_results_by_attempt", {})
     )
     qa_results_by_attempt: dict[str, QAAttemptResult] = dict(state.get("qa_results_by_attempt", {}))
+    qa_rechecks_by_attempt: dict[str, int] = dict(state.get("qa_rechecks_by_attempt", {}))
     processed_worker_attempt_ids: set[str] = set(state.get("processed_worker_attempt_ids", []))
     processed_qa_attempt_ids: set[str] = set(state.get("processed_qa_attempt_ids", []))
     prior_consistency_events: list[StateConsistencyEvent] = list(
@@ -2224,28 +2227,63 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
             qa_requires_rerun = (
                 qa_result.evaluation.evidence_inconclusive or qa_result.evaluation.contract_error
             )
+            if qa_requires_rerun:
+                attempt_id = task.current_attempt_id
+                recheck_count = qa_rechecks_by_attempt.get(attempt_id, 0)
+                scan_evidence = qa_result.evaluation.scan_evidence
+                rerun_kind = (
+                    "contract_error"
+                    if qa_result.evaluation.contract_error
+                    else "evidence_inconclusive"
+                )
+                if recheck_count >= MAX_QA_EVIDENCE_RERUNS_PER_ATTEMPT:
+                    qa_requires_rerun = False
+                    _commit_task_transition(
+                        task_queue,
+                        task_id,
+                        updates={"status": TaskStatus.INCONCLUSIVE},
+                        close_attempt=True,
+                        clear_selected_version=True,
+                    )
+                    detail = (
+                        f"QA {rerun_kind} recheck limit reached for {task_id} "
+                        f"attempt {attempt_id}; marked task inconclusive."
+                    )
+                    logger.warning("supervisor: %s", detail)
+                    errors.append(f"supervisor: {detail}")
+                else:
+                    qa_rechecks_by_attempt[attempt_id] = recheck_count + 1
+                    logger.warning(
+                        "supervisor: QA rerun task=%s attempt=%s kind=%s recheck=%d/%d "
+                        "scan_scope=%s scan_complete=%s scan_fallback=%s.",
+                        task_id,
+                        attempt_id,
+                        rerun_kind,
+                        recheck_count + 1,
+                        MAX_QA_EVIDENCE_RERUNS_PER_ATTEMPT,
+                        scan_evidence.effective_scope.value if scan_evidence else None,
+                        scan_evidence.complete if scan_evidence else None,
+                        (
+                            scan_evidence.fallback_reason.value
+                            if scan_evidence and scan_evidence.fallback_reason
+                            else None
+                        ),
+                    )
             if not qa_requires_rerun:
-                # QA closes the worker attempt before any status or stage
-                # change. The next planner proposal must observe a task with
-                # no active worker input; otherwise it can see the new retry
-                # stage paired with the old attempt snapshot.
-                _commit_task_transition(
-                    task_queue,
-                    task_id,
-                    updates={},
-                    close_attempt=True,
-                    clear_selected_version=True,
-                )
-            else:
-                # Keep the committed attempt open so QA can be rerun without
-                # creating a worker retry or losing its provenance.
-                logger.info(
-                    "supervisor: preserving attempt for non-remediation QA rerun on %s.",
-                    task_id,
-                )
-        if not qa_requires_rerun:
-            processed_qa_attempt_ids.add(task.current_attempt_id)
-            new_qa_attempt_ids.append(task.current_attempt_id)
+                if task_queue[task_id].status not in _TERMINAL_STATUSES:
+                    # QA closes the worker attempt before any status or stage
+                    # change. The next planner proposal must observe a task with
+                    # no active worker input; otherwise it can see the new retry
+                    # stage paired with the old immutable snapshot.
+                    _commit_task_transition(
+                        task_queue,
+                        task_id,
+                        updates={},
+                        close_attempt=True,
+                        clear_selected_version=True,
+                    )
+                processed_qa_attempt_ids.add(task.current_attempt_id)
+                new_qa_attempt_ids.append(task.current_attempt_id)
     auto_new_constraints: list[str] = []
 
     if state.get("status") in {"qa_completed", "qa_failed"}:
@@ -2260,32 +2298,66 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 # identity cannot mutate an attempted task.
                 continue
             task = task_queue[resolved_t_id]
-            if task.status in (TaskStatus.UNFIXABLE, TaskStatus.QA_PASSED):
+            if task.status in _TERMINAL_STATUSES:
                 continue
-            if evaluation.contract_error:
-                # A malformed judge response is a QA-contract failure, not a
-                # remediation failure. Requeue QA without advancing the
-                # strategy stage or consuming the worker retry budget.
+            if evaluation.contract_error or evaluation.evidence_inconclusive:
+                if resolved_t_id not in qa_result_task_ids:
+                    if task.current_attempt_id is None:
+                        _commit_task_transition(
+                            task_queue,
+                            resolved_t_id,
+                            updates={"status": TaskStatus.INCONCLUSIVE},
+                            clear_selected_version=True,
+                        )
+                        detail = (
+                            f"QA recheck for {resolved_t_id} has no committed worker attempt; "
+                            "marked task inconclusive."
+                        )
+                        logger.warning("supervisor: %s", detail)
+                        errors.append(f"supervisor: {detail}")
+                        continue
+                    recheck_key = task.current_attempt_id
+                    recheck_count = qa_rechecks_by_attempt.get(recheck_key, 0)
+                    if recheck_count >= MAX_QA_EVIDENCE_RERUNS_PER_ATTEMPT:
+                        _commit_task_transition(
+                            task_queue,
+                            resolved_t_id,
+                            updates={"status": TaskStatus.INCONCLUSIVE},
+                            close_attempt=True,
+                            clear_selected_version=True,
+                        )
+                        detail = (
+                            f"QA recheck limit reached for {resolved_t_id} "
+                            f"attempt {recheck_key}; marked task inconclusive."
+                        )
+                        logger.warning("supervisor: %s", detail)
+                        errors.append(f"supervisor: {detail}")
+                        continue
+                    qa_rechecks_by_attempt[recheck_key] = recheck_count + 1
+                    logger.warning(
+                        "supervisor: QA rerun task=%s attempt=%s kind=%s recheck=%d/%d "
+                        "without consuming a worker retry.",
+                        resolved_t_id,
+                        recheck_key,
+                        "contract_error" if evaluation.contract_error else "evidence_inconclusive",
+                        recheck_count + 1,
+                        MAX_QA_EVIDENCE_RERUNS_PER_ATTEMPT,
+                    )
                 _commit_task_transition(
                     task_queue,
                     resolved_t_id,
                     updates={"status": TaskStatus.OPTIMISTICALLY_FIXED},
                 )
-                errors.append(
-                    f"supervisor: QA contract error for {resolved_t_id}; "
-                    "requeued QA without consuming a remediation retry."
-                )
-                continue
-            if evaluation.evidence_inconclusive:
-                _commit_task_transition(
-                    task_queue,
-                    resolved_t_id,
-                    updates={"status": TaskStatus.OPTIMISTICALLY_FIXED},
-                )
-                errors.append(
-                    f"supervisor: dependency evidence inconclusive for {resolved_t_id}; "
-                    "requeued QA without consuming a remediation retry."
-                )
+                if evaluation.contract_error:
+                    errors.append(
+                        f"supervisor: QA contract error for {resolved_t_id}; "
+                        "requeued QA without consuming a remediation retry."
+                    )
+                else:
+                    errors.append(
+                        f"supervisor: dependency evidence inconclusive for {resolved_t_id}; "
+                        "requeued QA without consuming a remediation retry."
+                    )
                 continue
             if evaluation.passed:
                 _commit_task_transition(
@@ -3831,9 +3903,11 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
                 )
 
     logger.info(
-        "supervisor: routing to '%s' with targets=%s",
+        "supervisor: routing to '%s' decision=%s targets=%s reason=%s",
         resolved_next_node,
+        decision.decision_code.value if decision.decision_code else None,
         resolved_target_task_ids,
+        decision.decision_reason,
     )
 
     # ------------------------------------------------------------------
@@ -3912,6 +3986,7 @@ def run_supervisor_node(state: OrchestratorState) -> dict[str, Any]:
         # constraints_ledger uses operator.add â€” return only NEW entries
         "constraints_ledger": returned_constraints,
         "errors": errors,
+        "qa_rechecks_by_attempt": qa_rechecks_by_attempt,
     }
 
 

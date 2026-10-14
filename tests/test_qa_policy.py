@@ -26,6 +26,7 @@ from remediation_engine.contracts.schemas import (
     QATestAttribution,
     RemediationTask,
     RoutingStrategy,
+    ScanFallbackReason,
     ScannerExecutionStatus,
     ScanScope,
     SecurityReviewVerdict,
@@ -359,6 +360,31 @@ def test_version_bump_unavailable_dependency_evidence_is_inconclusive() -> None:
     assert result.passed is False
     assert result.evidence_inconclusive is True
     assert result.failure_category == FailureCategory.SECURITY_FLAG
+
+
+def test_version_bump_incomplete_scan_evidence_is_inconclusive() -> None:
+    """A successful empty fallback report must not clear a target."""
+    results = _results()
+    results.scan_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.FULL,
+        complete=False,
+        fallback_reason=ScanFallbackReason.INCOMPLETE_CLOSURE,
+    )
+
+    result = _evaluate(
+        _group("g1"),
+        QAPolicy.VERSION_BUMP,
+        results,
+        QAEvaluation(task_id="task-1", passed=True),
+    )
+
+    assert result.passed is False
+    assert result.evidence_inconclusive is True
+    assert result.deterministic_gates is not None
+    assert result.deterministic_gates.scan_evidence_complete is False
+    assert result.deterministic_gates.target_scanner_cleared is None
+    assert "ODC scan evidence was incomplete" in (result.retry_feedback or "")
 
 
 def test_version_bump_collects_task_keyed_dependency_evidence() -> None:

@@ -42,7 +42,10 @@ _ODC_INTERNAL_FULL_SCAN_EXCLUDES = (
     "**/.remedy-attempt-snapshots/**",
     "**/.odc-targeted/**",
 )
-_ODC_PYTHON_FULL_SCAN_EXCLUDES = ("**/.remedy-pipenv/**",)
+_ODC_PYTHON_FULL_SCAN_EXCLUDES = (
+    "**/.remedy-pipenv/**",
+    "**/.venv/**",
+)
 
 
 @dataclass(frozen=True)
@@ -465,6 +468,27 @@ def _parse_report_issues(report_text: str) -> list[VulnerabilityIssue] | None:
         return None
 
 
+def _parse_report_python_packages(
+    report_text: str,
+) -> set[tuple[str, str]] | None:
+    """Extract PyPI package/version identities from a parseable ODC report."""
+    try:
+        report = json.loads(report_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("qa_critic: failed to decode ODC package inventory — %s", exc)
+        return None
+    try:
+        from remediation_engine.tools.odc_parser import parse_python_packages
+    except ImportError:
+        logger.warning("qa_critic: remediation_engine.tools.odc_parser not importable.")
+        return None
+    try:
+        return parse_python_packages(report)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("qa_critic: failed to parse ODC package inventory — %s", exc)
+        return None
+
+
 def _odc_command(
     workspace_volume: str,
     scan_subdir: str | None = None,
@@ -722,6 +746,9 @@ def _run_security_scan(
     report_text = _read_report_from_workspace(sandbox)
     found_identifiers = _parse_report_identifiers(report_text) if report_text is not None else None
     found_issues = _parse_report_issues(report_text) if report_text is not None else None
+    scanned_packages = (
+        _parse_report_python_packages(report_text) if report_text is not None else set()
+    )
     # Legacy direct callers/tests may replace the identifier-only parser. In
     # that compatibility mode there is no typed issue snapshot to propagate,
     # but the identifier scan can still be evaluated normally.
@@ -800,6 +827,7 @@ def _run_security_scan(
                 new_identifiers,
                 found_issues,
                 execution_status=ScannerExecutionStatus.SUCCESS,
+                scanned_packages=scanned_packages or set(),
             ),
             exit_code=exit_code,
             stdout=stdout,
@@ -820,6 +848,7 @@ def _run_security_scan(
             new_identifiers,
             found_issues,
             execution_status=ScannerExecutionStatus.SUCCESS,
+            scanned_packages=scanned_packages or set(),
         ),
         exit_code=exit_code,
         stdout=stdout,
@@ -973,6 +1002,9 @@ def _run_targeted_security_scan(
     report_text = _read_report_from_workspace(sandbox, report_dir)
     found_identifiers = _parse_report_identifiers(report_text) if report_text is not None else None
     found_issues = _parse_report_issues(report_text) if report_text is not None else None
+    scanned_packages = (
+        _parse_report_python_packages(report_text) if report_text is not None else None
+    )
     if found_issues is None and found_identifiers is not None:
         found_issues = []
     if exit_code != 0 and (found_identifiers is None or found_issues is None):
@@ -996,7 +1028,7 @@ def _run_targeted_security_scan(
             diagnostic_log_path=diagnostic_log_path,
             error=summary,
         )
-    if found_identifiers is None or found_issues is None:
+    if found_identifiers is None or found_issues is None or scanned_packages is None:
         summary = (
             "FAILURE: Dependency-Check report was not parseable "
             f"(exit {exit_code}).\n"
@@ -1017,25 +1049,8 @@ def _run_targeted_security_scan(
             diagnostic_log_path=diagnostic_log_path,
             error=summary,
         )
-    if exit_code != 0:
-        summary = (
-            f"FAILURE: targeted Dependency-Check exited {exit_code}.\nstderr:\n{stderr[:2000]}"
-        )
-        return finish(
-            _SecurityScanResult(
-                False,
-                summary + report_location_note,
-                set(),
-                set(),
-                set(),
-                execution_status=ScannerExecutionStatus.UNPARSEABLE,
-            ),
-            exit_code=exit_code,
-            stdout=stdout,
-            stderr=stderr,
-            diagnostic_log_path=diagnostic_log_path,
-            error=summary,
-        )
+    # Match full-scan semantics: a nonzero ODC exit can still have a usable,
+    # parseable report. The caller validates the targeted package inventory.
 
     found = {identifier.upper().strip() for identifier in found_identifiers if identifier}
     remaining = {
@@ -1058,6 +1073,7 @@ def _run_targeted_security_scan(
                 new_identifiers,
                 found_issues,
                 execution_status=ScannerExecutionStatus.SUCCESS,
+                scanned_packages=scanned_packages,
             ),
             exit_code=exit_code,
             stdout=stdout,
@@ -1077,6 +1093,7 @@ def _run_targeted_security_scan(
             new_identifiers,
             found_issues,
             execution_status=ScannerExecutionStatus.SUCCESS,
+            scanned_packages=scanned_packages,
         ),
         exit_code=exit_code,
         stdout=stdout,

@@ -246,7 +246,9 @@ class TestTriageNodeIntegration:
         issues = [_issue()]
         system_context = SystemContext(scan_id="test")
 
-        mock_engine.invoke.return_value = {"status": "completed", "valid_groups": [_group()]}
+        mock_engine.stream.return_value = iter(
+            [{"status": "completed", "valid_groups": [_group()]}]
+        )
 
         with patch(
             "remediation_engine.orchestration.graph.build_phase5_runnable_config",
@@ -259,7 +261,7 @@ class TestTriageNodeIntegration:
                 system_context=system_context,
             )
 
-        invoked_state = mock_engine.invoke.call_args[0][0]
+        invoked_state = mock_engine.stream.call_args[0][0]
         assert invoked_state["issues"] == issues
         assert invoked_state["system_context"] == system_context
         assert invoked_state["repo_root"] == str(tmp_path)

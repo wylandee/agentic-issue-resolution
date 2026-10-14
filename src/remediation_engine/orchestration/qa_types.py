@@ -45,6 +45,7 @@ class _SecurityScanResult:
     raw_stderr: str | None = None
     diagnostic_log_path: str | None = None
     scan_records: tuple[_QALogRecord, ...] = ()
+    scanned_packages: set[tuple[str, str]] = field(default_factory=set)
 
 
 @dataclass

@@ -1609,6 +1609,13 @@ class QADeterministicGates(BaseModel):
     scanner_execution_status: ScannerExecutionStatus
     target_remaining_identifiers: list[str] = Field(default_factory=list)
     target_scanner_cleared: bool | None = None
+    scan_evidence_complete: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the scanner report covered the requested dependency closure. "
+            "False means the report is incomplete and cannot clear a target."
+        ),
+    )
     tests_passed: bool | None = None
     package_manifest_state: str | None = None
     package_graph_state: str | None = None
@@ -1637,6 +1644,7 @@ class ODCScanEvidence(BaseModel):
     remaining_target_identifiers: list[str] = Field(default_factory=list)
     complete: bool = False
     fallback_reason: ScanFallbackReason | None = None
+    scanned_package_specs: list[str] = Field(default_factory=list)
 
 
 class FinalFullScanResult(BaseModel):

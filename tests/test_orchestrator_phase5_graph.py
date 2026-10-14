@@ -163,7 +163,7 @@ class TestPhase5RunOrchestrator:
     def test_run_orchestrator_builds_initial_state_and_invokes_graph(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         mock_engine = MagicMock()
-        mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
+        mock_engine.stream.return_value = iter([{"status": "completed", "workspace_volume": None}])
 
         with (
             patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
@@ -174,7 +174,7 @@ class TestPhase5RunOrchestrator:
         ):
             result = run_orchestrator(str(tmp_path), groups)
 
-        invoked_state = mock_engine.invoke.call_args[0][0]
+        invoked_state = mock_engine.stream.call_args[0][0]
         assert invoked_state["repo_root"] == str(tmp_path)
         assert invoked_state["valid_groups"] == groups
         assert invoked_state["constraints_ledger"] == []
@@ -185,7 +185,7 @@ class TestPhase5RunOrchestrator:
     def test_run_orchestrator_passes_config_and_surfaces_trace_metadata(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         mock_engine = MagicMock()
-        mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
+        mock_engine.stream.return_value = iter([{"status": "completed", "workspace_volume": None}])
         run_id = uuid4()
         config = {
             "run_id": run_id,
@@ -207,7 +207,7 @@ class TestPhase5RunOrchestrator:
         ):
             result = run_orchestrator(str(tmp_path), groups)
 
-        invoked_state, invoked_config = mock_engine.invoke.call_args[0]
+        invoked_state, invoked_config = mock_engine.stream.call_args[0]
         assert invoked_state["repo_root"] == str(tmp_path)
         assert invoked_config == config
         assert result["langsmith_run_id"] == str(run_id)
@@ -218,7 +218,7 @@ class TestPhase5RunOrchestrator:
     def test_run_orchestrator_succeeds_when_trace_url_lookup_fails(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         mock_engine = MagicMock()
-        mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
+        mock_engine.stream.return_value = iter([{"status": "completed", "workspace_volume": None}])
         run_id = uuid4()
         config = {"run_id": run_id}
 
@@ -246,7 +246,7 @@ class TestPhase5RunOrchestrator:
         report_dir = tmp_path / "reports"
         monkeypatch.setenv("REMEDIATION_REPORT_DIR", str(report_dir))
         mock_engine = MagicMock()
-        mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
+        mock_engine.stream.return_value = iter([{"status": "completed", "workspace_volume": None}])
 
         with (
             patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
@@ -278,7 +278,7 @@ class TestPhase5RunOrchestrator:
         report_dir = tmp_path / "reports"
         monkeypatch.setenv("REMEDIATION_REPORT_DIR", str(report_dir))
         mock_engine = MagicMock()
-        mock_engine.invoke.side_effect = RuntimeError("graph exploded")
+        mock_engine.stream.side_effect = RuntimeError("graph exploded")
 
         with (
             patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
@@ -297,6 +297,73 @@ class TestPhase5RunOrchestrator:
         report_files = list(report_dir.glob("*.md"))
         assert len(report_files) == 1
         assert report_files[0].read_text(encoding="utf-8")
+
+    def test_keyboard_interrupt_preserves_partial_state_and_writes_follow_up_report(
+        self, tmp_path, monkeypatch
+    ):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        trajectory_dir = tmp_path / "trajectories"
+        report_dir = tmp_path / "reports"
+        monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
+        monkeypatch.setenv("REMEDIATION_REPORT_DIR", str(report_dir))
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={"status": TaskStatus.INCONCLUSIVE}
+        )
+        partial_state = {
+            **_initial_state(tmp_path, groups),
+            "initial_valid_groups": groups,
+            "task_queue": {"task-1": task},
+            "workspace_volume": "agent_workspace_interrupted",
+            "status": "qa_completed",
+            "active_target_task_ids": ["task-1"],
+        }
+
+        def interrupted_stream(*_args, **_kwargs):
+            yield partial_state
+            raise KeyboardInterrupt()
+
+        mock_engine = MagicMock()
+        mock_engine.stream.side_effect = interrupted_stream
+        teardown_update = {
+            "status": "completed_with_errors",
+            "workspace_volume": None,
+            "changed_files": [],
+            "diff": "",
+        }
+
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=(None, None),
+            ),
+            patch(
+                "remediation_engine.orchestration.graph.run_teardown_node",
+                return_value=teardown_update,
+            ) as mock_teardown,
+            pytest.raises(KeyboardInterrupt),
+        ):
+            run_orchestrator(str(tmp_path), groups)
+
+        mock_engine.stream.assert_called_once()
+        assert mock_engine.stream.call_args.kwargs["stream_mode"] == "values"
+        mock_teardown.assert_called_once()
+        assert mock_teardown.call_args.args[0]["task_queue"]["task-1"].status == (
+            TaskStatus.INCONCLUSIVE
+        )
+
+        report_files = list(report_dir.glob("*.md"))
+        assert len(report_files) == 1
+        report_text = report_files[0].read_text(encoding="utf-8")
+        assert "Vulnerability groups requiring follow-up" in report_text
+        assert "lodash" in report_text
+
+        trajectory_files = list(trajectory_dir.glob("*.md"))
+        assert len(trajectory_files) == 1
+        trajectory_text = trajectory_files[0].read_text(encoding="utf-8")
+        assert "task-1" in trajectory_text
+        assert "orchestrator interrupted by KeyboardInterrupt" in trajectory_text
+        assert "inconclusive" in trajectory_text
 
 
 class TestPhase5GraphIntegration:

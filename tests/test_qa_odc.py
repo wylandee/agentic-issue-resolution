@@ -42,10 +42,12 @@ from remediation_engine.orchestration.qa_odc import (
     _ODC_TIMEOUT_SECONDS,
     _odc_command,
     _parse_report_identifiers,
+    _parse_report_python_packages,
     _read_report_from_workspace,
     _run_odc,
     _run_security_scan,
     _run_targeted_odc,
+    _run_targeted_security_scan,
 )
 from remediation_engine.orchestration.qa_test_parsing import (
     _NPM_INSTALL_TIMEOUT_SECONDS,
@@ -342,6 +344,25 @@ class TestParseReportIdentifiers:
         assert "CVE-2021-23337" in result
 
 
+def test_python_package_inventory_includes_nonvulnerable_dependencies():
+    report = json.dumps(
+        {
+            "dependencies": [
+                {
+                    "packages": [{"id": "pkg:pypi/Certifi@2024.7.4"}],
+                    "vulnerabilities": [],
+                },
+                {
+                    "packages": [{"id": "pkg:npm/example@1.0.0"}],
+                    "vulnerabilities": [],
+                },
+            ]
+        }
+    )
+
+    assert _parse_report_python_packages(report) == {("certifi", "2024.7.4")}
+
+
 class TestRunOdc:
     def test_includes_workspace_volume_in_command(self):
         with patch("subprocess.run") as mock_run:
@@ -387,7 +408,7 @@ class TestRunOdc:
         assert command.count("--enableExperimental") == 1
         assert command[-3:] == ["--format", "XML", "--enableExperimental"]
         assert "**/.remedy-pipenv/**" in command
-        assert "**/.venv/**" not in command
+        assert "**/.venv/**" in command
 
     def test_python_command_does_not_duplicate_configured_experimental_flag(self):
         with patch(
@@ -409,6 +430,7 @@ class TestRunOdc:
         assert command[-2:] == ["--format", "XML"]
         assert "--enableExperimental" not in command
         assert "**/.remedy-pipenv/**" not in command
+        assert "**/.venv/**" not in command
 
     def test_python_install_and_tests_use_persistent_venv(self):
         sandbox = _make_sandbox()
@@ -570,6 +592,104 @@ class TestRunOdc:
         payload = json.loads(Path(raised.value.log_path).read_text(encoding="utf-8"))
         assert payload["cleanup"]["succeeded"] is False
         assert payload["cleanup"]["error"] == "permission denied"
+
+
+def test_targeted_python_scan_reports_clean_package_inventory():
+    sandbox = MagicMock()
+    report = json.dumps(
+        {
+            "dependencies": [
+                {
+                    "packages": [{"id": "pkg:pypi/certifi@2024.7.4"}],
+                    "vulnerabilities": [],
+                }
+            ]
+        }
+    )
+    process = subprocess.CompletedProcess(
+        args=["docker"],
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/docker"),
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_targeted_odc",
+            return_value=process,
+        ) as targeted_odc,
+        patch(
+            "remediation_engine.orchestration.qa_odc._read_report_from_workspace",
+            return_value=report,
+        ),
+        patch(
+            "remediation_engine.orchestration.qa_odc._persist_workspace_report_to_host",
+            return_value=None,
+        ),
+    ):
+        result = _run_targeted_security_scan(
+            sandbox,
+            "test-volume",
+            set(),
+            set(),
+            ".odc-targeted",
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+    assert result.ok is True
+    assert result.execution_status.value == "success"
+    assert result.scanned_packages == {("certifi", "2024.7.4")}
+    assert targeted_odc.call_args.args[2] == ProjectLanguage.PYTHON
+
+
+def test_targeted_scan_accepts_parseable_report_with_nonzero_exit() -> None:
+    report = json.dumps(
+        {
+            "dependencies": [
+                {
+                    "packages": [{"id": "pkg:pypi/certifi@2024.7.4"}],
+                    "vulnerabilities": [],
+                }
+            ]
+        }
+    )
+    process = subprocess.CompletedProcess(
+        args=["docker"],
+        returncode=14,
+        stdout="ODC emitted a parseable report with analyzer warnings",
+        stderr="",
+    )
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/docker"),
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_targeted_odc",
+            return_value=process,
+        ) as targeted_odc,
+        patch(
+            "remediation_engine.orchestration.qa_odc._read_report_from_workspace",
+            return_value=report,
+        ),
+        patch(
+            "remediation_engine.orchestration.qa_odc._persist_workspace_report_to_host",
+            return_value=None,
+        ),
+    ):
+        result = _run_targeted_security_scan(
+            MagicMock(),
+            "test-volume",
+            {"CVE-2026-0001"},
+            {"CVE-2026-0001"},
+            ".odc-targeted",
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+    assert result.ok is True
+    assert result.execution_status.value == "success"
+    assert result.scanned_packages == {("certifi", "2024.7.4")}
+    assert result.exit_code == 14
+    assert targeted_odc.call_args.args[2] == ProjectLanguage.PYTHON
 
 
 class TestRunSecurityScan:
