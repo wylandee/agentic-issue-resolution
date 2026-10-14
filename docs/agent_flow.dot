@@ -1,0 +1,38 @@
+digraph AgentFlow {
+    rankdir=TB;
+    graph [fontname="Helvetica,Arial,sans-serif", fontsize=12, pad="0.5", nodesep="0.7", ranksep="0.9"];
+    node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box, style="rounded,filled", margin="0.22,0.16"];
+    edge [fontname="Helvetica,Arial,sans-serif", fontsize=10];
+
+    __start__ [label="START", shape=circle, fillcolor="#1F2937", color="#111827", fontcolor="#FFFFFF", width=0.8];
+    __end__ [label="END", shape=doublecircle, fillcolor="#1F2937", color="#111827", fontcolor="#FFFFFF", width=0.8];
+
+    triage_agent [label="Triage Agent\n(Parse, Group & Reconcile)", fillcolor="#FEF3C7", color="#F59E0B", fontcolor="#92400E", penwidth=1.8];
+    supervisor [label="SUPERVISOR\n(Central Attempt Authority)", fillcolor="#EDE9FE", color="#8B5CF6", fontcolor="#5B21B6", penwidth=2.5];
+    
+    update_agent [label="Update Agent\n(Atomic Dep Bump)", fillcolor="#DBEAFE", color="#3B82F6", fontcolor="#1E40AF", penwidth=1.8];
+    workaround_agent [label="Code Workaround Agent\n(Phase-Gated Code Fix)", fillcolor="#DBEAFE", color="#3B82F6", fontcolor="#1E40AF", penwidth=1.8];
+    qa_agent [label="QA Agent\n(Deterministic QA Gates)", fillcolor="#FEE2E2", color="#EF4444", fontcolor="#991B1B", penwidth=1.8];
+    report_agent [label="Report Agent\n(Markdown & Diff Summary)", fillcolor="#D1FAE5", color="#10B981", fontcolor="#065F46", penwidth=1.8];
+
+    { rank = same; update_agent; workaround_agent; qa_agent; }
+
+    __start__ -> triage_agent [color="#1F2937", penwidth=1.5];
+    triage_agent -> supervisor [color="#1F2937", penwidth=1.5, label="Initial Triage Done"];
+    triage_agent -> report_agent [style=dashed, color="#6B7280", label="No Actionable Work"];
+
+    supervisor -> update_agent [style=dashed, color="#3B82F6", label="Committed Update"];
+    update_agent -> supervisor [color="#1F2937", penwidth=1.2];
+
+    supervisor -> workaround_agent [style=dashed, color="#3B82F6", label="Committed Workaround"];
+    workaround_agent -> supervisor [color="#1F2937", penwidth=1.2];
+
+    supervisor -> qa_agent [style=dashed, color="#EF4444", label="Validate Attempt"];
+    qa_agent -> supervisor [color="#1F2937", penwidth=1.2, label="Attempt Evaluation"];
+
+    supervisor -> triage_agent [style=dashed, color="#F59E0B", label="Post-QA Re-Triage"];
+    triage_agent -> supervisor [color="#1F2937", penwidth=1.2, label="Reconciled"];
+
+    supervisor -> report_agent [color="#1F2937", penwidth=1.5, label="All Tasks Evaluated"];
+    report_agent -> __end__ [color="#1F2937", penwidth=1.5];
+}

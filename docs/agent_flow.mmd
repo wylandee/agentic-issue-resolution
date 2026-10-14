@@ -1,0 +1,27 @@
+flowchart TD
+    Start([START]):::boundary --> Triage["Triage Agent<br/>(Parse, Group & Reconcile)"]:::triage
+    
+    Triage -->|Initial Triage Done| Supervisor["SUPERVISOR<br/>(Central Attempt Authority)"]:::supervisor
+    Triage -.->|No Actionable Work| Report["Report Agent<br/>(Markdown & Diff Summary)"]:::report
+    
+    Supervisor -.->|Committed Update| Update["Update Agent<br/>(Atomic Dep Bump)"]:::worker
+    Update --> Supervisor
+    
+    Supervisor -.->|Committed Workaround| Workaround["Code Workaround Agent<br/>(Phase-Gated Code Fix)"]:::worker
+    Workaround --> Supervisor
+    
+    Supervisor -.->|Validate Attempt| QA["QA Agent<br/>(Deterministic QA Gates)"]:::qa
+    QA -->|Attempt Evaluation| Supervisor
+    
+    Supervisor -.->|Post-QA Re-Triage| Triage
+    Triage -->|Reconciled| Supervisor
+    
+    Supervisor -->|All Tasks Evaluated| Report
+    Report --> End([END]):::boundary
+
+    classDef boundary fill:#1f2937,stroke:#111827,stroke-width:2px,color:#ffffff;
+    classDef supervisor fill:#ede9fe,stroke:#8b5cf6,stroke-width:2.5px,color:#5b21b6;
+    classDef worker fill:#dbeafe,stroke:#3b82f6,stroke-width:2px,color:#1e40af;
+    classDef qa fill:#fee2e2,stroke:#ef4444,stroke-width:2px,color:#991b1b;
+    classDef triage fill:#fef3c7,stroke:#f59e0b,stroke-width:2px,color:#92400e;
+    classDef report fill:#d1fae5,stroke:#10b981,stroke-width:2px,color:#065f46;
