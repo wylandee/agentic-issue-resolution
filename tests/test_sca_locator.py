@@ -689,6 +689,22 @@ class TestFindNearestManifest:
         assert manifest.parent.name == "frontend"
         assert manifest.name == "package.json"
 
+    def test_scan_mount_nested_frontend_prefers_frontend_manifest(self, tmp_repo_nested):
+        """Container-mounted ODC paths must strip the ``/scan`` virtual root."""
+        manifest = _find_nearest_manifest(
+            tmp_repo_nested,
+            "/scan/frontend/package-lock.json?/elliptic:6.6.1",
+        )
+        assert manifest == (tmp_repo_nested / "frontend" / "package.json").resolve()
+
+    def test_relative_scan_mount_nested_frontend_prefers_frontend_manifest(self, tmp_repo_nested):
+        """The same normalization applies when ODC omits the leading slash."""
+        manifest = _find_nearest_manifest(
+            tmp_repo_nested,
+            "scan/frontend/package-lock.json?/elliptic:6.6.1",
+        )
+        assert manifest == (tmp_repo_nested / "frontend" / "package.json").resolve()
+
     def test_empty_path_returns_none(self, tmp_repo):
         result = _find_nearest_manifest(tmp_repo, "")
         # Empty path â€” falls back gracefully
@@ -958,6 +974,20 @@ class TestLocateFromIssue:
         issue = self._make_issue()
         loc = locate_from_issue(issue, tmp_repo)
         assert loc.localization_confidence >= 0.9
+
+    def test_scan_mount_path_is_preserved_in_localized_manifest(self, tmp_repo_nested):
+        issue = self._make_issue(
+            package_name="elliptic",
+            package_version="6.6.1",
+            purl="pkg:npm/elliptic@6.6.1",
+            file_path="/scan/frontend/package-lock.json?/elliptic:6.6.1",
+            raw_payload={"filePath": "/scan/frontend/package-lock.json?/elliptic:6.6.1"},
+        )
+
+        loc = locate_from_issue(issue, tmp_repo_nested)
+
+        assert loc.manifest_file == "frontend/package.json"
+        assert loc.is_direct_dependency is True
 
     def test_low_confidence_for_transitive(self, tmp_repo):
         issue = self._make_issue(

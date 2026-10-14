@@ -17,6 +17,8 @@ LLM-backed agents. The tactical Supervisor uses a stable system prompt plus a
 bounded dynamic context, may select an immediate remediation pivot, and falls
 back to the deterministic router when the key or model is unavailable. Python
 still verifies every target and version and commits the worker instruction.
+Portfolio planning and certification remain deterministic; package updates are
+constrained by the committed solver plan and its approved mutation allowlist.
 
 The runtime reads these environment names:
 
@@ -26,11 +28,18 @@ The runtime reads these environment names:
   `GITHUB_TOKEN`.
 * **Scanning and workflow controls:** `ODC_EXTRA_ARGS`,
   `REMEDY_BYPASS_WORKAROUND_SUBAGENT`, `REMEDY_DISABLE_POST_QA_TRIAGE`,
-  `REMEDY_RETRIAGE_LIMIT_ENABLED`, and `REMEDY_RETRIAGE_LIMIT`.
+  `REMEDY_RETRIAGE_LIMIT_ENABLED`, `REMEDY_RETRIAGE_LIMIT`, and
+  `REMEDY_MAX_DELTA_CANARY_PROBES`.
 * **Caching, reports, and tracing:** `TRIAGE_CACHE_DIR`,
-  `REMEDIATION_TRAJECTORY_DIR`, `REMEDIATION_REPORT_DIR`,
-  `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, and
-  `LANGSMITH_ENDPOINT`.
+  `REMEDIATION_SOLVER_CACHE_DIR`, `REMEDIATION_TRAJECTORY_DIR`,
+  `REMEDIATION_REPORT_DIR`, `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`,
+  `LANGSMITH_PROJECT`, and `LANGSMITH_ENDPOINT`.
+* **Portfolio solver controls:** `REMEDY_SOLVER_TIMEOUT_SECONDS`,
+  `REMEDY_SOLVER_TOP_K`, `REMEDY_SOLVER_PHASE_BUDGET`,
+  `REMEDY_SOLVER_ACCEPT_FEASIBLE`, `REMEDY_SOLVER_RANDOM_SEED`,
+  `REMEDY_SOLVER_NUM_SEARCH_WORKERS`, `REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET`,
+  `REMEDY_SOLVER_MAX_MODEL_VARIABLES`, `REMEDY_SOLVER_LLM_ENABLED`, and
+  `SOLVER_LLM_MODEL`.
 
 Unset node-specific model values use `REMEDY_LLM_MODEL`. The retriage limit is
 a development guard and is unlimited by default.
@@ -41,9 +50,18 @@ The canonical issue interchange format is JSONL: one validated issue object per
 line. `ingest` accepts `odc-json`, `semgrep-json`, or canonical `jsonl` input
 (`--format auto` detects `.jsonl` and `.ndjson`; use an explicit format for
 scanner reports) and writes canonical JSONL. `triage` consumes canonical JSONL
-and writes its JSON group result. `run` consumes canonical JSONL and writes a
-typed result JSON, with an optional reviewable unified diff and Markdown
-report.
+and writes its JSON group result. `solve` consumes pre-triaged groups JSON and
+builds a deterministic, offline portfolio/DAG plan without workers or host
+repository mutation; pass `--tasks` for an optional task-queue fixture. `run`
+consumes canonical JSONL and writes a typed result JSON, with an optional
+reviewable unified diff and Markdown report.
+
+For a solver dry run:
+
+```bash
+remedy solve /tmp/remediation-groups.json --repo "$REPO_ROOT" \
+  --output /tmp/portfolio-plan.json
+```
 
 After cloning a target repository, run the maintained Juice Shop fixture
 through the complete flow:
@@ -74,10 +92,10 @@ diagnostic basis and strategy proposal; Python verifies the normalized
 security floor, candidate whitelist, task identity, dependency type, and
 relative file hints, then renders and digests the exact worker instruction.
 Breaking-change evidence can pivot directly to a workaround. Peer conflicts
-may be recorded as a Phase 2 portfolio referral, while actual clustering and
-multi-package orchestration remain deferred to Phase 3. Without an API key,
-or when the model or registry verification fails, the deterministic router
-remains authoritative.
+are referred to the deterministic outer portfolio solver, which owns package
+clustering and multi-package planning; tactical decisions remain single-task.
+Without an API key, or when the model or registry verification fails, the
+deterministic router remains authoritative.
 
 Workaround retries restore only the child source-edit snapshot when QA rejects
 an intermediate hypothesis, preserving the resolved dependency candidate.
@@ -87,9 +105,13 @@ the bounded worker loop after all tool responses in that model turn are
 recorded, so a later max-round guard cannot turn a passing workaround into a
 surrender.
 
-The CLI exits with `0` for a completed run without errors, `1` for a completed
-run with remediation errors or unfixable tasks, and `2` for invalid input or
-missing prerequisites. `--output` and `--patch-out` write files; without an
+`remedy run` exits with `0` for a completed run without errors, `1` for a
+completed run with remediation errors or unfixable tasks, and `2` for invalid
+input or missing prerequisites. Offline `remedy solve` exits with `0` for an
+`OPTIMAL` or `FEASIBLE` solver status without diagnostics, `1` for other solver
+statuses or diagnostics, and `2` for invalid input or missing prerequisites.
+`solve` is a non-dispatchable preview: package resolution remains `NOT_RUN` and
+`dispatchable` is false. `--output` and `--patch-out` write files; without an
 output path, serialized output is written to stdout.
 
 ## Python API
@@ -118,6 +140,26 @@ optional trajectory/report paths. The API and CLI never apply changes to the
 host repository. Use `triage_issues` when callers need to create actionable
 groups explicitly; internal graph state, workers, and Docker clients are not
 public API.
+
+The immutable portfolio surface is available from
+`remediation_engine.orchestration` for callers that already have validated
+triage groups and a repository workspace:
+
+```python
+from remediation_engine.orchestration import (
+    apply_portfolio_plan,
+    build_portfolio_plan,
+    prepare_portfolio_inputs,
+)
+
+groups, task_queue, diagnostics = prepare_portfolio_inputs(repo_root, groups, task_queue)
+plan = build_portfolio_plan(repo_root, groups, task_queue)
+groups, task_queue, diagnostics = apply_portfolio_plan(plan, groups, task_queue)
+```
+
+These functions are copy-on-write and return typed plan/task projections; they
+do not dispatch workers or mutate the repository. The lower-level occurrence
+solver entry points remain under `remediation_engine.solver`.
 
 ## Development and evaluation
 

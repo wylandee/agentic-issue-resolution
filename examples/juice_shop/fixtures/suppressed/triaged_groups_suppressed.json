@@ -1,5 +1,6 @@
 [
   {
+
     "cve_ids": [
       "CVE-2026-3449"
     ],
@@ -1901,6 +1902,7 @@
     "vulnerable_component": "notevil"
   },
   {
+
     "cve_ids": [
       "CVE-2022-25887",
       "CVE-2016-1000237",

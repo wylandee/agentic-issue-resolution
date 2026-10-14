@@ -65,8 +65,63 @@ def test_retriage_limit_is_disabled_by_default_and_toggleable(monkeypatch):
     assert AppSettings.from_env().remedy_retriage_limit == 7
 
 
+def test_final_full_scan_is_disabled_by_default_and_toggleable(monkeypatch):
+    variable = "REMEDY_FINAL_FULL_SCAN_ENABLED"
+    monkeypatch.delenv(variable, raising=False)
+    assert AppSettings().remedy_final_full_scan_enabled is False
+    assert AppSettings.from_env().remedy_final_full_scan_enabled is False
+
+    monkeypatch.setenv(variable, "true")
+    assert AppSettings.from_env().remedy_final_full_scan_enabled is True
+
+
 def test_retriage_limit_rejects_invalid_values(monkeypatch):
     monkeypatch.setenv("REMEDY_RETRIAGE_LIMIT", "not-a-number")
 
     with pytest.raises(ValueError, match="REMEDY_RETRIAGE_LIMIT must be an integer"):
+        AppSettings.from_env()
+
+
+def test_solver_certification_timeout_has_positive_configurable_default(monkeypatch):
+    monkeypatch.delenv("REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS", raising=False)
+    assert AppSettings.from_env().solver_certification_timeout_seconds == 900
+
+    monkeypatch.setenv("REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS", "37")
+    assert AppSettings.from_env().solver_certification_timeout_seconds == 37
+
+    monkeypatch.setenv("REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValueError, match="must be at least 1"):
+        AppSettings.from_env()
+
+
+def test_candidate_limit_default_and_override(monkeypatch):
+    variable = "REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET"
+    monkeypatch.delenv(variable, raising=False)
+
+    assert AppSettings().solver_max_candidates_per_target == 256
+    assert AppSettings.from_env().solver_max_candidates_per_target == 256
+
+    monkeypatch.setenv(variable, "96")
+    assert AppSettings.from_env().solver_max_candidates_per_target == 96
+
+
+def test_delta_canary_probe_budget_default_and_override(monkeypatch):
+    variable = "REMEDY_MAX_DELTA_CANARY_PROBES"
+    monkeypatch.delenv(variable, raising=False)
+
+    assert AppSettings().max_delta_canary_probes == 2
+    assert AppSettings.from_env().max_delta_canary_probes == 2
+
+    monkeypatch.setenv(variable, "5")
+    assert AppSettings.from_env().max_delta_canary_probes == 5
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("0", "must be at least 1"), ("not-an-integer", "must be an integer")],
+)
+def test_delta_canary_probe_budget_requires_positive_integer(monkeypatch, value, message):
+    monkeypatch.setenv("REMEDY_MAX_DELTA_CANARY_PROBES", value)
+
+    with pytest.raises(ValueError, match=message):
         AppSettings.from_env()

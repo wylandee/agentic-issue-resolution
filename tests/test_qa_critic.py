@@ -13,6 +13,8 @@ from remediation_engine.contracts.schemas import (
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
+    ScanFallbackReason,
+    ScannerExecutionStatus,
     TaskAttemptSnapshot,
     TaskStatus,
 )
@@ -192,6 +194,35 @@ class TestRunQACriticNode:
         assert call["scan_skip_reason"] == "no_fix_package_removal"
         assert result["new_vulnerability_status"] == "not_scanned"
         assert result["qa_evaluations"]["task-1"].passed is True
+
+    def test_no_matching_target_is_skipped_but_not_passed(self):
+        group = _make_group()
+        state = _make_minimal_state(groups=[group])
+        results = _make_fully_populated_results(ok=True)
+        results.scan_target_failures_by_task = {
+            "task-1": (
+                ScanFallbackReason.NO_MATCHING_TARGET,
+                "Task task-1 target selection failed for package-lock.json: no_matching_target",
+            )
+        }
+        patches = self._patch_node(group=group, results=results)
+
+        with patches["sandbox"], patches["global_exec"], patches["investigators"]:
+            result = run_qa_critic_node(state)
+
+        evaluation = result["qa_evaluations"]["task-1"]
+        gates = evaluation.deterministic_gates
+        assert result["eval_status"] == "failures_detected"
+        assert evaluation.passed is False
+        assert evaluation.evidence_inconclusive is True
+        assert evaluation.failure_category == FailureCategory.SECURITY_FLAG
+        assert gates is not None
+        assert gates.status == "fail"
+        assert gates.scanner_execution_status == ScannerExecutionStatus.SKIPPED
+        assert gates.target_scanner_cleared is None
+        assert any("scan skipped" in item for item in gates.diagnostics)
+        assert "not evidence" in evaluation.retry_feedback.lower()
+        assert not any("no_matching_target" in error for error in result["errors"])
 
     def test_same_parent_group_tasks_receive_isolated_task_evaluations(self):
         group = _make_group()

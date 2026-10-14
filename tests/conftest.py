@@ -50,6 +50,7 @@ def isolate_external_runtime_environment(monkeypatch: pytest.MonkeyPatch) -> Non
         "REMEDY_BYPASS_WORKAROUND_SUBAGENT",
         "REMEDY_RETRIAGE_LIMIT_ENABLED",
         "REMEDY_RETRIAGE_LIMIT",
+        "REMEDY_MAX_DELTA_CANARY_PROBES",
         "ODC_EXTRA_ARGS",
     ):
         monkeypatch.delenv(name, raising=False)

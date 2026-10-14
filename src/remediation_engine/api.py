@@ -5,10 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .contracts.schemas import SystemContext, VulnerabilityGroup, VulnerabilityIssue
 from .orchestration.graph import run_orchestrator
+from .orchestration.state import normalize_target_packages, validate_target_package_scope
 from .orchestration.task_utils import terminal_outcome_issues
 from .settings import AppSettings
 from .triage.pipeline import run_triage_pipeline
@@ -20,6 +21,8 @@ class RemediationRequest(BaseModel):
     ``repo_root`` is normalized to an absolute path during validation. The
     orchestrator runs against an isolated workspace; callers supply either
     pre-grouped findings or raw typed issues for the graph's triage node.
+    ``target_packages`` is an explicit development-only allowlist; leaving it
+    empty preserves the normal full-repository behavior.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -28,6 +31,13 @@ class RemediationRequest(BaseModel):
     valid_groups: list[VulnerabilityGroup] = Field(default_factory=list)
     issues: list[VulnerabilityIssue] = Field(default_factory=list)
     system_context: SystemContext | None = None
+    target_packages: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional development-only package allowlist. Empty means the full "
+            "repository is in scope."
+        ),
+    )
 
     @field_validator("repo_root")
     @classmethod
@@ -40,6 +50,18 @@ class RemediationRequest(BaseModel):
         if not resolved.is_dir():
             raise ValueError(f"repo_root must be an existing directory: {value}")
         return resolved
+
+    @field_validator("target_packages")
+    @classmethod
+    def normalize_target_package_names(cls, value: list[str]) -> list[str]:
+        """Normalize and de-duplicate development package scope names."""
+        return normalize_target_packages(value)
+
+    @model_validator(mode="after")
+    def validate_development_package_scope(self) -> RemediationRequest:
+        """Reject package scoping unless the request explicitly targets dev."""
+        validate_target_package_scope(self.target_packages, self.system_context)
+        return self
 
 
 class RemediationResult(BaseModel):
@@ -107,7 +129,8 @@ def run_remediation(
     paths, a unified diff, and any accumulated errors.
 
     Args:
-        request: Validated repository path and typed findings or groups.
+        request: Validated repository path, typed findings or groups, and an
+            optional development-only package scope.
         settings: Optional settings dependency for CLI and embedding callers.
 
     Returns:
@@ -125,6 +148,7 @@ def run_remediation(
         "valid_groups": groups,
         "issues": request.issues,
         "system_context": request.system_context,
+        "target_packages": request.target_packages,
         "settings": resolved_settings,
     }
     state = run_orchestrator(**orchestrator_kwargs)

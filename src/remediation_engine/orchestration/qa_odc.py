@@ -15,12 +15,16 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from packageurl import PackageURL
+
 from remediation_engine.contracts.schemas import ScannerExecutionStatus, VulnerabilityIssue
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.tools.package_identity import package_name_from_purl
 
 from .qa_types import (
     _exception_stream,
+    _ODCReportedPackageOccurrence,
     _QALogRecord,
     _SecurityScanResult,
     _subprocess_text,
@@ -451,6 +455,158 @@ def _parse_report_issues(report_text: str) -> list[VulnerabilityIssue] | None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("qa_critic: failed to parse ODC vulnerabilities â€” %s", exc)
         return None
+
+
+def _normalise_odc_report_path(value: str) -> str | None:
+    """Return a workspace-relative report path, retaining targeted project identity."""
+    normalized = value.strip().replace("\\", "/").split("?", 1)[0].split("#", 1)[0]
+    if not normalized:
+        return None
+    targeted_marker = ".odc-targeted/"
+    if targeted_marker in normalized:
+        normalized = targeted_marker + normalized.split(targeted_marker, 1)[1]
+    elif normalized.startswith("/scan/"):
+        normalized = normalized[len("/scan/") :]
+    elif normalized.startswith("scan/"):
+        normalized = normalized[len("scan/") :]
+    else:
+        normalized = normalized.lstrip("/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized or normalized == ".." or normalized.startswith("../") or "/../" in normalized:
+        return None
+    return normalized
+
+
+def _parse_report_dependency_paths(report_text: str) -> list[str] | None:
+    """Extract primary and related dependency paths, including clean entries.
+
+    An empty list is a valid report with no dependency file coverage; ``None``
+    means the report could not prove a dependency list.
+    """
+    try:
+        report = json.loads(report_text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(report, dict) or not isinstance(report.get("dependencies"), list):
+        return None
+
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add_path(raw_path: Any) -> None:
+        if not isinstance(raw_path, str):
+            return
+        normalized_path = _normalise_odc_report_path(raw_path)
+        if normalized_path and normalized_path not in seen:
+            seen.add(normalized_path)
+            paths.append(normalized_path)
+
+    for dependency in report["dependencies"]:
+        if not isinstance(dependency, dict):
+            continue
+        add_path(dependency.get("filePath"))
+        related_dependencies = dependency.get("relatedDependencies") or []
+        if isinstance(related_dependencies, list):
+            for related in related_dependencies:
+                if isinstance(related, dict):
+                    add_path(related.get("filePath"))
+    return paths
+
+
+def _parse_report_package_occurrences(
+    report_text: str,
+) -> list[_ODCReportedPackageOccurrence] | None:
+    """Parse PURL-backed package occurrences from primary and related entries."""
+    try:
+        report = json.loads(report_text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(report, dict) or not isinstance(report.get("dependencies"), list):
+        return None
+
+    occurrences: list[_ODCReportedPackageOccurrence] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_packages(packages: Any, report_path: Any) -> None:
+        if not isinstance(packages, list):
+            return
+        normalized_path = (
+            _normalise_odc_report_path(report_path) if isinstance(report_path, str) else None
+        )
+        raw_path = (
+            report_path.strip().replace("\\", "/")
+            if isinstance(report_path, str) and report_path.strip()
+            else None
+        )
+        if raw_path is not None:
+            base_path, separator, query = raw_path.partition("?")
+            normalized_base = _normalise_odc_report_path(base_path)
+            occurrence_path = (
+                f"{normalized_base}?{query.split('#', 1)[0]}"
+                if normalized_base and separator
+                else normalized_base
+            )
+        else:
+            occurrence_path = None
+
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            purl = package.get("id")
+            if not isinstance(purl, str) or not purl.startswith("pkg:"):
+                continue
+            try:
+                parsed = PackageURL.from_string(purl)
+            except Exception:  # noqa: BLE001 - malformed package identity is not trusted
+                continue
+            package_name = package_name_from_purl(purl)
+            version = str(parsed.version or "").strip()
+            ecosystem = str(parsed.type or "").strip()
+            if not package_name or not version or not ecosystem:
+                continue
+            if occurrence_path is not None:
+                identity = (occurrence_path, purl)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            occurrences.append(
+                _ODCReportedPackageOccurrence(
+                    package_name=package_name,
+                    version=version,
+                    ecosystem=ecosystem,
+                    file_path=normalized_path,
+                    raw_file_path=raw_path,
+                )
+            )
+
+    for dependency in report["dependencies"]:
+        if not isinstance(dependency, dict):
+            continue
+        add_packages(dependency.get("packages") or [], dependency.get("filePath"))
+        related_dependencies = dependency.get("relatedDependencies") or []
+        if not isinstance(related_dependencies, list):
+            continue
+        for related in related_dependencies:
+            if not isinstance(related, dict):
+                continue
+            package_ids = related.get("packageIds")
+            if package_ids is None:
+                package_ids = related.get("packages")
+            add_packages(package_ids or [], related.get("filePath"))
+    return occurrences
+
+
+def _parse_report_package_identities(report_text: str) -> list[tuple[str, str]] | None:
+    """Extract npm package name/version pairs ODC actually enumerated."""
+    occurrences = _parse_report_package_occurrences(report_text)
+    if occurrences is None:
+        return None
+    return [
+        (occurrence.package_name.casefold(), occurrence.version)
+        for occurrence in occurrences
+        if occurrence.ecosystem.casefold() == "npm"
+    ]
 
 
 def _odc_command(
@@ -933,6 +1089,21 @@ def _run_targeted_security_scan(
     report_text = _read_report_from_workspace(sandbox, report_dir)
     found_identifiers = _parse_report_identifiers(report_text) if report_text is not None else None
     found_issues = _parse_report_issues(report_text) if report_text is not None else None
+    reported_package_occurrences = (
+        _parse_report_package_occurrences(report_text) if report_text is not None else None
+    )
+    reported_packages = (
+        None
+        if reported_package_occurrences is None
+        else [
+            (occurrence.package_name.casefold(), occurrence.version)
+            for occurrence in reported_package_occurrences
+            if occurrence.ecosystem.casefold() == "npm"
+        ]
+    )
+    reported_paths = (
+        _parse_report_dependency_paths(report_text) if report_text is not None else None
+    )
     if found_issues is None and found_identifiers is not None:
         found_issues = []
     if exit_code != 0 and (found_identifiers is None or found_issues is None):
@@ -1018,6 +1189,9 @@ def _run_targeted_security_scan(
                 new_identifiers,
                 found_issues,
                 execution_status=ScannerExecutionStatus.SUCCESS,
+                reported_packages=reported_packages,
+                reported_paths=reported_paths,
+                reported_package_occurrences=reported_package_occurrences,
             ),
             exit_code=exit_code,
             stdout=stdout,
@@ -1037,9 +1211,33 @@ def _run_targeted_security_scan(
             new_identifiers,
             found_issues,
             execution_status=ScannerExecutionStatus.SUCCESS,
+            reported_packages=reported_packages,
+            reported_paths=reported_paths,
+            reported_package_occurrences=reported_package_occurrences,
         ),
         exit_code=exit_code,
         stdout=stdout,
         stderr=stderr,
         diagnostic_log_path=diagnostic_log_path,
+    )
+
+
+def _run_incremental_security_scan(
+    sandbox: DockerSandbox,
+    workspace_volume: str,
+    scan_subdir: str,
+    baseline_identifiers: set[str],
+) -> _SecurityScanResult:
+    """Scan changed-input projects that have no task-target identifiers.
+
+    The targeted runner owns Docker execution, report parsing, package identity
+    extraction, and failure classification. Supplying no target identifiers
+    leaves only the immutable baseline subtraction as the result projection.
+    """
+    return _run_targeted_security_scan(
+        sandbox,
+        workspace_volume,
+        set(),
+        baseline_identifiers,
+        scan_subdir,
     )

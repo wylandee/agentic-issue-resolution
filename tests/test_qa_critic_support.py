@@ -35,7 +35,7 @@ _MISSING = object()
 
 
 def _make_group(
-    group_id: str = "sca:package.json:lodash:version_bump",
+    group_id: str = "sca:package.json:lodash",
     cve_ids=None,
     ghsa_ids=None,
     fix_plan_status: FixPlanStatus = FixPlanStatus.VERSION_FOUND,

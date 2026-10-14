@@ -31,20 +31,30 @@ from remediation_engine.contracts.decision_codes import DecisionCode
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     FinalFullScanResult,
+    IncrementalScanRecord,
+    IssueType,
+    MultiPackageAction,
     ODCScanEvidence,
+    PackageScanOccurrence,
+    PortfolioPlan,
     QAAttemptResult,
     QAEvaluation,
     RemediationTask,
     RoutingStrategy,
-    StateConsistencyEvent,
     SupervisorRetryPlan,
     SystemContext,
     TaskAttemptSnapshot,
+    TaskScanRecord,
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
     WorkaroundReplayPlan,
     WorkerAttemptResult,
+)
+from remediation_engine.contracts.solver_models import (
+    PortfolioReplanRequest,
+    QAPassedWorkspacePrefix,
+    SolverRemediationPlan,
 )
 from remediation_engine.contracts.supervisor_phases import AuditRecord
 from remediation_engine.runtime.path_policy import (
@@ -56,6 +66,110 @@ from remediation_engine.tools.manifest_locator import expand_dependency_ancestry
 
 K = TypeVar("K")
 V = TypeVar("V")
+
+DEVELOPMENT_ENVIRONMENTS = frozenset({"dev", "development"})
+
+
+def normalize_target_packages(values: Sequence[str] | None) -> list[str]:
+    """Return a deterministic, validated package allowlist.
+
+    Args:
+        values: Package names supplied by a development-only scoped run.
+
+    Returns:
+        Sorted, de-duplicated package names. ``None`` becomes an empty list,
+        which means that the engine should process the full repository.
+
+    Raises:
+        ValueError: If a package name is not a non-empty string.
+    """
+    if isinstance(values, str):
+        raise ValueError("target_packages must be a sequence of package names")
+    normalized: set[str] = set()
+    for value in values or ():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("target_packages must contain non-empty package names")
+        normalized.add(value.strip())
+    return sorted(normalized)
+
+
+def validate_target_package_scope(
+    target_packages: Sequence[str] | None,
+    system_context: SystemContext | None,
+) -> list[str]:
+    """Validate that package scoping is explicitly limited to development.
+
+    Args:
+        target_packages: Requested package allowlist.
+        system_context: Caller-supplied environment metadata.
+
+    Returns:
+        Normalized package names.
+
+    Raises:
+        ValueError: If a non-empty package scope is requested without a
+            development environment label.
+    """
+    normalized = normalize_target_packages(target_packages)
+    environment = (system_context.environment if system_context else "") or ""
+    if normalized and environment.strip().lower() not in DEVELOPMENT_ENVIRONMENTS:
+        raise ValueError(
+            "target_packages is development-only; set system_context.environment to "
+            "'development' or 'dev'"
+        )
+    return normalized
+
+
+def _group_package_identities(group: VulnerabilityGroup) -> set[str]:
+    """Collect package names that identify one vulnerability group."""
+    identities = {
+        value.strip()
+        for value in (
+            group.vulnerable_component,
+            group.parent_package_name,
+            *(issue.package_name for issue in group.issues or []),
+            *(localized.issue.package_name for localized in group.localized_issues or []),
+        )
+        if isinstance(value, str) and value.strip()
+    }
+    return identities
+
+
+def filter_groups_to_target_packages(
+    groups: Sequence[VulnerabilityGroup],
+    target_packages: Sequence[str] | None,
+) -> list[VulnerabilityGroup]:
+    """Keep only SCA groups that belong to a requested package scope.
+
+    Non-SCA groups are retained because package scoping controls dependency
+    portfolio discovery, not source-code remediation.
+    """
+    scope = set(normalize_target_packages(target_packages))
+    if not scope:
+        return list(groups)
+    return [
+        group
+        for group in groups
+        if group.issue_type != IssueType.SCA or bool(_group_package_identities(group) & scope)
+    ]
+
+
+def filter_issues_to_target_packages(
+    issues: Sequence[VulnerabilityIssue],
+    target_packages: Sequence[str] | None,
+) -> list[VulnerabilityIssue]:
+    """Keep dependency findings inside a requested package scope.
+
+    SAST findings remain available to the normal source-remediation path.
+    """
+    scope = set(normalize_target_packages(target_packages))
+    if not scope:
+        return list(issues)
+    return [
+        issue
+        for issue in issues
+        if issue.issue_type != IssueType.SCA or (issue.package_name or "").strip() in scope
+    ]
 
 
 class ChangedFilesProjection(list[str]):
@@ -239,13 +353,35 @@ def normalize_group_paths(
         for old, new in replacements.items():
             group_id = group_id.replace(str(old).replace("\\", "/"), new)
         fix_plan = group.fix_plan
-        if fix_plan is not None and replacements:
-            instruction = fix_plan.instruction or ""
-            for old, new in replacements.items():
-                instruction = instruction.replace(str(old), new).replace(
-                    str(old).replace("\\", "/"), new
+        fix_plan_candidates = list(group.fix_plan_candidates or [])
+        if replacements:
+            replacement_items = tuple(replacements.items())
+
+            def _rewrite_instruction(
+                instruction: str,
+                replacement_items: tuple[tuple[str, str], ...] = replacement_items,
+            ) -> str:
+                rewritten = instruction or ""
+                for old, new in replacement_items:
+                    rewritten = rewritten.replace(str(old), new).replace(
+                        str(old).replace("\\", "/"), new
+                    )
+                return rewritten
+
+            if fix_plan is not None:
+                fix_plan = fix_plan.model_copy(
+                    update={"instruction": _rewrite_instruction(fix_plan.instruction)}
                 )
-            fix_plan = fix_plan.model_copy(update={"instruction": instruction})
+            fix_plan_candidates = [
+                candidate.model_copy(
+                    update={
+                        "plan": candidate.plan.model_copy(
+                            update={"instruction": _rewrite_instruction(candidate.plan.instruction)}
+                        )
+                    }
+                )
+                for candidate in fix_plan_candidates
+            ]
         if (
             group_id == group.group_id
             and file_path == group.file_path
@@ -254,6 +390,7 @@ def normalize_group_paths(
             and expanded_group_ancestry == list(group.dependency_ancestry)
             and expanded_group_versions == dict(group.dependency_versions)
             and fix_plan is group.fix_plan
+            and fix_plan_candidates == list(group.fix_plan_candidates or [])
         ):
             # Keep object identity for already-canonical groups.  Some graph
             # reconciliation paths deliberately reuse unchanged group objects.
@@ -269,6 +406,7 @@ def normalize_group_paths(
                     "dependency_ancestry": expanded_group_ancestry,
                     "dependency_versions": expanded_group_versions,
                     "fix_plan": fix_plan,
+                    "fix_plan_candidates": fix_plan_candidates,
                 }
             )
         )
@@ -325,6 +463,10 @@ class OrchestratorState(TypedDict, total=False):
     valid_groups: list[VulnerabilityGroup]
     initial_valid_groups: list[VulnerabilityGroup]
     run_started_at: str
+    # Empty means the normal full-repository portfolio. Non-empty values are
+    # accepted only for development runs and limit synthetic dependency
+    # discovery to the requested package closure.
+    target_packages: list[str]
 
     issues: list[VulnerabilityIssue]
     system_context: SystemContext
@@ -334,6 +476,10 @@ class OrchestratorState(TypedDict, total=False):
     group_strategies: Annotated[dict[str, RoutingStrategy], merge_dict_reducer]
     qa_evaluations: Annotated[dict[str, QAEvaluation], replace_dict_reducer]
     action_summaries: Annotated[list[AgentActionSummary], operator.add]
+    # Candidate files accumulate across worker/QA bridges. Teardown emits a
+    # ``ChangedFilesProjection`` marker to replace that candidate ledger with
+    # the files that actually produced the final diff.
+    changed_files: Annotated[list[str], merge_changed_files_reducer]
     retry_diagnostics_by_task: Annotated[dict[str, UpdateRetryDiagnostics], replace_dict_reducer]
     retry_plans_by_task: Annotated[dict[str, SupervisorRetryPlan], replace_dict_reducer]
     workaround_replay_plans_by_task: Annotated[
@@ -343,18 +489,46 @@ class OrchestratorState(TypedDict, total=False):
     # This is an authoritative projection of immutable task baselines. A
     # merge reducer would leave removed snapshot IDs stale in state.
     workspace_rollback_anchors_by_task: Annotated[dict[str, str], replace_dict_reducer]
+    # Latest cumulative workspace state accepted by scoped QA. Its snapshot is
+    # retained until teardown so a replan can restore the exact fingerprint.
+    qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None
     worker_results_by_attempt: Annotated[dict[str, WorkerAttemptResult], merge_dict_reducer]
     qa_results_by_attempt: Annotated[dict[str, QAAttemptResult], merge_dict_reducer]
-    scan_evidence_by_task: Annotated[dict[str, ODCScanEvidence], merge_dict_reducer]
+    # Counts same-attempt QA reruns caused by inconclusive evidence or an
+    # invalid evaluator contract. The Supervisor owns this bounded ledger.
+    qa_rerun_counts_by_attempt: Annotated[dict[str, int], replace_dict_reducer]
+    accepted_package_inventory_by_lockfile: Annotated[dict[str, str], replace_dict_reducer]
+    current_scan_observations_by_occurrence: Annotated[
+        dict[str, PackageScanOccurrence], replace_dict_reducer
+    ]
+    latest_successful_scan_by_task: Annotated[dict[str, TaskScanRecord], replace_dict_reducer]
+    latest_incremental_scan_by_input: Annotated[
+        dict[str, IncrementalScanRecord], replace_dict_reducer
+    ]
+    setup_scan_evidence: ODCScanEvidence | None
+    setup_scan_committed: bool
+    package_inventory_baseline_complete: bool
     processed_worker_attempt_ids: Annotated[list[str], operator.add]
     processed_qa_attempt_ids: Annotated[list[str], operator.add]
-    consistency_events: Annotated[list[StateConsistencyEvent], operator.add]
-    state_revision: int
-    changed_files: Annotated[list[str], merge_changed_files_reducer]
-
     # Phase 5 Task Queue (primary orchestration unit)
     task_queue: Annotated[dict[str, RemediationTask], replace_dict_reducer]
     active_target_task_ids: list[str]
+    portfolio_plan: PortfolioPlan | None
+    portfolio_solver_plan: SolverRemediationPlan | None
+    portfolio_iteration: int
+    portfolio_replan_request: PortfolioReplanRequest | None
+    # Counts replan requests by a stable diagnostic-reason key.  The outer
+    # portfolio node uses this bounded ledger to fail closed on no-progress
+    # replan loops without making ordinary one-off replans terminal.
+    portfolio_replan_history: Annotated[dict[str, int], replace_dict_reducer]
+    portfolio_dirty: bool
+    # Legacy dictionary retained at the migration boundary. New callers should
+    # use ``portfolio_replan_request``.
+    portfolio_escalation: dict[str, Any] | None
+    active_cluster_id: str | None
+    active_dispatch_batch_id: str | None
+    active_multi_package_action: MultiPackageAction | None
+    delta_isolation_by_cluster: Annotated[dict[str, Any], merge_dict_reducer]
 
     workspace_volume: str | None
 
@@ -367,16 +541,16 @@ class OrchestratorState(TypedDict, total=False):
     supervisor_instructions: str
     eval_status: str
     qa_investigation_report: str
+    baseline_scan_complete: bool
     baseline_scan_identifiers: list[str]
     post_remediation_scan_identifiers: list[str]
     post_remediation_scan_issues: list[VulnerabilityIssue]
     new_vulnerability_identifiers: list[str]
     new_vulnerability_status: str
     final_full_scan_result: FinalFullScanResult | None
-    final_full_scan_completed: bool
-    final_scan_workspace_fingerprint: str | None
-    previous_final_scan_workspace_fingerprint: str | None
+    final_full_scan_enabled: bool
     triage_required: bool
+    post_qa_triage_enabled: bool
     post_qa_retriage_count: int
     post_qa_retriage_limit_reached: bool
     initial_triage_status: str
@@ -406,6 +580,9 @@ class SubagentState(TypedDict, total=False):
     workspace_volume: str
 
     target_tasks: list[RemediationTask]
+    active_cluster_id: str | None
+    dispatch_batch_id: str | None
+    multi_package_action: MultiPackageAction | None
     target_groups: list[VulnerabilityGroup]
     feedback_by_group: dict[str, str]
     feedback_by_task: dict[str, str]
@@ -433,20 +610,35 @@ def initial_orchestrator_state(
     valid_groups: list[VulnerabilityGroup],
     issues: list[VulnerabilityIssue] | None = None,
     system_context: SystemContext | None = None,
+    target_packages: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """Build a well-formed initial ``OrchestratorState`` dict."""
+    """Build a well-formed initial ``OrchestratorState`` dict.
+
+    ``target_packages`` is an opt-in development allowlist.  An empty list
+    preserves the production/default behavior of processing the entire
+    repository.
+    """
+    normalized_target_packages = validate_target_package_scope(
+        target_packages,
+        system_context,
+    )
     valid_groups = normalize_group_paths(valid_groups, repo_root)
+    baseline_scan_complete = issues is not None
     baseline_scan_identifiers = (
         _scan_identifiers_from_issues(issues)
         if issues is not None
         else _scan_identifiers_from_groups(valid_groups)
     )
+    valid_groups = filter_groups_to_target_packages(valid_groups, normalized_target_packages)
+    if issues is not None:
+        issues = filter_issues_to_target_packages(issues, normalized_target_packages)
     state: dict[str, Any] = {
         "repo_root": repo_root,
         "run_id": "",
         "valid_groups": valid_groups,
         "initial_valid_groups": list(valid_groups),
         "run_started_at": datetime.now(UTC).isoformat(),
+        "target_packages": normalized_target_packages,
         "constraints_ledger": [],
         "retry_counts": {},
         "group_strategies": {},
@@ -456,9 +648,10 @@ def initial_orchestrator_state(
         "retry_plans_by_task": {},
         "attempt_snapshots_by_id": {},
         "workspace_rollback_anchors_by_task": {},
+        "qa_passed_workspace_prefix": None,
         "worker_results_by_attempt": {},
         "qa_results_by_attempt": {},
-        "scan_evidence_by_task": {},
+        "qa_rerun_counts_by_attempt": {},
         "processed_worker_attempt_ids": [],
         "processed_qa_attempt_ids": [],
         "consistency_events": [],
@@ -466,6 +659,17 @@ def initial_orchestrator_state(
         "changed_files": [],
         "task_queue": {},
         "active_target_task_ids": [],
+        "portfolio_plan": None,
+        "portfolio_solver_plan": None,
+        "portfolio_iteration": 0,
+        "portfolio_replan_request": None,
+        "portfolio_replan_history": {},
+        "portfolio_dirty": True,
+        "portfolio_escalation": None,
+        "active_cluster_id": None,
+        "active_dispatch_batch_id": None,
+        "active_multi_package_action": None,
+        "delta_isolation_by_cluster": {},
         "workspace_volume": None,
         "status": "pending",
         "next_routing_step": "",
@@ -475,15 +679,22 @@ def initial_orchestrator_state(
         "eval_status": "",
         "qa_investigation_report": "",
         "baseline_scan_identifiers": baseline_scan_identifiers,
+        "baseline_scan_complete": baseline_scan_complete,
+        "package_inventory_baseline_complete": False,
+        "accepted_package_inventory_by_lockfile": {},
+        "current_scan_observations_by_occurrence": {},
+        "latest_successful_scan_by_task": {},
+        "latest_incremental_scan_by_input": {},
+        "setup_scan_evidence": None,
+        "setup_scan_committed": False,
         "post_remediation_scan_identifiers": [],
         "post_remediation_scan_issues": [],
         "new_vulnerability_identifiers": [],
         "new_vulnerability_status": "not_scanned",
         "final_full_scan_result": None,
-        "final_full_scan_completed": False,
-        "final_scan_workspace_fingerprint": None,
-        "previous_final_scan_workspace_fingerprint": None,
+        "final_full_scan_enabled": False,
         "triage_required": False,
+        "post_qa_triage_enabled": True,
         "post_qa_retriage_count": 0,
         "post_qa_retriage_limit_reached": False,
         "initial_triage_status": "pending",
@@ -515,6 +726,9 @@ def initial_update_subagent_state(
     previous_action_summaries_by_task: Mapping[str, str] | None = None,
     retry_diagnostics_by_task: Mapping[str, UpdateRetryDiagnostics] | None = None,
     target_attempt_snapshots: Mapping[str, TaskAttemptSnapshot] | None = None,
+    active_cluster_id: str | None = None,
+    dispatch_batch_id: str | None = None,
+    multi_package_action: MultiPackageAction | None = None,
     messages: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Build the initial update-worker state from committed task inputs."""
@@ -544,6 +758,9 @@ def initial_update_subagent_state(
         "previous_action_summaries_by_task": previous_summaries_dict,
         "retry_diagnostics_by_task": retry_diagnostics_dict,
         "target_attempt_snapshots": target_attempt_snapshots_dict,
+        "active_cluster_id": active_cluster_id,
+        "dispatch_batch_id": dispatch_batch_id,
+        "multi_package_action": multi_package_action,
         "constraints_ledger": constraints_list,
         "messages": list(messages or []),
         "changed_files": [],

@@ -26,6 +26,7 @@ from remediation_engine.contracts import (
     CodeWorkaroundSupervisorAction,
     DecisionCode,
     FailureCategory,
+    FinalFullScanResult,
     FixPlan,
     FixPlanStatus,
     IssueSource,
@@ -35,6 +36,7 @@ from remediation_engine.contracts import (
     ODCScanEvidence,
     PackageMutation,
     PackageOverrideSupervisorAction,
+    PackageScanOccurrence,
     PortfolioEscalationSupervisorAction,
     QAEvaluation,
     QAFailureEvidence,
@@ -48,6 +50,7 @@ from remediation_engine.contracts import (
     TaskCluster,
     TaskDependency,
     TaskDependencyKind,
+    TaskScanRecord,
     TestAttributionVerdict,
     VersionBumpSupervisorAction,
     VulnerabilityIssue,
@@ -55,7 +58,11 @@ from remediation_engine.contracts import (
 from remediation_engine.contracts.schemas import (
     CWEEntry,
     LineRange,
+    QAAttemptResult,
+    RemediationTask,
     SupervisorDecision,
+    TaskAttemptSnapshot,
+    WorkerAttemptResult,
 )
 
 # ===========================================================================
@@ -269,6 +276,13 @@ class TestQAEvaluation:
             effective_scope=ScanScope.TARGETED,
             covered_task_ids=["task-1"],
             closure_package_names=["express"],
+            found_identifiers=["CVE-2025-0001"],
+            new_identifiers=["CVE-2025-0001"],
+            remaining_target_identifiers=["CVE-2024-0001"],
+            covered_input_paths=["package-lock.json"],
+            inventory_updates={"occurrence": "fingerprint"},
+            inventory_removals=["removed-occurrence"],
+            scan_performed=False,
             complete=True,
         )
         evaluation = QAEvaluation(
@@ -279,6 +293,57 @@ class TestQAEvaluation:
 
         reloaded = QAEvaluation.model_validate_json(evaluation.model_dump_json())
         assert reloaded.scan_evidence == evidence
+
+
+def test_incremental_scan_contracts_round_trip_and_reject_invalid_occurrences():
+    occurrence = PackageScanOccurrence(
+        source_input_path="packages/api/package-lock.json",
+        package_name="@scope/library",
+        version="1.2.3",
+        lockfile_key="node_modules/@scope/library",
+        occurrence_index=1,
+        found_identifiers=["CVE-2025-0001"],
+    )
+    record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-1",
+        task_revision=2,
+        new_identifiers=["CVE-2025-0001"],
+        covered_occurrences=[occurrence],
+        complete=True,
+    )
+
+    assert PackageScanOccurrence.model_validate_json(occurrence.model_dump_json()) == occurrence
+    assert TaskScanRecord.model_validate_json(record.model_dump_json()) == record
+    with pytest.raises(ValidationError):
+        PackageScanOccurrence(
+            source_input_path="package-lock.json",
+            package_name="library",
+            version="1.2.3",
+            occurrence_index=-1,
+        )
+    with pytest.raises(ValidationError):
+        PackageScanOccurrence(
+            source_input_path="package-lock.json",
+            package_name="library",
+            version="1.2.3",
+            unexpected="not allowed",
+        )
+
+
+def test_final_scan_result_defaults_to_legacy_full_workspace_scope():
+    legacy = FinalFullScanResult(completed=True)
+    incremental = FinalFullScanResult(
+        completed=True,
+        authoritative=False,
+        coverage_scope="incremental_dependency_inputs",
+        coverage_complete=True,
+    )
+
+    assert legacy.authoritative is True
+    assert legacy.coverage_scope == "full_workspace"
+    assert legacy.coverage_complete is None
+    assert FinalFullScanResult.model_validate_json(incremental.model_dump_json()) == incremental
 
 
 class TestAgentActionSummary:
@@ -817,7 +882,7 @@ def test_task_cluster_rejects_invalid_membership_or_edges(cluster_kwargs):
         TaskCluster(cluster_id="cluster-1", reason="reason", **cluster_kwargs)
 
 
-def test_task_cluster_rejects_self_edges_and_more_than_ten_tasks():
+def test_task_cluster_rejects_self_edges_and_oversized_clusters():
     with pytest.raises(ValidationError):
         TaskDependency(
             upstream_task_id="task-a",
@@ -942,3 +1007,25 @@ def test_qa_test_attribution_remains_fail_closed():
     )
     assert inconclusive.verdict == TestAttributionVerdict.INCONCLUSIVE
     assert inconclusive.reasoning == ""
+
+
+def test_workerless_remediation_action_is_normalized_and_stays_out_of_attempt_envelopes():
+    task = RemediationTask(
+        task_id="task-absent",
+        parent_group_id="group-1",
+        strategy=RoutingStrategy.VERSION_BUMP,
+        remediation_action="  Removed after another package upgrade.  ",
+    )
+    assert task.remediation_action == "Removed after another package upgrade."
+    assert (
+        RemediationTask(
+            task_id="task-empty",
+            parent_group_id="group-1",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            remediation_action="  ",
+        ).remediation_action
+        is None
+    )
+    assert "remediation_action" not in TaskAttemptSnapshot.model_fields
+    assert "remediation_action" not in WorkerAttemptResult.model_fields
+    assert "remediation_action" not in QAAttemptResult.model_fields

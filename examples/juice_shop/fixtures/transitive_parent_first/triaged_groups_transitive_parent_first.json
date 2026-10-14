@@ -1,6 +1,6 @@
 [
   {
-    "group_id": "sca:package.json:@tootallnate/once:parent=sqlite3:type=dependencies:UPDATE_VERSION",
+    "group_id": "sca:package.json:@tootallnate/once",
     "issue_type": "sca",
     "vulnerable_component": "@tootallnate/once",
     "file_path": "package.json",
@@ -80,7 +80,7 @@
     }
   },
   {
-    "group_id": "sca:package.json:got:parent=download:type=dependencies:UPDATE_VERSION",
+    "group_id": "sca:package.json:got",
     "issue_type": "sca",
     "vulnerable_component": "got",
     "file_path": "package.json",
@@ -150,7 +150,7 @@
     }
   },
   {
-    "group_id": "sca:package.json:crypto-js:parent=pdfkit:type=dependencies:UPDATE_VERSION",
+    "group_id": "sca:package.json:crypto-js",
     "issue_type": "sca",
     "vulnerable_component": "crypto-js",
     "file_path": "package.json",

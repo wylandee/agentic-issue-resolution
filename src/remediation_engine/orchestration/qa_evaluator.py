@@ -18,6 +18,7 @@ from remediation_engine.contracts.schemas import (
     QAEvaluation,
     QAFailureEvidence,
     QAPolicy,
+    RoutingStrategy,
     ScannerExecutionStatus,
     ScratchpadScope,
     SecurityReviewVerdict,
@@ -44,6 +45,7 @@ from .qa_types import (
     _scan_result_value,
     _validate_qa_path,
 )
+from .task_utils import select_package_fix_plan
 
 logger = logging.getLogger(__name__)
 
@@ -557,6 +559,12 @@ def _qa_status(
         return "SKIPPED"
     if result is None:
         return "NOT_RUN"
+    if isinstance(result, tuple):
+        # Install and test results are stored as ``(ok, summary)`` tuples,
+        # whereas scan results expose an ``ok`` attribute.  Keep the prompt
+        # projection aligned with the typed execution result instead of
+        # treating the tuple as a scan object.
+        return "PASS" if result and bool(result[0]) else "FAIL"
     execution_status = getattr(result, "execution_status", None)
     status_value = getattr(execution_status, "value", execution_status)
     if str(status_value).lower() == "not_run":
@@ -593,7 +601,11 @@ def _build_qa_dynamic_context(
     Returns:
         The bounded dynamic evaluator context.
     """
-    fix_plan = group.fix_plan
+    current_strategy = (
+        RoutingStrategy(strategy) if strategy in {item.value for item in RoutingStrategy} else None
+    )
+    selection = select_package_fix_plan(group, current_strategy)
+    fix_plan = selection.plan
     fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
     fix_instruction = fix_plan.instruction if fix_plan else "(none)"
     cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"

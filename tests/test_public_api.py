@@ -15,6 +15,7 @@ from remediation_engine.contracts.schemas import (
     IssueType,
     LocalizedIssue,
     Severity,
+    SystemContext,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -63,6 +64,24 @@ def test_request_rejects_file_as_repository_root(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="existing directory"):
         RemediationRequest(repo_root=file_path)
+
+
+def test_target_package_scope_is_development_only(tmp_path: Path) -> None:
+    """Package scoping is normalized and rejected for production requests."""
+    request = RemediationRequest(
+        repo_root=tmp_path,
+        target_packages=[" @angular/core", "@angular/core", "@angular/common "],
+        system_context=SystemContext(environment="development"),
+    )
+
+    assert request.target_packages == ["@angular/common", "@angular/core"]
+
+    with pytest.raises(ValueError, match="development-only"):
+        RemediationRequest(
+            repo_root=tmp_path,
+            target_packages=["@angular/core"],
+            system_context=SystemContext(environment="production"),
+        )
 
 
 def test_run_remediation_projects_orchestrator_state(tmp_path: Path) -> None:
@@ -177,7 +196,7 @@ def test_graph_group_paths_are_repo_relative(tmp_path: Path) -> None:
     )
     absolute_manifest = str(tmp_path / "package.json")
     group = VulnerabilityGroup(
-        group_id=f"sca:{absolute_manifest}:lodash:UPDATE_VERSION",
+        group_id=f"sca:{absolute_manifest}:lodash",
         issue_type=IssueType.SCA,
         vulnerable_component="lodash",
         file_path=absolute_manifest,
@@ -255,7 +274,7 @@ def test_preprocessed_groups_expand_compressed_npm_ancestry(tmp_path: Path) -> N
         parent_declaration_type="dependencies",
     )
     group = VulnerabilityGroup(
-        group_id="sca:package.json:@tootallnate/once:UPDATE_VERSION",
+        group_id="sca:package.json:@tootallnate/once",
         issue_type=IssueType.SCA,
         vulnerable_component="@tootallnate/once",
         file_path="package.json",

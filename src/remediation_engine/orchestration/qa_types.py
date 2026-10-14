@@ -8,8 +8,10 @@ from typing import Any, TypeVar, cast
 
 from remediation_engine.contracts.schemas import (
     ODCScanEvidence,
+    PeerConflictEvidence,
     QADependencyEvidence,
     RemediationTask,
+    ScanFallbackReason,
     ScannerExecutionStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -30,6 +32,17 @@ class _QALogRecord:
 
 
 @dataclass(frozen=True)
+class _ODCReportedPackageOccurrence:
+    """One package identity and report path emitted by ODC."""
+
+    package_name: str
+    version: str
+    ecosystem: str
+    file_path: str | None
+    raw_file_path: str | None = None
+
+
+@dataclass(frozen=True)
 class _SecurityScanResult:
     """Complete deterministic security-scan outcome."""
 
@@ -45,6 +58,9 @@ class _SecurityScanResult:
     raw_stderr: str | None = None
     diagnostic_log_path: str | None = None
     scan_records: tuple[_QALogRecord, ...] = ()
+    reported_packages: list[tuple[str, str]] | None = None
+    reported_paths: list[str] | None = None
+    reported_package_occurrences: list[_ODCReportedPackageOccurrence] | None = None
 
 
 @dataclass
@@ -63,17 +79,23 @@ class _QAExecutionResults:
 
     install: tuple[bool, str] | None = None
     scan: _SecurityScanResult | None = None
+    scan_evidence_by_task: dict[str, ODCScanEvidence] = field(default_factory=dict)
     tests: tuple[bool, str] | None = None
     install_exit_code: int | None = None
     install_error_category: str | None = None
     install_raw_stdout: str | None = None
     install_raw_stderr: str | None = None
+    peer_conflicts: list[PeerConflictEvidence] = field(default_factory=list)
     test_exit_code: int | None = None
     test_failure_count: int | None = None
     test_raw_stdout: str | None = None
     test_raw_stderr: str | None = None
     log_records: dict[str, tuple[_QALogRecord, ...]] = field(default_factory=dict)
     scan_evidence: ODCScanEvidence | None = None
+    scan_target_failures_by_task: dict[str, tuple[ScanFallbackReason, str]] = field(
+        default_factory=dict
+    )
+    scan_target_skipped_by_task: dict[str, str] = field(default_factory=dict)
     package_state_by_task: dict[str, _QAPackageState] = field(default_factory=dict)
     scan_skipped: bool = False
     scan_skip_reason: str | None = None

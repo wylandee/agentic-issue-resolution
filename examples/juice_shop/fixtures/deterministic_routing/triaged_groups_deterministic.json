@@ -1,6 +1,6 @@
 [
   {
-    "group_id": "sca:package.json:@tootallnate/once:UPDATE_VERSION",
+    "group_id": "sca:package.json:@tootallnate/once",
     "issue_type": "sca",
     "vulnerable_component": "@tootallnate/once",
     "file_path": "package.json",
@@ -67,7 +67,7 @@
     "grouped_at": "2026-08-13T00:00:00Z"
   },
   {
-    "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+    "group_id": "sca:package.json:express-jwt",
     "issue_type": "sca",
     "vulnerable_component": "express-jwt",
     "file_path": "package.json",
@@ -138,7 +138,7 @@
     "grouped_at": "2026-08-13T00:00:00Z"
   },
   {
-    "group_id": "sca:package.json:got:UPDATE_VERSION",
+    "group_id": "sca:package.json:got",
     "issue_type": "sca",
     "vulnerable_component": "got",
     "file_path": "package.json",
@@ -200,7 +200,7 @@
     "grouped_at": "2026-08-13T00:00:00Z"
   },
   {
-    "group_id": "sca:package.json:notevil:NO_FIX",
+    "group_id": "sca:package.json:notevil",
     "issue_type": "sca",
     "vulnerable_component": "notevil",
     "file_path": "package.json",
@@ -265,7 +265,7 @@
     "grouped_at": "2026-08-13T00:00:00Z"
   },
   {
-    "group_id": "sca:package.json:sanitize-html:UPDATE_VERSION",
+    "group_id": "sca:package.json:sanitize-html",
     "issue_type": "sca",
     "vulnerable_component": "sanitize-html",
     "file_path": "package.json",
