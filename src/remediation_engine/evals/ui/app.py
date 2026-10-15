@@ -9,7 +9,12 @@ import streamlit as st
 
 from remediation_engine.evals.comparison import format_run_label
 from remediation_engine.evals.db import EvalDatabase
-from remediation_engine.evals.runner import SUITE_PATHS, create_sample_run, run_eval_subprocess
+from remediation_engine.evals.runner import (
+    SUITE_PATHS,
+    EvalProcessOutcome,
+    create_sample_run,
+    run_eval_subprocess,
+)
 
 # ---------------------------------------------------------------------------
 # Page Configuration & Styling
@@ -134,10 +139,11 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Filter Test Cases")
-    status_filter = st.selectbox("Status", ["All", "PASSED", "FAILED", "SKIPPED"], index=0)
+    available_statuses, available_suites = db.get_test_case_filter_values(selected_run_id)
+    status_filter = st.selectbox("Status", ["All", *available_statuses], index=0)
     suite_filter = st.selectbox(
         "Component Suite",
-        ["All", "report", "triage", "fix_planner", "qa_critic", "subagent", "general"],
+        ["All", *available_suites],
         index=0,
     )
     search_query = st.text_input("Search (text, ID, prompt)", placeholder="e.g. CVE, narrative...")
@@ -235,13 +241,13 @@ with tab_explorer:
                 st.warning("No test cases match the selected filters.")
             else:
                 for idx, tc in enumerate(test_cases, start=1):
-                    status_badge = (
-                        "🟢 PASS"
-                        if tc["status"] == "PASSED"
-                        else "🔴 FAIL"
-                        if tc["status"] == "FAILED"
-                        else "🟡 SKIP"
-                    )
+                    status_badges = {
+                        "PASSED": "🟢 PASS",
+                        "FAILED": "🔴 FAIL",
+                        "ERROR": "🔴 ERROR",
+                        "SKIPPED": "🟡 SKIPPED",
+                    }
+                    status_badge = status_badges.get(tc["status"].upper(), f"⚪ {tc['status']}")
 
                     # Summary metric scores for expander label
                     metric_summaries = [
@@ -529,16 +535,27 @@ with tab_runner:
     if st.button("▶ Start Evaluation Run", type="primary"):
         output_placeholder = st.empty()
         log_lines: list[str] = []
+        terminal_outcomes: list[EvalProcessOutcome] = []
+
+        def record_outcome(outcome: EvalProcessOutcome) -> None:
+            """Capture the terminal process status for the result message."""
+            terminal_outcomes.append(outcome)
 
         with st.spinner("Executing evaluation suite..."):
             runner_gen = run_eval_subprocess(
                 suite_key=suite_choice,
                 is_live=live_eval,
                 judge_model=judge_choice,
+                on_complete=record_outcome,
             )
             for line in runner_gen:
                 log_lines.append(line)
                 output_placeholder.code("".join(log_lines[-40:]), language="bash")
 
-        st.success("Evaluation run completed and persisted to database!")
+        terminal_outcome = terminal_outcomes[-1] if terminal_outcomes else None
+        if terminal_outcome is not None and terminal_outcome.succeeded:
+            st.success("Evaluation suite completed successfully.")
+        else:
+            exit_code = terminal_outcome.exit_code if terminal_outcome else "unknown"
+            st.error(f"Evaluation suite failed (exit code {exit_code}). Review the output above.")
         st.rerun()

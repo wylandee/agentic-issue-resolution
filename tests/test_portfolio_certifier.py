@@ -239,6 +239,11 @@ class _FakeSandbox:
             for path, content in self.state.archive.items():
                 self.state.files[f"{scratch_path}/{path}"] = content
             return self._result()
+        if command.startswith("rm -f -- "):
+            for path in shlex.split(command)[3:]:
+                relative = path.removeprefix("/workspace/").removeprefix("./")
+                self.state.files.pop(relative, None)
+            return self._result()
         if command.startswith("rm -rf -- "):
             self.state.cleanup_count += 1
             if self.state.cleanup_failures > 0:
@@ -300,9 +305,9 @@ class _FakeSandbox:
             if "download" in dependencies:
                 packages["node_modules/download"]["dependencies"] = {"decompress": "^4.2.1"}
                 packages["node_modules/decompress"] = {"version": "4.2.1"}
-            if "express-jwt" in dependencies and express_version == "6.1.1":
+            if "express-jwt" in dependencies:
                 packages["node_modules/express-jwt/node_modules/jsonwebtoken"] = {
-                    "version": "8.5.1"
+                    "version": "8.5.1" if express_version == "6.1.1" else "9.0.2"
                 }
             lockfile = {"name": "app", "lockfileVersion": 3, "packages": packages}
             lockfile_path = f"{prefix}package-lock.json"
@@ -1545,11 +1550,16 @@ def test_strict_npm_resolution_certifies_nested_lockfile(tmp_path: Path):
     from remediation_engine.runtime.docker_client import get_docker_client
     from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
-    client = get_docker_client()
+    try:
+        client = get_docker_client()
+    except RuntimeError as exc:
+        pytest.skip(f"Docker daemon is not available: {exc}")
     try:
         client.images.get("node:22")
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"node:22 image is not available locally: {exc}")
+    finally:
+        client.close()
 
     packages = {
         "name": "app",
@@ -2297,7 +2307,15 @@ def test_exact_rejection_maps_use_full_assignment_no_goods(
     real_solve = portfolio_certifier.solve_portfolio
 
     def count_solves(*args: Any, **kwargs: Any) -> Any:
-        solver_inputs.append(dict(kwargs))
+        solver_inputs.append(
+            {
+                **kwargs,
+                "forbidden_assignments": [
+                    dict(assignment) for assignment in kwargs.get("forbidden_assignments", [])
+                ],
+                "forbidden_conflicts": list(kwargs.get("forbidden_conflicts", [])),
+            }
+        )
         return real_solve(*args, **kwargs)
 
     def reject_every_candidate(
@@ -2336,17 +2354,19 @@ def test_exact_rejection_maps_use_full_assignment_no_goods(
     monkeypatch.setattr(portfolio_certifier, "_certify_assignment", reject_every_candidate)
     plan, _state, _factory = _run_fake_certifier(root, files, groups, task_queue, solver_top_k=1)
 
-    assert len(attempts) == 1
-    assert len(solver_inputs) == 2
+    assert len(attempts) == 2
+    assert len(solver_inputs) == 3
     assert solver_inputs[1]["forbidden_assignments"] == [attempts[0]]
     assert solver_inputs[1]["forbidden_conflicts"] == []
+    assert solver_inputs[2]["forbidden_assignments"] == attempts
+    assert solver_inputs[2]["forbidden_conflicts"] == []
     assert plan.solver_plan is not None
     assert plan.solver_plan.status == SolverStatus.INFEASIBLE
     assert plan.solver_plan.selected_plan is None
     assert plan.resolution_certificate is not None
     assert plan.resolution_certificate.status == PackageResolutionStatus.REJECTED
-    assert len(plan.resolution_certificate.rejected_assignment_digests) == 1
-    assert len(plan.resolution_certificate.rejection_conflicts) == 1
+    assert len(plan.resolution_certificate.rejected_assignment_digests) == 2
+    assert len(plan.resolution_certificate.rejection_conflicts) == 2
 
 
 def test_dependency_range_failure_learns_pair_only_for_exact_mutable_physical_edge(
@@ -2669,7 +2689,12 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
     from remediation_engine.orchestration import supervisor_portfolio
     from remediation_engine.orchestration.state import initial_orchestrator_state
     from remediation_engine.orchestration.supervisor_node import MAX_RETRIES, run_supervisor_node
+    from remediation_engine.orchestration.tactical_supervisor import (
+        TacticalCandidateSet,
+        TacticalStrategy,
+    )
     from remediation_engine.orchestration.teardown_node import run_teardown_node
+    from remediation_engine.settings import AppSettings
 
     def make_group(package_name: str, cve_id: str) -> VulnerabilityGroup:
         issue = VulnerabilityIssue(
@@ -2935,6 +2960,38 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
     )
     assert retained_prefix is not None
     assert retained_prefix.graph_digest == prefix_snapshot.repository_fingerprint
+
+    def provide_task_candidates(context: Any) -> tuple[tuple[TacticalCandidateSet, ...], None]:
+        package_name = context.task.target_package_name or context.group.vulnerable_component
+        version = context.task.selected_version or context.group.fix_plan.fixed_version
+        assert package_name is not None
+        assert version is not None
+        return (
+            (
+                TacticalCandidateSet(
+                    strategy=TacticalStrategy.VERSION_BUMP,
+                    target_package_name=package_name,
+                    dependency_type=context.task.target_dependency_type or "dependencies",
+                    security_floor=version,
+                    versions=(version,),
+                    canonical_version=version,
+                ),
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.get_runtime_settings",
+        lambda: AppSettings(openai_api_key=None),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.registry_candidate_sets_for_context",
+        provide_task_candidates,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.propose_and_verify_tactical_action",
+        lambda *_args, **_kwargs: (None, None),
+    )
 
     next_supervisor = run_supervisor_node({**state, **portfolio_result})
     assert next_supervisor["next_routing_step"] == "update_subagent"

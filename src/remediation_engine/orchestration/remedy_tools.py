@@ -147,6 +147,8 @@ def build_workaround_toolbelt(
 
     The optional NO_FIX arguments add one narrowly scoped package-removal
     capability. They never relax the source-edit or generic manifest guards.
+    ``mandatory_search_terms`` remains accepted for caller compatibility;
+    web queries are supplied by the worker and are not silently augmented.
     """
     if plan_state is None:
         plan_state = {}
@@ -213,7 +215,7 @@ def build_workaround_toolbelt(
     toolbelt = [
         _make_record_plan_tool(plan_state),
         _make_record_targeted_test_substitution_tool(sandbox, plan_state),
-        _make_search_web_tool(mandatory_search_terms=mandatory_search_terms, plan_state=plan_state),
+        _make_search_web_tool(plan_state=plan_state),
         _make_read_web_page_tool(plan_state),
         _make_read_repository_map_tool(sandbox),
         _make_read_workspace_file_tool(sandbox, plan_state),

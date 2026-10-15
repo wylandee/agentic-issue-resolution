@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .contracts.schemas import SystemContext, VulnerabilityGroup, VulnerabilityIssue
 from .orchestration.graph import run_orchestrator
+from .orchestration.runtime_context import use_runtime_settings
 from .orchestration.state import normalize_target_packages, validate_target_package_scope
 from .orchestration.task_utils import terminal_outcome_issues
 from .settings import AppSettings
@@ -107,12 +108,13 @@ def triage_issues(
         environment="production",
         primary_language="javascript/nodejs",
     )
-    results = run_triage_pipeline(
-        issues,
-        context,
-        str(repo_root) if repo_root else None,
-        settings=resolved_settings,
-    )
+    with use_runtime_settings(resolved_settings):
+        results = run_triage_pipeline(
+            issues,
+            context,
+            str(repo_root) if repo_root else None,
+            settings=resolved_settings,
+        )
     return [group for group, verdict in results if verdict.is_valid]
 
 

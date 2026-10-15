@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 import xml.etree.ElementTree as ET
@@ -248,7 +249,6 @@ def test_run_batch_dry_run(tmp_path: Path) -> None:
     suppressions_file.write_text(_SAMPLE_SUPPRESSIONS_XML, encoding="utf-8")
 
     output_dir = tmp_path / "trajectories"
-
     summaries = run_batch(
         iterations=3,
         batch_size=2,
@@ -294,6 +294,7 @@ def test_run_batch_mocked_remediation(tmp_path: Path) -> None:
     suppressions_file.write_text(_SAMPLE_SUPPRESSIONS_XML, encoding="utf-8")
 
     output_dir = tmp_path / "trajectories"
+    evidence_dir = tmp_path / "evidence"
 
     mock_result = RemediationResult(
         run_id="test-run-id",
@@ -304,6 +305,7 @@ def test_run_batch_mocked_remediation(tmp_path: Path) -> None:
         fixed_task_count=2,
         failed_task_count=0,
         errors=[],
+        trajectory_path="trajectory-unique.md",
         raw_state={},
     )
 
@@ -318,6 +320,7 @@ def test_run_batch_mocked_remediation(tmp_path: Path) -> None:
             suppressed_issues_path=suppressed_issues_file,
             suppressions_xml_path=suppressions_file,
             output_dir=output_dir,
+            evidence_dir=evidence_dir,
             seed=42,
             dry_run=False,
         )
@@ -337,8 +340,21 @@ def test_run_batch_mocked_remediation(tmp_path: Path) -> None:
         for i in range(1, 3):
             res_file = output_dir / f"juice-shop-run-{i:02d}-result.json"
             patch_file = output_dir / f"juice-shop-run-{i:02d}.patch"
+            evidence_file = evidence_dir / f"juice-shop-run-{i:02d}-evidence.json"
             assert res_file.is_file()
             assert patch_file.is_file()
+            evidence = json.loads(evidence_file.read_text(encoding="utf-8"))
+            assert evidence["result_binding"] == {
+                "status": "completed",
+                "changed_files": ["package-lock.json", "package.json"],
+                "diff_sha256": hashlib.sha256(
+                    b"--- a/package.json\n+++ b/package.json\n"
+                ).hexdigest(),
+                "trajectory_path": "trajectory-unique.md",
+            }
+            assert evidence["task_queue"] == {}
+            result = json.loads(res_file.read_text(encoding="utf-8"))
+            assert "run_id" not in result
             assert (
                 patch_file.read_text(encoding="utf-8") == "--- a/package.json\n+++ b/package.json\n"
             )

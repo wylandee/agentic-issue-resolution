@@ -37,7 +37,7 @@ DEFAULT_REMEDY_RETRIAGE_LIMIT = 3
 DEFAULT_SOLVER_MAX_MODEL_VARIABLES = 10_000
 # Candidate catalogs above this per-target bound are pruned to the installed
 # version, security floor, and latest release from each eligible minor branch.
-DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET = 256
+DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET = 1000
 
 DEFAULT_MAX_DELTA_CANARY_PROBES = 2
 

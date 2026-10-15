@@ -32,6 +32,7 @@ class _FakeResult:
     errors: list[str] = []
     changed_files: list[str] = []
     diff = ""
+    trajectory_path: str | None = None
     raw_state: dict[str, object] = {}
 
     def model_dump(self, **_: object) -> dict[str, object]:
@@ -179,6 +180,7 @@ def test_raw_issue_fixture_runners_enforce_package_scope(
     module = _load_runner(name, runner_file)
     output_path = tmp_path / f"{name}-result.json"
     patch_path = tmp_path / f"{name}.patch"
+    evidence_path = tmp_path / "shared-name-evidence.json"
     arguments = [
         str(runner_file),
         "--repo",
@@ -188,6 +190,8 @@ def test_raw_issue_fixture_runners_enforce_package_scope(
         "--patch-out",
         str(patch_path),
     ]
+    if name == "shared_name_scope":
+        arguments.extend(["--evidence-out", str(evidence_path)])
 
     with (
         patch.object(module, "run_remediation", return_value=_FakeResult()) as run,
@@ -199,3 +203,11 @@ def test_raw_issue_fixture_runners_enforce_package_scope(
     assert request.target_packages == sorted(module._TARGET_PACKAGES)
     assert request.system_context.environment == "development"
     assert {issue.package_name for issue in request.issues} == module._TARGET_PACKAGES
+    if name == "shared_name_scope":
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        assert evidence["result_binding"]["status"] == "completed"
+        assert evidence["result_binding"]["changed_files"] == []
+        assert evidence["result_binding"]["trajectory_path"] is None
+        assert len(evidence["result_binding"]["diff_sha256"]) == 64
+        assert evidence["task_queue"] == {}
+        assert "run_id" not in json.loads(output_path.read_text(encoding="utf-8"))

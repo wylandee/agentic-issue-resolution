@@ -7,12 +7,19 @@ import json
 import logging
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from remediation_engine import RemediationRequest, run_remediation
 from remediation_engine.contracts.schemas import SystemContext, VulnerabilityIssue
+
+try:
+    from examples.juice_shop.fixture_acceptance import write_fixture_evidence
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from fixture_acceptance import write_fixture_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +103,11 @@ def main() -> int:
     parser.add_argument("--suppressions", type=Path, default=_DEFAULT_SUPPRESSIONS)
     parser.add_argument("--output", type=Path, default=_DEFAULT_OUTPUT)
     parser.add_argument("--patch-out", type=Path, default=_DEFAULT_PATCH)
+    parser.add_argument(
+        "--evidence-out",
+        type=Path,
+        help="Optional private state projection for deterministic fixture acceptance checks.",
+    )
     args = parser.parse_args()
 
     load_dotenv()
@@ -144,6 +156,15 @@ def main() -> int:
     )
     args.patch_out.parent.mkdir(parents=True, exist_ok=True)
     args.patch_out.write_text(result.diff, encoding="utf-8")
+    if args.evidence_out is not None:
+        write_fixture_evidence(
+            result.raw_state,
+            args.evidence_out,
+            status=result.status,
+            changed_files=result.changed_files,
+            diff=result.diff,
+            trajectory_path=result.trajectory_path,
+        )
     logger.info("status=%s changed_files=%s", result.status, result.changed_files)
     return 0 if result.status in {"completed", "completed_with_errors"} else 1
 

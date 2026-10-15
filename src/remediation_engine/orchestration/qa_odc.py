@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import shutil
 import subprocess
@@ -45,6 +46,22 @@ _ODC_INTERNAL_FULL_SCAN_EXCLUDES = (
     "**/.remedy-attempt-snapshots/**",
     "**/.odc-targeted/**",
 )
+_ODC_SENSITIVE_OPTION_PATTERN = (
+    r"--[A-Za-z0-9_.-]*(?:api.?key|password|pass|secret|token|credential|authorization)"
+    r"[A-Za-z0-9_.-]*"
+)
+_ODC_REPR_ARGUMENT_RE = re.compile(
+    rf"(?i)(?P<quote>['\"])(?P<option>{_ODC_SENSITIVE_OPTION_PATTERN})(?P=quote)"
+    r"(?P<separator>\s*,\s*)(?P<value_quote>['\"])(?P<value>.*?)(?P=value_quote)"
+)
+_ODC_INLINE_ARGUMENT_RE = re.compile(
+    rf"(?i)(?P<prefix>{_ODC_SENSITIVE_OPTION_PATTERN}\s*=\s*)"
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;\]\)]+)"
+)
+_ODC_SEPARATE_ARGUMENT_RE = re.compile(
+    rf"(?i)(?P<prefix>{_ODC_SENSITIVE_OPTION_PATTERN}\s+)"
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;\]\)]+)"
+)
 
 
 @dataclass(frozen=True)
@@ -81,11 +98,16 @@ class _ODCScanTimeout(subprocess.TimeoutExpired):
         cleanup: _ODCCleanupResult,
         log_path: Path | None,
     ) -> None:
+        command = original.cmd
+        if isinstance(command, Sequence) and not isinstance(command, (str, bytes)):
+            safe_command: str | list[str] = _redact_odc_command(command)
+        else:
+            safe_command = _redact_odc_text(str(command))
         super().__init__(
-            original.cmd,
+            safe_command,
             original.timeout,
-            output=getattr(original, "output", None),
-            stderr=getattr(original, "stderr", None),
+            output=_redact_odc_text(_subprocess_text(getattr(original, "output", None))),
+            stderr=_redact_odc_text(_subprocess_text(getattr(original, "stderr", None))),
         )
         self.run_id = execution.run_id
         self.scope = execution.scope
@@ -107,13 +129,7 @@ def _new_odc_execution(scope: str) -> _ODCExecution:
 
 
 def _redact_odc_command(command: Sequence[str]) -> list[str]:
-    """Redact values for the small set of secret-bearing ODC options."""
-    sensitive_options = {
-        "--apikey",
-        "--nvdapikey",
-        "--proxypass",
-        "--password",
-    }
+    """Redact values for secret-bearing ODC options in split or inline form."""
     redacted: list[str] = []
     redact_next = False
     for argument in command:
@@ -121,10 +137,65 @@ def _redact_odc_command(command: Sequence[str]) -> list[str]:
             redacted.append("<redacted>")
             redact_next = False
             continue
-        redacted.append(argument)
-        if argument.lower() in sensitive_options:
+        option, separator, value = argument.partition("=")
+        if separator and _is_sensitive_odc_option(option):
+            redacted.append(f"{option}={'<redacted>' if value else ''}")
+            redact_next = not value
+        else:
+            redacted.append(argument)
+        if not separator and _is_sensitive_odc_option(argument):
             redact_next = True
     return redacted
+
+
+def _is_sensitive_odc_option(option: str) -> bool:
+    """Return whether an option name can carry a credential or token."""
+    if not option.startswith("--"):
+        return False
+    normalized = option.lstrip("-").replace("-", "").replace("_", "").casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "apikey",
+            "password",
+            "pass",
+            "secret",
+            "token",
+            "credential",
+            "authorization",
+        )
+    )
+
+
+def _redact_odc_text(value: str) -> str:
+    """Redact secret-bearing ODC option values embedded in diagnostic text."""
+    redacted = _ODC_REPR_ARGUMENT_RE.sub(
+        lambda match: (
+            f"{match.group('quote')}{match.group('option')}{match.group('quote')}"
+            f"{match.group('separator')}{match.group('value_quote')}<redacted>"
+            f"{match.group('value_quote')}"
+        ),
+        value,
+    )
+    redacted = _ODC_INLINE_ARGUMENT_RE.sub(
+        lambda match: f"{match.group('prefix')}<redacted>", redacted
+    )
+    return _ODC_SEPARATE_ARGUMENT_RE.sub(
+        lambda match: f"{match.group('prefix')}<redacted>", redacted
+    )
+
+
+def _redact_odc_exception(error: BaseException) -> str:
+    """Render an ODC exception without exposing its command or output secrets."""
+    message = str(error)
+    command = getattr(error, "cmd", None)
+    if command is not None:
+        if isinstance(command, Sequence) and not isinstance(command, (str, bytes)):
+            safe_command: str | list[str] = _redact_odc_command(command)
+        else:
+            safe_command = _redact_odc_text(str(command))
+        message = message.replace(repr(command), repr(safe_command))
+    return _redact_odc_text(message)
 
 
 def _cleanup_odc_container(container_name: str) -> _ODCCleanupResult:
@@ -208,11 +279,19 @@ def _write_odc_diagnostic_log(
     cleanup: _ODCCleanupResult | None = None,
 ) -> Path | None:
     """Persist one ODC invocation's command, output, and lifecycle evidence."""
-    stdout = _subprocess_text(
-        getattr(process, "stdout", None) if process is not None else getattr(error, "stdout", None)
+    stdout = _redact_odc_text(
+        _subprocess_text(
+            getattr(process, "stdout", None)
+            if process is not None
+            else getattr(error, "stdout", None)
+        )
     )
-    stderr = _subprocess_text(
-        getattr(process, "stderr", None) if process is not None else getattr(error, "stderr", None)
+    stderr = _redact_odc_text(
+        _subprocess_text(
+            getattr(process, "stderr", None)
+            if process is not None
+            else getattr(error, "stderr", None)
+        )
     )
     exit_code = getattr(process, "returncode", None) if process is not None else None
     cleanup_payload: dict[str, Any] | None = None
@@ -222,9 +301,9 @@ def _write_odc_diagnostic_log(
             "succeeded": cleanup.succeeded,
             "already_absent": cleanup.already_absent,
             "returncode": cleanup.returncode,
-            "stdout": cleanup.stdout,
-            "stderr": cleanup.stderr,
-            "error": cleanup.error,
+            "stdout": _redact_odc_text(cleanup.stdout),
+            "stderr": _redact_odc_text(cleanup.stderr),
+            "error": _redact_odc_text(cleanup.error) if cleanup.error else None,
         }
     payload = {
         "run_id": execution.run_id,
@@ -238,7 +317,7 @@ def _write_odc_diagnostic_log(
         "command": _redact_odc_command(command),
         "stdout": stdout,
         "stderr": stderr,
-        "error": str(error) if error is not None else None,
+        "error": _redact_odc_exception(error) if error is not None else None,
         "cleanup": cleanup_payload,
     }
     try:
@@ -306,7 +385,8 @@ def _run_odc_process(
     scope = "targeted" if scan_subdir else "full"
     execution = _new_odc_execution(scope)
     cmd = _odc_command(workspace_volume, scan_subdir, execution.container_name)
-    logger.info("qa_critic: running %s ODC in Docker: %s", scope, " ".join(cmd))
+    safe_command = shlex.join(_redact_odc_command(cmd))
+    logger.info("qa_critic: running %s ODC in Docker: %s", scope, safe_command)
     try:
         process = subprocess.run(
             cmd,
@@ -682,8 +762,9 @@ def _record_scan_result(
     error: str | None = None,
 ) -> _SecurityScanResult:
     """Attach private process metadata and one immutable scan log record."""
-    raw_stdout = _subprocess_text(stdout)
-    raw_stderr = _subprocess_text(stderr)
+    raw_stdout = _redact_odc_text(_subprocess_text(stdout))
+    raw_stderr = _redact_odc_text(_subprocess_text(stderr))
+    safe_error = _redact_odc_text(error) if error else None
     path = str(diagnostic_log_path) if diagnostic_log_path else None
     record = _QALogRecord(
         phase="scan",
@@ -691,10 +772,11 @@ def _record_scan_result(
         exit_code=exit_code,
         stdout=raw_stdout,
         stderr=raw_stderr,
-        error=error,
+        error=safe_error,
     )
     return replace(
         result,
+        summary=_redact_odc_text(result.summary),
         exit_code=exit_code,
         raw_stdout=raw_stdout,
         raw_stderr=raw_stderr,

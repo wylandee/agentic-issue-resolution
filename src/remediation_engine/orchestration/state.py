@@ -1,9 +1,9 @@
 """
 state.py - LangGraph state schemas for the AppSec Remediation Engine.
 
-``OrchestratorState`` - supervisor master state for the hub-and-spoke remedy
+``OrchestratorState`` — supervisor master state for the hub-and-spoke remedy
 architecture.
-``SubagentState`` - ephemeral private state for specialist subagents.
+``SubagentState`` — ephemeral private state for specialist subagents.
 
 Reducer notes
 -------------
@@ -13,6 +13,8 @@ Reducer notes
   stay isolated from the long-lived supervisor state.
 * ``changed_files`` uses an order-preserving set-like reducer so retries and
   bridge nodes cannot duplicate the same path in the final patch projection.
+* ``task_queue`` and committed attempt snapshots are the authoritative
+  orchestration state and bind worker/QA results to Supervisor authorization.
 * All other fields use the default "last writer wins" semantics.
 """
 
@@ -455,7 +457,8 @@ class OrchestratorState(TypedDict, total=False):
     changed_files:
         Repo-relative files successfully modified across subagent runs.
     task_queue:
-        Dict mapping task_id â†’ RemediationTask; the primary unit of Phase 5 work.
+        Dict mapping task IDs to ``RemediationTask`` records; the primary unit
+        of Phase 5 orchestration.
     """
 
     repo_root: str

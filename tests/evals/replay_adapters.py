@@ -726,6 +726,11 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str
                 complete=bool(execution.get("scan_complete", True)),
                 fallback_reason=ScanFallbackReason(str(fallback)) if fallback else None,
             )
+            # Each production replay models one assigned QA task. Preserve
+            # that task ownership explicitly so the evaluator exercises the
+            # same scoped evidence contract as the live QA path.
+            if results.scan_evidence.covered_task_ids == [task_id]:
+                results.scan_evidence_by_task[task_id] = results.scan_evidence
         except (TypeError, ValueError):
             results.scan_evidence = None
 

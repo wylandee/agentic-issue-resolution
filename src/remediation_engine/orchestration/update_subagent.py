@@ -33,7 +33,10 @@ from remediation_engine.orchestration.remedy_tools import (
     build_multi_package_update_toolbelt,
     build_update_toolbelt,
 )
-from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.orchestration.runtime_context import (
+    get_runtime_settings,
+    openai_api_key_kwargs,
+)
 from remediation_engine.orchestration.state import SubagentState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
 from remediation_engine.orchestration.supervisor_planner import instruction_digest
@@ -1190,9 +1193,14 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 "errors": action_errors,
             }
 
-        model_name = get_runtime_settings().update_llm_model
+        settings = get_runtime_settings()
+        model_name = settings.update_llm_model
         try:
-            llm = ChatOpenAI(model=model_name, temperature=0)
+            llm = ChatOpenAI(
+                model=model_name,
+                temperature=0,
+                **openai_api_key_kwargs(settings),
+            )
         except Exception as exc:  # noqa: BLE001
             msg = f"Update Subagent: failed to initialize LLM - {exc}."
             summaries = _build_surrender_summaries(
@@ -1398,9 +1406,14 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": resolution_errors + [msg],
         }
 
-    model_name = get_runtime_settings().update_llm_model
+    settings = get_runtime_settings()
+    model_name = settings.update_llm_model
     try:
-        llm = ChatOpenAI(model=model_name, temperature=0)
+        llm = ChatOpenAI(
+            model=model_name,
+            temperature=0,
+            **openai_api_key_kwargs(settings),
+        )
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: failed to initialize LLM - {exc}."
         summaries = _build_surrender_summaries(

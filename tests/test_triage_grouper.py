@@ -250,6 +250,7 @@ class TestSCAGrouping:
         g = groups[0]
         assert IssueSource.SEMGREP in g.sources
         assert IssueSource.ODC in g.sources
+        assert g.sources == sorted(g.sources, key=lambda source: source.value)
         assert len(g.issues) == 2
         assert g.fix_plan is not None
         assert g.fix_plan.strategy_used == "WORKAROUND"

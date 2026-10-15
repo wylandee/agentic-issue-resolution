@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from remediation_engine.orchestration.state import OrchestratorState
+from remediation_engine.orchestration.trajectory_exporter import get_active_trajectory_recorder
 from remediation_engine.runtime.docker_client import close_docker_client
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox, get_docker_client
 
@@ -83,8 +84,7 @@ def _collect_source_package_lock_inventory(
             for path in repo_root.rglob("package-lock.json")
             if path.is_file()
             and not any(
-                part in _SKIP_PACKAGE_DIR_NAMES
-                for part in path.relative_to(repo_root).parts
+                part in _SKIP_PACKAGE_DIR_NAMES for part in path.relative_to(repo_root).parts
             )
         ),
         key=lambda path: path.relative_to(repo_root).as_posix(),
@@ -101,7 +101,6 @@ def _collect_source_package_lock_inventory(
         except (OSError, UnicodeError, ValueError) as exc:
             errors.append(f"{relative_path}: {exc}")
     return ({} if errors else inventory), errors
-
 
 
 def _install_workspace_dependencies(
@@ -183,6 +182,9 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
     try:
         client = get_docker_client()
         client.volumes.create(name=volume_name)
+        recorder = get_active_trajectory_recorder()
+        if recorder is not None:
+            recorder.register_workspace_volume(volume_name)
     except Exception as exc:  # noqa: BLE001
         msg = f"workspace_builder_node: failed to create workspace volume - {exc}"
         logger.exception("workspace_builder_node: workspace volume creation failed.")

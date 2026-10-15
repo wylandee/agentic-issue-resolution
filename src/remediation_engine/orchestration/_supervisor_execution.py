@@ -299,12 +299,11 @@ def _impl__validate_committed_state(
     events: list[StateConsistencyEvent] = []
     errors: list[str] = []
 
-    # Reconcile every task before validating routing.  Worker and QA bridges
-    # are not allowed to repair planner-owned fields, so if a stale reducer
-    # or compatibility projection paired a task with a different current
-    # snapshot, the immutable snapshot wins for an active task.  A terminal
-    # task has no authorized future worker input, so its dangling attempt is
-    # detached instead of being allowed to leak into the next prompt.
+    # Reconcile every task before validating routing. Worker and QA bridges
+    # cannot repair planner-owned fields. A matching task/attempt/revision
+    # snapshot may repair corrupted input fields; foreign identity or revision
+    # evidence is rejected without mutating the task. A terminal task has no
+    # authorized future worker input, so its dangling attempt is detached.
     for task_id, task in list(task_queue.items()):
         if task.status in _dependency("_TERMINAL_STATUSES", _DEFAULT_TERMINAL_STATUSES) and (
             task.current_attempt_id is not None or task.selected_version is not None
@@ -338,10 +337,44 @@ def _impl__validate_committed_state(
             errors.append(f"supervisor: task {task_id} references a missing attempt snapshot.")
             continue
 
+        if (
+            snapshot.attempt_id != task.current_attempt_id
+            or snapshot.task_id != task_id
+            or snapshot.task_id != task.task_id
+        ):
+            detail = "Active task references a snapshot with foreign task or attempt identity."
+            errors.append(f"supervisor: {detail}")
+            events.append(
+                _build_consistency_event(
+                    error_code="TASK_SNAPSHOT_IDENTITY_REJECTED",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=snapshot.attempt_id,
+                    action="rejected",
+                    details=detail,
+                )
+            )
+            continue
+        if snapshot.task_revision != task.task_revision:
+            detail = (
+                "Active task revision differs from its committed attempt snapshot; "
+                "snapshot repair was refused."
+            )
+            errors.append(f"supervisor: {detail}")
+            events.append(
+                _build_consistency_event(
+                    error_code="TASK_SNAPSHOT_REVISION_REJECTED",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=snapshot.attempt_id,
+                    action="rejected",
+                    details=detail,
+                )
+            )
+            continue
+
         snapshot_matches = (
-            snapshot.task_id == task.task_id
-            and snapshot.task_revision == task.task_revision
-            and snapshot.strategy_stage == task.strategy_stage
+            snapshot.strategy_stage == task.strategy_stage
             and snapshot.no_fix_stage == task.no_fix_stage
             and snapshot.qa_policy == task.qa_policy
             and snapshot.selected_version == task.selected_version
@@ -368,7 +401,6 @@ def _impl__validate_committed_state(
 
         task_queue[task_id] = task.model_copy(
             update={
-                "task_revision": snapshot.task_revision,
                 "current_attempt_id": snapshot.attempt_id,
                 "strategy_stage": snapshot.strategy_stage,
                 "no_fix_stage": snapshot.no_fix_stage,

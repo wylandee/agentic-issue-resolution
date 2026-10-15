@@ -1116,7 +1116,11 @@ def _build_qa_scan_targets(
         ).strip()
         attempt_version, has_attempt_version_evidence = _attempt_version_evidence(state, task)
         expected_version = (
-            task.selected_version if task is not None and task.selected_version else attempt_version
+            attempt_version
+            if has_attempt_version_evidence
+            else task.selected_version
+            if task is not None
+            else None
         )
         # A workaround task deliberately has no supervisor-selected package
         # version.  Its worker may leave the installed dependency at whatever
@@ -2516,6 +2520,7 @@ def _write_targeted_artifacts(
     task_ids_by_project: dict[str, tuple[str, ...]] = {}
     input_paths_by_project: dict[str, tuple[str, ...]] = {}
     artifact_index = 0
+    staged_npm_files: dict[str, str] = {}
 
     for source_lockfile, task_ids in sorted(task_ids_by_lockfile.items()):
         raw_lockfile = sandbox.read_file(source_lockfile)
@@ -2571,14 +2576,10 @@ def _write_targeted_artifacts(
 
         project_path = f"{targeted_subdir}/{artifact_index:03d}"
         artifact_index += 1
-        sandbox.write_file(
-            _validate_qa_path(f"{project_path}/package.json"),
-            package_json_text,
-        )
-        sandbox.write_file(
-            _validate_qa_path(f"{project_path}/package-lock.json"),
-            raw_lockfile,
-        )
+        project_manifest_path = _validate_qa_path(f"{project_path}/package.json")
+        project_lockfile_path = _validate_qa_path(f"{project_path}/package-lock.json")
+        staged_npm_files[project_manifest_path] = package_json_text
+        staged_npm_files[project_lockfile_path] = raw_lockfile
 
         occurrences: list[PackageScanOccurrence] = []
         for lockfile_key, metadata in sorted(packages.items(), key=lambda item: str(item[0])):
@@ -2606,14 +2607,13 @@ def _write_targeted_artifacts(
             # One lockfile preserves a single Node Audit request per input;
             # companion manifests let ODC identify each physical package.
             package_manifest_path = _validate_qa_path(f"{project_path}/{lockfile_key}/package.json")
-            sandbox.write_file(
-                package_manifest_path,
+            staged_npm_files[package_manifest_path] = (
                 json.dumps(
                     {"name": package_name, "version": version},
                     indent=2,
                     sort_keys=True,
                 )
-                + "\n",
+                + "\n"
             )
         occurrences_by_project[project_path] = tuple(occurrences)
         task_ids_by_project[project_path] = tuple(sorted(task_ids))
@@ -2621,6 +2621,9 @@ def _write_targeted_artifacts(
         expected_package_occurrences.extend(
             (occurrence.package_name, occurrence.version) for occurrence in occurrences
         )
+
+    if staged_npm_files:
+        sandbox.write_files(staged_npm_files)
 
     for project in sorted(non_npm_input_projects, key=lambda item: item.source_input_path):
         project_path = f"{targeted_subdir}/{artifact_index:03d}"

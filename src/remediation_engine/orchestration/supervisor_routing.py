@@ -1,11 +1,12 @@
-"""Deterministic Supervisor routing, reconciliation, and transition helpers."""
+"""Deterministic Supervisor routing decisions and audit helpers."""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import Any
 
-from remediation_engine.contracts.decision_codes import DecisionCode, validate_transition
+from remediation_engine.contracts.decision_codes import DecisionCode
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     NoFixMitigationStage,
@@ -15,19 +16,12 @@ from remediation_engine.contracts.schemas import (
     RoutingStrategy,
     StateConsistencyEvent,
     SupervisorDecision,
-    SupervisorRetryPlan,
-    TaskAttemptSnapshot,
     TaskSpawnRequest,
     TaskStatus,
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
 )
-from remediation_engine.contracts.supervisor_phases import (
-    AuditRecord,
-    EligibleActions,
-    ReconciliationResult,
-)
-from remediation_engine.orchestration.state import OrchestratorState
+from remediation_engine.contracts.supervisor_phases import AuditRecord
 from remediation_engine.orchestration.supervisor_planner import (
     QA_DISPATCH_LIMIT,
     UPDATE_DISPATCH_LIMIT,
@@ -211,6 +205,7 @@ def _deterministic_routing(
     current_status: str = "",
     triage_required: bool = False,
     portfolio_plan: PortfolioPlan | None = None,
+    delta_replay_task_ids: Iterable[str] = (),
 ) -> SupervisorDecision:
     """
     Pure-Python routing used as the Supervisor's authoritative state machine.
@@ -313,9 +308,9 @@ def _deterministic_routing(
         portfolio_plan,
         task_queue,
         qa=False,
+        preferred_ids=list(active_target_task_ids or []),
     )
     portfolio_work_target_ids = set(portfolio_work_targets)
-
     # NO_FIX is a deterministic same-task state machine.  Keep it ahead of
     # generic workaround routing so an untrusted decision cannot skip a
     # mitigation stage or
@@ -366,6 +361,29 @@ def _deterministic_routing(
             decision_reason=(
                 f"Deterministic NO_FIX routing selected {target.no_fix_stage.value} "
                 f"for task '{target.task_id}'."
+            ),
+        )
+
+    delta_replay_task_ids = set(delta_replay_task_ids)
+    delta_replay_targets = [
+        task_id
+        for task_id in portfolio_work_targets
+        if task_id in delta_replay_task_ids
+        and task_queue[task_id].strategy == RoutingStrategy.VERSION_BUMP
+    ]
+    if delta_replay_targets:
+        target = task_queue[delta_replay_targets[0]]
+        return SupervisorDecision(
+            decision_code=DecisionCode.NEW_VERSION_BUMP,
+            next_node="update_subagent",
+            target_task_ids=[target.task_id],
+            instructions=(
+                "Run the restored delta peer's committed candidate as a singleton "
+                "so authoritative QA can validate it independently."
+            ),
+            decision_reason=(
+                f"Dispatching restored delta peer '{target.task_id}' from the "
+                "committed portfolio head before unrelated retries."
             ),
         )
 
@@ -426,6 +444,76 @@ def _deterministic_routing(
             instructions="Pivot exhausted update remediation to workaround child tasks.",
             decision_reason=(
                 f"Retry diagnostics show {len(exhausted_retries)} update task(s) no longer have a remaining manifest-based update path."
+            ),
+        )
+
+    # A conclusive QA failure is still the active task's responsibility, even
+    # when the portfolio plan has already advanced to another ready cluster.
+    # Give a singleton retry to tactical planning before dispatching unrelated
+    # work. Never split a committed multi-task cluster.
+    active_retry_task = None
+    active_retry_evaluation = None
+    if len(active_target_task_ids or ()) == 1:
+        active_task_id = active_target_task_ids[0]
+        candidate_task = task_queue.get(active_task_id)
+        candidate_evaluation = qa_evaluations.get(active_task_id)
+        if (
+            candidate_task is not None
+            and candidate_task.strategy == RoutingStrategy.VERSION_BUMP
+            and candidate_task.status == TaskStatus.NEEDS_RETRY
+            and candidate_task.current_attempt_id is None
+            and candidate_evaluation is not None
+            and not candidate_evaluation.passed
+            and not candidate_evaluation.contract_error
+            and not candidate_evaluation.evidence_inconclusive
+            and not _has_existing_workaround_child(candidate_task, task_queue)
+        ):
+            cluster_id = (
+                portfolio_plan.task_to_cluster.get(active_task_id)
+                if portfolio_plan is not None
+                else None
+            )
+            active_cluster = (
+                next(
+                    (
+                        cluster
+                        for cluster in portfolio_plan.clusters
+                        if cluster.cluster_id == cluster_id
+                    ),
+                    None,
+                )
+                if portfolio_plan is not None and cluster_id is not None
+                else None
+            )
+            if active_cluster is None or len(active_cluster.task_ids) == 1:
+                active_retry_task = candidate_task
+                active_retry_evaluation = candidate_evaluation
+
+    if active_retry_task is not None and active_retry_evaluation is not None:
+        retry_instruction = _build_high_level_retry_instruction(
+            active_retry_task,
+            group_by_id.get(active_retry_task.parent_group_id),
+            active_retry_evaluation,
+            retry_diagnostics_by_task.get(active_retry_task.task_id),
+        )
+        retry_feedback = (
+            {active_retry_task.task_id: active_retry_evaluation.retry_feedback}
+            if active_retry_evaluation.retry_feedback
+            else {}
+        )
+        return SupervisorDecision(
+            decision_code=DecisionCode.RETRY_VERSION_BUMP,
+            next_node="update_subagent",
+            target_task_ids=[active_retry_task.task_id],
+            feedback_by_task=retry_feedback,
+            revised_instructions={active_retry_task.task_id: retry_instruction},
+            instructions=(
+                "Route the active QA-failed dependency task through tactical/retry planning "
+                "before dispatching unrelated portfolio work."
+            ),
+            decision_reason=(
+                f"Prioritizing active QA retry task '{active_retry_task.task_id}' "
+                "before unrelated portfolio dispatch."
             ),
         )
 
@@ -647,247 +735,6 @@ def _deterministic_routing(
     )
 
 
-def _reconcile_results(
-    state: OrchestratorState,
-    task_queue: dict[str, RemediationTask],
-    group_by_id: dict[str, VulnerabilityGroup],
-    *,
-    qa_evaluations: dict[str, QAEvaluation] | None = None,
-    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
-    consistency_events: list[StateConsistencyEvent] | None = None,
-    auto_constraints: list[str] | None = None,
-    errors: list[str] | None = None,
-) -> ReconciliationResult:
-    """Project worker/QA outcomes into a detached reconciliation result.
-
-    This phase deliberately does not select a route.  It is small enough to
-    run in replay tests without constructing an LLM or touching the graph.
-    The production node retains its richer attempt-correlation reducer; this
-    helper exposes the same state-machine boundary for focused callers.
-    """
-
-    projected_tasks = {task_id: task.model_copy() for task_id, task in task_queue.items()}
-    projected_evaluations = dict(qa_evaluations or state.get("qa_evaluations", {}) or {})
-    projected_diagnostics = dict(
-        retry_diagnostics_by_task or state.get("retry_diagnostics_by_task", {}) or {}
-    )
-    projected_events = list(consistency_events or [])
-    projected_constraints = list(auto_constraints or [])
-    projected_errors = list(errors or [])
-
-    if state.get("status") in {"qa_completed", "qa_failed"}:
-        for task_id in sorted(projected_evaluations):
-            evaluation = projected_evaluations[task_id]
-            task = projected_tasks.get(task_id)
-            if task is None or task.status != TaskStatus.OPTIMISTICALLY_FIXED:
-                continue
-            if evaluation.passed:
-                if validate_transition(task.status, TaskStatus.QA_PASSED):
-                    projected_tasks[task_id] = task.model_copy(
-                        update={"status": TaskStatus.QA_PASSED}
-                    )
-            elif evaluation.contract_error or evaluation.evidence_inconclusive:
-                # QA contract/evidence failures rerun the same candidate
-                # without advancing remediation or consuming a worker retry.
-                continue
-            elif validate_transition(task.status, TaskStatus.NEEDS_RETRY):
-                projected_tasks[task_id] = task.model_copy(
-                    update={
-                        "status": TaskStatus.NEEDS_RETRY,
-                        "retry_count": task.retry_count + 1,
-                    }
-                )
-
-    return ReconciliationResult(
-        task_queue=projected_tasks,
-        qa_evaluations=projected_evaluations,
-        retry_diagnostics_by_task=projected_diagnostics,
-        consistency_events=projected_events,
-        auto_constraints=projected_constraints,
-        errors=projected_errors,
-    )
-
-
-def _validate_invariants(
-    task_queue: dict[str, RemediationTask],
-    attempt_snapshots_by_id: dict[str, TaskAttemptSnapshot],
-    retry_plans_by_task: dict[str, SupervisorRetryPlan],
-    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
-    target_task_ids: list[str],
-    next_node: str,
-) -> tuple[list[StateConsistencyEvent], list[str]]:
-    """Validate committed state without mutating the caller's task queue."""
-
-    projected_tasks = {task_id: task.model_copy() for task_id, task in task_queue.items()}
-    return _validate_committed_state(
-        projected_tasks,
-        dict(attempt_snapshots_by_id),
-        dict(retry_plans_by_task),
-        dict(retry_diagnostics_by_task),
-        list(target_task_ids),
-        next_node,
-    )
-
-
-def _calculate_eligible_actions(
-    task_queue: dict[str, RemediationTask],
-    group_by_id: dict[str, VulnerabilityGroup],
-    qa_evaluations: dict[str, QAEvaluation],
-    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
-    *,
-    active_target_task_ids: list[str] | None = None,
-    current_status: str = "",
-    triage_required: bool = False,
-) -> EligibleActions:
-    """Return the pure eligibility projection consumed by routing."""
-
-    ordered = sorted(task_queue.values(), key=lambda task: _task_sort_key(task, group_by_id))
-    non_terminal = [task for task in ordered if task.status not in _TERMINAL_STATUSES]
-    workable = [task for task in non_terminal if task.status in _WORKABLE_STATUSES]
-    current_qa = _qa_ready_task_ids(
-        task_queue,
-        preferred_ids=active_target_task_ids or [],
-        group_by_id=group_by_id,
-    )
-    all_qa = _qa_ready_task_ids(task_queue, group_by_id=group_by_id)
-    no_fix = [
-        task
-        for task in workable
-        if task.strategy == RoutingStrategy.CODE_WORKAROUND
-        and task.no_fix_stage
-        in {
-            NoFixMitigationStage.PACKAGE_REMOVAL,
-            NoFixMitigationStage.VULNERABLE_CODE_REMOVAL,
-        }
-    ]
-    exhausted = [
-        task
-        for task in workable
-        if _is_exhausted_update_pivot_candidate(task, retry_diagnostics_by_task.get(task.task_id))
-        and not _has_existing_workaround_child(task, task_queue)
-    ]
-    retries = [
-        task
-        for task in workable
-        if task.strategy == RoutingStrategy.VERSION_BUMP
-        and task.status == TaskStatus.NEEDS_RETRY
-        and task not in exhausted
-        and not _has_existing_workaround_child(task, task_queue)
-    ]
-    pending_updates = [
-        task
-        for task in workable
-        if task.strategy == RoutingStrategy.VERSION_BUMP
-        and task.status == TaskStatus.PENDING
-        and not _has_existing_workaround_child(task, task_queue)
-    ]
-    workarounds = [
-        task
-        for task in workable
-        if task.strategy == RoutingStrategy.CODE_WORKAROUND and task.no_fix_stage is None
-    ]
-    return EligibleActions(
-        non_terminal_tasks=[task.task_id for task in non_terminal],
-        qa_ready_task_ids=(
-            current_qa if current_status != "qa_completed" and current_qa else all_qa
-        ),
-        workable_tasks=[task.task_id for task in workable],
-        no_fix_workable=[task.task_id for task in no_fix],
-        exhausted_pivots=[task.task_id for task in exhausted],
-        retry_version_bumps=[task.task_id for task in retries],
-        new_version_bumps=[task.task_id for task in pending_updates],
-        workaround_tasks=[task.task_id for task in workarounds],
-        triage_required=triage_required
-        and current_status in {"qa_completed", "qa_failed", "final_scan_completed"},
-    )
-
-
-def _select_deterministic_action(
-    eligible: EligibleActions,
-    task_queue: dict[str, RemediationTask],
-    group_by_id: dict[str, VulnerabilityGroup],
-    qa_evaluations: dict[str, QAEvaluation],
-    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
-) -> SupervisorDecision:
-    """Select the same fixed-priority action as the authoritative router."""
-
-    return _deterministic_routing(
-        task_queue,
-        group_by_id,
-        qa_evaluations,
-        retry_diagnostics_by_task,
-        active_target_task_ids=eligible.qa_ready_task_ids,
-        current_status="",
-        triage_required=eligible.triage_required,
-    )
-
-
-def _apply_transition(
-    decision: SupervisorDecision,
-    task_queue: dict[str, RemediationTask],
-    attempt_snapshots_by_id: dict[str, TaskAttemptSnapshot],
-    retry_plans_by_task: dict[str, SupervisorRetryPlan],
-    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
-    group_by_id: dict[str, VulnerabilityGroup],
-    state_revision: int,
-) -> dict[str, Any]:
-    """Apply a dispatch projection without performing another route decision."""
-
-    projected_tasks = {task_id: task.model_copy() for task_id, task in task_queue.items()}
-    projected_snapshots = dict(attempt_snapshots_by_id)
-    target_ids = _normalize_target_task_ids_for_node(
-        decision.next_node,
-        list(decision.target_task_ids),
-        projected_tasks,
-        retry_diagnostics_by_task,
-        group_by_id,
-    )
-    if decision.next_node in {"update_subagent", "workaround_subagent"}:
-        dispatchable_target_ids: list[str] = []
-        for task_id in target_ids:
-            task = projected_tasks[task_id]
-            if decision.next_node == "update_subagent" and task.current_attempt_id is None:
-                plan = retry_plans_by_task.get(task_id)
-                diagnostics = retry_diagnostics_by_task.get(task_id)
-                authorization = _authorize_update_dispatch(
-                    task,
-                    plan=plan,
-                    diagnostics=diagnostics,
-                )
-                if authorization is None:
-                    logger.warning(
-                        "supervisor: rejected candidate-less update projection for task '%s'.",
-                        task_id,
-                    )
-                    continue
-                allowed_versions = list(authorization.allowed_target_versions)
-                allowed_dependency_types = list(authorization.allowed_dependency_types)
-            else:
-                allowed_versions, allowed_dependency_types = [], []
-            dispatchable_target_ids.append(task_id)
-            if task.current_attempt_id is None and task.instruction:
-                plan = retry_plans_by_task.get(task_id)
-                committed, _snapshot = _create_attempt_snapshot(
-                    task,
-                    dispatch_node=decision.next_node,
-                    snapshots_by_id=projected_snapshots,
-                    state_revision=state_revision,
-                    plan_id=(plan.plan_id if plan is not None else None),
-                    portfolio_plan_id=task.portfolio_plan_id,
-                    allowed_target_versions=allowed_versions,
-                    allowed_dependency_types=allowed_dependency_types,
-                )
-                projected_tasks[task_id] = committed
-        target_ids = dispatchable_target_ids
-    return {
-        "task_queue": projected_tasks,
-        "attempt_snapshots_by_id": projected_snapshots,
-        "next_routing_step": decision.next_node,
-        "active_target_task_ids": target_ids,
-        "decision_code": decision.decision_code,
-    }
-
-
 def _emit_audit(
     decision: SupervisorDecision,
     consistency_events: list[StateConsistencyEvent],
@@ -952,33 +799,3 @@ def _no_fix_decision_requires_fallback(
     ):
         return True
     return any(request.parent_task_id == expected_task_id for request in decision.spawn_requests)
-
-
-def _validate_committed_state(*args: Any, **kwargs: Any) -> Any:
-    from remediation_engine.orchestration import supervisor_node
-
-    return supervisor_node._validate_committed_state(*args, **kwargs)
-
-
-def _normalize_target_task_ids_for_node(*args: Any, **kwargs: Any) -> Any:
-    from remediation_engine.orchestration import supervisor_node
-
-    return supervisor_node._normalize_target_task_ids_for_node(*args, **kwargs)
-
-
-def _authorize_update_dispatch(*args: Any, **kwargs: Any) -> Any:
-    from remediation_engine.orchestration import supervisor_node
-
-    return supervisor_node._authorize_update_dispatch(*args, **kwargs)
-
-
-def _ordered_update_candidates(*args: Any, **kwargs: Any) -> Any:
-    from remediation_engine.orchestration import supervisor_node
-
-    return supervisor_node._ordered_update_candidates(*args, **kwargs)
-
-
-def _create_attempt_snapshot(*args: Any, **kwargs: Any) -> Any:
-    from remediation_engine.orchestration import supervisor_node
-
-    return supervisor_node._create_attempt_snapshot(*args, **kwargs)

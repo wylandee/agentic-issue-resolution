@@ -8,10 +8,11 @@ apply a patch to the caller's repository.
 
 ## Graph topology
 
-The graph has one initial preprocessing pass, a shared Docker workspace, and an
-outer portfolio boundary before the Supervisor hub. Every worker result returns
-to the Supervisor, which may request a post-QA triage/portfolio replan before
-deciding the next committed transition.
+The graph has an initial preprocessing pass, a shared Docker workspace, a
+scoped setup scan, and a Supervisor hub. Portfolio planning and certification
+run as Supervisor-invoked functions, not as a separate graph node. Every worker
+and QA result returns to the Supervisor, which may request post-QA
+reconciliation and replan before committing the next transition.
 
 ```text
 START
@@ -20,37 +21,37 @@ START
   |          |                                                    |
   |          +--> workspace_builder --(failure)-------------------+--> teardown
   |                              |                                 |
-  |                              +--> portfolio --(invalid)--------+
-  |                                     |                          |
-  |                                     +--> supervisor <-----------+
-  |                                            |  ^                 |
-  |                    +-----------------------+  |                 |
-  |                    |                          |                 |
-  |                    +--> update_subagent ------+                 |
-  |                    +--> workaround_subagent --+                 |
-  |                    +--> qa_critic ------------+                 |
-  |                    +--> triage --> portfolio --+                 |
-  |                    +--> final_full_scan -------+                 |
-  |                    +--> teardown --------------------------------> report --> END
+  |                              +--> workspace_setup_scan --> supervisor
+  |                                                             |  ^
+  |                    +----------------------------------------+  |
+  |                    |                                           |
+  |                    +--> update_subagent -----------------------+
+  |                    +--> workaround_subagent -------------------+
+  |                    +--> qa_critic ------------------------------+
+  |                    +--> triage (post-QA reconciliation) --------+
+  |                    +--> final_full_scan (optional) -------------+
+  |                    +--> teardown --> report --> END
 ```
 
 `initial_triage` accepts the caller's groups or runs the initial triage
-pipeline. `workspace_builder` creates and populates the shared volume.
-`portfolio` snapshots the npm graph, solves the active SCA task portfolio, and
-commits the resulting task allowlists copy-on-write. Only a validated,
-dispatchable portfolio reaches `supervisor`; infeasible, unknown, fallback,
-invalid-DAG, and unresolved no-fix plans fail closed to teardown.
+pipeline. `workspace_builder` creates and populates the shared volume, then
+`workspace_setup_scan` records setup evidence before the first Supervisor
+transition. The Supervisor invokes the portfolio planning and certification
+functions when the active task set needs a plan. Invalid or non-dispatchable
+plans are handled by Supervisor policy and can fail closed to teardown.
 
 The `supervisor` dispatches committed tasks subject to the dispatch limits in
 the implementation. It can route an update worker, workaround worker, or QA;
-request post-QA `triage` (which always returns through `portfolio`); request the
-authoritative `final_full_scan`; or finish at `teardown`. The final scan and
-teardown are graph-level operations rather than task dispatches.
+request post-QA `triage`; invoke portfolio replanning after reconciliation; or
+finish at `teardown`. It requests `final_full_scan` only when
+`REMEDY_FINAL_FULL_SCAN_ENABLED` is enabled and the configured workflow reaches
+that gate. The optional scan and teardown are graph-level operations rather
+than task dispatches.
 
 The `triage` node is reserved for post-QA reconciliation. It consumes the
-complete parseable scan snapshot, reconciles groups with task lineage, and
-returns control to the outer portfolio boundary. A reopened cycle clears the
-final-scan completion gate before more work is dispatched.
+available parseable scan snapshot, reconciles groups with task lineage, and
+returns control to the Supervisor. A reopened cycle invalidates affected scan
+and plan evidence before more work is dispatched.
 
 ## Package boundaries
 
@@ -58,10 +59,10 @@ final-scan completion gate before more work is dispatched.
   ingestion, triage, orchestration, workers, QA, and the public result
   boundary. `contracts/accessors.py` provides the typed accessor used where
   orchestration accepts model or mapping state.
-- Tactical action, task-cluster, dependency, and multi-package envelopes are
-  proposal contracts. Phase 2 validates and seals single-task tactical actions
-  into `TaskAttemptSnapshot`; cluster and multi-package envelopes remain
-  non-authoritative until Phase 3.
+- Tactical actions are model proposals until Python validates them. The
+  occurrence-aware portfolio planner supplies deterministic clusters and
+  multi-package batches; the Supervisor commits the selected action, batch
+  provenance, and per-task `TaskAttemptSnapshot` records before dispatch.
 - `triage` owns scanner normalization, enrichment, reachability analysis,
   grouping, and the initial/post-QA triage pipeline.
 - `orchestration/graph.py` builds the LangGraph and owns graph-level triage,
@@ -124,15 +125,25 @@ planned revisions must match the active queue before the Supervisor dispatches.
 attempt. Task lineage uses `parent_group_id` and explicit parent-task links;
 group identity is triage/report context, while task ID is the execution and QA
 correlation key. `active_target_task_ids` identifies the tasks selected for the
-current dispatch.
+current dispatch. Tasks in one atomic multi-package dispatch share the
+committed `dispatch_batch_id` and action provenance while retaining one
+snapshot per attempt. If a batch fails QA, bounded canary replays may test
+candidate subsets against the saved baseline. Blame is usable only after the
+candidate workspace is verified restored; an incomplete restore blocks further
+mutation and remains visible in the run diagnostics.
 
 Before dispatch, the Supervisor commits an attempt snapshot containing the
-task ID and revision, attempt ID, strategy stage, selected version (when
-applicable), approved target-version and dependency-type candidates, exact
-instruction and digest, QA policy, and dispatch node. Worker and QA results
-must match the current task revision and attempt envelope. A stale, detached,
-or policyless result is rejected before it can mutate the workspace or enter
-evaluation.
+task ID and revision, attempt ID, strategy stage, approved target-version and
+dependency-type candidates, exact instruction and digest, QA policy, and
+dispatch node. The mutable `RemediationTask.selected_version` is a planning
+hint; the committed snapshot, exact atomic mutation target, and sealed worker
+instruction define execution authorization. A worker may execute an alternate
+only when an explicit committed candidate rule permits it; it cannot expand
+the set or query a registry. QA checks current attempt evidence for the
+effective version actually executed.
+Worker and QA results must match the current task revision and attempt
+envelope. A stale, detached, or policyless result is rejected before it can
+mutate the workspace or enter evaluation.
 
 `worker_results_by_attempt` and `qa_results_by_attempt` retain typed result
 envelopes keyed by attempt ID. `qa_evaluations` is a derived, task-keyed view
@@ -142,22 +153,16 @@ that produced it. Scratchpads, conversation messages, summaries, and report
 views are derived or ephemeral and cannot select a version, retry, pivot, or
 new task.
 
-The outer Portfolio Orchestrator alone:
+The Supervisor is the only orchestration policy owner. It invokes the
+portfolio-planning adapter when initial preparation or reconciliation requires
+an executable plan. The adapter builds the occurrence-aware npm graph, obtains
+bounded registry/cache candidates, calls the CP-SAT solver, certifies resolver
+evidence, and returns a copy-on-write plan. The Supervisor decides how that
+result changes task state and whether to dispatch, retry, pivot, replan, or
+stop. Workers execute only the sealed attempts; certification and task
+selection are not separate graph nodes.
 
-1. snapshots the npm graph and selects bounded registry/cache candidates through
-   the CP-SAT portfolio solver;
-2. commits the immutable plan, target identities, allowlists, and task revisions;
-3. validates the dependency DAG and dispatch phases before handing work to the
-   Supervisor.
-
-The Supervisor alone:
-
-1. consumes the committed plan and selects the next route;
-2. chooses retry, pivot, and post-QA reconciliation actions from committed
-   evidence; and
-3. commits task attempts and decides when the final scan gate may run.
-
-### Phase 2 tactical supervision
+### Optional tactical Supervisor proposals
 
 The tactical Supervisor is a pure diagnostic classifier layered on top of the
 deterministic target selector. The selector chooses one eligible task first;
@@ -179,13 +184,12 @@ rendered instruction is committed, hashed, and sealed in the attempt snapshot
 before dispatch. A rejected proposal can receive one repair proposal; neither
 proposal can mutate task state, create a spawn request, or invoke a worker.
 
-The tactical playbook permits an immediate breaking-change workaround, a
-transitive child override, or a Phase 2 `PEER_CONFLICT_ESCALATION` referral
-when no compatible single-task candidate exists. The referral uses existing
-UNFIXABLE reporting and final-scan/teardown routing; Phase 2 does not add
-portfolio execution, clustering, or DAG orchestration. The stage ladder is
-used only by deterministic fallback, and API-key/model/registry failures do
-not change safety boundaries.
+When enabled, the tactical model may propose a single-task action or peer
+conflict referral. The Supervisor validates the proposal and remains the sole
+authority that commits it. Multi-package clustering, dependency ordering, and
+portfolio certification are deterministic functions invoked by the
+Supervisor. The stage ladder is used only by deterministic fallback, and
+model/registry failures do not change safety boundaries.
 
 ## Worker execution
 
@@ -222,42 +226,50 @@ terminal for the bounded worker loop after matching tool responses are emitted.
 call. The QA runtime performs dependency installation, the applicable ODC
 scan, and workspace tests, retaining bounded summaries and private raw
 diagnostics. The structured evaluator then receives compact status flags,
-identifiers, package-state facts, bounded action summaries, and read-only
+task-scoped scanner evidence, bounded action summaries, and read-only
 source-review tools. It returns a typed terminal decision for the task.
 `qa_policy_engine` applies deterministic gates, attaches test/scan evidence,
 and rejects decisions that are not backed by the required evidence.
 
-For supported npm `package-lock.json` workspaces, QA resolves every matching
-physical target package entry from the live volume and builds a separate
-one-package project for each entry. The selected installed version and
-dependency ancestry narrow the candidates when they identify a specific nested
-copy; each synthetic lockfile contains only its target package and no dependency
-edges. QA requires the ODC report to enumerate every targeted package occurrence
-at the expected version before it can confirm target CVE status. Unsupported
-package managers, missing or invalid lockfiles, unresolvable targets, and
-incomplete or unparseable reports produce inconclusive QA and do not consume a
-remediation retry. They never trigger a full-scan fallback. The authoritative
-final full scan checks the complete workspace. A scoped NO_FIX package-removal
-policy can skip the per-task scan only when its other deterministic
-install/test and package-state gates are satisfied.
+For supported npm `package-lock.json` workspaces, QA resolves physical target
+package occurrences from the live volume. Targeted artifact staging creates
+one temporary project per changed source lockfile and preserves that
+lockfile's raw content and applicable physical manifests; it does not slice
+the artifact down to a target-only synthetic dependency closure. Closure
+analysis is used for coverage planning. QA requires the ODC report to account
+for the requested target occurrences at the expected versions before it can
+confirm target CVE status. Unsupported package managers, missing or invalid
+lockfiles, unresolvable targets, and incomplete or unparseable reports produce
+inconclusive QA and do not consume a remediation retry. They do not trigger a
+full-scan fallback. A NO_FIX package-removal batch can skip ODC only when the
+accepted change is verified as deletion-only; deterministic install and test
+gates still apply. Manifest and resolved-graph QA checks are currently
+disabled.
+
+Each task evaluator receives its task-scoped occurrence projection. Findings
+from report-wide cumulative scans remain available to terminal triage and do
+not independently fail an unrelated task.
 
 Targeted per-task scans and evaluator decisions are attempt-local evidence.
 They do not establish repository-wide security status and do not independently
-reopen or close work. Before teardown, the Supervisor routes the terminal
-workspace through exactly one authoritative full ODC scan:
+reopen or close work. By default, when all tasks are terminal, the Supervisor
+records the available incremental dependency-input coverage in a
+`FinalFullScanResult` compatibility contract with `authoritative=false` and
+`coverage_scope=incremental_dependency_inputs`. This state does not claim a
+full-repository scan. A full ODC scan is opt-in through
+`REMEDY_FINAL_FULL_SCAN_ENABLED=true`; when enabled, the graph routes through:
 
 ```text
 supervisor -> final_full_scan -> supervisor -> teardown
 ```
 
-The final scan compares the post-remediation workspace with the baseline and
-records remaining target identifiers, newly found identifiers, typed issues,
-scan status, and a workspace fingerprint. A failed or incomplete authoritative
-scan remains visible to teardown and reporting; it cannot be interpreted as a
-clean result. If the scan reports unresolved or newly introduced findings,
-the Supervisor may route retryable work through post-QA `triage`. Any reopened
-cycle resets the final-scan gate and requires another authoritative scan before
-teardown.
+The optional scan compares the post-remediation workspace with the baseline
+and records remaining target identifiers, newly found identifiers, typed
+issues, scan status, and a workspace fingerprint. A failed or incomplete scan
+remains visible to teardown and reporting; it cannot be interpreted as a clean
+result. If the scan reports unresolved or newly introduced findings, the
+Supervisor may route retryable work through post-QA `triage`. Reopened work
+invalidates affected evidence and can cause the optional scan to run again.
 
 ## Report lifecycle and public boundary
 
@@ -318,6 +330,12 @@ include `OPENAI_API_KEY`, `REMEDY_LLM_MODEL`, the node-specific
 `ODC_EXTRA_ARGS`, `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`,
 `LANGSMITH_PROJECT`, `LANGSMITH_ENDPOINT`, `TRIAGE_CACHE_DIR`,
 `REMEDIATION_TRAJECTORY_DIR`, `REMEDIATION_REPORT_DIR`,
+`REMEDY_FINAL_FULL_SCAN_ENABLED`, `REMEDY_SOLVER_TIMEOUT_SECONDS`,
+`REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS`, `REMEDY_SOLVER_TOP_K`,
+`REMEDY_SOLVER_PHASE_BUDGET`, `REMEDY_SOLVER_ACCEPT_FEASIBLE`,
+`REMEDY_SOLVER_RANDOM_SEED`, `REMEDY_SOLVER_NUM_SEARCH_WORKERS`,
+`REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET`, `REMEDY_SOLVER_MAX_MODEL_VARIABLES`,
+`REMEDY_SOLVER_LLM_ENABLED`, `SOLVER_LLM_MODEL`,
 `REMEDY_BYPASS_WORKAROUND_SUBAGENT`,
 `REMEDY_DISABLE_POST_QA_TRIAGE`, `REMEDY_RETRIAGE_LIMIT_ENABLED`,
 `REMEDY_RETRIAGE_LIMIT`, and `REMEDY_MAX_DELTA_CANARY_PROBES`.

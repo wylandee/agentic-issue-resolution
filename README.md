@@ -16,9 +16,11 @@ Set `OPENAI_API_KEY` to enable the QA-aware tactical Supervisor and other
 LLM-backed agents. The tactical Supervisor uses a stable system prompt plus a
 bounded dynamic context, may select an immediate remediation pivot, and falls
 back to the deterministic router when the key or model is unavailable. Python
-still verifies every target and version and commits the worker instruction.
-Portfolio planning and certification remain deterministic; package updates are
-constrained by the committed solver plan and its approved mutation allowlist.
+validates targets, authorized candidate versions, and the worker instruction.
+The Supervisor owns version policy; a worker may use an alternate only when
+the committed attempt explicitly allows it. QA checks the effective version
+actually executed. Portfolio planning and certification remain deterministic,
+and triage/advisory proposals do not authorize mutations.
 
 The runtime reads these environment names:
 
@@ -29,15 +31,20 @@ The runtime reads these environment names:
 * **Scanning and workflow controls:** `ODC_EXTRA_ARGS`,
   `REMEDY_BYPASS_WORKAROUND_SUBAGENT`, `REMEDY_DISABLE_POST_QA_TRIAGE`,
   `REMEDY_RETRIAGE_LIMIT_ENABLED`, `REMEDY_RETRIAGE_LIMIT`, and
-  `REMEDY_MAX_DELTA_CANARY_PROBES`.
+  `REMEDY_MAX_DELTA_CANARY_PROBES`. Set `REMEDY_FINAL_FULL_SCAN_ENABLED=true`
+  to opt into a final full-repository Dependency-Check scan; it is disabled by
+  default, which leaves the final result scoped to incremental dependency-input
+  scan coverage.
 * **Caching, reports, and tracing:** `TRIAGE_CACHE_DIR`,
   `REMEDIATION_SOLVER_CACHE_DIR`, `REMEDIATION_TRAJECTORY_DIR`,
   `REMEDIATION_REPORT_DIR`, `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`,
   `LANGSMITH_PROJECT`, and `LANGSMITH_ENDPOINT`.
 * **Portfolio solver controls:** `REMEDY_SOLVER_TIMEOUT_SECONDS`,
-  `REMEDY_SOLVER_TOP_K`, `REMEDY_SOLVER_PHASE_BUDGET`,
+  `REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS`, `REMEDY_SOLVER_TOP_K`,
+  `REMEDY_SOLVER_PHASE_BUDGET`,
   `REMEDY_SOLVER_ACCEPT_FEASIBLE`, `REMEDY_SOLVER_RANDOM_SEED`,
-  `REMEDY_SOLVER_NUM_SEARCH_WORKERS`, `REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET`,
+  `REMEDY_SOLVER_NUM_SEARCH_WORKERS`,
+  `REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET`,
   `REMEDY_SOLVER_MAX_MODEL_VARIABLES`, `REMEDY_SOLVER_LLM_ENABLED`, and
   `SOLVER_LLM_MODEL`.
 
@@ -82,20 +89,26 @@ remedy run /tmp/remediation-findings.jsonl --format jsonl --repo "$REPO_ROOT" \
 `run` executes the Phase 5 task queue. Update and workaround workers execute
 Supervisor-committed attempts in isolation. QA runs deterministic install,
 security-scan, and test gates, then performs a bounded read-only evaluation
-for each task. QA results remain keyed to their task, and Supervisor requires
-the authoritative final full scan before teardown.
+for each task. QA results remain keyed to their task. By default, the terminal
+result reports incremental dependency-input scan coverage and is not an
+authoritative full-repository scan. Set `REMEDY_FINAL_FULL_SCAN_ENABLED=true`
+to request the optional final full scan before teardown.
 
-Phase 2 tactical supervision is single-task and QA-aware. It uses a stable
+Tactical supervision is single-task and QA-aware. It uses a stable
 system prompt plus a bounded, deterministically ordered context so task facts
 do not invalidate the reusable prompt prefix. The model returns only a typed
 diagnostic basis and strategy proposal; Python verifies the normalized
 security floor, candidate whitelist, task identity, dependency type, and
 relative file hints, then renders and digests the exact worker instruction.
 Breaking-change evidence can pivot directly to a workaround. Peer conflicts
-are referred to the deterministic outer portfolio solver, which owns package
-clustering and multi-package planning; tactical decisions remain single-task.
-Without an API key, or when the model or registry verification fails, the
-deterministic router remains authoritative.
+are referred to the Supervisor's deterministic portfolio-planning function,
+which owns package clustering and multi-package planning; tactical decisions
+remain single-task.
+Without an API key, or when the model returns no accepted action, the
+deterministic router remains authoritative. If registry verification fails,
+the affected task becomes inconclusive with its retry budget preserved, and
+the Supervisor re-enters routing for any remaining tasks; no unverified
+package version is dispatched.
 
 Workaround retries restore only the child source-edit snapshot when QA rejects
 an intermediate hypothesis, preserving the resolved dependency candidate.

@@ -41,6 +41,7 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration._qa_runtime import (
     _attempt_version_evidence,
+    _build_qa_scan_targets,
     _collect_group_package_state,
     _dependency_tree_versions,
     _derive_qa_task_policies,
@@ -380,6 +381,56 @@ def test_version_bump_scanner_is_group_scoped() -> None:
     )
     assert evaluations["task-1"].passed is True
     assert evaluations["task-2"].failure_category == FailureCategory.SECURITY_FLAG
+
+
+def test_task_scan_projection_overrides_unrelated_global_identifier() -> None:
+    """A report-wide occurrence cannot make a clean task fail its scanner gate."""
+    group = _group("g1", "CVE-2025-0001")
+    context = _task_context(group, "task-1")
+    results = _results(remaining={"CVE-2025-0001"})
+    results.scan_evidence_by_task["task-1"] = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1"],
+        complete=True,
+        found_identifiers=[],
+        new_identifiers=[],
+        remaining_target_identifiers=[],
+    )
+
+    gates, _ = _evaluate_policy_gates(
+        [context],
+        results,
+        {context.task_id: QAPolicy.VERSION_BUMP},
+    )
+
+    assert gates["task-1"].target_scanner_cleared is True
+    assert gates["task-1"].target_remaining_identifiers == []
+
+
+def test_missing_task_scan_projection_fails_closed_instead_of_using_global_ids() -> None:
+    """Aggregate scan identifiers cannot stand in for a missing task projection."""
+    group = _group("g1", "CVE-2025-0001")
+    context = _task_context(group, "task-1")
+    results = _results(remaining={"CVE-2025-0001"})
+    results.scan_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1"],
+        complete=True,
+        found_identifiers=["CVE-2025-0001"],
+        remaining_target_identifiers=["CVE-2025-0001"],
+    )
+
+    gates, _ = _evaluate_policy_gates(
+        [context],
+        results,
+        {context.task_id: QAPolicy.VERSION_BUMP},
+    )
+
+    assert gates["task-1"].target_scanner_cleared is False
+    assert gates["task-1"].target_remaining_identifiers == []
+    assert "Task-specific scanner occurrence coverage is incomplete." in gates["task-1"].diagnostics
 
 
 def test_missing_target_skip_satisfies_policy_and_python_owned_qa() -> None:
@@ -779,6 +830,61 @@ def test_attempt_version_evidence_prefers_allowed_effective_candidate() -> None:
 
     assert version == "2.0.0"
     assert has_evidence is True
+
+
+def test_qa_scan_target_uses_authorized_attempt_version_over_task_hint() -> None:
+    """Current execution evidence is authoritative over an older task hint."""
+    group = _group("g1")
+    task = _task_context(group).task.model_copy(update={"selected_version": "1.0.0"})
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=task.current_attempt_id,
+        task_id=task.task_id,
+        task_revision=task.task_revision,
+        selected_version="1.0.0",
+        allowed_target_versions=["1.0.0", "2.0.0"],
+        instruction="Update demo-package.",
+        instruction_digest="digest",
+        dispatch_node="update_subagent",
+    )
+    worker_result = WorkerAttemptResult(
+        attempt_id=task.current_attempt_id,
+        task_id=task.task_id,
+        task_revision=task.task_revision,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=["2.0.0"],
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            executed_versions=["2.0.0"],
+            effective_target_version="2.0.0",
+        ),
+        instruction_digest="digest",
+    )
+    state = {
+        "active_target_task_ids": [task.task_id],
+        "task_queue": {task.task_id: task},
+        "attempt_snapshots_by_id": {task.current_attempt_id: snapshot},
+        "worker_results_by_attempt": {task.current_attempt_id: worker_result},
+    }
+
+    target = _build_qa_scan_targets(state, [group])[0]
+
+    assert target.expected_version == "2.0.0"
+
+    invalid_result = worker_result.model_copy(
+        update={
+            "executed_versions": ["9.9.9"],
+            "execution_diagnostics": WorkerExecutionDiagnostics(
+                executed_versions=["9.9.9"],
+                effective_target_version="9.9.9",
+            ),
+        }
+    )
+    invalid_state = {
+        **state,
+        "worker_results_by_attempt": {task.current_attempt_id: invalid_result},
+    }
+    invalid_target = _build_qa_scan_targets(invalid_state, [group])[0]
+
+    assert invalid_target.expected_version is None
 
 
 def test_attempt_version_evidence_rejects_foreign_snapshot() -> None:

@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from remediation_engine.triage.enrichment import enrich_cves
+from remediation_engine.triage.enrichment import _fetch_epss_chunk, enrich_cves
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -54,6 +54,26 @@ def _fake_response(json_data: dict, status_code: int = 200) -> MagicMock:
 
 
 class TestEPSSEnrichment:
+    def test_invalid_scores_fall_back_without_discarding_valid_entries(self, monkeypatch):
+        monkeypatch.setattr(
+            "remediation_engine.triage.enrichment.requests.get",
+            lambda *args, **kwargs: _fake_response(
+                {
+                    "data": [
+                        {"cve": "CVE-2026-0001", "epss": "1.2", "percentile": "0.5"},
+                        {"cve": "CVE-2026-0002", "epss": "nan", "percentile": "0.5"},
+                        {"cve": "CVE-2026-0004", "epss": "0.5"},
+                        {"cve": "CVE-2026-0003", "epss": "0.2", "percentile": "0.9"},
+                        None,
+                    ]
+                }
+            ),
+        )
+
+        result = _fetch_epss_chunk(["CVE-2026-0001", "CVE-2026-0002", "CVE-2026-0003"])
+
+        assert result == {"CVE-2026-0003": (0.2, 0.9)}
+
     def test_epss_200_parses_score_and_percentile(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
 

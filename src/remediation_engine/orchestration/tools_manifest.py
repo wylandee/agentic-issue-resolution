@@ -69,6 +69,7 @@ def _restore_package_checkpoint(
 ) -> str | None:
     """Restore one package checkpoint and return a rollback error, if any."""
     rollback_errors: list[str] = []
+    restored_paths: set[str] = set()
     for path, content in checkpoint.files.items():
         try:
             if content is None:
@@ -77,13 +78,19 @@ def _restore_package_checkpoint(
                     rollback_errors.append(
                         f"{path}: delete failed with exit {result.exit_code}: {result.stderr}"
                     )
+                else:
+                    restored_paths.add(path)
             else:
                 sandbox.write_file(path, content)
+                restored_paths.add(path)
         except Exception as exc:  # noqa: BLE001
             rollback_errors.append(f"{path}: {exc}")
 
-    touched_files.difference_update(checkpoint.files)
+    touched_files.difference_update(restored_paths)
     touched_files.update(checkpoint.touched_files_before)
+    # Failed paths stay in the final candidate ledger so the outer workspace
+    # anchor can restore them before another worker is dispatched.
+    touched_files.update(set(checkpoint.files) - restored_paths)
     if rollback_errors:
         return "Package checkpoint rollback failed: " + " | ".join(rollback_errors)
     return None
@@ -100,7 +107,8 @@ def rollback_pending_package_updates(
         rollback_error = _restore_package_checkpoint(sandbox, checkpoint, touched_files)
         if rollback_error:
             errors.append(f"Package '{package_name}': {rollback_error}")
-        package_checkpoints.pop(package_name, None)
+        else:
+            package_checkpoints.pop(package_name, None)
     return errors
 
 
@@ -398,7 +406,7 @@ def apply_multi_package_action(
         return True, ""
     except Exception as exc:  # noqa: BLE001 - atomic boundary owns rollback
         rollback_error = _restore_package_checkpoint(sandbox, checkpoint, touched_files)
-        if checkpoint_store is not None:
+        if checkpoint_store is not None and rollback_error is None:
             checkpoint_store.pop(checkpoint_key, None)
         suffix = f" Rollback: {rollback_error}" if rollback_error else " Rollback complete."
         return False, f"Multi-package action failed: {exc}.{suffix}"
@@ -689,7 +697,7 @@ def _make_modify_and_validate_npm_dependency_tool(
                     if checkpoint is not None
                     else None
                 )
-                if package_checkpoints is not None:
+                if package_checkpoints is not None and rollback_error is None:
                     package_checkpoints.pop(package_key, None)
                 if execution_state is not None:
                     execution_state["pending_validation_package"] = None
@@ -713,7 +721,7 @@ def _make_modify_and_validate_npm_dependency_tool(
                     if checkpoint is not None
                     else None
                 )
-                if package_checkpoints is not None:
+                if package_checkpoints is not None and rollback_error is None:
                     package_checkpoints.pop(package_key, None)
                 if execution_state is not None:
                     execution_state["pending_validation_package"] = None
@@ -751,7 +759,7 @@ def _make_modify_and_validate_npm_dependency_tool(
                 if checkpoint is not None
                 else None
             )
-            if package_checkpoints is not None:
+            if package_checkpoints is not None and rollback_error is None:
                 package_checkpoints.pop(package_key, None)
             if execution_state is not None:
                 execution_state["pending_validation_package"] = None
@@ -869,6 +877,13 @@ def _make_remove_no_fix_dependency_tool(
         """Remove only the configured vulnerable direct dependency safely."""
         nonlocal checkpoint
 
+        if plan_state.get("restoration_failed"):
+            paths = ", ".join(plan_state.get("restoration_failure_paths", []) or [])
+            return (
+                "ERROR: [RESTORATION_INCOMPLETE] A previous rollback did not restore "
+                f"the workspace files ({paths}); package removal is blocked until the "
+                "outer attempt snapshot restores the workspace."
+            )
         if plan_state.get("no_fix_stage") != NoFixMitigationStage.PACKAGE_REMOVAL.value:
             return "NOT_APPLICABLE: package removal is available only during PACKAGE_REMOVAL."
         if not plan_state.get("recorded") or not plan_state.get("package_removal_planned"):

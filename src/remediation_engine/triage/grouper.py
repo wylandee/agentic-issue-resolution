@@ -419,7 +419,7 @@ def _group_sca(
                 context_localized.parent_declaration_type if context_localized else None
             ),
             parent_contexts=parent_contexts,
-            sources=list(sources_set),
+            sources=sorted(sources_set, key=lambda source: source.value),
             representative_issue_id=rep.id,
             issues=member_issues,
             localized_issues=localized_members,

@@ -1595,3 +1595,31 @@ def test_multi_package_override_accepts_transitive_target_pruned_by_parent_updat
 
     assert succeeded is True
     assert error == ""
+
+
+def test_failed_package_checkpoint_restore_retains_anchor_and_unresolved_paths():
+    from remediation_engine.orchestration.tools_manifest import (
+        _PackageCheckpoint,
+        rollback_pending_package_updates,
+    )
+
+    sandbox = MagicMock()
+    sandbox.run.return_value = CommandResult(
+        exit_code=1,
+        stdout="",
+        stderr="cannot remove generated lockfile",
+        duration_seconds=0.1,
+    )
+    checkpoint = _PackageCheckpoint(
+        files={"package.json": '{"dependencies":{}}', "package-lock.json": None},
+        touched_files_before={"prior.js"},
+    )
+    checkpoints = {"demo-package": checkpoint}
+    touched_files = {"package.json", "package-lock.json", "other.js", "prior.js"}
+
+    errors = rollback_pending_package_updates(sandbox, checkpoints, touched_files)
+
+    assert errors and "package-lock.json" in errors[0]
+    assert checkpoints == {"demo-package": checkpoint}
+    assert touched_files == {"package-lock.json", "other.js", "prior.js"}
+    sandbox.write_file.assert_called_once_with("package.json", '{"dependencies":{}}')

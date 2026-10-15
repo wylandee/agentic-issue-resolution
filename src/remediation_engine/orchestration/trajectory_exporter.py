@@ -26,6 +26,7 @@ from langchain_core.messages import BaseMessage
 from langchain_core.tracers.langchain import wait_for_all_tracers
 from langsmith import Client
 
+from remediation_engine.orchestration.report_persistence import write_text_atomic
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 
 logger = logging.getLogger(__name__)
@@ -350,6 +351,7 @@ class TrajectoryRecorder(BaseCallbackHandler):
         self._token_data_available = False
         self._token_cost: float | None = None
         self._cached_input_tokens: int | None = None
+        self._workspace_volume: str | None = None
 
     def _start(
         self,
@@ -462,6 +464,24 @@ class TrajectoryRecorder(BaseCallbackHandler):
         """Return the number of spans recorded so far."""
         with self._lock:
             return self._sequence
+
+    @property
+    def workspace_volume(self) -> str | None:
+        """Return the run-owned volume explicitly registered by workspace setup."""
+        with self._lock:
+            return self._workspace_volume
+
+    def register_workspace_volume(self, volume_name: str) -> None:
+        """Record a volume created by this run's workspace-builder node."""
+        if volume_name.startswith("agent_workspace_"):
+            with self._lock:
+                self._workspace_volume = volume_name
+
+    def clear_workspace_volume(self, volume_name: str) -> None:
+        """Clear this run's volume record after Docker confirms its removal."""
+        with self._lock:
+            if self._workspace_volume == volume_name:
+                self._workspace_volume = None
 
     def has_span_since(self, sequence: int, run_type: str | None = None) -> bool:
         """Return whether a span of the requested type started after a sequence."""
@@ -1074,9 +1094,7 @@ def _write_trajectory_markdown(
         run_error=_error_text(run_error),
         trajectory_path=output_file,
     )
-    temporary_path = output_file.with_suffix(".md.tmp")
-    temporary_path.write_text(markdown, encoding="utf-8")
-    temporary_path.replace(output_file)
+    write_text_atomic(output_file, markdown)
 
 
 def export_phase5_trajectory(

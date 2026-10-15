@@ -8,9 +8,16 @@ from unittest.mock import patch
 
 import pytest
 
-from remediation_engine.api import RemediationRequest, RemediationResult, run_remediation
+from remediation_engine.api import (
+    RemediationRequest,
+    RemediationResult,
+    run_remediation,
+    triage_issues,
+)
 from remediation_engine.cli import _load_issues, build_parser, main
 from remediation_engine.contracts.schemas import (
+    FixPlan,
+    FixPlanStatus,
     IssueSource,
     IssueType,
     LocalizedIssue,
@@ -19,7 +26,12 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.orchestration.runtime_context import (
+    get_bound_runtime_settings,
+    get_runtime_settings,
+)
 from remediation_engine.orchestration.state import normalize_group_paths
+from remediation_engine.settings import AppSettings
 
 
 def _issue() -> VulnerabilityIssue:
@@ -118,6 +130,42 @@ def test_run_remediation_leaves_initial_triage_to_graph(tmp_path: Path) -> None:
     mock_triage.assert_not_called()
     assert mock_orchestrator.call_args.kwargs["valid_groups"] == []
     assert mock_orchestrator.call_args.kwargs["issues"] == request.issues
+
+
+def test_triage_issues_binds_injected_settings_for_planner_and_resets(monkeypatch) -> None:
+    """Standalone triage exposes supplied settings to planner runtime lookups."""
+    observed_keys: list[str] = []
+    settings = AppSettings(openai_api_key="injected-test-key")
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-12345",
+        package_name="fixture-package",
+        package_version="1.0.0",
+        file_path="package.json",
+    )
+
+    def plan_fix(_localized_issue):
+        observed_keys.append(get_runtime_settings().openai_api_key)
+        return FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version="1.0.1",
+            instruction="Upgrade fixture-package to 1.0.1.",
+            strategy_used="osv_api",
+        ).model_dump()
+
+    monkeypatch.setattr("remediation_engine.tools.fix_planner.plan_fix", plan_fix)
+    monkeypatch.setattr(
+        "remediation_engine.triage.pipeline._run_enrichment", lambda *_args, **_kw: {}
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    groups = triage_issues([issue], settings=settings)
+
+    assert groups
+    assert observed_keys == ["injected-test-key"]
+    assert get_bound_runtime_settings() is None
 
 
 def test_run_remediation_reports_completed_with_errors(tmp_path: Path) -> None:

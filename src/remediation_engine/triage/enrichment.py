@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -174,14 +175,26 @@ def _fetch_epss_chunk(cve_ids: list[str]) -> dict[str, tuple[float, float]]:
         )
         resp.raise_for_status()
         data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            return {}
         result: dict[str, tuple[float, float]] = {}
         for entry in data.get("data", []):
-            cve = entry.get("cve", "").upper()
+            if not isinstance(entry, dict):
+                continue
+            cve = str(entry.get("cve") or "").strip().upper()
             try:
-                epss = float(entry.get("epss", 0.0))
-                pct = float(entry.get("percentile", 0.0))
-            except (TypeError, ValueError):
-                epss, pct = 0.0, 0.0
+                epss = float(entry["epss"])
+                pct = float(entry["percentile"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (
+                math.isfinite(epss)
+                and math.isfinite(pct)
+                and 0.0 <= epss <= 1.0
+                and 0.0 <= pct <= 1.0
+            ):
+                logger.warning("Ignoring invalid EPSS values for %s.", cve or "unknown CVE")
+                continue
             if cve:
                 result[cve] = (epss, pct)
         return result

@@ -1,17 +1,16 @@
 """
 qa_critic.py - Agentic QA evaluator node for the Phase 5 orchestrator.
 
-The QA Critic now follows a single structured-evaluator architecture:
+The QA Critic runs deterministic workspace checks followed by structured
+per-task evaluations:
 
-  Step 0 â€” Global Execution (deterministic Python):
-    run_dependency_install â†’ run_security_scan â†’ run_unit_tests, called
-    exactly once via direct
-    Python helpers, with no LLM tools involved.
+  Step 0 — Global Execution (deterministic Python):
+    Run dependency installation, security scanning, and unit tests once for
+    the dispatched workspace scope, with no LLM tools involved.
 
   Evaluator:
-    One bounded read-only tool loop per dispatched task. The model must finish
-    by calling the typed emit_qa_evaluation terminal tool; the normal node path
-    does not invoke a batch judge.
+    Run one bounded read-only tool loop per dispatched task. Each model must
+    finish by calling the typed emit_qa_evaluation terminal tool.
 
   Python Guardrails:
     Normalize, validate, and fill missing/duplicate/unknown evaluations
@@ -255,7 +254,7 @@ def _run_global_execution(
 
     deletion_only_skip = False
     precomputed_resolution_batch = None
-    if skip_scan and scan_skip_reason == "no_fix_package_removal":
+    if skip_scan and scan_skip_reason == "no_fix_package_removal" and scan_targets:
         precomputed_resolution_batch = _resolve_targeted_packages(
             sandbox,
             scan_targets or (),
@@ -748,12 +747,12 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     """
     LangGraph node: run the structured QA evaluator for the supplied group scope.
 
-    Normal Supervisor dispatches supply one task and therefore one parent group.
-    Direct callers may still provide multiple groups; each group is evaluated
-    independently and returns one structured result.
+    Supervisor dispatches may supply one task or a committed atomic task set.
+    Each task receives its own structured evaluation after shared deterministic
+    workspace checks; direct callers may supply multiple groups.
 
     Pipeline:
-      Step 0 â€” Global Execution (deterministic Python, no LLM tools)
+      Step 0 — Global Execution (deterministic Python, no LLM tools)
       Evaluator â€” One bounded read-only tool loop with a typed terminal result
       Guards â€” Python guardrails normalize and validate evaluations
     """
@@ -1017,20 +1016,59 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                     results,
                     task_policies,
                 )
-                inconclusive_evaluations = {
-                    context.task_id: QAEvaluation(
-                        task_id=context.task_id,
-                        passed=False,
-                        failure_category=FailureCategory.SECURITY_FLAG,
-                        retry_feedback=(
-                            f"{detail} Correct the targeted scan evidence and re-run QA; "
-                            "this result does not consume a remediation retry."
-                        ),
-                        evidence_inconclusive=True,
-                        deterministic_gates=deterministic_gates.get(context.task_id),
-                    )
-                    for context in task_contexts
-                }
+                failed_test_run = results.tests is not None and not results.tests[0]
+                deterministic_test_evidence = (
+                    _extract_deterministic_test_evidence(results, sandbox=sandbox)
+                    if failed_test_run
+                    else None
+                )
+                inconclusive_evaluations: dict[str, QAEvaluation] = {}
+                for context in task_contexts:
+                    gates = deterministic_gates.get(context.task_id)
+                    if singleton_scope and failed_test_run:
+                        test_summary = results.tests[1] if results.tests is not None else ""
+                        evaluation = QAEvaluation(
+                            task_id=context.task_id,
+                            passed=False,
+                            failure_category=FailureCategory.BREAKING_CHANGE,
+                            retry_feedback=(
+                                f"Unit tests failed after the worker attempt: {test_summary} "
+                                "Targeted scanner coverage is also incomplete, so security "
+                                "clearance remains unverified."
+                            ),
+                            failure_evidence=deterministic_test_evidence,
+                            deterministic_gates=gates,
+                        )
+                        if gates is not None:
+                            evaluation = (
+                                _qa_policy_engine_module._normalize_singleton_test_attribution(
+                                    evaluation,
+                                    context,
+                                    gates,
+                                    deterministic_test_evidence=deterministic_test_evidence,
+                                )
+                            )
+                    else:
+                        evaluation = QAEvaluation(
+                            task_id=context.task_id,
+                            passed=False,
+                            failure_category=FailureCategory.SECURITY_FLAG,
+                            retry_feedback=(
+                                f"{detail} Correct the targeted scan evidence and re-run QA; "
+                                "this result does not consume a remediation retry."
+                            ),
+                            failure_evidence=deterministic_test_evidence,
+                            deterministic_gates=gates,
+                            evidence_inconclusive=True,
+                        )
+                    inconclusive_evaluations[context.task_id] = evaluation
+                inconclusive_evaluations = _attach_failure_evidence_to_evaluations(
+                    inconclusive_evaluations,
+                    results,
+                    state,
+                    deterministic_evidence=deterministic_test_evidence,
+                    sandbox=sandbox,
+                )
                 inconclusive_evaluations = _attach_scan_evidence_to_evaluations(
                     inconclusive_evaluations,
                     results.scan_evidence,
@@ -1169,6 +1207,43 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                     "diagnostics": [*inconclusive_gates.diagnostics, failure_detail],
                 }
             )
+
+        gates = current.deterministic_gates
+        has_failure_evidence = bool(
+            current.failure_evidence
+            and (
+                current.failure_evidence.failed_tests or current.failure_evidence.exact_diagnostics
+            )
+        )
+        actionable_qa_failure = not current.passed and (
+            current.failure_category
+            in {FailureCategory.BREAKING_CHANGE, FailureCategory.PEER_CONFLICT}
+            or has_failure_evidence
+            or (
+                gates is not None
+                and (
+                    gates.tests_passed is False
+                    or not gates.install_passed
+                    or bool(gates.target_remaining_identifiers)
+                    or bool(gates.peer_conflicts)
+                )
+            )
+        )
+        if actionable_qa_failure:
+            # Preserve independent test, install, peer, and scanner failures.
+            retry_feedback = current.retry_feedback or "QA reported an actionable failure."
+            qa_evaluations[task_id] = current.model_copy(
+                update={
+                    "retry_feedback": (
+                        f"{retry_feedback.rstrip()} Targeted scanner coverage is also "
+                        f"incomplete: {failure_detail} Security clearance remains unverified."
+                    ),
+                    "deterministic_gates": inconclusive_gates,
+                    "evidence_inconclusive": False,
+                }
+            )
+            continue
+
         retry_feedback = (
             f"{failure_detail} This skipped target is not evidence that the "
             "vulnerability was cleared. QA remains inconclusive and does not consume "

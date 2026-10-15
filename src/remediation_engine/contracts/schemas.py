@@ -1560,9 +1560,29 @@ class QATestAttribution(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     verdict: TestAttributionVerdict
-    responsible_group_ids: list[str] = Field(default_factory=list)
-    failed_tests: list[str] = Field(default_factory=list)
-    reasoning: str = ""
+    responsible_group_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Exact group_id values responsible for the test failures. Required and non-empty "
+            "for responsible or exonerated verdicts; use an empty list only when verdict is "
+            "inconclusive."
+        ),
+    )
+    failed_tests: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Exact failing test names or identifiers from QA evidence. Required and non-empty "
+            "for responsible or exonerated verdicts."
+        ),
+    )
+    reasoning: str = Field(
+        default="",
+        description=(
+            "Evidence-based explanation tying the named responsible groups to the listed tests, "
+            "or explaining why attribution is inconclusive. Required for responsible and "
+            "exonerated verdicts."
+        ),
+    )
 
     @field_validator("responsible_group_ids", "failed_tests", mode="before")
     @classmethod
@@ -1836,7 +1856,14 @@ class QACriticLLMOutput(BaseModel):
         description="Required retry guidance when passed=False.",
     )
     semantic_security_review: QASemanticSecurityReview | None = Field(default=None)
-    test_attribution: QATestAttribution | None = Field(default=None)
+    test_attribution: QATestAttribution | None = Field(
+        default=None,
+        description=(
+            "When tests fail, attribute them using exact group IDs, failed test names, and "
+            "reasoning. Responsible/exonerated verdicts require all three evidence fields; "
+            "use inconclusive when the task owner cannot be established."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_pass_fail_payload(self) -> QACriticLLMOutput:
@@ -2721,6 +2748,7 @@ class SupervisorDecision(BaseModel):
       the current Supervisor dispatch policy narrows this to one target.
     - ``qa_critic`` accepts one or more ``target_task_ids`` for reusable batch QA;
       the current Supervisor dispatch policy narrows this to one target.
+    - ``supervisor`` re-enters the Supervisor to reconcile a committed task transition.
     - ``triage`` is a graph-level handoff and does not target a task.
     - ``teardown`` requires empty ``target_task_ids``.
     - ``unfixable_task_ids`` and ``target_task_ids`` must not overlap.
@@ -2739,6 +2767,7 @@ class SupervisorDecision(BaseModel):
 
     next_node: Literal[
         "portfolio",
+        "supervisor",
         "update_subagent",
         "workaround_subagent",
         "qa_critic",

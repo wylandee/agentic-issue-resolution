@@ -6,6 +6,8 @@ import contextlib
 import json
 import os
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -39,16 +41,30 @@ class EvalDatabase:
         """Create and configure a SQLite connection with foreign keys and WAL enabled."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON;")
-        with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute("PRAGMA journal_mode = WAL;")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON;")
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("PRAGMA journal_mode = WAL;")
+            return conn
+        except BaseException:
+            conn.close()
+            raise
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Commit or roll back one operation and always close its connection."""
+        conn = self._get_connection()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def init_db(self) -> None:
         """Initialize the evaluation database tables and indexes."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS eval_runs (
@@ -163,7 +179,7 @@ class EvalDatabase:
         Returns:
             The saved run_id.
         """
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
 
             # Insert or replace run record
@@ -287,7 +303,7 @@ class EvalDatabase:
         Returns:
             Runs ordered newest first, with tags and computed pass rates.
         """
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             query = """
                 SELECT
@@ -322,7 +338,7 @@ class EvalDatabase:
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         """Retrieve full details for a single evaluation run."""
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             row = cursor.execute(
                 """
@@ -360,7 +376,7 @@ class EvalDatabase:
         if not normalized_tag:
             return None
 
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             query = """
                 SELECT
                     id, run_id, timestamp, tag, suite_name, judge_model, is_live,
@@ -387,7 +403,7 @@ class EvalDatabase:
         Returns:
             The newest matching run, or ``None`` when no run exists.
         """
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             query = """
                 SELECT
                     id, run_id, timestamp, tag, suite_name, judge_model, is_live,
@@ -437,10 +453,10 @@ class EvalDatabase:
         status_filter: str | None = None,
         suite_filter: str | None = None,
         search_query: str | None = None,
-        limit: int = 500,
+        limit: int | None = 500,
     ) -> list[dict[str, Any]]:
         """Retrieve test cases with filters and attached metrics."""
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             query = """
                 SELECT
@@ -476,8 +492,10 @@ class EvalDatabase:
                 pattern = f"%{search_query}%"
                 params.extend([pattern, pattern, pattern, pattern, pattern])
 
-            query += " ORDER BY tc.id ASC LIMIT ?"
-            params.append(limit)
+            query += " ORDER BY tc.id ASC"
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(limit)
 
             tc_rows = cursor.execute(query, params).fetchall()
             test_cases: list[dict[str, Any]] = []
@@ -508,9 +526,40 @@ class EvalDatabase:
 
             return test_cases
 
+    def get_test_case_filter_values(self, run_id: str | None = None) -> tuple[list[str], list[str]]:
+        """Return persisted test statuses and suite names for dashboard filters.
+
+        Args:
+            run_id: Optional run ID to scope the values. ``None`` combines all
+                persisted runs.
+
+        Returns:
+            A pair of sorted status and suite-name values.
+        """
+        with self._connection() as conn:
+            statuses = conn.execute(
+                """
+                SELECT DISTINCT UPPER(status) AS value
+                FROM eval_test_cases
+                WHERE ? IS NULL OR run_id = ?
+                ORDER BY value
+                """,
+                (run_id, run_id),
+            ).fetchall()
+            suites = conn.execute(
+                """
+                SELECT DISTINCT LOWER(suite) AS value
+                FROM eval_test_cases
+                WHERE ? IS NULL OR run_id = ?
+                ORDER BY value
+                """,
+                (run_id, run_id),
+            ).fetchall()
+        return [row["value"] for row in statuses], [row["value"] for row in suites]
+
     def get_metric_trends(self, metric_name: str | None = None) -> list[dict[str, Any]]:
         """Retrieve aggregated metric performance trends across historical runs."""
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             query = """
                 SELECT
@@ -557,8 +606,23 @@ class EvalDatabase:
         if not run_a or not run_b:
             return {"error": "One or both runs could not be found."}
 
-        cases_a = {c["test_name"]: c for c in self.get_test_cases(run_id=run_id_a)}
-        cases_b = {c["test_name"]: c for c in self.get_test_cases(run_id=run_id_b)}
+        def index_cases(
+            cases: list[dict[str, Any]],
+        ) -> dict[tuple[str, str, str, int], dict[str, Any]]:
+            indexed: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+            occurrence_counts: dict[tuple[str, str, str], int] = {}
+            for case in cases:
+                case_id = case.get("case_id")
+                identity_kind = "case_id" if case_id else "test_name"
+                identity_value = str(case_id or case["test_name"])
+                base = (str(case.get("suite") or ""), identity_kind, identity_value)
+                occurrence = occurrence_counts.get(base, 0)
+                occurrence_counts[base] = occurrence + 1
+                indexed[(*base, occurrence)] = case
+            return indexed
+
+        cases_a = index_cases(self.get_test_cases(run_id=run_id_a, limit=None))
+        cases_b = index_cases(self.get_test_cases(run_id=run_id_b, limit=None))
 
         all_names = sorted(set(cases_a.keys()) | set(cases_b.keys()))
         comparisons: list[dict[str, Any]] = []
@@ -582,7 +646,7 @@ class EvalDatabase:
             )
 
             entry = {
-                "test_name": name,
+                "test_name": (cb or ca)["test_name"],
                 "suite": (cb or ca)["suite"],
                 "status_a": status_a,
                 "status_b": status_b,
@@ -615,7 +679,7 @@ class EvalDatabase:
 
     def delete_run(self, run_id: str) -> bool:
         """Delete an evaluation run and all associated test cases and metrics."""
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM eval_runs WHERE run_id = ?", (run_id,))
             conn.commit()
@@ -623,7 +687,7 @@ class EvalDatabase:
 
     def clear_all(self) -> None:
         """Clear all evaluation runs, test cases, and metrics."""
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             conn.executescript(
                 """
                 DELETE FROM eval_metrics;

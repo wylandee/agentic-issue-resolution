@@ -10,6 +10,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import CommandResult
+from remediation_engine.orchestration.trajectory_exporter import (
+    TrajectoryRecorder,
+    use_trajectory_recorder,
+)
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 
 _VOLUME_HEX = "deadbeefcafebabe"
@@ -31,6 +35,28 @@ def _volume_name_patch():
 
 
 class TestWorkspaceBuilderNode:
+    def test_created_volume_is_registered_on_the_active_run_recorder(self, tmp_path):
+        recorder = TrajectoryRecorder()
+        client = MagicMock()
+        sandbox = _sandbox_mock()
+
+        with (
+            _volume_name_patch(),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
+                return_value=sandbox,
+            ),
+            use_trajectory_recorder(recorder),
+        ):
+            result = run_workspace_builder_node({"repo_root": str(tmp_path)})
+
+        assert result["workspace_volume"] == "agent_workspace_deadbeef"
+        assert recorder.workspace_volume == result["workspace_volume"]
+
     def test_success_creates_named_volume_copies_repo_and_returns_ready_projection(self, tmp_path):
         """The builder provisions one volume and hands the repository to the sandbox."""
         (tmp_path / "package.json").write_text("{}", encoding="utf-8")

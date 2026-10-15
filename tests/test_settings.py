@@ -2,7 +2,10 @@
 
 import pytest
 
-from remediation_engine.settings import AppSettings
+from remediation_engine.settings import (
+    DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET,
+    AppSettings,
+)
 
 
 def test_node_models_can_be_configured_independently(monkeypatch):
@@ -98,8 +101,13 @@ def test_candidate_limit_default_and_override(monkeypatch):
     variable = "REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET"
     monkeypatch.delenv(variable, raising=False)
 
-    assert AppSettings().solver_max_candidates_per_target == 256
-    assert AppSettings.from_env().solver_max_candidates_per_target == 256
+    assert (
+        AppSettings().solver_max_candidates_per_target == DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET
+    )
+    assert (
+        AppSettings.from_env().solver_max_candidates_per_target
+        == DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET
+    )
 
     monkeypatch.setenv(variable, "96")
     assert AppSettings.from_env().solver_max_candidates_per_target == 96

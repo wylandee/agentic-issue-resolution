@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from semantic_version import Version
+
 from remediation_engine.contracts import (
     FailureCategory,
     FixPlan,
@@ -45,6 +47,7 @@ from remediation_engine.tools.fix_planner import (
     plan_fix,
 )
 from remediation_engine.tools.registry_tools import (
+    _requirement_matches,
     fetch_registry_candidates,
     plan_npm_parent_version,
     select_npm_parent_version,
@@ -74,6 +77,21 @@ def _localized(issue: VulnerabilityIssue) -> LocalizedIssue:
         is_direct_dependency=True,
         localization_confidence=1.0,
     )
+
+
+def test_registry_parent_requirement_accepts_operator_whitespace_without_policy_change():
+    """Operator-space normalization agrees with manifest range handling."""
+    candidate = Version("1.2.4")
+    assert _requirement_matches("^ 1.2.3", candidate)
+    assert _requirement_matches(">= 1.2.3 < 2.0.0", candidate)
+    assert _requirement_matches("~ 1.2.3", candidate)
+
+    assert _requirement_matches("*", candidate)
+    assert not _requirement_matches(None, candidate)
+    assert not _requirement_matches("", candidate)
+    assert not _requirement_matches("latest", candidate)
+    assert not _requirement_matches("not a range", candidate)
+    assert not _requirement_matches("^1.2.3", Version("1.3.0-beta.1"))
 
 
 def _plan(

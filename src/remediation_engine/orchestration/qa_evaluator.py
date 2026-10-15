@@ -14,6 +14,7 @@ from langchain_core.tools import StructuredTool, tool
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     FailureCategory,
+    ODCScanEvidence,
     QACriticLLMOutput,
     QAEvaluation,
     QAFailureEvidence,
@@ -26,7 +27,10 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
 )
 from remediation_engine.orchestration.context_manager import ContextManager
-from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.orchestration.runtime_context import (
+    get_runtime_settings,
+    openai_api_key_kwargs,
+)
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
@@ -445,6 +449,10 @@ def _build_qa_terminal_tool() -> StructuredTool:
             f"Use exact serialized enum values: failure_category={_QA_FAILURE_CATEGORY_VALUES}; "
             f"semantic_security_review.verdict={_QA_SECURITY_REVIEW_VALUES}; "
             f"test_attribution.verdict={_QA_TEST_ATTRIBUTION_VALUES}. "
+            "For responsible or exonerated test attribution, include non-empty "
+            "responsible_group_ids, failed_tests, and reasoning; use exact group IDs "
+            "from the supplied task context. Use inconclusive when group ownership is "
+            "not supported by positive evidence. "
             "Do not write a narrative response."
         ),
         args_schema=QACriticLLMOutput,
@@ -584,6 +592,7 @@ def _build_qa_dynamic_context(
     action_summaries: list[AgentActionSummary],
     qa_policy: QAPolicy | None = None,
     singleton_scope: bool = False,
+    task_scan_evidence: ODCScanEvidence | None = None,
 ) -> str:
     """Build task-owned facts appended to the static evaluator prompt.
 
@@ -597,6 +606,7 @@ def _build_qa_dynamic_context(
         action_summaries: Bounded worker action summaries.
         qa_policy: Supervisor-owned QA policy, when available.
         singleton_scope: Whether exactly one active task owns this QA run.
+        task_scan_evidence: Scanner findings projected to this task's dependency closure.
 
     Returns:
         The bounded dynamic evaluator context.
@@ -673,10 +683,17 @@ def _build_qa_dynamic_context(
         else "(none - scanner cleared this group)"
     )
     target_identifiers = sorted(group_target_identifiers(group))
-    post_scan_identifiers = sorted(
-        _scan_result_value(results.scan, "found_identifiers", set()) or set()
+    post_scan_identifiers = (
+        sorted(task_scan_evidence.found_identifiers) if task_scan_evidence else []
     )
-    new_identifiers = sorted(_scan_result_value(results.scan, "new_identifiers", set()) or set())
+    new_identifiers = sorted(task_scan_evidence.new_identifiers) if task_scan_evidence else []
+    scan_coverage = (
+        "complete"
+        if task_scan_evidence is not None and task_scan_evidence.complete
+        else "incomplete"
+        if task_scan_evidence is not None or results.scan_evidence is not None
+        else "unavailable"
+    )
     summaries_text = (
         "\n".join(
             f"  - {summary.status.value}: {_bounded_qa_action_summary(summary.summary, group)}"
@@ -723,6 +740,7 @@ def _build_qa_dynamic_context(
 - Install exit code: {install_exit_code}
 - Install error category: {install_category}
 - Scanner execution status: {scan_execution_status}
+- Task-scoped scanner coverage: {scan_coverage}
 - Remaining identifiers for this group: {remaining_text}
 - Remaining identifier count: {len(group_remaining_ids)}
 - Test failure count: {test_failure_count}
@@ -735,11 +753,11 @@ def _build_qa_dynamic_context(
 
 ## Identifiers and Files
 - Changed files reported by the worker: {changed_files_text}
-- All post-remediation scanner identifiers: {", ".join(post_scan_identifiers) if post_scan_identifiers else "(none or unavailable)"}
-- New baseline-absent scanner identifiers: {", ".join(new_identifiers) if new_identifiers else "(none)"}
+- Task-scoped post-remediation scanner identifiers: {", ".join(post_scan_identifiers) if post_scan_identifiers else "(none or unavailable)"}
+- Task-scoped baseline-absent scanner identifiers: {", ".join(new_identifiers) if new_identifiers else "(none or unavailable)"}
 
-New identifiers are graph-level findings for later triage. Do not attribute them
-to this group without direct deterministic evidence.
+Repository-wide scanner findings are intentionally excluded from this task context.
+Only the task-scoped occurrence evidence above can affect this task's verdict.
 
 ## Action Summaries
 {summaries_text}
@@ -754,7 +772,13 @@ emit_qa_evaluation:
 - semantic_security_review: include a verdict from {_QA_SECURITY_REVIEW_VALUES},
   reasoning, and concrete evidence_refs when the assigned policy requires semantic review
 - test_attribution: when Unit tests is FAIL, use one of {_QA_TEST_ATTRIBUTION_VALUES};
-  in SINGLETON scope the assigned task is responsible by deterministic contract
+  provide the complete object fields verdict, responsible_group_ids, failed_tests, and reasoning
+- for responsible or exonerated, responsible_group_ids must be a non-empty list of exact
+  group_id values from the supplied context, failed_tests must contain exact failed test names,
+  and reasoning must explain the evidence for that attribution
+- use inconclusive with an empty responsible_group_ids list when positive evidence does not
+  identify which remediation group owns the failure; do not blame every group in a batch
+- in SINGLETON scope Python assigns test ownership by deterministic contract
 
 Python owns deterministic_gates, failure_evidence, scan_evidence, and
 contract/provenance fields. Do not fill those fields."""
@@ -770,6 +794,7 @@ def _build_individual_investigator_prompt(
     action_summaries: list[AgentActionSummary],
     qa_policy: QAPolicy | None = None,
     singleton_scope: bool = False,
+    task_scan_evidence: ODCScanEvidence | None = None,
 ) -> str:
     """Build the lean static-plus-dynamic prompt for one QA evaluator.
 
@@ -800,6 +825,7 @@ def _build_individual_investigator_prompt(
             action_summaries=action_summaries,
             qa_policy=qa_policy,
             singleton_scope=singleton_scope,
+            task_scan_evidence=task_scan_evidence,
         )
     )
 
@@ -848,7 +874,8 @@ def _run_individual_investigations(
     """
     from langchain_openai import ChatOpenAI
 
-    model_name = get_runtime_settings().qa_llm_model
+    settings = get_runtime_settings()
+    model_name = settings.qa_llm_model
     known_task_ids = {context.task_id for context in task_contexts}
     evaluations: dict[str, GroupInvestigation] = {}
 
@@ -857,8 +884,20 @@ def _run_individual_investigations(
         group = context.group
         task_changed_files = changed_files_by_task.get(task_id, [])
         strategy = task_strategies.get(task_id, "")
-        remaining_scan = _scan_result_value(results.scan, "remaining_identifiers", set())
-        group_remaining_ids = sorted(group_target_identifiers(group) & set(remaining_scan or set()))
+        task_scan_evidence = results.scan_evidence_by_task.get(task_id)
+        if task_scan_evidence is None:
+            if results.scan_evidence is not None:
+                # Aggregate scan identifiers are not attributable to one task.
+                # Missing task projection is incomplete evidence, not a reason
+                # to fall back to report-wide findings in the evaluator prompt.
+                group_remaining_ids = []
+            else:
+                remaining_scan = _scan_result_value(results.scan, "remaining_identifiers", set())
+                group_remaining_ids = sorted(
+                    group_target_identifiers(group) & set(remaining_scan or set())
+                )
+        else:
+            group_remaining_ids = sorted(task_scan_evidence.remaining_target_identifiers)
         qa_policy = task_policies.get(task_id)
         relevant_summaries = _relevant_action_summaries(action_summaries, task_id, known_task_ids)
         dynamic_context = _build_qa_dynamic_context(
@@ -871,6 +910,7 @@ def _run_individual_investigations(
             action_summaries=relevant_summaries,
             qa_policy=qa_policy,
             singleton_scope=singleton_scope,
+            task_scan_evidence=task_scan_evidence,
         )
         terminal_tool = _build_qa_terminal_tool()
         review_tools = [
@@ -888,7 +928,11 @@ def _run_individual_investigations(
             skip_phase_gating=True,
             scratchpad_scope=ScratchpadScope.QA,
         )
-        llm = ChatOpenAI(model=model_name, temperature=0)
+        llm = ChatOpenAI(
+            model=model_name,
+            temperature=0,
+            **openai_api_key_kwargs(settings),
+        )
         initial_messages = [
             SystemMessage(content=_QA_EVALUATOR_STATIC_PREAMBLE),
             HumanMessage(

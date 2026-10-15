@@ -1428,6 +1428,12 @@ def _candidate_domains(
             security_floor=floor,
             diagnostics=diagnostics,
         )
+        if len(ordered) > limit:
+            complete = False
+            completeness_diagnostics.append(
+                f"candidate resource guard exceeded for {target.occurrence_id!r}; "
+                "the full catalog was retained but cannot be certified within the configured limit"
+            )
         domains[target.occurrence_id] = ordered
         if not ordered and target.eligible_for_atomic_update:
             diagnostics.append(f"empty candidate domain for {target.occurrence_id}")
@@ -2406,8 +2412,14 @@ def apply_portfolio_plan(
                 f"nested lockfile target for task {task_id!r} requires a package override"
             )
         if non_mutating_workaround:
+            # Source-only workarounds must not retain package mutation
+            # authorization inherited from the initial task or a prior stage.
             committed[task_id] = task.model_copy(
                 update={
+                    "selected_version": None,
+                    "allowed_target_versions": [],
+                    "allowed_dependency_types": [],
+                    "target_dependency_type": None,
                     "portfolio_plan_id": plan_id,
                     "selected_plan_issue_ids": list(decision.selected_plan_issue_ids),
                     "task_revision": task.task_revision + 1,

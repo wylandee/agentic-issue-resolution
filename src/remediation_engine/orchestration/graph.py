@@ -108,7 +108,10 @@ from remediation_engine.orchestration.supervisor_node import (
 from remediation_engine.orchestration.task_utils import (
     build_initial_remediation_task,
 )
-from remediation_engine.orchestration.teardown_node import run_teardown_node
+from remediation_engine.orchestration.teardown_node import (
+    _cleanup_run_owned_workspace_volume,
+    run_teardown_node,
+)
 from remediation_engine.orchestration.trajectory_exporter import (
     TrajectoryRecorder,
     build_phase5_trajectory_path,
@@ -896,6 +899,8 @@ def run_orchestrator(
     )
     result: OrchestratorState | None = None
     run_error: BaseException | None = None
+    emergency_workspace_volume: str | None = None
+    emergency_cleanup_errors: list[str] = []
     trace_url: str | None = None
     interrupted_trace_closed = False
     planned_trajectory_path = build_phase5_trajectory_path(trace_id)
@@ -938,6 +943,26 @@ def run_orchestrator(
                 "run_orchestrator: failed to persist early interruption trajectory: %s",
                 export_error,
             )
+        # A LangGraph invoke can raise after the workspace builder has created
+        # its run-owned volume, before the graph reaches the teardown node.
+        # The callback recorder keeps that node output even when no final state
+        # is returned, so clean the volume without replacing the original error.
+        workspace_volume = recorder.workspace_volume
+        if workspace_volume:
+            try:
+                volume_removed, cleanup_errors = _cleanup_run_owned_workspace_volume(
+                    workspace_volume
+                )
+                emergency_workspace_volume = None if volume_removed else workspace_volume
+                emergency_cleanup_errors.extend(cleanup_errors)
+                if volume_removed:
+                    recorder.clear_workspace_volume(workspace_volume)
+            except BaseException as cleanup_error:  # noqa: BLE001 - preserve the graph failure
+                emergency_workspace_volume = workspace_volume
+                emergency_cleanup_errors.append(
+                    f"emergency workspace cleanup failed for '{workspace_volume}': "
+                    f"{_error_text(cleanup_error)}"
+                )
         if langsmith_enabled and run_id is not None:
             try:
                 with use_runtime_settings(settings):
@@ -962,7 +987,8 @@ def run_orchestrator(
             result = {
                 **initial_state,
                 "status": "completed_with_errors",
-                "errors": fallback_errors,
+                "workspace_volume": emergency_workspace_volume,
+                "errors": [*fallback_errors, *emergency_cleanup_errors],
             }
             try:
                 with use_runtime_settings(settings):
@@ -971,7 +997,11 @@ def run_orchestrator(
                     report_errors = list(report_update.pop("errors", []) or [])
                     result.update(report_update)
                     if report_errors:
-                        result["errors"] = fallback_errors + report_errors
+                        result["errors"] = [
+                            *fallback_errors,
+                            *emergency_cleanup_errors,
+                            *report_errors,
+                        ]
             except Exception as report_node_error:  # noqa: BLE001
                 log.exception("run_orchestrator: fallback report node failed")
                 result.setdefault("errors", []).append(

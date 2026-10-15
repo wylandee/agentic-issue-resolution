@@ -45,6 +45,7 @@ from remediation_engine.tools.npm_graph import (
     check_npm_range,
     load_npm_graph_snapshot,
     load_npm_graph_snapshot_from_documents,
+    make_occurrence_id,
 )
 
 
@@ -529,9 +530,83 @@ def test_candidate_relations_constrain_joint_version_assignment():
         for decision in result.selected_plan.task_decisions
     }
     assert (selected[parent.occurrence_id], selected[child.occurrence_id]) in {
+        ("1.0.0", "1.0.0"),
         ("1.0.0", "1.5.0"),
         ("2.0.0", "2.5.0"),
     }
+
+
+def test_unchanged_required_peer_constrains_target_candidate_without_becoming_a_task():
+    package_data = {
+        "name": "app",
+        "dependencies": {"@angular/build": "21.2.12", "@angular/compiler": "21.2.14"},
+    }
+    lockfile_data = {
+        "name": "app",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "app",
+                "dependencies": package_data["dependencies"],
+            },
+            "node_modules/@angular/build": {
+                "version": "21.2.12",
+                "peerDependencies": {"@angular/compiler": "^21.0.0"},
+            },
+            "node_modules/@angular/compiler": {"version": "21.2.14"},
+        },
+    }
+    snapshot = load_npm_graph_snapshot_from_documents(
+        {
+            "package.json": json.dumps(package_data),
+            "package-lock.json": json.dumps(lockfile_data),
+        }
+    )
+    target_id = make_occurrence_id("package.json", "@angular/compiler")
+    fixed_peer_id = make_occurrence_id("package.json", "@angular/build")
+    target = SolverTarget(
+        occurrence_id=target_id,
+        task_id="task-compiler",
+        group_id="group-compiler",
+        package_name="@angular/compiler",
+        target_package_name="@angular/compiler",
+        manifest_path="package.json",
+        lockfile_package_key="node_modules/@angular/compiler",
+        installed_version="21.2.14",
+        finding_ids=["CVE-2026-50001"],
+    )
+    finding = SolverFindingRequirement(
+        finding_id="CVE-2026-50001",
+        cve_id="CVE-2026-50001",
+        vulnerable_occurrence_id=target_id,
+        vulnerable_package="@angular/compiler",
+        target_occurrence_id=target_id,
+        fixed_version="21.2.17",
+        severity="HIGH",
+    )
+
+    subgraph = extract_solver_subgraph(snapshot, [target], [finding])
+    constraint = next(
+        peer
+        for peer in subgraph.peer_constraints
+        if peer.source_occurrence_id == fixed_peer_id and peer.target_occurrence_id == target_id
+    )
+    assert constraint.version_range == "^21.0.0"
+    assert {item.task_id for item in subgraph.targets} == {"task-compiler"}
+
+    result = solve_portfolio(
+        subgraph,
+        {
+            target_id: [
+                SolverVersionCandidate(version="21.2.17"),
+                SolverVersionCandidate(version="22.2.3"),
+            ]
+        },
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+    )
+
+    assert result.selected_plan is not None
+    assert result.selected_plan.selected_candidate_versions[target_id] == "21.2.17"
 
 
 def test_forbidden_assignment_rejects_exact_map_and_partial_map():
@@ -1170,8 +1245,9 @@ def test_unproven_workaround_cannot_satisfy_direct_coverage():
         settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
     )
 
-    assert result.status == SolverStatus.INFEASIBLE
-    assert result.selected_plan is None
+    assert result.status == SolverStatus.OPTIMAL
+    assert result.selected_plan is not None
+    assert result.selected_plan.task_decisions[0].selected_strategy == "no_fix"
     assert result.unresolved_finding_ids == ["GHSA-AAAA-BBBB-CCCC"]
 
 

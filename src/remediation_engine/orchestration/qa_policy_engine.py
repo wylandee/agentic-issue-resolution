@@ -241,11 +241,26 @@ def _evaluate_policy_gates(
             or (results.scan_skipped and policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL)
             else scanner_status
         )
-        remaining = sorted(group_target_identifiers(group) & remaining_global)
+        remaining = (
+            sorted(group_target_identifiers(group) & remaining_global)
+            if target_package_absent
+            else sorted(task_scan_evidence.remaining_target_identifiers)
+            if task_scan_evidence is not None
+            else []
+            if results.scan_evidence is not None
+            else sorted(group_target_identifiers(group) & remaining_global)
+        )
         package_state = results.package_state_by_task.get(task_id, _QAPackageState())
         dependency_evidence = package_state.dependency_evidence
+        target_scan_complete = (
+            task_scan_evidence.complete
+            if task_scan_evidence is not None
+            else results.scan_evidence is None
+        )
         target_cleared = (
-            effective_scanner_status == ScannerExecutionStatus.SUCCESS and not remaining
+            effective_scanner_status == ScannerExecutionStatus.SUCCESS
+            and target_scan_complete
+            and not remaining
         )
         diagnostics: list[str] = []
         if not install_passed:
@@ -260,6 +275,8 @@ def _evaluate_policy_gates(
                 "Targeted ODC was skipped because complete lockfile evidence proved "
                 "the target package absent."
             )
+        elif not target_scan_complete:
+            diagnostics.append("Task-specific scanner occurrence coverage is incomplete.")
         if _QA_PACKAGE_STATE_CHECKS_ENABLED and not target_package_absent:
             diagnostics.extend(package_state.diagnostics)
         if (

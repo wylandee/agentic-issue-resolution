@@ -288,6 +288,9 @@ class TestSandboxRun:
         with pytest.raises(RuntimeError, match="Sandbox is not running."):
             sandbox.write_file("package.json", "{}")
 
+        with pytest.raises(RuntimeError, match="Sandbox is not running."):
+            sandbox.write_files({"package.json": "{}"})
+
 
 class TestSandboxWorkspaceSnapshots:
     def _started_sandbox(self, tmp_path, client, container):
@@ -402,6 +405,43 @@ class TestSandboxFileIO:
 
         args, _kwargs = container.put_archive.call_args
         assert args[0] == "/workspace/config"
+
+    def test_write_files_uploads_nested_files_in_one_archive(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+        files = {
+            "package.json": "{}",
+            ".odc-targeted/000/node_modules/esbuild/package.json": (
+                '{"name":"esbuild","version":"0.28.1"}'
+            ),
+        }
+
+        sandbox.write_files(files)
+
+        container.put_archive.assert_called_once()
+        archive_path, archive_bytes = container.put_archive.call_args.args
+        assert archive_path == "/workspace"
+        container.exec_run.assert_called_once()
+        assert sandbox.read_cache_metrics()["epoch"] == 1
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+            package_json = archive.extractfile("package.json")
+            esbuild_manifest = archive.extractfile(
+                ".odc-targeted/000/node_modules/esbuild/package.json"
+            )
+            assert package_json is not None
+            assert esbuild_manifest is not None
+            assert package_json.read() == b"{}"
+            assert esbuild_manifest.read() == (b'{"name":"esbuild","version":"0.28.1"}')
+
+    def test_write_files_rejects_duplicate_normalized_paths(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(WorkspacePathError, match="duplicate normalized"):
+            sandbox.write_files({"config//overrides.json": "{}", "config/overrides.json": "{}"})
+
+        container.exec_run.assert_not_called()
+        container.put_archive.assert_not_called()
 
     def test_read_file_uses_workspace_path(self, tmp_path):
         docker_mod, docker_errors, client, container = _docker_modules()

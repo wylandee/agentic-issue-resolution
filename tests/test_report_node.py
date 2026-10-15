@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from remediation_engine.orchestration import report_node
 from remediation_engine.orchestration.graph import build_orchestrator_graph
 from remediation_engine.orchestration.report_node import (
     finalize_report,
@@ -810,7 +811,13 @@ def test_finalize_report_is_deterministic(tmp_path: Path):
     settings = AppSettings(
         remediation_report_dir=tmp_path,
     )
-    with patch("langchain_openai.ChatOpenAI") as chat_openai:
+    with (
+        patch(
+            "remediation_engine.orchestration.report_node._build_context",
+            wraps=report_node._build_context,
+        ) as build_context,
+        patch("langchain_openai.ChatOpenAI") as chat_openai,
+    ):
         report, _ = finalize_report(
             state,
             recorder=None,
@@ -820,6 +827,7 @@ def test_finalize_report_is_deterministic(tmp_path: Path):
         )
 
     chat_openai.assert_not_called()
+    build_context.assert_called_once()
     assert "4.17.15 → 4.17.21 via dependencies" in report
     assert "executive narrative" not in report.casefold()
 

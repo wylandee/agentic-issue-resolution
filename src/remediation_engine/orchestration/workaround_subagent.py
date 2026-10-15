@@ -36,7 +36,10 @@ from remediation_engine.orchestration._tool_support import (
 )
 from remediation_engine.orchestration.context_manager import ContextManager
 from remediation_engine.orchestration.remedy_tools import build_workaround_toolbelt
-from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.orchestration.runtime_context import (
+    get_runtime_settings,
+    openai_api_key_kwargs,
+)
 from remediation_engine.orchestration.state import SubagentState
 from remediation_engine.orchestration.subagent_runtime import (
     has_successful_validation_gate,
@@ -920,6 +923,8 @@ def _workaround_attempt_succeeded(
     plan_state: dict[str, Any] | None = None,
 ) -> bool:
     """Apply the deterministic success contract for one workaround attempt."""
+    if plan_state and plan_state.get("restoration_failed"):
+        return False
     validation_passed = (
         validation_gate_passed if validation_gate_passed is not None else has_all_validated
     )
@@ -1128,9 +1133,14 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": ["Workaround Subagent: 'langchain-openai' is not installed."],
         }
 
-    model_name = get_runtime_settings().workaround_llm_model
+    settings = get_runtime_settings()
+    model_name = settings.workaround_llm_model
     try:
-        llm = ChatOpenAI(model=model_name, temperature=0)
+        llm = ChatOpenAI(
+            model=model_name,
+            temperature=0,
+            **openai_api_key_kwargs(settings),
+        )
     except Exception as exc:  # noqa: BLE001
         summaries = _build_surrender_summaries(
             t_id, "Stopped before execution because the LLM failed to initialize."
@@ -1464,8 +1474,11 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                     for edit_set in replayed_edit_sets
                     for edit in edit_set.replacements
                 }
-                current_attempt_files = set(runtime.changed_files) - replayed_files
+                current_attempt_files = (set(runtime.changed_files) - replayed_files) | set(
+                    plan_state.get("restoration_failure_paths", []) or []
+                )
                 restored_files: set[str] = set()
+                restoration_errors: list[str] = []
                 for f in current_attempt_files:
                     try:
                         _restore_attempt_file(
@@ -1479,9 +1492,18 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                         restored_files.add(f)
                     except Exception as exc:  # noqa: BLE001
                         logger.error("Failed to restore failed-attempt file %s: %s", f, exc)
+                        restoration_errors.append(f"{f}: {exc}")
                 touched_files -= restored_files
+                unresolved_files = current_attempt_files - restored_files
+                touched_files.update(unresolved_files)
+                runtime_errors = list(getattr(runtime, "errors", []) or [])
+                runtime_errors.extend(
+                    f"workaround rollback failed for {detail}" for detail in restoration_errors
+                )
                 runtime = dataclasses.replace(
-                    runtime, changed_files=sorted(replayed_files & set(touched_files))
+                    runtime,
+                    changed_files=sorted((replayed_files & set(touched_files)) | unresolved_files),
+                    errors=runtime_errors,
                 )
 
     except Exception as exc:  # noqa: BLE001

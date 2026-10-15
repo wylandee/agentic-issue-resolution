@@ -1,6 +1,6 @@
 # Evaluation runbook
 
-The evaluation suites live under `tests/evals/`. They combine deterministic contract checks with optional DeepEval judgments. The six maintained golden datasets are JSON lists with a shared envelope (`case_id`, `input`, `context`, `expected_output`, and `expected_tools`):
+The evaluation suites live under `tests/evals/`. They combine deterministic contract checks with optional DeepEval judgments. The seven maintained golden datasets are JSON lists with a shared envelope (`case_id`, `input`, `context`, `expected_output`, and `expected_tools`):
 
 | Dataset | Cases | Consumer |
 | --- | ---: | --- |
@@ -10,6 +10,7 @@ The evaluation suites live under `tests/evals/`. They combine deterministic cont
 | `tests/evals/golden/update_subagent_cases.json` | 11 | `test_update_subagent_eval.py` |
 | `tests/evals/golden/workaround_subagent_cases.json` | 16 | `test_workaround_subagent_eval.py` |
 | `tests/evals/golden/qa_cases.json` | 20 | `test_qa_critic_eval.py` |
+| `tests/evals/golden/supervisor_cases.json` | 10 | `test_supervisor_eval.py` |
 
 Every dataset is validated by `tests/evals/golden_schema.py`. Agent replay cases contain a typed `replay.input` and an `offline_fixture`; provenance fields identify the source trajectory or explain why a case is synthetic. Historical evidence is input context, not an unmarked live result.
 
@@ -62,7 +63,7 @@ Report cases expand compact evidence into task queue, attempt, QA, patch, and di
 
 - `test_adapters.py` checks trajectory Markdown/dictionary parsing, span classification, token/tool extraction, conversion to DeepEval-compatible test cases, loader behavior, and evaluation settings.
 - `test_replay_harness.py` checks the in-memory sandbox, command recording, rollback, tool traces, and replay caching/deduplication.
-- `test_golden_schema.py` checks all six datasets, required fields, replay inputs, duplicate IDs, and the separation of `offline_fixture` observations from expected/live fields.
+- `test_golden_schema.py` checks all seven datasets, required fields, replay inputs, duplicate IDs, and the separation of `offline_fixture` observations from expected/live fields.
 
 These tests are deterministic and do not invoke a model judge.
 
@@ -80,6 +81,18 @@ Offline mode does not substitute a cached judge: it runs the deterministic repor
 ### Triage (`test_triage_eval.py`)
 
 The 15 cases cover actionable/false-positive/deferred decisions, priority and reachability handling, missing advisory data, and deterministic guardrail recovery. Offline tests exercise the real triage path with deterministic inputs, including timeout fallback and protection against a hallucinated selected issue. Live mode runs the production triage replay and one DeepEval `TaskCompletionMetric` at threshold `0.70`. Triage has no expected tool trace.
+
+### Tactical Supervisor (`test_supervisor_eval.py`)
+
+The ten cases exercise bounded single-task model proposals and Python-side
+verification, including retry/repair behavior, candidate authorization,
+peer-conflict referral, workaround pivots, and inconclusive QA. Offline replay
+tests call the production tactical boundary with scripted model/tool output and
+assert decision codes, attempt identity, selected version, staged resolution,
+and state preservation. Live mode uses task-completion and, where applicable,
+tool-correctness judgments. These cases evaluate a proposal boundary; the
+Supervisor and deterministic portfolio functions remain the orchestration
+authorities.
 
 ### Fix Planner (`test_fix_planner_eval.py`)
 

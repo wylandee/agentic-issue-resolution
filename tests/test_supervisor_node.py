@@ -28,9 +28,12 @@ from remediation_engine.contracts.schemas import (
     IncrementalScanRecord,
     IssueSource,
     IssueType,
+    MultiPackageAction,
     ODCScanEvidence,
+    PackageMutation,
     PackageScanOccurrence,
     PeerConflictEvidence,
+    PortfolioPlan,
     QAAttemptResult,
     QADeterministicGates,
     QAEvaluation,
@@ -44,6 +47,7 @@ from remediation_engine.contracts.schemas import (
     SupervisorDecision,
     SupervisorRetryPlan,
     TaskAttemptSnapshot,
+    TaskCluster,
     TaskScanRecord,
     TaskSpawnRequest,
     TaskStatus,
@@ -71,6 +75,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _repair_invalid_planner_plans,
     _task_scan_record_from_qa_result,
     _validate_committed_state,
+    _validated_delta_replay_task_ids,
     _verified_absent_package_tasks,
     instruction_digest,
     reconcile_phase5_state_before_teardown,
@@ -284,6 +289,13 @@ class TestSupervisorDecisionSchema:
             decision_reason="test",
         )
         assert decision.next_node == "update_subagent"
+        deferred = SupervisorDecision(
+            next_node="supervisor",
+            target_task_ids=[],
+            instructions="Reconcile a deferred task before selecting another action.",
+            decision_reason="Registry verification is temporarily unavailable.",
+        )
+        assert deferred.next_node == "supervisor"
 
     def test_workaround_subagent_rejects_zero_or_two_targets(self):
         with pytest.raises(ValidationError):
@@ -373,6 +385,33 @@ def test_deferred_consistency_action_is_mapped_to_typed_rejection():
     )
 
     assert event.action == "rejected"
+
+
+def test_registry_verification_pending_reenters_supervisor_without_forcing_final_scan(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    group = _sca_group("g-registry-pending", FixPlanStatus.VERSION_FOUND)
+    task = _make_task("task-registry-pending", group.group_id)
+    state = _base_state(
+        [group],
+        task_queue={task.task_id: task},
+        portfolio_plan=_portfolio_stub(),
+        portfolio_dirty=False,
+        workspace_volume="workspace-volume",
+        final_full_scan_enabled=False,
+    )
+    _keep_portfolio_current(monkeypatch)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.registry_candidate_sets_for_context",
+        lambda _context: ((), "registry temporarily unavailable"),
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["decision_code"] == DecisionCode.REGISTRY_VERIFICATION_PENDING
+    assert result["next_routing_step"] == "supervisor"
+    assert result["task_queue"][task.task_id].status == TaskStatus.INCONCLUSIVE
+    assert result["task_queue"][task.task_id].retry_count == task.retry_count
 
 
 def test_attempt_snapshot_allowlists_default_for_legacy_payloads():
@@ -499,6 +538,102 @@ def test_committed_state_rejects_active_empty_update_authorization():
 
     assert any(event.error_code == "UPDATE_ATTEMPT_WITHOUT_CANDIDATE" for event in events)
     assert any("candidate authorization" in error for error in errors)
+
+
+def test_committed_state_refuses_snapshot_revision_rewind():
+    instruction = "Update test-pkg to 2.0.0."
+    task = _make_task("task-1", "g1").model_copy(
+        update={
+            "task_revision": 4,
+            "current_attempt_id": "attempt-current",
+            "selected_version": "2.0.0",
+            "instruction": instruction,
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-1",
+        task_revision=1,
+        selected_version="1.0.0",
+        instruction="Update test-pkg to 1.0.0.",
+        instruction_digest=instruction_digest("Update test-pkg to 1.0.0."),
+        dispatch_node="update_subagent",
+    )
+    queue = {"task-1": task}
+
+    events, errors = _validate_committed_state(
+        queue, {snapshot.attempt_id: snapshot}, {}, {}, [], "teardown"
+    )
+
+    assert queue["task-1"].task_revision == 4
+    assert queue["task-1"].selected_version == "2.0.0"
+    assert queue["task-1"].instruction == instruction
+    assert any(event.error_code == "TASK_SNAPSHOT_REVISION_REJECTED" for event in events)
+    assert any("snapshot repair was refused" in error for error in errors)
+
+
+def test_committed_state_rejects_foreign_task_snapshot_identity():
+    instruction = "Update test-pkg to 1.0.0."
+    task = _make_task("task-1", "g1").model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": "attempt-current",
+            "selected_version": "1.0.0",
+            "instruction": instruction,
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-foreign",
+        task_revision=1,
+        selected_version="9.9.9",
+        instruction="Update test-pkg to 9.9.9.",
+        instruction_digest=instruction_digest("Update test-pkg to 9.9.9."),
+        dispatch_node="update_subagent",
+    )
+    queue = {"task-1": task}
+
+    events, errors = _validate_committed_state(
+        queue, {snapshot.attempt_id: snapshot}, {}, {}, [], "teardown"
+    )
+
+    assert queue["task-1"].task_id == "task-1"
+    assert queue["task-1"].selected_version == "1.0.0"
+    assert queue["task-1"].instruction == instruction
+    assert any(event.error_code == "TASK_SNAPSHOT_IDENTITY_REJECTED" for event in events)
+    assert any("foreign task or attempt identity" in error for error in errors)
+
+
+def test_committed_state_repairs_mutated_inputs_for_same_snapshot_revision():
+    committed_instruction = "Update test-pkg to 1.0.0."
+    task = _make_task("task-1", "g1").model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": "attempt-current",
+            "selected_version": "2.0.0",
+            "instruction": "Update test-pkg to 2.0.0.",
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-1",
+        task_revision=1,
+        selected_version="1.0.0",
+        instruction=committed_instruction,
+        instruction_digest=instruction_digest(committed_instruction),
+        dispatch_node="update_subagent",
+    )
+    queue = {"task-1": task}
+
+    events, errors = _validate_committed_state(
+        queue, {snapshot.attempt_id: snapshot}, {}, {}, [], "teardown"
+    )
+
+    assert queue["task-1"].task_revision == 1
+    assert queue["task-1"].selected_version == "1.0.0"
+    assert queue["task-1"].instruction == committed_instruction
+    assert any(event.error_code == "TASK_SNAPSHOT_REPAIRED" for event in events)
+    assert not errors
 
 
 # ===========================================================================
@@ -871,6 +1006,116 @@ class TestRunSupervisorNodeVersionBump:
         assert decision.next_node == "update_subagent"
         assert decision.target_task_ids == ["task-1"]
 
+    def test_active_qa_retry_precedes_unrelated_portfolio_task(self):
+        failed_group = _sca_group("g1")
+        ready_group = _sca_group("g2")
+        failed_task = _make_task(
+            "task-1",
+            failed_group.group_id,
+            status=TaskStatus.NEEDS_RETRY,
+            retry_count=1,
+        )
+        ready_task = _make_task("task-2", ready_group.group_id)
+
+        portfolio_plan = _portfolio_stub()
+        cluster_id = "cluster-task-2"
+        portfolio_plan.task_ids = ["task-2"]
+        portfolio_plan.clusters = [
+            SimpleNamespace(
+                cluster_id=cluster_id,
+                task_ids=["task-2"],
+                dependencies=[],
+                dispatchable=True,
+            )
+        ]
+        portfolio_plan.cluster_order = [cluster_id]
+        portfolio_plan.task_order = ["task-2"]
+        portfolio_plan.task_to_cluster = {"task-2": cluster_id}
+
+        decision = _deterministic_routing(
+            {"task-1": failed_task, "task-2": ready_task},
+            {failed_group.group_id: failed_group, ready_group.group_id: ready_group},
+            {
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="Repair the compatibility regression.",
+                )
+            },
+            {},
+            active_target_task_ids=["task-1"],
+            current_status="qa_completed",
+            portfolio_plan=portfolio_plan,
+        )
+
+        assert decision.decision_code == DecisionCode.RETRY_VERSION_BUMP
+        assert decision.target_task_ids == ["task-1"]
+        assert "tactical/retry planning" in decision.instructions
+
+    def test_active_qa_retry_does_not_split_atomic_portfolio_cluster(self):
+        groups = [_sca_group(f"g{i}") for i in range(1, 4)]
+        tasks = {
+            "task-1": _make_task(
+                "task-1",
+                "g1",
+                status=TaskStatus.NEEDS_RETRY,
+                retry_count=1,
+            ),
+            "task-2": _make_task(
+                "task-2",
+                "g2",
+                status=TaskStatus.NEEDS_RETRY,
+                retry_count=1,
+            ),
+            "task-3": _make_task("task-3", "g3"),
+        }
+        portfolio_plan = _portfolio_stub()
+        unrelated_cluster_id = "unrelated-cluster"
+        cluster_id = "atomic-cluster"
+        portfolio_plan.task_ids = ["task-3", "task-1", "task-2"]
+        portfolio_plan.clusters = [
+            SimpleNamespace(
+                cluster_id=unrelated_cluster_id,
+                task_ids=["task-3"],
+                dependencies=[],
+                dispatchable=True,
+            ),
+            SimpleNamespace(
+                cluster_id=cluster_id,
+                task_ids=["task-1", "task-2"],
+                dependencies=[],
+                dispatchable=True,
+            ),
+        ]
+        portfolio_plan.cluster_order = [unrelated_cluster_id, cluster_id]
+        portfolio_plan.task_order = ["task-3", "task-1", "task-2"]
+        portfolio_plan.task_to_cluster = {
+            "task-1": cluster_id,
+            "task-2": cluster_id,
+            "task-3": unrelated_cluster_id,
+        }
+
+        decision = _deterministic_routing(
+            tasks,
+            {group.group_id: group for group in groups},
+            {
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="Repair the compatibility regression.",
+                )
+            },
+            {},
+            active_target_task_ids=["task-1"],
+            current_status="qa_completed",
+            portfolio_plan=portfolio_plan,
+        )
+
+        assert decision.decision_code == DecisionCode.ATOMIC_CLUSTER_DISPATCH
+        assert decision.target_task_ids == ["task-1", "task-2"]
+
     def test_repeated_routing_advances_to_the_next_task_after_completion(self):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
         tasks = {f"task-{i + 1}": _make_task(f"task-{i + 1}", f"g{i}") for i in range(3)}
@@ -911,6 +1156,101 @@ class TestRunSupervisorNodeToQA:
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "qa_critic"
         assert "task-1" in result["active_target_task_ids"]
+
+    def test_active_cluster_action_survives_qa_handoff(self):
+        cluster_id = "cluster-active-qa"
+        batch_id = "batch-active-qa"
+        task_specs = [("task-1", "g1", "pkg-a"), ("task-2", "g2", "pkg-b")]
+        groups = [
+            _sca_group(group_id).model_copy(update={"vulnerable_component": package_name})
+            for _, group_id, package_name in task_specs
+        ]
+        action = MultiPackageAction(
+            cluster_id=cluster_id,
+            dispatch_batch_id=batch_id,
+            selected_strategy="version_bump",
+            package_mutations=[
+                PackageMutation(
+                    task_id=task_id,
+                    package_name=package_name,
+                    target_version="1.2.3",
+                    dependency_type="dependencies",
+                )
+                for task_id, _, package_name in task_specs
+            ],
+            rationale="test atomic QA handoff",
+        )
+        action_digest = instruction_digest(action.model_dump_json())
+        tasks = {}
+        snapshots = {}
+        worker_results = {}
+        for task_id, group_id, package_name in task_specs:
+            attempt_id = f"attempt-{task_id}"
+            instruction = f"Update {package_name} to 1.2.3."
+            task = _make_task(
+                task_id,
+                group_id,
+                status=TaskStatus.OPTIMISTICALLY_FIXED,
+            ).model_copy(
+                update={
+                    "task_revision": 1,
+                    "current_attempt_id": attempt_id,
+                    "qa_policy": QAPolicy.VERSION_BUMP,
+                    "selected_version": "1.2.3",
+                    "allowed_target_versions": ["1.2.3"],
+                    "target_package_name": package_name,
+                    "target_dependency_type": "dependencies",
+                    "instruction": instruction,
+                }
+            )
+            snapshot = TaskAttemptSnapshot(
+                attempt_id=attempt_id,
+                task_id=task_id,
+                task_revision=task.task_revision,
+                cluster_id=cluster_id,
+                dispatch_batch_id=batch_id,
+                action_digest=action_digest,
+                qa_policy=task.qa_policy,
+                selected_version=task.selected_version,
+                target_package_name=package_name,
+                target_dependency_type="dependencies",
+                instruction=instruction,
+                instruction_digest=instruction_digest(instruction),
+                dispatch_node="update_subagent",
+            )
+            tasks[task_id] = task
+            snapshots[attempt_id] = snapshot
+            worker_results[attempt_id] = WorkerAttemptResult(
+                attempt_id=attempt_id,
+                task_id=task_id,
+                task_revision=task.task_revision,
+                cluster_id=cluster_id,
+                dispatch_batch_id=batch_id,
+                action_digest=action_digest,
+                status=AgentActionStatus.SUCCESS,
+                execution_diagnostics=WorkerExecutionDiagnostics(validation_passed=True),
+                instruction_digest=snapshot.instruction_digest,
+            )
+
+        state = _base_state(
+            groups,
+            task_queue=tasks,
+            active_target_task_ids=[task_id for task_id, _, _ in task_specs],
+            active_cluster_id=cluster_id,
+            active_dispatch_batch_id=batch_id,
+            active_multi_package_action=action,
+            attempt_snapshots_by_id=snapshots,
+            worker_results_by_attempt=worker_results,
+            processed_worker_attempt_ids=list(worker_results),
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "qa_critic"
+        assert result["active_target_task_ids"] == ["task-1", "task-2"]
+        assert result["active_cluster_id"] == cluster_id
+        assert result["active_dispatch_batch_id"] == batch_id
+        assert result["active_multi_package_action"] == action
 
     def test_all_optimistically_fixed_tasks_route_to_qa_within_limit(self):
         g1 = _sca_group("g1")
@@ -1773,6 +2113,86 @@ def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
     assert committed.selected_version == "2.0.0"
     assert committed.status == TaskStatus.OPTIMISTICALLY_FIXED
     assert any(event.error_code == "STALE_WORKER_RESULT" for event in result["consistency_events"])
+
+
+def test_worker_result_under_current_key_must_carry_current_attempt_id():
+    group = _sca_group("g1")
+    instruction = "Update test-pkg to 2.0.0."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-1",
+        state_revision=2,
+        task_revision=2,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.0.0",
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="update_subagent",
+    )
+    task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+        update={
+            "task_revision": 2,
+            "current_attempt_id": snapshot.attempt_id,
+            "strategy_stage": snapshot.strategy_stage,
+            "selected_version": snapshot.selected_version,
+            "instruction": instruction,
+        }
+    )
+    foreign_result = WorkerAttemptResult(
+        attempt_id="attempt-foreign",
+        task_id="task-1",
+        task_revision=2,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=["2.0.0"],
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            attempted_versions=["2.0.0"],
+            executed_versions=["2.0.0"],
+            validation_passed=True,
+        ),
+        instruction_digest=snapshot.instruction_digest,
+    )
+
+    state = _base_state(
+        [group],
+        task_queue={"task-1": task},
+        active_target_task_ids=["task-1"],
+        attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+        # The map key is current, but the serialized envelope identity is not.
+        worker_results_by_attempt={snapshot.attempt_id: foreign_result},
+    )
+    result = run_supervisor_node(state)
+
+    assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+    assert result.get("retry_diagnostics_by_task", {}).get("task-1") is None
+    assert snapshot.attempt_id not in result["processed_worker_attempt_ids"]
+    assert any(
+        event.error_code == "WORKER_ATTEMPT_MISMATCH"
+        and event.expected_attempt_id == snapshot.attempt_id
+        and event.received_attempt_id == "attempt-foreign"
+        for event in result["consistency_events"]
+    )
+
+    valid_result = WorkerAttemptResult(
+        attempt_id=snapshot.attempt_id,
+        task_id="task-1",
+        task_revision=snapshot.task_revision,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=["2.0.0"],
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            attempted_versions=["2.0.0"],
+            executed_versions=["2.0.0"],
+            validation_passed=True,
+        ),
+        instruction_digest=snapshot.instruction_digest,
+    )
+    next_state = {**state, **result}
+    next_state["active_target_task_ids"] = ["task-1"]
+    next_state["worker_results_by_attempt"] = {snapshot.attempt_id: valid_result}
+
+    next_result = run_supervisor_node(next_state)
+
+    assert next_result["retry_diagnostics_by_task"]["task-1"].executed_versions == ["2.0.0"]
+    assert snapshot.attempt_id in next_result["processed_worker_attempt_ids"]
 
 
 def test_worker_result_persists_attempts_by_target_and_override_usage():
@@ -3770,6 +4190,7 @@ def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
             qa_policy=task.qa_policy,
             strategy_stage=task.strategy_stage,
             selected_version=task.selected_version,
+            allowed_target_versions=list(task.allowed_target_versions),
             target_package_name=task.target_package_name,
             target_dependency_type=task.target_dependency_type,
             instruction=instruction,
@@ -3792,6 +4213,7 @@ def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
             dispatch_batch_id=dispatch_batch_id,
             action_digest=action_digest,
             status=AgentActionStatus.SUCCESS,
+            executed_versions=[task.selected_version],
             execution_diagnostics=WorkerExecutionDiagnostics(validation_passed=True),
             instruction_digest=snapshot.instruction_digest,
         )
@@ -3903,6 +4325,145 @@ def test_atomic_cluster_delta_isolation_charges_only_validated_blame(
     assert request.triggering_attempt_id == "attempt-b"
     assert request.source_portfolio_plan_id == "portfolio-source"
     assert result["next_routing_step"] == "supervisor"
+
+
+def test_delta_isolation_requeues_unblamed_peer_for_authoritative_singleton_qa(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state, _original_tasks, _snapshots = _atomic_cluster_delta_failure_state()
+    _keep_portfolio_current(monkeypatch)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._apply_tactical_supervisor",
+        lambda *args, **kwargs: None,
+    )
+
+    def rebuild_portfolio(portfolio_input):
+        task_queue = {
+            task_id: task.model_copy(update={"portfolio_plan_id": "portfolio-replanned"})
+            for task_id, task in portfolio_input["task_queue"].items()
+        }
+        clusters = [
+            TaskCluster(cluster_id=f"singleton-{task_id}", task_ids=[task_id], reason="replanned")
+            for task_id in ("task-a", "task-b")
+        ]
+        plan = PortfolioPlan(
+            plan_id="plan-replanned",
+            portfolio_plan_id="portfolio-replanned",
+            repository_fingerprint="repo-fingerprint",
+            graph_digest="graph-digest",
+            plan_digest="plan-digest",
+            task_ids=["task-a", "task-b"],
+            clusters=clusters,
+            cluster_order=[cluster.cluster_id for cluster in clusters],
+            task_order=["task-a", "task-b"],
+            task_to_cluster={task_id: f"singleton-{task_id}" for task_id in ("task-a", "task-b")},
+            task_revisions={task_id: task.task_revision for task_id, task in task_queue.items()},
+            planned_task_revisions={
+                task_id: task.task_revision for task_id, task in task_queue.items()
+            },
+            task_strategies={task_id: task.strategy for task_id, task in task_queue.items()},
+        )
+        return {
+            "status": "portfolio_ready",
+            "next_routing_step": "supervisor",
+            "portfolio_plan": plan,
+            "portfolio_solver_plan": None,
+            "portfolio_iteration": 1,
+            "portfolio_replan_request": None,
+            "portfolio_escalation": None,
+            "portfolio_dirty": False,
+            "valid_groups": portfolio_input["valid_groups"],
+            "task_queue": task_queue,
+            "active_target_task_ids": [],
+            "active_cluster_id": None,
+            "active_dispatch_batch_id": None,
+            "active_multi_package_action": None,
+            "errors": [],
+        }
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        rebuild_portfolio,
+    )
+
+    replanned = run_supervisor_node(state)
+    record = replanned["delta_isolation_by_cluster"]["cluster-atomic"]
+    assert record["authoritative_qa_replay_task_ids"] == ["task-a"]
+    assert replanned["task_queue"]["task-a"].status == TaskStatus.PENDING
+    assert replanned["task_queue"]["task-a"].retry_count == 1
+    assert replanned["retry_diagnostics_by_task"]["task-a"].attempted_versions == ["1.2.3"]
+    assert _validated_delta_replay_task_ids(
+        replanned["task_queue"],
+        replanned["delta_isolation_by_cluster"],
+        replanned["attempt_snapshots_by_id"],
+    ) == {"task-a"}
+
+    singleton_dispatch = run_supervisor_node(replanned)
+    assert singleton_dispatch["next_routing_step"] == "update_subagent"
+    assert singleton_dispatch["active_target_task_ids"] == ["task-a"]
+    peer = singleton_dispatch["task_queue"]["task-a"]
+    attempt = peer.current_attempt_id
+    assert attempt is not None
+    snapshot = singleton_dispatch["attempt_snapshots_by_id"][attempt]
+    assert snapshot.dispatch_batch_id is None
+    assert snapshot.cluster_id is None
+    assert snapshot.selected_version == "1.2.3"
+    assert singleton_dispatch["retry_diagnostics_by_task"]["task-a"].attempted_versions == ["1.2.3"]
+    assert (
+        singleton_dispatch["delta_isolation_by_cluster"]["cluster-atomic"][
+            "authoritative_qa_replay_task_ids"
+        ]
+        == []
+    )
+
+    worker_result = WorkerAttemptResult(
+        attempt_id=attempt,
+        task_id="task-a",
+        task_revision=peer.task_revision,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=["1.2.3"],
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            validation_passed=True,
+            effective_target_version="1.2.3",
+        ),
+        instruction_digest=snapshot.instruction_digest,
+    )
+    worker_completed = run_supervisor_node(
+        {
+            **singleton_dispatch,
+            "status": "worker_completed",
+            "active_target_task_ids": ["task-a"],
+            "worker_results_by_attempt": {
+                **singleton_dispatch["worker_results_by_attempt"],
+                attempt: worker_result,
+            },
+        }
+    )
+    assert worker_completed["next_routing_step"] == "qa_critic"
+    assert worker_completed["active_target_task_ids"] == ["task-a"]
+
+    passing_evaluation = QAEvaluation(task_id="task-a", passed=True)
+    qa_result = QAAttemptResult(
+        attempt_id=attempt,
+        task_id="task-a",
+        task_revision=worker_completed["task_queue"]["task-a"].task_revision,
+        qa_policy=snapshot.qa_policy,
+        qa_policy_source="attempt_snapshot",
+        evaluation=passing_evaluation,
+    )
+    qa_completed = run_supervisor_node(
+        {
+            **worker_completed,
+            "status": "qa_completed",
+            "active_target_task_ids": ["task-a"],
+            "qa_evaluations": {"task-a": passing_evaluation},
+            "qa_results_by_attempt": {
+                **worker_completed["qa_results_by_attempt"],
+                attempt: qa_result,
+            },
+        }
+    )
+    assert qa_completed["task_queue"]["task-a"].status == TaskStatus.QA_PASSED
 
 
 def test_atomic_cluster_without_delta_attribution_keeps_all_member_retry_behavior():

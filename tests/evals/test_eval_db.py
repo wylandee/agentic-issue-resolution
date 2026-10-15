@@ -223,6 +223,34 @@ def test_get_test_cases_filtering_and_search(temp_db: EvalDatabase) -> None:
     assert searched[0]["case_id"] == "cve_001"
 
 
+def test_dashboard_filter_values_include_persisted_errors_and_custom_suites(
+    temp_db: EvalDatabase,
+) -> None:
+    """Dashboard filter choices reflect the stored status and suite vocabulary."""
+    temp_db.save_run(
+        EvalRunRecord(
+            run_id="filter-values",
+            timestamp="2026-10-15T00:00:00",
+            suite_name="mixed",
+            total_tests=2,
+            failed_tests=1,
+            test_cases=[
+                EvalTestCaseRecord(test_name="test_error", suite="integration", status="ERROR"),
+                EvalTestCaseRecord(test_name="test_pass", suite="api", status="PASSED"),
+            ],
+        )
+    )
+
+    assert temp_db.get_test_case_filter_values("filter-values") == (
+        ["ERROR", "PASSED"],
+        ["api", "integration"],
+    )
+    assert temp_db.get_test_case_filter_values() == (
+        ["ERROR", "PASSED"],
+        ["api", "integration"],
+    )
+
+
 def test_metric_trends_aggregation(temp_db: EvalDatabase) -> None:
     """Verify aggregation of metric scores across historical runs."""
     # Run 1
@@ -322,6 +350,118 @@ def test_run_comparison_detects_regressions_and_fixes(temp_db: EvalDatabase) -> 
     assert comp["regressions"][0]["test_name"] == "test_1"
     assert comp["total_fixes"] == 1
     assert comp["fixes"][0]["test_name"] == "test_2"
+
+
+def test_run_comparison_reads_all_cases_and_distinguishes_duplicate_names(
+    temp_db: EvalDatabase,
+) -> None:
+    """Comparisons include rows after 500 and pair repeated names by case identity."""
+    cases_a = [
+        EvalTestCaseRecord(
+            case_id=f"case-{index}",
+            test_name=f"test-{index}",
+            suite="report",
+            status="PASSED",
+        )
+        for index in range(501)
+    ]
+    cases_b = [
+        EvalTestCaseRecord(
+            case_id=f"case-{index}",
+            test_name=f"test-{index}",
+            suite="report",
+            status="FAILED" if index == 500 else "PASSED",
+        )
+        for index in range(501)
+    ]
+    cases_a.extend(
+        [
+            EvalTestCaseRecord(
+                case_id="duplicate-a", test_name="repeated", suite="report", status="PASSED"
+            ),
+            EvalTestCaseRecord(
+                case_id="duplicate-b", test_name="repeated", suite="report", status="FAILED"
+            ),
+        ]
+    )
+    cases_b.extend(
+        [
+            EvalTestCaseRecord(
+                case_id="duplicate-a", test_name="repeated", suite="report", status="FAILED"
+            ),
+            EvalTestCaseRecord(
+                case_id="duplicate-b", test_name="repeated", suite="report", status="PASSED"
+            ),
+        ]
+    )
+    for run_id, cases in (("all-a", cases_a), ("all-b", cases_b)):
+        temp_db.save_run(
+            EvalRunRecord(
+                run_id=run_id,
+                timestamp="2026-10-15T00:00:00",
+                suite_name="report",
+                total_tests=len(cases),
+                passed_tests=sum(case.status == "PASSED" for case in cases),
+                failed_tests=sum(case.status == "FAILED" for case in cases),
+                test_cases=cases,
+            )
+        )
+
+    comparison = temp_db.get_run_comparison("all-a", "all-b")
+
+    assert comparison["total_regressions"] == 2
+    assert comparison["total_fixes"] == 1
+    assert any(item["case_a"]["case_id"] == "case-500" for item in comparison["regressions"])
+    assert any(item["case_a"]["case_id"] == "duplicate-a" for item in comparison["regressions"])
+    assert comparison["fixes"][0]["case_a"]["case_id"] == "duplicate-b"
+
+
+def test_database_operation_closes_connection_on_success_and_failure(
+    temp_db: EvalDatabase, monkeypatch
+) -> None:
+    """SQLite transaction contexts are closed whether a query succeeds or fails."""
+    successful_connection = temp_db._get_connection()
+    monkeypatch.setattr(temp_db, "_get_connection", lambda: successful_connection)
+
+    assert temp_db.get_run("missing") is None
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        successful_connection.execute("SELECT 1")
+
+    failed_connection = sqlite3.connect(":memory:")
+    monkeypatch.setattr(temp_db, "_get_connection", lambda: failed_connection)
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        temp_db.get_run("missing")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        failed_connection.execute("SELECT 1")
+
+
+def test_connection_setup_failure_closes_open_sqlite_connection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failed required PRAGMA closes the connection before propagating."""
+
+    class FakeConnection:
+        row_factory = None
+        closed = False
+
+        def execute(self, statement: str):
+            assert statement == "PRAGMA foreign_keys = ON;"
+            raise sqlite3.OperationalError("setup failed")
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        "remediation_engine.evals.db.sqlite3.connect", lambda *_args, **_kwargs: connection
+    )
+    database = EvalDatabase.__new__(EvalDatabase)
+    database.db_path = tmp_path / "failed-setup.sqlite3"
+
+    with pytest.raises(sqlite3.OperationalError, match="setup failed"):
+        database._get_connection()
+
+    assert connection.closed
 
 
 def test_tagged_runs_resolve_by_id_tag_and_latest(temp_db: EvalDatabase) -> None:

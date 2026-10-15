@@ -2400,6 +2400,11 @@ def generate_report(
         token_summary=token_summary,
         run_ended_at=run_ended_at,
     )
+    return _render_report_context(context)
+
+
+def _render_report_context(context: ReportContext) -> str:
+    """Render a report from one already-built evidence context."""
     sections = [
         _render_follow_up_actions(context),
         _render_successful_remediations(context),
@@ -2488,13 +2493,7 @@ def finalize_report(
         token_summary=token_summary,
         run_ended_at=ended_at,
     )
-    markdown = generate_report(
-        state,
-        trajectory_path=trajectory_path,
-        trace_url=trace_url,
-        token_summary=token_summary,
-        run_ended_at=ended_at,
-    )
+    markdown = _render_report_context(base_context)
     try:
         report_dir = _resolve_report_dir(settings)
         path = report_dir / _report_filename(base_context.run_id)

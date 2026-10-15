@@ -26,13 +26,11 @@ from remediation_engine.contracts import (
 )
 from remediation_engine.orchestration.supervisor_node import (
     _build_deterministic_retry_plan,
-    _calculate_eligible_actions,
     _commit_registry_resolution_fallback,
     _commit_task_transition,
     _deterministic_routing,
     _emit_audit,
     _no_fix_failure_transition,
-    _select_deterministic_action,
     _task_sort_key,
     supervisor_router,
 )
@@ -485,12 +483,12 @@ def test_deterministic_retry_planner_exhaustion_pivots_to_workaround(monkeypatch
     assert plan.selected_version is None
 
 
-def test_phase_projection_and_audit_are_typed():
+def test_authoritative_route_and_audit_are_typed():
     group = _group("g")
     tasks = {"task-1": _task("task-1", "g")}
-    eligible = _calculate_eligible_actions(tasks, {"g": group}, {}, {})
-    decision = _select_deterministic_action(eligible, tasks, {"g": group}, {}, {})
+    decision = _deterministic_routing(tasks, {"g": group}, {}, {})
     audit = _emit_audit(decision, [], 4)
-    assert eligible.new_version_bumps == ["task-1"]
+    assert decision.next_node == "update_subagent"
+    assert decision.target_task_ids == ["task-1"]
     assert audit.decision_code == DecisionCode.NEW_VERSION_BUMP
     assert audit.state_revision == 4

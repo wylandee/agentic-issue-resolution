@@ -736,7 +736,6 @@ def run_delta_isolation_canaries(
                     unexpected_error = str(exc)
                     log.exception("Delta-isolation runner failed unexpectedly.")
                 finally:
-                    candidate_was_restored = candidate_restored
                     final_restore_succeeded = restore_candidate()
                     if final_restore_succeeded:
                         try:
@@ -747,10 +746,6 @@ def run_delta_isolation_canaries(
                                 "Delta-isolation candidate archive removal failed for %s.",
                                 candidate_snapshot_id,
                             )
-                    elif candidate_was_restored:
-                        # No mutation followed the last successful per-probe
-                        # restore, so retain that verified candidate state.
-                        candidate_restored = True
     except Exception as exc:  # noqa: BLE001 - preserve QA's failed result
         unexpected_error = unexpected_error or str(exc)
         log.exception("Delta-isolation Docker sandbox failed.")
@@ -1183,11 +1178,11 @@ def _finalize_qa_workspace_snapshot(
     result: dict[str, Any],
 ) -> list[str]:
     """Finalize the candidate workspace after scoped QA.
-    A validated dependency update that fails only because it introduced a
-    runtime or test regression is still the correct base for a workaround
-    child. Preserve that candidate while handing control back to the
-    Supervisor. Other QA failures restore the immutable task baseline when one
-    exists, so a rejected retry cannot leak into the next task.
+
+    QA-only evidence reruns retain the candidate and its original snapshot.
+    The snapshot remains available until the task passes or an unrelated
+    dispatch restores the task baseline. A dependency update rejected by tests
+    remains available for a same-task workaround child.
     """
     result["candidate_workspace_retained"] = False
     if snapshot_id is None:
@@ -1228,9 +1223,11 @@ def _finalize_qa_workspace_snapshot(
     if result.get("status") != "qa_completed":
         if _qa_result_requires_non_remediation_rerun(result):
             # QA infrastructure/contract failures must rerun against the
-            # candidate rather than restoring the worker's baseline.
+            # candidate rather than restoring the worker's baseline. Keep its
+            # archive alive so a terminal inconclusive result can be isolated
+            # before the next unrelated dispatch.
             result["candidate_workspace_retained"] = True
-            return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
+            return []
         return restore_failed_workaround() if workaround_attempt else restore_failed_update()
     evaluations = result.get("qa_evaluations") or {}
     update_candidate = (
@@ -1279,6 +1276,12 @@ def _finalize_qa_workspace_snapshot(
             return []
         result["candidate_workspace_retained"] = True
         return _finish_workspace_attempt_snapshot(state, snapshot_id, restore=False)
+    if has_non_remediation_rerun and not has_real_failure:
+        # Keep the candidate and its pre-attempt archive for a bounded QA-only
+        # retry. The rollback anchor is projected below and restores this
+        # candidate before the workspace is handed to an unrelated task.
+        result["candidate_workspace_retained"] = True
+        return []
     if update_candidate and has_regression:
         # The next Supervisor decision may dispatch a workaround child. The
         # child creates its own checkpoint from this retained candidate, while
@@ -1314,10 +1317,10 @@ def _qa_workspace_rollback_anchor_updates(
     result: dict[str, Any],
 ) -> dict[str, str]:
     """Project immutable task baselines and remove resolved snapshot IDs.
-    The first regression snapshot becomes the task baseline. Later update
-    retries retain that original ID instead of replacing it with the
-    pre-retry candidate, which previously allowed a failed dependency change
-    to leak into subsequent tasks.
+
+    The first rejected or evidence-inconclusive candidate snapshot remains
+    the baseline across retries. It is restored before an unrelated dispatch,
+    preventing an unaccepted candidate from leaking into another task.
     """
     anchors = dict(state.get("workspace_rollback_anchors_by_task", {}) or {})
     if snapshot_id is None:
@@ -1344,10 +1347,18 @@ def _qa_workspace_rollback_anchor_updates(
     )
     if result.get("status") != "qa_completed":
         if _qa_result_requires_non_remediation_rerun(result):
+            if result.get("candidate_workspace_retained"):
+                evaluations = result.get("qa_evaluations") or {}
+                for task in target_tasks:
+                    evaluation = evaluations.get(task.task_id)
+                    if evaluation is not None and (
+                        evaluation.contract_error or evaluation.evidence_inconclusive
+                    ):
+                        anchors.setdefault(task.task_id, snapshot_id)
             return anchors
         if workaround_attempt:
             # Preserve the parent dependency candidate while a workaround
-            # retry remains possible.  The anchor is consumed only after a
+            # retry remains possible. The anchor is consumed only after a
             # workaround passes or the Supervisor terminalizes the task.
             return anchors
         return anchors
@@ -1361,19 +1372,32 @@ def _qa_workspace_rollback_anchor_updates(
         if workaround_attempt:
             if not evaluation.passed:
                 workaround_passed = False
-            if evaluation.passed and task.parent_task_id:
-                anchors.pop(task.parent_task_id, None)
+                evidence = evaluation.failure_evidence
+                if result.get("candidate_workspace_retained") and (
+                    evaluation.evidence_inconclusive
+                    or evaluation.contract_error
+                    or evaluation.failure_category == FailureCategory.BREAKING_CHANGE
+                    or bool(evidence and evidence.failed_tests)
+                ):
+                    anchors.setdefault(task.task_id, snapshot_id)
+            else:
+                anchors.pop(task.task_id, None)
+                if task.parent_task_id:
+                    anchors.pop(task.parent_task_id, None)
             continue
         if evaluation.passed:
             anchors.pop(task.task_id, None)
             continue
         evidence = evaluation.failure_evidence
         if result.get("candidate_workspace_retained") and (
-            evaluation.failure_category == FailureCategory.BREAKING_CHANGE
+            evaluation.evidence_inconclusive
+            or evaluation.contract_error
+            or evaluation.failure_category == FailureCategory.BREAKING_CHANGE
             or bool(evidence and evidence.failed_tests)
         ):
             # A persistent rollback anchor must still have a live archive.
-            # Finalization restores and deletes rejected atomic-batch snapshots.
+            # Retain it for evidence-only reruns as well as real regressions,
+            # so unaccepted candidates cannot leak into a later task.
             anchors.setdefault(task.task_id, snapshot_id)
     if workaround_passed:
         # The current workspace is now the authoritative cumulative patch.
@@ -1385,12 +1409,11 @@ def _qa_workspace_rollback_anchor_updates(
 
 def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     """
-    Bridge OrchestratorState â†’ SubagentState for the dependency update subagent.
+    Bridge OrchestratorState → SubagentState for the dependency update subagent.
 
-    Normal Supervisor dispatches contain one active task. The bridge retains
-    generic target-list handling for direct and future batch callers, resolves
-    the associated VulnerabilityGroups, calls ``run_update_subagent_node``, and
-    merges results back into the orchestrator state via ``task_queue`` while
+    The Supervisor supplies the committed singleton or atomic task set. The
+    bridge resolves its VulnerabilityGroups, calls
+    ``run_update_subagent_node``, and merges results into ``task_queue`` while
     preserving attempt snapshots, task revisions, and typed result correlation.
     """
     task_queue: dict[str, RemediationTask] = state.get("task_queue", {})
@@ -1502,10 +1525,29 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
     worker_results = result.get("worker_results_by_attempt") or {}
     if worker_results:
         out["worker_results_by_attempt"] = dict(worker_results)
-    if result.get("retry_diagnostics_by_task"):
-        # Keep cumulative version/type evidence available to the Supervisor in
-        # addition to the attempt-correlated worker envelope.
-        out["retry_diagnostics_by_task"] = result["retry_diagnostics_by_task"]
+    returned_diagnostics = result.get("retry_diagnostics_by_task")
+    if isinstance(returned_diagnostics, Mapping) and returned_diagnostics:
+        # This state field uses a replacement reducer, so a worker's per-task
+        # update must be projected onto the complete prior map. Missing keys
+        # mean "unchanged" here; only the Supervisor may delete task entries.
+        diagnostics_by_task = dict(state.get("retry_diagnostics_by_task") or {})
+        target_tasks_by_id = {task.task_id: task for task in target_tasks}
+        accepted_diagnostics: dict[str, Any] = {}
+        for task_id, diagnostics in returned_diagnostics.items():
+            task = target_tasks_by_id.get(task_id)
+            snapshot = target_attempt_snapshots.get(task_id)
+            if (
+                task is None
+                or snapshot is None
+                or getattr(diagnostics, "task_id", None) != task_id
+                or getattr(diagnostics, "committed_attempt_id", None) != task.current_attempt_id
+                or getattr(diagnostics, "instruction_digest", None) != snapshot.instruction_digest
+            ):
+                continue
+            accepted_diagnostics[task_id] = diagnostics
+        diagnostics_by_task.update(accepted_diagnostics)
+        if accepted_diagnostics:
+            out["retry_diagnostics_by_task"] = diagnostics_by_task
     out["errors"] = list(out.get("errors", [])) + _finalize_worker_workspace_snapshot(
         state,
         target_tasks,
@@ -1519,7 +1561,7 @@ def run_workaround_subagent_from_orchestrator(
     state: OrchestratorState,
 ) -> dict[str, Any]:
     """
-    Bridge OrchestratorState â†’ SubagentState for the single-group workaround subagent.
+    Bridge OrchestratorState → SubagentState for the single-task workaround subagent.
 
     Takes the first entry of ``active_target_task_ids``, resolves the associated
     VulnerabilityGroup, calls ``run_workaround_subagent_node``, then merges

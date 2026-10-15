@@ -27,13 +27,19 @@ diff to the host repository.
    Worker execution normally requires `OPENAI_API_KEY`; deterministic fixture
    loading and batch preparation can be run without making LLM calls.
 
-Temporary Docker volumes are cleaned up during teardown. A final full scan is
-Supervisor-owned and runs before teardown for a terminal remediation cycle.
+Temporary Docker volumes are cleaned up during teardown. Incremental
+dependency-input scan coverage is the default terminal evidence; the result is
+not an authoritative full-repository scan. Set
+`REMEDY_FINAL_FULL_SCAN_ENABLED=true` to opt into a Supervisor-routed full scan
+before teardown.
 The task queue and committed attempt snapshots are authoritative: Supervisor
 creates tasks, selects versions, owns retries and pivots, and carries each
 attempt's QA policy into QA. Update/workaround workers execute committed
 attempts; QA records task-keyed evidence from install, scan, tests, and bounded
-read-only evaluation.
+read-only evaluation. Portfolio planning and resolver certification are
+Supervisor-invoked functions, not a separate graph node. A failed
+multi-package QA batch may trigger bounded delta-isolation canaries to identify
+a responsible task, with restoration verified before blame is retained.
 
 ## Single-run workflow
 
@@ -181,7 +187,10 @@ for the exact components and closure coverage.
 
 `run_batch.py` samples distinct package batches from the read-only baseline
 JSONL, writes each selected subset as canonical JSONL, and stores per-iteration
-results and patches under `data/trajectories/`:
+results and patches under `data/trajectories/`. A selected finding scope can
+produce a larger mutation closure; for example, the shared-name Angular
+fixture expands three finding packages to nine peer-coordinated mutation tasks
+in one atomic batch:
 
 ```bash
 python examples/juice_shop/run_batch.py \

@@ -24,8 +24,8 @@ import tarfile
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
-from pathlib import Path
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path, PurePosixPath
 from threading import RLock
 
 from langsmith import traceable
@@ -182,6 +182,7 @@ class WorkspaceReadCache:
 
 _DEFAULT_READ_FILES_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _MAX_READ_FILES = 10_000
+_MAX_CONTAINER_PATH_CHECK_COMMAND_BYTES = 32_768
 
 
 class _ReadFilesResult(dict[str, str]):
@@ -214,6 +215,14 @@ def _trace_read_files_outputs(output: object) -> dict[str, object]:
         "duration_seconds": round(output.duration_seconds, 3),
         "digest": output.digest,
     }
+
+
+def _trace_write_files_inputs(inputs: dict[str, object]) -> dict[str, int]:
+    """Keep batched write traces free of workspace paths and file contents."""
+    files = inputs.get("files")
+    if not isinstance(files, Mapping):
+        return {"file_count": 0}
+    return {"file_count": len(files)}
 
 
 def _workspace_snapshot_archive(snapshot_id: str) -> str:
@@ -444,17 +453,40 @@ class DockerSandbox:
 
     def _assert_container_path(self, absolute_path: str) -> None:
         """Reject a container path whose existing symlinks leave ``/workspace``."""
+        self._assert_container_paths((absolute_path,))
+
+    def _assert_container_paths(self, absolute_paths: Sequence[str]) -> None:
+        """Reject paths whose existing symlinks leave ``/workspace``."""
         if self._container is None:
             raise RuntimeError("Sandbox is not running.")
-        quoted_path = shlex.quote(absolute_path)
-        command = (
-            f"resolved=$(realpath -m -- {quoted_path}) || exit 1; "
-            'case "$resolved" in /workspace|/workspace/*) exit 0 ;; *) exit 1 ;; esac'
-        )
-        result = self._container.exec_run(["/bin/sh", "-lc", command])
-        exit_code = result[0] if isinstance(result, tuple) else getattr(result, "exit_code", 1)
-        if exit_code != 0:
-            raise WorkspacePathError(f"container path resolves outside /workspace: {absolute_path}")
+
+        batches: list[list[str]] = []
+        current_batch: list[str] = []
+        current_size = 0
+        for absolute_path in absolute_paths:
+            quoted_path = shlex.quote(absolute_path)
+            path_size = len(quoted_path.encode("utf-8")) + 1
+            if current_batch and current_size + path_size > _MAX_CONTAINER_PATH_CHECK_COMMAND_BYTES:
+                batches.append(current_batch)
+                current_batch = []
+                current_size = 0
+            current_batch.append(quoted_path)
+            current_size += path_size
+        if current_batch:
+            batches.append(current_batch)
+
+        for batch in batches:
+            quoted_paths = " ".join(batch)
+            command = (
+                f"for path in {quoted_paths}; do "
+                'resolved=$(realpath -m -- "$path") || exit 1; '
+                'case "$resolved" in /workspace|/workspace/*) : ;; *) exit 1 ;; esac; '
+                "done"
+            )
+            result = self._container.exec_run(["/bin/sh", "-lc", command])
+            exit_code = result[0] if isinstance(result, tuple) else getattr(result, "exit_code", 1)
+            if exit_code != 0:
+                raise WorkspacePathError("one or more container paths resolve outside /workspace")
 
     @traceable(run_type="tool", name="docker_sandbox.run")
     def run(
@@ -633,6 +665,75 @@ class DockerSandbox:
 
         self._container.put_archive(parent_dir, buf.read())
         logger.debug("DockerSandbox: wrote %d bytes to %s.", len(encoded), abs_path)
+
+    @traceable(
+        run_type="tool",
+        name="docker_sandbox.write_files",
+        process_inputs=_trace_write_files_inputs,
+    )
+    def write_files(self, files: Mapping[str, str]) -> None:
+        """Write multiple workspace files with one Docker archive upload.
+
+        Args:
+            files: Mapping of workspace-relative paths to UTF-8 text contents.
+
+        Raises:
+            RuntimeError: If the sandbox is not running.
+            TypeError: If any file content is not text.
+            WorkspacePathError: If paths are unsafe, collide after normalization,
+                or escape the workspace through parent symlinks.
+        """
+        if not self._alive or self._container is None:
+            raise RuntimeError("Sandbox is not running.")
+        normalized_files: dict[str, str] = {}
+        parent_dirs: set[str] = set()
+        for file_path, content in files.items():
+            relative_path = normalize_workspace_path(file_path)
+            if not isinstance(content, str):
+                raise TypeError("workspace file contents must be text.")
+            if relative_path in normalized_files:
+                raise WorkspacePathError(f"duplicate normalized workspace path: {relative_path!r}")
+            normalized_files[relative_path] = content
+            parent = PurePosixPath(relative_path).parent
+            while parent != PurePosixPath("."):
+                parent_dirs.add(parent.as_posix())
+                parent = parent.parent
+
+        if not normalized_files:
+            return
+
+        conflicting_paths = set(normalized_files).intersection(parent_dirs)
+        if conflicting_paths:
+            raise WorkspacePathError(
+                f"workspace path is both a file and a directory: {min(conflicting_paths)!r}"
+            )
+
+        ordered_directories = sorted(parent_dirs, key=lambda path: (path.count("/"), path))
+        parent_paths = tuple(f"/workspace/{path}" for path in ordered_directories) or (
+            "/workspace",
+        )
+        self._assert_container_paths(parent_paths)
+
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            for directory in ordered_directories:
+                directory_info = tarfile.TarInfo(name=f"{directory}/")
+                directory_info.type = tarfile.DIRTYPE
+                directory_info.mode = 0o755
+                directory_info.mtime = 0
+                archive.addfile(directory_info)
+            for relative_path, content in normalized_files.items():
+                encoded = content.encode("utf-8")
+                file_info = tarfile.TarInfo(name=relative_path)
+                file_info.size = len(encoded)
+                archive.addfile(file_info, io.BytesIO(encoded))
+
+        self.invalidate_read_cache("write_files")
+        self._container.put_archive("/workspace", buffer.getvalue())
+        logger.debug(
+            "DockerSandbox: wrote %d files in one archive.",
+            len(normalized_files),
+        )
 
     def _read_file_bytes_untraced(
         self,

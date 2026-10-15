@@ -52,7 +52,14 @@ def _read_host_text(repo_root: Path, rel_path: str) -> str:
     return file_path.read_text(encoding="utf-8")
 
 
-def _build_diff(rel_path: str, before_text: str, after_text: str) -> str:
+def _build_diff(
+    rel_path: str,
+    before_text: str,
+    after_text: str,
+    *,
+    before_exists: bool = True,
+    after_exists: bool = True,
+) -> str:
     """Build a unified diff with standard missing-final-newline markers."""
     rel_path = normalize_workspace_path(rel_path, allow_workspace_prefix=False)
     before_has_no_final_newline = bool(before_text) and not before_text.endswith(("\n", "\r"))
@@ -70,8 +77,8 @@ def _build_diff(rel_path: str, before_text: str, after_text: str) -> str:
     for line in difflib.unified_diff(
         before_lines,
         after_lines,
-        fromfile=f"a/{rel_path}",
-        tofile=f"b/{rel_path}",
+        fromfile=f"a/{rel_path}" if before_exists else "/dev/null",
+        tofile=f"b/{rel_path}" if after_exists else "/dev/null",
     ):
         rendered.append(line)
         if line.startswith(("---", "+++", "@@")) or not line:
@@ -206,6 +213,58 @@ def _cleanup_workspace_volume(client: Any, workspace_volume: str) -> tuple[bool,
             f"teardown_node: failed to remove workspace volume '{workspace_volume}' - {volume_error}"
         )
     return False, errors
+
+
+def _cleanup_run_owned_workspace_volume(workspace_volume: str) -> tuple[bool, list[str]]:
+    """Remove a run-owned workspace volume outside the normal teardown node.
+
+    Args:
+        workspace_volume: Volume name returned by the workspace builder.
+
+    Returns:
+        Whether Docker confirmed removal and any cleanup diagnostics.
+
+    Side Effects:
+        Connects to Docker, removes containers attached to this run's volume,
+        removes the volume, and closes the Docker client.
+    """
+    if not workspace_volume.startswith("agent_workspace_"):
+        return False, [
+            f"teardown_node: refused emergency cleanup of unexpected volume name '{workspace_volume}'"
+        ]
+    try:
+        client = get_docker_client()
+    except Exception as exc:  # noqa: BLE001 - cleanup cannot mask the graph failure
+        return False, [
+            f"teardown_node: could not connect to Docker for emergency cleanup of "
+            f"'{workspace_volume}' - {exc}"
+        ]
+
+    removed = False
+    errors: list[str] = []
+    try:
+        removed, errors = _cleanup_workspace_volume(client, workspace_volume)
+    except BaseException as exc:  # noqa: BLE001 - client closure also covers interrupts
+        errors.append(f"teardown_node: emergency cleanup of '{workspace_volume}' failed - {exc}")
+    finally:
+        try:
+            _close_client(client)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"teardown_node: emergency Docker client close failed - {exc}")
+    return removed, errors
+
+
+def _clear_active_workspace_volume(workspace_volume: str | None) -> None:
+    """Clear the current run's resource record after verified volume removal."""
+    if not workspace_volume:
+        return
+    from remediation_engine.orchestration.trajectory_exporter import (
+        get_active_trajectory_recorder,
+    )
+
+    recorder = get_active_trajectory_recorder()
+    if recorder is not None:
+        recorder.clear_workspace_volume(workspace_volume)
 
 
 def _lockfile_dependencies_contain(
@@ -463,17 +522,29 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
         Reads changed files from the Docker workspace and attempts to remove
         attached containers and the run-owned workspace volume.
     """
+    workspace_volume = state.get("workspace_volume")
     try:
-        return _run_teardown_node_impl(state)
-    except Exception as exc:  # noqa: BLE001
+        result = _run_teardown_node_impl(state)
+        if result.get("workspace_volume") is None:
+            _clear_active_workspace_volume(workspace_volume)
+        return result
+    except BaseException as exc:  # noqa: BLE001 - clean up before propagating interrupts
+        workspace_volume = state.get("workspace_volume")
+        cleanup_errors: list[str] = []
+        volume_removed = not bool(workspace_volume)
+        if isinstance(workspace_volume, str) and workspace_volume:
+            volume_removed, cleanup_errors = _cleanup_run_owned_workspace_volume(workspace_volume)
+            if volume_removed:
+                _clear_active_workspace_volume(workspace_volume)
+        if not isinstance(exc, Exception):
+            raise
         logger.exception("teardown_node: unexpected teardown failure.")
         return {
             "status": "completed_with_errors",
-            "workspace_volume": state.get("workspace_volume"),
+            "workspace_volume": None if volume_removed else workspace_volume,
             "changed_files": ChangedFilesProjection(),
             "diff": "",
-            "errors": list(state.get("errors", []) or [])
-            + [f"teardown_node: unexpected teardown failure - {exc}"],
+            "errors": [f"teardown_node: unexpected teardown failure - {exc}", *cleanup_errors],
         }
 
 
@@ -642,6 +713,7 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                                 continue
                             host_path = resolve_repository_path(repo_root, rel_path)
                             host_exists = host_path.is_file()
+                            workspace_file_exists = updated_text is not None
                             if updated_text is None and not host_exists:
                                 continue
                             if updated_text is None:
@@ -662,7 +734,13 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                                     errors,
                                 )
 
-                            diff_text = _build_diff(rel_path, original_text, updated_text)
+                            diff_text = _build_diff(
+                                rel_path,
+                                original_text,
+                                updated_text,
+                                before_exists=host_exists,
+                                after_exists=workspace_file_exists,
+                            )
                             if diff_text:
                                 diff_chunks.append(diff_text)
                                 changed_files.append(rel_path)

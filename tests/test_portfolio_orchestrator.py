@@ -920,6 +920,22 @@ def test_scoped_materialization_does_not_expand_optional_peer(tmp_path: Path):
 
 
 def test_scoped_angular_mutation_closure_stays_at_nine_packages(tmp_path: Path):
+    from remediation_engine.contracts.schemas import (
+        AgentActionStatus,
+        QAEvaluation,
+        QAPolicy,
+        RoutingStrategy,
+        SCARemediationStage,
+        TaskAttemptSnapshot,
+        WorkerAttemptResult,
+        WorkerExecutionDiagnostics,
+    )
+    from remediation_engine.orchestration.graph_wrappers import (
+        run_qa_critic_from_orchestrator,
+        run_update_subagent_from_orchestrator,
+    )
+    from remediation_engine.orchestration.supervisor_planner import instruction_digest
+
     angular_packages = [
         "@angular/animations",
         "@angular/common",
@@ -1077,6 +1093,134 @@ def test_scoped_angular_mutation_closure_stays_at_nine_packages(tmp_path: Path):
     assert batches[0].atomic
     assert batches[0].dispatchable
     assert set(batches[0].task_ids) == set(queue)
+
+    # Drive the real graph adapters and Supervisor transitions with only the
+    # worker and QA execution boundaries mocked.  This protects the complete
+    # closure -> atomic dispatch -> worker -> QA -> terminal-task path.
+    plan_id = "fixture-angular-nine"
+    dispatch_batch_id = batches[0].batch_id
+    cluster_id = "cluster-angular-nine"
+    committed_queue = {
+        task_id: task.model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": f"attempt-{task_id}",
+                "portfolio_plan_id": plan_id,
+                "strategy": RoutingStrategy.VERSION_BUMP,
+                "strategy_stage": SCARemediationStage.OSV_MINIMUM,
+                "qa_policy": QAPolicy.VERSION_BUMP,
+                "status": TaskStatus.PENDING,
+                "selected_version": "21.2.17",
+                "allowed_target_versions": ["21.2.17"],
+                "allowed_dependency_types": ["dependencies"],
+                "target_dependency_type": "dependencies",
+                "instruction": f"Update {task.target_package_name} to 21.2.17.",
+            }
+        )
+        for task_id, task in queue.items()
+    }
+    action = MultiPackageAction(
+        cluster_id=cluster_id,
+        dispatch_batch_id=dispatch_batch_id,
+        selected_strategy="version_bump",
+        package_mutations=[
+            PackageMutation(
+                task_id=task.task_id,
+                package_name=task.target_package_name,
+                manifest_path="package.json",
+                target_version="21.2.17",
+                dependency_type="dependencies",
+            )
+            for task in committed_queue.values()
+        ],
+        rationale="One atomic Angular dependency-closure update.",
+    )
+    action_digest = instruction_digest(action.model_dump_json())
+    snapshots = {
+        task.current_attempt_id: TaskAttemptSnapshot(
+            attempt_id=task.current_attempt_id,
+            task_id=task.task_id,
+            state_revision=1,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=dispatch_batch_id,
+            action_digest=action_digest,
+            qa_policy=task.qa_policy,
+            strategy_stage=task.strategy_stage,
+            selected_version=task.selected_version,
+            allowed_target_versions=task.allowed_target_versions,
+            target_package_name=task.target_package_name,
+            target_dependency_type=task.target_dependency_type,
+            allowed_dependency_types=task.allowed_dependency_types,
+            instruction=task.instruction,
+            instruction_digest=instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+            portfolio_plan_id=plan_id,
+        )
+        for task in committed_queue.values()
+    }
+    state = initial_orchestrator_state(str(tmp_path), prepared_groups)
+    state.update(
+        {
+            "task_queue": committed_queue,
+            "portfolio_dirty": False,
+            "active_target_task_ids": list(committed_queue),
+            "active_cluster_id": cluster_id,
+            "active_dispatch_batch_id": dispatch_batch_id,
+            "active_multi_package_action": action,
+            "attempt_snapshots_by_id": snapshots,
+        }
+    )
+    worker_results = {
+        task.current_attempt_id: WorkerAttemptResult(
+            attempt_id=task.current_attempt_id,
+            task_id=task.task_id,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=dispatch_batch_id,
+            action_digest=action_digest,
+            status=AgentActionStatus.SUCCESS,
+            executed_versions=["21.2.17"],
+            execution_diagnostics=WorkerExecutionDiagnostics(
+                validation_passed=True,
+                executed_versions=["21.2.17"],
+                effective_target_version="21.2.17",
+                effective_dependency_type="dependencies",
+            ),
+            instruction_digest=instruction_digest(task.instruction),
+        )
+        for task in committed_queue.values()
+    }
+    from unittest.mock import patch
+
+    with patch(
+        "remediation_engine.orchestration.graph.run_update_subagent_node",
+        return_value={"worker_results_by_attempt": worker_results, "errors": []},
+    ):
+        worker_projection = run_update_subagent_from_orchestrator(state)
+    after_worker = run_supervisor_node({**state, **worker_projection})
+    assert {task.status for task in after_worker["task_queue"].values()} == {
+        TaskStatus.OPTIMISTICALLY_FIXED
+    }
+
+    pass_evaluations = {
+        task.task_id: QAEvaluation(task_id=task.task_id, passed=True)
+        for task in committed_queue.values()
+    }
+    with patch(
+        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        return_value={
+            "qa_evaluations": pass_evaluations,
+            "eval_status": "all_passed",
+            "status": "qa_completed",
+            "errors": [],
+        },
+    ):
+        qa_projection = run_qa_critic_from_orchestrator(after_worker)
+    final = run_supervisor_node({**after_worker, **qa_projection})
+    assert set(final["task_queue"]) == set(queue)
+    assert {task.status for task in final["task_queue"].values()} == {TaskStatus.QA_PASSED}
+    assert final["next_routing_step"] == "teardown"
 
 
 def test_scoped_coupling_does_not_enable_non_angular_namespaces():
@@ -1797,7 +1941,9 @@ def test_supervisor_preserves_all_cluster_targets_through_commit(tmp_path: Path)
     } == set(queue)
 
 
-def test_certified_plan_continues_after_breaking_change_workaround_pivot(tmp_path: Path):
+def test_certified_plan_continues_after_breaking_change_workaround_pivot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     from remediation_engine.contracts.schemas import (
         FailureCategory,
         QAAttemptResult,
@@ -1809,6 +1955,7 @@ def test_certified_plan_continues_after_breaking_change_workaround_pivot(tmp_pat
         UpdateRetryDiagnostics,
     )
     from remediation_engine.orchestration.supervisor_planner import instruction_digest
+    from remediation_engine.settings import AppSettings
 
     groups = [
         _group("express-jwt", "package.json", package_version="0.1.3", fixed_version="7.7.8"),
@@ -2016,6 +2163,19 @@ def test_certified_plan_continues_after_breaking_change_workaround_pivot(tmp_pat
         }
     )
 
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.get_runtime_settings",
+        lambda: AppSettings(openai_api_key=None),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.registry_candidate_sets_for_context",
+        lambda _context: ((), None),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.propose_and_verify_tactical_action",
+        lambda *_args, **_kwargs: (None, None),
+    )
+
     pivot = run_supervisor_node(state)
 
     assert pivot["next_routing_step"] == "workaround_subagent"
@@ -2132,6 +2292,83 @@ def test_apply_maps_solver_no_fix_to_code_workaround(tmp_path: Path):
 
     assert diagnostics == []
     assert committed["task-1"].strategy.value == "code_workaround"
+
+
+def test_apply_clears_stale_mutation_inputs_for_code_workaround():
+    issue = VulnerabilityIssue(
+        source=IssueSource.SYNTHETIC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-77777",
+        package_name="notevil",
+        package_version="1.3.3",
+        file_path="package.json",
+    )
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file="package.json",
+        package_manager="npm",
+        declaration_type="dependencies",
+        is_direct_dependency=True,
+        localization_confidence=1.0,
+    )
+    workaround_plan = FixPlan(
+        status=FixPlanStatus.WORKAROUND_FOUND,
+        instruction="Apply the authorized code workaround.",
+        strategy_used="WORKAROUND",
+        workaround_snippets=["Guard the vulnerable call."],
+    )
+    group = group_issues([issue], sca_issue_plans=[(localized, workaround_plan)])[0]
+    task = build_initial_remediation_task(group, "task-1")
+    assert task.strategy == RoutingStrategy.CODE_WORKAROUND
+    assert task.target_dependency_type == "dependencies"
+    assert task.selected_plan_issue_ids
+
+    decision = SolverTaskDecision(
+        task_id=task.task_id,
+        selected_strategy="code_workaround",
+        selected_route="code_workaround",
+        selected_version=None,
+        allowed_alternative_versions=[],
+        allowed_dependency_types=[],
+        strategy_stage="code_workaround",
+        selected_plan_issue_ids=list(task.selected_plan_issue_ids),
+        target_occurrence_id=make_occurrence_id("package.json", "notevil"),
+        target_group_id=group.group_id,
+        target_package_name="notevil",
+        manifest_path="package.json",
+        lockfile_package_key="node_modules/notevil",
+        dependency_type=None,
+    )
+    plan_id = "portfolio-code-workaround"
+    plan = SimpleNamespace(
+        plan_id=plan_id,
+        portfolio_plan_id=plan_id,
+        task_ids=[task.task_id],
+        task_revisions={task.task_id: task.task_revision},
+        planned_task_revisions={task.task_id: task.task_revision + 1},
+        task_strategies={task.task_id: RoutingStrategy.CODE_WORKAROUND},
+        resolution_certificate=None,
+        solver_plan=SimpleNamespace(
+            status=SolverStatus.OPTIMAL,
+            candidate_catalog_complete=True,
+            selected_plan=SimpleNamespace(task_decisions=[decision]),
+        ),
+    )
+
+    committed_groups, committed, diagnostics = apply_portfolio_plan(
+        plan,
+        [group],
+        {task.task_id: task},
+    )
+
+    assert diagnostics == []
+    committed_task = committed[task.task_id]
+    assert committed_task.target_dependency_type is None
+    assert committed_task.selected_version is None
+    assert committed_task.allowed_target_versions == []
+    assert committed_task.allowed_dependency_types == []
+    assert _portfolio_plan_violations(plan, committed, committed_groups) == []
 
 
 def test_apply_syncs_direct_instruction_to_solver_selected_version(tmp_path: Path):

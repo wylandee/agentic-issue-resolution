@@ -20,6 +20,17 @@ def get_runtime_settings() -> AppSettings:
     return settings if settings is not None else AppSettings.from_env()
 
 
+def openai_api_key_kwargs(settings: AppSettings | None = None) -> dict[str, str]:
+    """Return the explicit OpenAI credential argument when settings provide one.
+
+    Leaving the argument out when the configured key is empty preserves the
+    OpenAI client's normal environment lookup for callers that do not inject
+    settings.
+    """
+    api_key = (settings or get_runtime_settings()).openai_api_key
+    return {"api_key": api_key} if api_key else {}
+
+
 def get_bound_runtime_settings() -> AppSettings | None:
     """Return settings explicitly bound by the current graph invocation."""
     return _settings_var.get()

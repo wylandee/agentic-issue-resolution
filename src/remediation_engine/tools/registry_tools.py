@@ -26,6 +26,7 @@ from langsmith import traceable
 from semantic_version import NpmSpec, Version
 
 from remediation_engine.contracts.version_policy import RegistryCandidate
+from remediation_engine.tools.npm_graph import _normalize_npm_operator_whitespace
 from remediation_engine.tools.registry_cache import (
     PackumentFetcher,
     RegistryPackumentCache,
@@ -74,7 +75,8 @@ def _requirement_matches(requirement: str | None, version: Version) -> bool:
     if not requirement:
         return False
     try:
-        return NpmSpec(requirement).match(version)
+        normalized = _normalize_npm_operator_whitespace(requirement)
+        return bool(normalized) and NpmSpec(normalized).match(version)
     except (TypeError, ValueError):
         return False
 

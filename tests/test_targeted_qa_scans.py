@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -28,6 +29,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.orchestration import qa_odc
 from remediation_engine.orchestration._qa_runtime import (
     _attribute_reported_occurrences,
     _package_lock_inventory,
@@ -42,6 +44,13 @@ from remediation_engine.orchestration.qa_critic import (
     _missing_targeted_input_paths,
     _run_global_execution,
     run_workspace_setup_scan_node,
+)
+from remediation_engine.orchestration.qa_odc import (
+    _ODCExecution,
+    _ODCScanTimeout,
+    _record_scan_result,
+    _redact_odc_command,
+    _run_odc_process,
 )
 from remediation_engine.orchestration.qa_policy_engine import (
     _apply_policy_decision,
@@ -159,6 +168,139 @@ def _test_outcome(ok: bool = True) -> _QATestExecutionOutcome:
             ),
         ),
     )
+
+
+def test_odc_redacts_secret_arguments_from_logs_diagnostics_and_scan_records(
+    tmp_path, caplog, monkeypatch
+) -> None:
+    """Keep ODC credentials out of command logs, diagnostic files, and QA evidence."""
+    secrets = (
+        "odc-api-key-test-only",
+        "odc-nvd-key-test-only",
+        "odc-proxy-pass-test-only",
+        "odc-output-key-test-only",
+    )
+    command = [
+        "docker",
+        "run",
+        "--apiKey",
+        secrets[0],
+        f"--nvdApiKey={secrets[1]}",
+        "--proxyPass",
+        secrets[2],
+    ]
+    execution = _ODCExecution(
+        run_id="run-id",
+        scope="targeted",
+        container_name="remedy-odc-run-id",
+        log_path=tmp_path / "odc.json",
+        started_at_utc="2026-10-15T00:00:00+00:00",
+    )
+    process = subprocess.CompletedProcess(
+        command,
+        0,
+        stdout=f"report complete --apiKey={secrets[3]}",
+        stderr=f"proxy --proxyPass {secrets[2]}",
+    )
+    monkeypatch.setattr(qa_odc, "_new_odc_execution", lambda _scope: execution)
+    monkeypatch.setattr(qa_odc, "_odc_command", lambda *_args: command)
+    monkeypatch.setattr(qa_odc.subprocess, "run", lambda *_args, **_kwargs: process)
+
+    result = _run_odc_process("workspace-volume", "targeted-dir")
+
+    assert _redact_odc_command(command) == [
+        "docker",
+        "run",
+        "--apiKey",
+        "<redacted>",
+        "--nvdApiKey=<redacted>",
+        "--proxyPass",
+        "<redacted>",
+    ]
+    assert _redact_odc_command(["echo", "tokenizer", "bypass", "still-visible"]) == [
+        "echo",
+        "tokenizer",
+        "bypass",
+        "still-visible",
+    ]
+    assert all(secret not in caplog.text for secret in secrets)
+    diagnostic = json.loads(execution.log_path.read_text(encoding="utf-8"))
+    assert all(secret not in json.dumps(diagnostic) for secret in secrets)
+
+    scan = _record_scan_result(
+        _SecurityScanResult(False, f"scan failed --apiKey {secrets[0]}", set(), set(), set()),
+        label="odc:targeted",
+        exit_code=1,
+        stdout=f"--nvdApiKey={secrets[1]}",
+        stderr=f"--proxyPass {secrets[2]}",
+        error=f"subprocess failed --password {secrets[3]}",
+    )
+    scan_payload = {
+        "summary": scan.summary,
+        "stdout": scan.raw_stdout,
+        "stderr": scan.raw_stderr,
+        "record": scan.scan_records[0].__dict__,
+    }
+    assert all(secret not in json.dumps(scan_payload) for secret in secrets)
+    assert result.returncode == 0
+
+
+def test_odc_timeout_exception_redacts_command_and_streams(tmp_path) -> None:
+    """A timeout's string form and retained streams must not expose credentials."""
+    secret = "odc-timeout-secret-test-only"
+    original = subprocess.TimeoutExpired(
+        ["docker", "run", "--nvdApiKey", secret],
+        10,
+        output=f"retrying --apiKey={secret}",
+        stderr=f"proxy --proxyPass {secret}",
+    )
+    execution = _ODCExecution(
+        run_id="run-id",
+        scope="full",
+        container_name="remedy-odc-run-id",
+        log_path=tmp_path / "odc-timeout.json",
+        started_at_utc="2026-10-15T00:00:00+00:00",
+    )
+    cleanup = qa_odc._ODCCleanupResult(
+        container_name=execution.container_name,
+        succeeded=True,
+        already_absent=False,
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    wrapped = _ODCScanTimeout(original, execution, cleanup, None)
+
+    assert secret not in str(wrapped)
+    assert secret not in str(wrapped.cmd)
+    assert secret not in str(wrapped.output)
+    assert secret not in str(wrapped.stderr)
+
+    qa_odc._write_odc_diagnostic_log(
+        execution,
+        original.cmd,
+        status="timeout",
+        error=original,
+    )
+    diagnostic = execution.log_path.read_text(encoding="utf-8")
+    assert secret not in diagnostic
+
+
+def test_odc_exception_redacts_quoted_and_escaped_command_values() -> None:
+    """Replace the exact command representation before scrubbing other text."""
+    from remediation_engine.orchestration.qa_odc import _redact_odc_exception
+
+    secret = "odc-quoted-'secret'\\path"
+    errors = (
+        subprocess.TimeoutExpired(["docker", "run", "--password", secret], 10),
+        subprocess.CalledProcessError(1, ["docker", "run", "--nvdApiKey", secret]),
+    )
+
+    for error in errors:
+        safe_message = _redact_odc_exception(error)
+        assert secret not in safe_message
+        assert "<redacted>" in safe_message
 
 
 def test_package_lock_inventory_fingerprints_root_edges_and_occurrence_metadata() -> None:
@@ -562,10 +704,10 @@ def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
     assert results.scan_evidence.effective_scope == ScanScope.TARGETED
     assert results.scan_evidence.authoritative is False
     assert results.scan_evidence.covered_task_ids == ["task-1"]
-    assert any(
-        call.args[0] == ".odc-targeted/000/package-lock.json"
-        for call in sandbox.write_file.call_args_list
-    )
+    staged_files = sandbox.write_files.call_args.args[0]
+    assert ".odc-targeted/000/package-lock.json" in staged_files
+    sandbox.write_files.assert_called_once()
+    sandbox.write_file.assert_not_called()
     sandbox.run.assert_called_once_with("rm -rf -- .odc-targeted", timeout=30)
 
 
@@ -811,16 +953,10 @@ def test_multiple_physical_targets_are_scanned_without_full_workspace_fallback()
         occurrence.found_identifiers == ["CVE-2026-0001"]
         for occurrence in evidence.covered_occurrences
     )
-    assert (
-        len(
-            [
-                call
-                for call in sandbox.write_file.call_args_list
-                if call.args[0].endswith("/package-lock.json")
-            ]
-        )
-        == 1
-    )
+    staged_files = sandbox.write_files.call_args.args[0]
+    assert sum(path.endswith("/package-lock.json") for path in staged_files) == 1
+    sandbox.write_files.assert_called_once()
+    sandbox.write_file.assert_not_called()
     sandbox.run.assert_called_once_with("rm -rf -- .odc-targeted", timeout=30)
 
 
@@ -1380,22 +1516,66 @@ def test_targeted_manifest_scans_each_package_lock_once_and_preserves_occurrence
         "node_modules/b",
     }
     assert manifest.input_paths_by_project == {".odc-targeted/000": ("package-lock.json",)}
-    written_files = {call.args[0]: call.args[1] for call in sandbox.write_file.call_args_list}
-    assert set(written_files) == {
+    sandbox.write_files.assert_called_once()
+    sandbox.write_file.assert_not_called()
+    staged_files = sandbox.write_files.call_args.args[0]
+    assert set(staged_files) == {
         ".odc-targeted/000/package.json",
         ".odc-targeted/000/package-lock.json",
         ".odc-targeted/000/node_modules/a/package.json",
         ".odc-targeted/000/node_modules/b/package.json",
         ".odc-targeted/000/node_modules/nested/node_modules/a/package.json",
     }
-    assert sum(path.endswith("/package-lock.json") for path in written_files) == 1
-    assert json.loads(written_files[".odc-targeted/000/node_modules/a/package.json"]) == {
+    assert sum(path.endswith("/package-lock.json") for path in staged_files) == 1
+    assert json.loads(staged_files[".odc-targeted/000/node_modules/a/package.json"]) == {
         "name": "a",
         "version": "1.0.0",
     }
     assert json.loads(
-        written_files[".odc-targeted/000/node_modules/nested/node_modules/a/package.json"]
+        staged_files[".odc-targeted/000/node_modules/nested/node_modules/a/package.json"]
     ) == {"name": "a", "version": "1.0.0"}
+
+
+def test_trace_esbuild_target_stages_files_in_one_batch() -> None:
+    sandbox = MagicMock()
+    lockfile = {
+        "lockfileVersion": 3,
+        "name": "juice-shop",
+        "version": "1.0.0",
+        "packages": {
+            "": {
+                "name": "juice-shop",
+                "version": "1.0.0",
+                "dependencies": {"esbuild": "0.28.1"},
+            },
+            "node_modules/esbuild": {"version": "0.28.1"},
+        },
+    }
+    sandbox.read_file.return_value = json.dumps(lockfile)
+    trace_target = replace(
+        _target(),
+        task_id="task-3",
+        target_package="esbuild",
+        expected_version="0.28.1",
+    )
+
+    batch = _resolve_targeted_packages(sandbox, [trace_target])
+    manifest = _write_targeted_artifacts(sandbox, batch.closures_by_task)
+
+    assert batch.failures_by_task == {}
+    assert manifest.expected_package_occurrences == (("esbuild", "0.28.1"),)
+    sandbox.write_files.assert_called_once()
+    sandbox.write_file.assert_not_called()
+    staged_files = sandbox.write_files.call_args.args[0]
+    assert set(staged_files) == {
+        ".odc-targeted/000/package.json",
+        ".odc-targeted/000/package-lock.json",
+        ".odc-targeted/000/node_modules/esbuild/package.json",
+    }
+    assert json.loads(staged_files[".odc-targeted/000/node_modules/esbuild/package.json"]) == {
+        "name": "esbuild",
+        "version": "0.28.1",
+    }
 
 
 def test_missing_targeted_project_path_keeps_coverage_inconclusive() -> None:

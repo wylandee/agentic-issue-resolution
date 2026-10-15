@@ -124,16 +124,12 @@ from remediation_engine.orchestration.supervisor_portfolio import (
     run_portfolio_plan_tool,
 )
 from remediation_engine.orchestration.supervisor_routing import (
-    _apply_transition,
     _build_consistency_event,
     _build_workaround_retry_instruction,
-    _calculate_eligible_actions,
     _dedupe_consistency_events,
     _deterministic_routing,
     _emit_audit,
     _no_fix_decision_requires_fallback,
-    _select_deterministic_action,
-    _validate_invariants,
 )
 from remediation_engine.orchestration.supervisor_spawn import (
     _materialize_spawn_requests,
@@ -778,8 +774,6 @@ __all__ = [
     "_build_deterministic_retry_plan",
     "_build_high_level_retry_instruction",
     "_build_workaround_retry_instruction",
-    "_calculate_eligible_actions",
-    "_apply_transition",
     "_commit_retry_plans",
     "_commit_task_transition",
     "_create_attempt_snapshot",
@@ -794,9 +788,7 @@ __all__ = [
     "_planner_plan_violations",
     "_repair_invalid_planner_plans",
     "_run_deterministic_retry_planner",
-    "_select_deterministic_action",
     "_terminalize_pivot_parents",
-    "_validate_invariants",
     "_next_sca_stage",
     "_validate_committed_state",
 ]
@@ -817,6 +809,7 @@ def _ordered_update_candidates(
     *,
     plan: SupervisorRetryPlan | None = None,
     diagnostics: UpdateRetryDiagnostics | None = None,
+    allow_attempted_selected_version: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Return candidates within the task's solver and retry allowlists."""
     solver_authoritative = (
@@ -898,7 +891,12 @@ def _ordered_update_candidates(
     for value in ordered_versions:
         normalized = str(value).strip().lstrip("vV")
         key = normalized.lower()
-        if not key or key in attempted_versions or key in seen_versions:
+        attempted_replay = (
+            allow_attempted_selected_version
+            and selected_version is not None
+            and key == selected_version.lower()
+        )
+        if not key or (key in attempted_versions and not attempted_replay) or key in seen_versions:
             continue
         seen_versions.add(key)
         versions.append(normalized)
@@ -974,6 +972,7 @@ def _authorize_update_dispatch(
     *,
     plan: SupervisorRetryPlan | None = None,
     diagnostics: UpdateRetryDiagnostics | None = None,
+    allow_attempted_selected_version: bool = False,
 ) -> _UpdateDispatchAuthorization | None:
     """Return a dispatch authorization or reject incomplete update state.
 
@@ -985,6 +984,7 @@ def _authorize_update_dispatch(
         task,
         plan=plan,
         diagnostics=diagnostics,
+        allow_attempted_selected_version=allow_attempted_selected_version,
     )
     if not task.instruction.strip():
         return None
@@ -1024,6 +1024,87 @@ def _authorize_update_dispatch(
         allowed_target_versions=tuple(allowed_versions),
         allowed_dependency_types=tuple(allowed_dependency_types),
     )
+
+
+def _validated_delta_replay_candidate(
+    task: RemediationTask,
+    delta_isolation_by_cluster: Mapping[str, Any],
+    attempt_snapshots_by_id: Mapping[str, TaskAttemptSnapshot],
+) -> str | None:
+    """Return the exact candidate a validated delta peer may replay once.
+
+    A failed atomic QA batch records each worker-executed version as attempted.
+    When the Supervisor validates a unique blame and a restored candidate,
+    each non-blamed task is requeued for its own authoritative QA run. Permit
+    only that task's original selected version, and only while its immutable
+    attempt snapshot and current solver allowlist still authorize it.
+    """
+    if (
+        task.status != TaskStatus.PENDING
+        or task.current_attempt_id is not None
+        or not task.selected_version
+    ):
+        return None
+    selected_version = task.selected_version.strip().lstrip("vV")
+    for cluster_id, record in delta_isolation_by_cluster.items():
+        if not isinstance(record, Mapping):
+            continue
+        authorized_task_ids = record.get("authoritative_qa_replay_task_ids")
+        attempt_ids_by_task = record.get("attempt_ids_by_task")
+        responsible_task_ids = record.get("responsible_task_ids")
+        if (
+            record.get("status") != "IDENTIFIED"
+            or record.get("candidate_restored") is not True
+            or record.get("cluster_id") != cluster_id
+            or not isinstance(authorized_task_ids, (list, tuple))
+            or task.task_id not in authorized_task_ids
+            or not isinstance(attempt_ids_by_task, Mapping)
+            or task.task_id not in attempt_ids_by_task
+            or not isinstance(responsible_task_ids, (list, tuple))
+            or len(responsible_task_ids) != 1
+            or task.task_id in responsible_task_ids
+        ):
+            continue
+
+        original_attempt_id = attempt_ids_by_task[task.task_id]
+        snapshot = attempt_snapshots_by_id.get(original_attempt_id)
+        if (
+            snapshot is None
+            or snapshot.attempt_id != original_attempt_id
+            or snapshot.task_id != task.task_id
+            or snapshot.dispatch_node != "update_subagent"
+            or snapshot.cluster_id != cluster_id
+            or snapshot.dispatch_batch_id != record.get("dispatch_batch_id")
+            or snapshot.action_digest != record.get("action_digest")
+            or snapshot.portfolio_plan_id != record.get("source_portfolio_plan_id")
+            or snapshot.selected_version is None
+            or snapshot.selected_version.strip().lstrip("vV") != selected_version
+            or selected_version
+            not in {value.strip().lstrip("vV") for value in snapshot.allowed_target_versions}
+            or selected_version
+            not in {value.strip().lstrip("vV") for value in task.allowed_target_versions}
+        ):
+            continue
+        return selected_version
+    return None
+
+
+def _validated_delta_replay_task_ids(
+    task_queue: Mapping[str, RemediationTask],
+    delta_isolation_by_cluster: Mapping[str, Any],
+    attempt_snapshots_by_id: Mapping[str, TaskAttemptSnapshot],
+) -> set[str]:
+    """Return pending peers with a still-valid one-use candidate replay grant."""
+    return {
+        task_id
+        for task_id, task in task_queue.items()
+        if _validated_delta_replay_candidate(
+            task,
+            delta_isolation_by_cluster,
+            attempt_snapshots_by_id,
+        )
+        is not None
+    }
 
 
 def _current_action_summaries(
@@ -1468,7 +1549,7 @@ def _apply_tactical_supervisor(
             errors.append(f"supervisor: {detail}")
             return SupervisorDecision(
                 decision_code=DecisionCode.REGISTRY_VERIFICATION_PENDING,
-                next_node="final_full_scan",
+                next_node="supervisor",
                 target_task_ids=[],
                 task_status_updates={task.task_id: TaskStatus.INCONCLUSIVE},
                 instructions=(
@@ -2171,6 +2252,60 @@ def _build_multi_package_action(
         )
     except ValueError:
         return None
+
+
+def _validated_active_qa_multi_package_action(
+    action: Any,
+    target_task_ids: Iterable[str],
+    task_queue: Mapping[str, RemediationTask],
+    attempt_snapshots_by_id: Mapping[str, TaskAttemptSnapshot],
+) -> MultiPackageAction | None:
+    """Return an active package action only when QA owns its exact committed batch.
+
+    Args:
+        action: Active action retained from the worker dispatch.
+        target_task_ids: Tasks selected for the current QA dispatch.
+        task_queue: Current authoritative task records.
+        attempt_snapshots_by_id: Immutable committed attempt snapshots.
+
+    Returns:
+        The action if its task set and provenance match the current QA attempts;
+        otherwise ``None``.
+    """
+    if not isinstance(action, MultiPackageAction):
+        return None
+
+    target_ids = list(target_task_ids)
+    mutation_task_ids = [mutation.task_id for mutation in action.package_mutations]
+    cluster_id = action.cluster_id
+    dispatch_batch_id = action.dispatch_batch_id
+    if (
+        not target_ids
+        or len(target_ids) != len(set(target_ids))
+        or len(mutation_task_ids) != len(set(mutation_task_ids))
+        or set(mutation_task_ids) != set(target_ids)
+        or not cluster_id
+        or not dispatch_batch_id
+    ):
+        return None
+
+    action_digest = instruction_digest(action.model_dump_json())
+    for task_id in target_ids:
+        task = task_queue.get(task_id)
+        if task is None or not task.current_attempt_id:
+            return None
+        snapshot = attempt_snapshots_by_id.get(task.current_attempt_id)
+        if (
+            snapshot is None
+            or snapshot.task_id != task_id
+            or snapshot.task_revision != task.task_revision
+            or snapshot.dispatch_node != "update_subagent"
+            or snapshot.cluster_id != cluster_id
+            or snapshot.dispatch_batch_id != dispatch_batch_id
+            or snapshot.action_digest != action_digest
+        ):
+            return None
+    return action
 
 
 def _group_manifest_path(group: VulnerabilityGroup) -> str | None:
@@ -2922,6 +3057,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         state.get("worker_results_by_attempt", {})
     )
     qa_results_by_attempt: dict[str, QAAttemptResult] = dict(state.get("qa_results_by_attempt", {}))
+    delta_isolation_by_cluster: dict[str, Any] = dict(
+        state.get("delta_isolation_by_cluster", {}) or {}
+    )
     qa_rerun_counts_by_attempt: dict[str, int] = dict(state.get("qa_rerun_counts_by_attempt", {}))
     accepted_package_inventory_by_lockfile: dict[str, str] = dict(
         state.get("accepted_package_inventory_by_lockfile", {}) or {}
@@ -3132,9 +3270,10 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             if snapshot is not None and isinstance(snapshot.action_digest, str)
             else None
         )
-        for stale_result in worker_results_by_attempt.values():
+        for result_key, stale_result in worker_results_by_attempt.items():
             if (
-                stale_result.task_id == task_id
+                result_key != current_attempt_id
+                and stale_result.task_id == task_id
                 and stale_result.attempt_id != current_attempt_id
                 and stale_result.attempt_id not in processed_worker_attempt_ids
             ):
@@ -3151,7 +3290,10 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 processed_worker_attempt_ids.add(stale_result.attempt_id)
                 new_worker_attempt_ids.append(stale_result.attempt_id)
         if result is not None and task.status in _TERMINAL_STATUSES:
-            if current_attempt_id not in processed_worker_attempt_ids:
+            if (
+                current_attempt_id not in processed_worker_attempt_ids
+                and result.attempt_id not in processed_worker_attempt_ids
+            ):
                 consistency_events.append(
                     _build_consistency_event(
                         error_code="TERMINAL_TASK_RESULT_IGNORED",
@@ -3162,12 +3304,17 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                         details="A late worker result cannot reopen a terminal task.",
                     )
                 )
-                processed_worker_attempt_ids.add(current_attempt_id)
-                new_worker_attempt_ids.append(current_attempt_id)
+                processed_worker_attempt_ids.add(result.attempt_id)
+                new_worker_attempt_ids.append(result.attempt_id)
             continue
-        if result is not None and current_attempt_id not in processed_worker_attempt_ids:
+        if (
+            result is not None
+            and current_attempt_id not in processed_worker_attempt_ids
+            and result.attempt_id not in processed_worker_attempt_ids
+        ):
             if (
-                result.task_id != task_id
+                result.attempt_id != current_attempt_id
+                or result.task_id != task_id
                 or result.task_revision != task.task_revision
                 or snapshot is None
                 or (snapshot is not None and snapshot.task_revision != result.task_revision)
@@ -3203,8 +3350,13 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     f"supervisor: ignored mismatched worker result for {task_id} "
                     f"attempt {result.attempt_id}."
                 )
-                processed_worker_attempt_ids.add(current_attempt_id)
-                new_worker_attempt_ids.append(current_attempt_id)
+                rejected_attempt_id = (
+                    result.attempt_id
+                    if result.attempt_id != current_attempt_id
+                    else current_attempt_id
+                )
+                processed_worker_attempt_ids.add(rejected_attempt_id)
+                new_worker_attempt_ids.append(rejected_attempt_id)
                 continue
 
             execution = result.execution_diagnostics
@@ -3790,7 +3942,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 }
             validated_delta_blame_task_id = _validated_delta_isolation_blame(
                 portfolio_escalation if isinstance(portfolio_escalation, Mapping) else None,
-                state.get("delta_isolation_by_cluster") or {},
+                delta_isolation_by_cluster,
                 atomic_cluster_task_ids,
                 task_queue,
                 attempt_snapshots_by_id,
@@ -3806,6 +3958,17 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     "triggering_attempt_id": None,
                     "source_portfolio_plan_id": None,
                 }
+            validated_delta_cluster_id = next(
+                (
+                    snapshot.cluster_id
+                    for task_id in atomic_cluster_task_ids
+                    if (task := task_queue.get(task_id)) is not None
+                    and task.current_attempt_id is not None
+                    and (snapshot := attempt_snapshots_by_id.get(task.current_attempt_id))
+                    is not None
+                ),
+                None,
+            )
             for task_id in atomic_cluster_task_ids:
                 task = task_queue[task_id]
                 if task_id == validated_delta_blame_task_id:
@@ -3826,7 +3989,18 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     updates=updates,
                     close_attempt=True,
                 )
-            if validated_delta_blame_task_id is not None:
+            if validated_delta_blame_task_id is not None and validated_delta_cluster_id is not None:
+                isolation_record = delta_isolation_by_cluster.get(validated_delta_cluster_id)
+                if isinstance(isolation_record, Mapping):
+                    replay_task_ids = [
+                        task_id
+                        for task_id in atomic_cluster_task_ids
+                        if task_id != validated_delta_blame_task_id
+                    ]
+                    delta_isolation_by_cluster[validated_delta_cluster_id] = {
+                        **isolation_record,
+                        "authoritative_qa_replay_task_ids": replay_task_ids,
+                    }
                 errors.append(
                     "supervisor: delta attribution charged the blamed task and requeued "
                     "untested cluster peers."
@@ -4279,6 +4453,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             current_status=str(state.get("status") or ""),
             triage_required=bool(state.get("triage_required")),
             portfolio_plan=state.get("portfolio_plan"),
+            delta_replay_task_ids=_validated_delta_replay_task_ids(
+                task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+            ),
         )
         target_task_id = (
             deterministic_target_decision.target_task_ids[0]
@@ -4370,6 +4547,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
                     portfolio_plan=state.get("portfolio_plan"),
+                    delta_replay_task_ids=_validated_delta_replay_task_ids(
+                        task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+                    ),
                 )
 
     # Retry exhaustion is evaluated only after tactical reasoning and the
@@ -4619,6 +4799,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             current_status=str(state.get("status") or ""),
             triage_required=triage_required,
             portfolio_plan=state.get("portfolio_plan"),
+            delta_replay_task_ids=_validated_delta_replay_task_ids(
+                task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+            ),
         )
     # The deterministic decision is authoritative. QA feedback below is
     # carried only when Python produced it for the selected task; no model
@@ -4668,6 +4851,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             active_target_task_ids=active_target_task_ids,
             current_status=str(state.get("status") or ""),
             portfolio_plan=state.get("portfolio_plan"),
+            delta_replay_task_ids=_validated_delta_replay_task_ids(
+                task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+            ),
         )
         logger.info("supervisor: deterministic fallback â†’ next_node=%s", decision.next_node)
         fallback_pivot_strategy_by_parent = {
@@ -4827,6 +5013,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 active_target_task_ids=active_target_task_ids,
                 current_status=str(state.get("status") or ""),
                 portfolio_plan=state.get("portfolio_plan"),
+                delta_replay_task_ids=_validated_delta_replay_task_ids(
+                    task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+                ),
             )
             fallback_pivot_strategy_by_parent = {
                 req.parent_task_id: req.strategy
@@ -4941,6 +5130,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     current_status=str(state.get("status") or ""),
                     triage_required=triage_required,
                     portfolio_plan=state.get("portfolio_plan"),
+                    delta_replay_task_ids=_validated_delta_replay_task_ids(
+                        task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+                    ),
                 )
                 valid_target_ids = list(decision.target_task_ids)
                 valid_unfixable_ids = list(decision.unfixable_task_ids)
@@ -5054,6 +5246,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
                     portfolio_plan=state.get("portfolio_plan"),
+                    delta_replay_task_ids=_validated_delta_replay_task_ids(
+                        task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+                    ),
                 )
                 valid_target_ids = list(decision.target_task_ids)
                 valid_unfixable_ids = list(decision.unfixable_task_ids)
@@ -5108,6 +5303,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     active_target_task_ids=active_target_task_ids,
                     current_status=str(state.get("status") or ""),
                     portfolio_plan=state.get("portfolio_plan"),
+                    delta_replay_task_ids=_validated_delta_replay_task_ids(
+                        task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+                    ),
                 )
 
     # ------------------------------------------------------------------
@@ -5346,6 +5544,11 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 continue
             plan = retry_plans_by_task.get(task_id)
             diagnostics = retry_diagnostics_by_task.get(task_id)
+            delta_replay_candidate = _validated_delta_replay_candidate(
+                task,
+                delta_isolation_by_cluster,
+                attempt_snapshots_by_id,
+            )
             if defer_verified_absent_portfolio_replan and task.current_attempt_id is not None:
                 snapshot = attempt_snapshots_by_id.get(task.current_attempt_id)
                 if (
@@ -5367,6 +5570,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 task,
                 plan=plan,
                 diagnostics=diagnostics,
+                allow_attempted_selected_version=delta_replay_candidate is not None,
             )
             if authorization is None and task.strategy == RoutingStrategy.VERSION_BUMP:
                 group = group_by_id.get(task.parent_group_id)
@@ -5399,6 +5603,14 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                             task,
                             plan=plan,
                             diagnostics=diagnostics,
+                            allow_attempted_selected_version=(
+                                _validated_delta_replay_candidate(
+                                    task,
+                                    delta_isolation_by_cluster,
+                                    attempt_snapshots_by_id,
+                                )
+                                is not None
+                            ),
                         )
             if authorization is not None:
                 update_dispatch_authorizations[task_id] = authorization
@@ -5454,6 +5666,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             current_status=str(state.get("status") or ""),
             triage_required=triage_required,
             portfolio_plan=state.get("portfolio_plan"),
+            delta_replay_task_ids=_validated_delta_replay_task_ids(
+                task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+            ),
         )
         resolved_next_node = decision.next_node
         resolved_target_task_ids = _normalize_target_task_ids_for_node(
@@ -5560,6 +5775,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             workspace_volume=state.get("workspace_volume"),
             final_full_scan_completed=bool(state.get("final_full_scan_completed")),
             portfolio_plan=state.get("portfolio_plan"),
+            delta_replay_task_ids=_validated_delta_replay_task_ids(
+                task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+            ),
         )
         resolved_next_node = decision.next_node
         resolved_target_task_ids = _normalize_target_task_ids_for_node(
@@ -5687,10 +5905,22 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             action = action.model_copy(update={"dispatch_batch_id": active_dispatch_batch_id})
             active_multi_package_action = action
             decision = decision.model_copy(update={"multi_package_action": action})
-    elif resolved_next_node == "qa_critic" and decision.cluster_id:
-        active_cluster_id = decision.cluster_id
-        active_dispatch_batch_id = state.get("active_dispatch_batch_id")
-        active_multi_package_action = state.get("active_multi_package_action")
+    elif resolved_next_node == "qa_critic":
+        if decision.cluster_id:
+            active_cluster_id = decision.cluster_id
+            active_dispatch_batch_id = state.get("active_dispatch_batch_id")
+            active_multi_package_action = state.get("active_multi_package_action")
+        else:
+            qa_action = _validated_active_qa_multi_package_action(
+                state.get("active_multi_package_action"),
+                resolved_target_task_ids,
+                task_queue,
+                attempt_snapshots_by_id,
+            )
+            if qa_action is not None:
+                active_cluster_id = qa_action.cluster_id
+                active_dispatch_batch_id = qa_action.dispatch_batch_id
+                active_multi_package_action = qa_action
     if resolved_next_node in {"update_subagent", "workaround_subagent", "qa_critic"}:
         for task_id in list(resolved_target_task_ids):
             task = task_queue.get(task_id)
@@ -5755,11 +5985,21 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 if resolved_next_node == "update_subagent"
                 else None
             )
+            delta_replay_candidate = (
+                _validated_delta_replay_candidate(
+                    task,
+                    delta_isolation_by_cluster,
+                    attempt_snapshots_by_id,
+                )
+                if resolved_next_node == "update_subagent"
+                else None
+            )
             if resolved_next_node == "update_subagent" and update_authorization is None:
                 update_authorization = _authorize_update_dispatch(
                     task,
                     plan=plan,
                     diagnostics=retry_diagnostics_by_task.get(task_id),
+                    allow_attempted_selected_version=delta_replay_candidate is not None,
                 )
                 if update_authorization is None:
                     errors.append(
@@ -5800,6 +6040,24 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 else None,
             )
             task_queue[task_id] = task
+            if delta_replay_candidate is not None:
+                for cluster_id, record in list(delta_isolation_by_cluster.items()):
+                    if not isinstance(record, Mapping):
+                        continue
+                    replay_task_ids = record.get("authoritative_qa_replay_task_ids")
+                    if (
+                        not isinstance(replay_task_ids, (list, tuple))
+                        or task_id not in replay_task_ids
+                    ):
+                        continue
+                    delta_isolation_by_cluster[cluster_id] = {
+                        **record,
+                        "authoritative_qa_replay_task_ids": [
+                            replay_task_id
+                            for replay_task_id in replay_task_ids
+                            if replay_task_id != task_id
+                        ],
+                    }
             prior = retry_diagnostics_by_task.get(task_id)
             if prior is not None:
                 retry_diagnostics_by_task[task_id] = prior.model_copy(
@@ -5976,6 +6234,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         "attempt_snapshots_by_id": attempt_snapshots_by_id,
         "worker_results_by_attempt": worker_results_by_attempt,
         "qa_results_by_attempt": qa_results_by_attempt,
+        "delta_isolation_by_cluster": delta_isolation_by_cluster,
         "qa_rerun_counts_by_attempt": qa_rerun_counts_by_attempt,
         "post_remediation_scan_identifiers": post_remediation_scan_identifiers,
         "post_remediation_scan_issues": post_remediation_scan_issues,
@@ -6082,6 +6341,11 @@ def supervisor_router(state: OrchestratorState) -> str:
         current_status=str(state.get("status") or ""),
         triage_required=bool(state.get("triage_required")),
         portfolio_plan=state.get("portfolio_plan"),
+        delta_replay_task_ids=_validated_delta_replay_task_ids(
+            task_queue,
+            state.get("delta_isolation_by_cluster", {}) or {},
+            dict(state.get("attempt_snapshots_by_id", {}) or {}),
+        ),
     )
     if decision.next_node not in _VALID_NEXT_NODES:
         logger.critical(

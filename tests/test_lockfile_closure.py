@@ -43,7 +43,12 @@ def _assert_artifact_graph_consistent(artifacts: dict[str, str]) -> None:
             continue
         manifest = json.loads(artifacts[f"{package_key}/package.json"])
         assert manifest == {"name": metadata["name"], "version": metadata["version"]}
-        for category in ("dependencies", "optionalDependencies", "peerDependencies"):
+        for category in (
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ):
             for package_name, requirement in metadata.get(category, {}).items():
                 candidates = _lockfile_package_candidates(
                     packages,
@@ -175,6 +180,187 @@ def test_missing_required_edge_is_incomplete_and_diagnostic():
     assert "node_modules/a/node_modules/missing@0.9.0" in closure.failure_detail
     with pytest.raises(ClosureResolutionError, match="Unresolved dependencies edge"):
         build_sliced_lockfile_artifacts(closure)
+
+
+def test_npm_alias_closure_preserves_alias_keys_and_real_package_names() -> None:
+    packages = {
+        "": {},
+        "node_modules/@isaacs/cliui": {
+            "name": "@isaacs/cliui",
+            "version": "8.0.2",
+            "dependencies": {
+                "string-width": "^5.1.2",
+                "string-width-cjs": "npm:string-width@^4.2.0",
+                "@test/alias": "npm:@test/real@^2.0.0",
+            },
+        },
+        "node_modules/string-width": {"name": "string-width", "version": "5.1.2"},
+        "node_modules/string-width-cjs": {"name": "string-width", "version": "4.2.3"},
+        "node_modules/@test/alias": {"name": "@test/real", "version": "2.1.0"},
+    }
+
+    closure = resolve_dependency_closure(
+        packages,
+        target_package="@isaacs/cliui",
+        target_version="8.0.2",
+    )
+
+    assert closure.complete
+    assert {
+        (node.lockfile_key, node.package_name, node.metadata["name"], node.version)
+        for node in closure.nodes
+    } == {
+        ("node_modules/@isaacs/cliui", "@isaacs/cliui", "@isaacs/cliui", "8.0.2"),
+        ("node_modules/string-width", "string-width", "string-width", "5.1.2"),
+        ("node_modules/string-width-cjs", "string-width-cjs", "string-width", "4.2.3"),
+        ("node_modules/@test/alias", "@test/alias", "@test/real", "2.1.0"),
+    }
+
+    artifacts = build_sliced_lockfile_artifacts(closure)
+    lockfile_packages = json.loads(artifacts["package-lock.json"])["packages"]
+    alias_key = "node_modules/string-width-cjs"
+    assert lockfile_packages[alias_key]["name"] == "string-width"
+    assert (
+        lockfile_packages["node_modules/@isaacs/cliui"]["dependencies"]["string-width-cjs"]
+        == "npm:string-width@^4.2.0"
+    )
+    assert json.loads(artifacts[f"{alias_key}/package.json"]) == {
+        "name": "string-width",
+        "version": "4.2.3",
+    }
+    _assert_artifact_graph_consistent(artifacts)
+
+
+@pytest.mark.parametrize(
+    ("requirement", "metadata_name"),
+    [
+        ("npm:string-width@^5.0.0", "string-width"),
+        ("npm:string-width@^4.2.0", "not-string-width"),
+    ],
+)
+def test_npm_alias_closure_rejects_mismatched_real_name_or_range(
+    requirement: str,
+    metadata_name: str,
+) -> None:
+    packages = {
+        "": {},
+        "node_modules/parent": {
+            "version": "1.0.0",
+            "dependencies": {"string-width-cjs": requirement},
+        },
+        "node_modules/parent/node_modules/string-width-cjs": {
+            "name": metadata_name,
+            "version": "4.2.3",
+        },
+    }
+
+    closure = resolve_dependency_closure(
+        packages,
+        target_package="parent",
+        target_version="1.0.0",
+    )
+
+    assert not closure.complete
+    assert closure.fallback_reason == "incomplete_closure"
+    assert closure.failure_detail is not None
+    assert f"string-width-cjs@{requirement}" in closure.failure_detail
+
+
+def test_sliced_closure_reserves_root_package_before_nested_same_name() -> None:
+    packages = {
+        "": {},
+        "node_modules/app": {
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": {
+                "aaa": "1.0.0",
+                "bbb": "1.0.0",
+                "ccc": "1.0.0",
+            },
+        },
+        "node_modules/aaa": {
+            "name": "aaa",
+            "version": "1.0.0",
+            "dependencies": {"chalk": "^4.0.0"},
+        },
+        "node_modules/aaa/node_modules/chalk": {
+            "name": "chalk",
+            "version": "4.2.1",
+        },
+        "node_modules/bbb": {
+            "name": "bbb",
+            "version": "1.0.0",
+            "dependencies": {"chalk": "^2.4.1"},
+        },
+        "node_modules/ccc": {
+            "name": "ccc",
+            "version": "1.0.0",
+            "dependencies": {"chalk": "^2.4.1"},
+        },
+        "node_modules/chalk": {"name": "chalk", "version": "2.4.1"},
+    }
+
+    closure = resolve_dependency_closure(
+        packages,
+        target_package="app",
+        target_version="1.0.0",
+    )
+
+    assert closure.complete
+    artifacts = build_sliced_lockfile_artifacts(closure)
+    synthetic_packages = json.loads(artifacts["package-lock.json"])["packages"]
+    assert synthetic_packages["node_modules/chalk"]["version"] == "2.4.1"
+    assert synthetic_packages["node_modules/aaa/node_modules/chalk"]["version"] == "4.2.1"
+    _assert_artifact_graph_consistent(artifacts)
+
+
+def test_project_root_closure_preserves_nested_and_hoisted_occurrences() -> None:
+    packages = {
+        "": {
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": {
+                "aaa": "1.0.0",
+                "bbb": "1.0.0",
+                "ccc": "1.0.0",
+            },
+            "devDependencies": {"dev-tool": "^4.00"},
+        },
+        "node_modules/dev-tool": {"name": "dev-tool", "version": "4.2.1"},
+        "node_modules/aaa": {
+            "name": "aaa",
+            "version": "1.0.0",
+            "dependencies": {"chalk": "^4.0.0"},
+        },
+        "node_modules/aaa/node_modules/chalk": {"name": "chalk", "version": "4.2.1"},
+        "node_modules/bbb": {
+            "name": "bbb",
+            "version": "1.0.0",
+            "dependencies": {"chalk": "^2.4.1"},
+        },
+        "node_modules/ccc": {
+            "name": "ccc",
+            "version": "1.0.0",
+            "dependencies": {"chalk": "^2.4.1"},
+        },
+        "node_modules/chalk": {"name": "chalk", "version": "2.4.1"},
+    }
+
+    closure = resolve_dependency_closure(
+        packages,
+        target_package="app",
+        target_version="1.0.0",
+    )
+
+    assert closure.complete
+    assert any(node.package_name == "dev-tool" for node in closure.nodes)
+
+    artifacts = build_sliced_lockfile_artifacts(closure)
+    synthetic_packages = json.loads(artifacts["package-lock.json"])["packages"]
+    assert synthetic_packages["node_modules/app"]["devDependencies"] == {"dev-tool": "^4.00"}
+    assert synthetic_packages["node_modules/chalk"]["version"] == "2.4.1"
+    assert synthetic_packages["node_modules/aaa/node_modules/chalk"]["version"] == "4.2.1"
+    _assert_artifact_graph_consistent(artifacts)
 
 
 @pytest.mark.parametrize(

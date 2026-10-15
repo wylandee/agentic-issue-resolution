@@ -336,6 +336,93 @@ def _build_metadata_edges(
     return list(edges.values()), list(peer_constraints.values())
 
 
+def _build_fixed_peer_constraints(
+    snapshot: NpmGraphSnapshot,
+    targets: Sequence[SolverTarget],
+    evidence_occurrences: Sequence[SolverPackageOccurrence],
+    *,
+    diagnostics: list[str],
+) -> tuple[list[SolverPeerConstraint], bool]:
+    """Constrain target versions by required peers of unchanged packages.
+
+    A candidate update can violate a peer range declared by a package that is
+    intentionally outside the mutation scope. Keep that installed consumer as
+    evidence and constrain the target candidate to its declared range instead
+    of silently upgrading or ignoring the consumer.
+    """
+    target_ids = {target.occurrence_id for target in targets}
+    evidence_ids = {occurrence.occurrence_id for occurrence in evidence_occurrences}
+    fixed_constraints: dict[tuple[str, str, str], SolverPeerConstraint] = {}
+    valid = True
+
+    for source_package in snapshot.lockfile_packages:
+        source_occurrence = next(
+            (
+                occurrence
+                for occurrence in snapshot.occurrences
+                if occurrence.manifest_path == source_package.manifest_path
+                and occurrence.package_name == source_package.package_name
+                and (occurrence.lockfile_package_key or "").replace("\\", "/")
+                == source_package.package_key.replace("\\", "/")
+            ),
+            None,
+        )
+        if source_occurrence is None:
+            continue
+        source_id = source_occurrence.occurrence_id
+        if source_id in target_ids or source_id not in evidence_ids:
+            continue
+        peer_dependencies = source_package.metadata.get("peerDependencies", {})
+        if not isinstance(peer_dependencies, Mapping):
+            diagnostics.append(f"malformed peerDependencies for fixed package {source_id!r}")
+            valid = False
+            continue
+        peer_metadata = source_package.metadata.get("peerDependenciesMeta", {})
+        if not isinstance(peer_metadata, Mapping):
+            diagnostics.append(f"malformed peerDependenciesMeta for fixed package {source_id!r}")
+            valid = False
+            continue
+
+        for target in targets:
+            if target.manifest_path != source_package.manifest_path:
+                continue
+            raw_range = peer_dependencies.get(target.target_package_name)
+            if raw_range is None:
+                continue
+            if not isinstance(raw_range, str) or not raw_range.strip():
+                diagnostics.append(
+                    f"invalid fixed peer range for {source_id!r} -> {target.occurrence_id!r}"
+                )
+                valid = False
+                continue
+            peer_meta = peer_metadata.get(target.target_package_name, {})
+            if isinstance(peer_meta, Mapping) and bool(peer_meta.get("optional")):
+                continue
+
+            resolved = resolve_lockfile_dependency_package(
+                snapshot,
+                source_id,
+                target.target_package_name,
+            )
+            if (
+                resolved is None
+                or resolved.manifest_path != target.manifest_path
+                or resolved.package_key.replace("\\", "/")
+                != target.lockfile_package_key.replace("\\", "/")
+            ):
+                continue
+
+            constraint = SolverPeerConstraint(
+                source_occurrence_id=source_id,
+                target_occurrence_id=target.occurrence_id,
+                version_range=raw_range.strip(),
+                is_strict=True,
+            )
+            fixed_constraints[(source_id, target.occurrence_id, raw_range.strip())] = constraint
+
+    return list(fixed_constraints.values()), valid
+
+
 def _build_ancestry_edges(
     targets: Sequence[SolverTarget],
 ) -> list[SolverEdge]:
@@ -754,6 +841,14 @@ def extract_solver_subgraph(
     edges, peer_constraints = _build_metadata_edges(
         snapshot, normalized_targets, diagnostics=diagnostics
     )
+    fixed_peer_constraints, fixed_peers_valid = _build_fixed_peer_constraints(
+        snapshot,
+        normalized_targets,
+        evidence_occurrences,
+        diagnostics=diagnostics,
+    )
+    peer_constraints.extend(fixed_peer_constraints)
+    valid = valid and fixed_peers_valid
     edges.extend(_build_ancestry_edges(normalized_targets))
     edges.extend(_build_boundary_edges(snapshot, normalized_targets))
     for raw_left, raw_right in pairs:

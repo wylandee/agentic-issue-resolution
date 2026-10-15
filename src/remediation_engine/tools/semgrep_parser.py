@@ -35,6 +35,7 @@ from remediation_engine.contracts import (
 from remediation_engine.contracts.schemas import LineRange
 
 log = logging.getLogger(__name__)
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 CSV_HEADERS = [
     "Repository",
@@ -61,20 +62,22 @@ _SEMGREP_SEVERITY_MAP: dict[str, Severity] = {
 
 
 def _default_input_json_path() -> Path:
-    script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent.parent
-    return project_root / "data" / "semgrep.json"
+    return _PROJECT_ROOT / "data" / "semgrep.json"
 
 
 def _extract_findings_page(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract a list of findings from known Semgrep response shapes."""
     if isinstance(payload.get("findings"), list):
-        return payload["findings"]
-    if isinstance(payload.get("results"), list):
-        return payload["results"]
-    if isinstance(payload.get("data"), list):
-        return payload["data"]
-    return []
+        findings = payload["findings"]
+    elif isinstance(payload.get("results"), list):
+        findings = payload["results"]
+    elif isinstance(payload.get("data"), list):
+        findings = payload["data"]
+    else:
+        return []
+    if any(not isinstance(item, dict) for item in findings):
+        raise ValueError("Semgrep findings must contain only JSON object records.")
+    return findings
 
 
 def load_findings_from_json(json_path: Path | str) -> list[dict[str, Any]]:
@@ -82,10 +85,12 @@ def load_findings_from_json(json_path: Path | str) -> list[dict[str, Any]]:
     path = Path(json_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
+        if any(not isinstance(item, dict) for item in payload):
+            raise ValueError("Semgrep findings must contain only JSON object records.")
+        return payload
     if isinstance(payload, dict):
         return _extract_findings_page(payload)
-    return []
+    raise ValueError("Semgrep report must be a JSON object or array of findings.")
 
 
 def _parse_cwe_entries(values: Any) -> list[CWEEntry]:
@@ -338,10 +343,8 @@ def main() -> None:
     load_dotenv()
 
     input_json = _default_input_json_path()
-    script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent.parent
-    output_jsonl = project_root / "data" / "semgrep_issues.jsonl"
-    output_csv = project_root / "data" / "semgrep_issues.csv"
+    output_jsonl = _PROJECT_ROOT / "data" / "semgrep_issues.jsonl"
+    output_csv = _PROJECT_ROOT / "data" / "semgrep_issues.csv"
 
     log.info("Starting Semgrep findings ingestion from %s", input_json)
     raw_findings = load_findings_from_json(input_json)

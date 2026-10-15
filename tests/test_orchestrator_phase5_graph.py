@@ -5,6 +5,7 @@ Tests for the Phase 5 LangGraph orchestrator wiring.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -64,6 +65,7 @@ from remediation_engine.orchestration.supervisor_portfolio import (
     run_portfolio_plan_tool,
 )
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+from remediation_engine.orchestration.teardown_node import run_teardown_node
 from remediation_engine.settings import AppSettings
 from remediation_engine.triage.grouper import group_issues
 
@@ -590,6 +592,41 @@ class TestPhase5RunOrchestrator:
         assert len(report_files) == 1
         assert report_files[0].read_text(encoding="utf-8")
 
+    def test_graph_exception_cleans_volume_reported_by_completed_setup_node(
+        self, tmp_path, monkeypatch
+    ):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(tmp_path / "trajectories"))
+        monkeypatch.setenv("REMEDIATION_REPORT_DIR", str(tmp_path / "reports"))
+        volume_name = "agent_workspace_deadbeef"
+        mock_engine = MagicMock()
+
+        def invoke_then_fail(state, config):
+            recorder = next(
+                callback
+                for callback in config["callbacks"]
+                if hasattr(callback, "workspace_volume")
+            )
+            recorder.register_workspace_volume(volume_name)
+            raise RuntimeError("failure after workspace setup")
+
+        mock_engine.invoke.side_effect = invoke_then_fail
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=(None, None),
+            ),
+            patch(
+                "remediation_engine.orchestration.graph._cleanup_run_owned_workspace_volume",
+                return_value=(True, []),
+            ) as cleanup,
+            pytest.raises(RuntimeError, match="failure after workspace setup"),
+        ):
+            run_orchestrator(str(tmp_path), groups)
+
+        cleanup.assert_called_once_with(volume_name)
+
     def test_failed_langsmith_run_is_closed_without_waiting_for_remote_spans(
         self, tmp_path, monkeypatch
     ):
@@ -675,9 +712,47 @@ class TestPhase5RunOrchestrator:
         assert "KeyboardInterrupt" in early_state["errors"][-1]
         assert list(trajectory_dir.glob("*.md"))
 
+    def test_teardown_exception_before_diff_still_cleans_volume(self, tmp_path, monkeypatch):
+        state = _initial_state(tmp_path, [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        monkeypatch.setattr(
+            "remediation_engine.orchestration.supervisor_node.reconcile_phase5_state_before_teardown",
+            lambda _state: (_ for _ in ()).throw(RuntimeError("state reconciliation failed")),
+        )
+        cleanup = MagicMock(return_value=(True, []))
+        monkeypatch.setattr(
+            "remediation_engine.orchestration.teardown_node._cleanup_run_owned_workspace_volume",
+            cleanup,
+        )
+
+        result = run_teardown_node(state)
+
+        cleanup.assert_called_once_with("agent_workspace_deadbeef")
+        assert result["workspace_volume"] is None
+        assert result["status"] == "completed_with_errors"
+        assert any("state reconciliation failed" in error for error in result["errors"])
+
+    def test_teardown_interrupt_cleans_volume_before_propagating(self, tmp_path, monkeypatch):
+        state = _initial_state(tmp_path, [])
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        monkeypatch.setattr(
+            "remediation_engine.orchestration.supervisor_node.reconcile_phase5_state_before_teardown",
+            lambda _state: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+        cleanup = MagicMock(return_value=(True, []))
+        monkeypatch.setattr(
+            "remediation_engine.orchestration.teardown_node._cleanup_run_owned_workspace_volume",
+            cleanup,
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            run_teardown_node(state)
+
+        cleanup.assert_called_once_with("agent_workspace_deadbeef")
+
 
 class TestPhase5GraphIntegration:
-    def test_update_wrapper_preserves_exact_task_instruction(self, tmp_path):
+    def test_update_wrapper_preserves_exact_task_instruction(self, tmp_path, monkeypatch):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task.instruction = 'Update "lodash" in package.json to version "4.17.22".'
@@ -701,6 +776,17 @@ class TestPhase5GraphIntegration:
             )
         ]
 
+        # This test verifies bridge payload construction. Snapshot lifecycle
+        # has separate failure-injection coverage and must not require Docker.
+        monkeypatch.setattr(
+            _graph_wrappers,
+            "_create_workspace_attempt_snapshot",
+            lambda *_args: ("attempt-workspace", []),
+        )
+        monkeypatch.setattr(
+            _graph_wrappers, "_finalize_worker_workspace_snapshot", lambda *_args: []
+        )
+
         update_subagent = MagicMock(return_value={"errors": [], "action_summaries": []})
 
         with patch(
@@ -719,7 +805,7 @@ class TestPhase5GraphIntegration:
         )
         assert "supervisor_instruction" not in subagent_state
 
-    def test_update_wrapper_surfaces_retry_diagnostics(self, tmp_path):
+    def test_update_wrapper_surfaces_retry_diagnostics(self, tmp_path, monkeypatch):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
@@ -729,9 +815,25 @@ class TestPhase5GraphIntegration:
         state["active_target_task_ids"] = ["task-1"]
         state["attempt_snapshots_by_id"] = {snapshot.attempt_id: snapshot}
         state["active_target_task_ids"] = ["task-1"]
+        retained_diagnostics = UpdateRetryDiagnostics(
+            task_id="task-2",
+            attempted_versions=["1.2.0"],
+            latest_version_seen="1.2.0",
+        )
+        state["retry_diagnostics_by_task"] = {"task-2": retained_diagnostics}
+        monkeypatch.setattr(
+            _graph_wrappers,
+            "_create_workspace_attempt_snapshot",
+            lambda *_args: ("attempt-workspace", []),
+        )
+        monkeypatch.setattr(
+            _graph_wrappers, "_finalize_worker_workspace_snapshot", lambda *_args: []
+        )
 
         diagnostics = UpdateRetryDiagnostics(
             task_id="task-1",
+            committed_attempt_id=snapshot.attempt_id,
+            instruction_digest=snapshot.instruction_digest,
             registry_query_performed=True,
             attempted_versions=["4.17.22"],
             candidate_versions_considered=["4.17.22", "4.17.21"],
@@ -752,6 +854,44 @@ class TestPhase5GraphIntegration:
             result = run_update_subagent_from_orchestrator(state)
 
         assert result["retry_diagnostics_by_task"]["task-1"] == diagnostics
+        assert result["retry_diagnostics_by_task"]["task-2"] == retained_diagnostics
+
+    def test_update_wrapper_rejects_diagnostics_with_foreign_task_identity(
+        self, tmp_path, monkeypatch
+    ):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1")
+        task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
+        state = _initial_state(tmp_path, groups)
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["task_queue"] = {"task-1": task}
+        state["active_target_task_ids"] = ["task-1"]
+        state["attempt_snapshots_by_id"] = {snapshot.attempt_id: snapshot}
+        monkeypatch.setattr(
+            _graph_wrappers,
+            "_create_workspace_attempt_snapshot",
+            lambda *_args: ("attempt-workspace", []),
+        )
+        monkeypatch.setattr(
+            _graph_wrappers, "_finalize_worker_workspace_snapshot", lambda *_args: []
+        )
+        foreign_diagnostics = UpdateRetryDiagnostics(
+            task_id="task-2",
+            committed_attempt_id=snapshot.attempt_id,
+            instruction_digest=snapshot.instruction_digest,
+            attempted_versions=["9.9.9"],
+        )
+
+        with patch(
+            "remediation_engine.orchestration.graph.run_update_subagent_node",
+            return_value={
+                "errors": [],
+                "retry_diagnostics_by_task": {"task-1": foreign_diagnostics},
+            },
+        ):
+            result = run_update_subagent_from_orchestrator(state)
+
+        assert "retry_diagnostics_by_task" not in result
 
     def test_workaround_wrapper_preserves_typed_attempt_result(self, tmp_path):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.WORKAROUND_FOUND))]
@@ -1455,8 +1595,35 @@ class TestPhase5GraphIntegration:
             result = run_qa_critic_from_orchestrator(state)
 
         sandbox.restore_workspace_snapshot.assert_not_called()
-        sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-qa-inconclusive")
+        sandbox.remove_workspace_snapshot.assert_not_called()
         assert result["qa_results_by_attempt"]["attempt-qa-inconclusive"].evaluation == evaluation
+        snapshot_id = "attempt-attempt-qa-inconclusive"
+        assert result["workspace_rollback_anchors_by_task"] == {"task-1": snapshot_id}
+
+        next_task = SimpleNamespace(
+            task_id="task-2",
+            parent_task_id=None,
+            strategy=RoutingStrategy.VERSION_BUMP,
+            current_attempt_id=None,
+        )
+        dispatch_state = {
+            "workspace_volume": "agent_workspace_deadbeef",
+            "task_queue": {"task-1": task, "task-2": next_task},
+            "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            "workspace_rollback_anchors_by_task": result["workspace_rollback_anchors_by_task"],
+        }
+        with patch(
+            "remediation_engine.orchestration.graph.DockerSandbox",
+            return_value=sandbox,
+        ):
+            prepared_state, errors = _graph_wrappers._prepare_workspace_for_dispatch(
+                dispatch_state, [next_task]
+            )
+
+        assert errors == []
+        assert prepared_state["workspace_rollback_anchors_by_task"] == {}
+        sandbox.restore_workspace_snapshot.assert_called_once_with(snapshot_id)
+        sandbox.remove_workspace_snapshot.assert_called_once_with(snapshot_id)
 
     def test_qa_failed_contract_error_retains_candidate_workspace(self, tmp_path):
         """Infrastructure QA failures retain the candidate for the same attempt."""
@@ -1514,7 +1681,10 @@ class TestPhase5GraphIntegration:
             result = run_qa_critic_from_orchestrator(state)
 
         sandbox.restore_workspace_snapshot.assert_not_called()
-        sandbox.remove_workspace_snapshot.assert_called_once_with("attempt-attempt-qa-contract")
+        sandbox.remove_workspace_snapshot.assert_not_called()
+        assert result["workspace_rollback_anchors_by_task"] == {
+            "task-1": "attempt-attempt-qa-contract"
+        }
         assert result["qa_results_by_attempt"]["attempt-qa-contract"].evaluation.contract_error
 
     def test_security_failure_restores_and_removes_attempt_workspace_snapshot(self, tmp_path):
@@ -2105,6 +2275,8 @@ class _DeltaSandbox:
         fail_candidate_remove: bool = False,
         fail_snapshot_create: bool = False,
         fail_preworker_restore_once: bool = False,
+        fail_candidate_restore_on_calls: set[int] | None = None,
+        destroy_before_candidate_restore_failure: bool = False,
     ) -> None:
         self.workspace = workspace
         self.archives = archives
@@ -2113,6 +2285,9 @@ class _DeltaSandbox:
         self.fail_preworker_restore_once = fail_preworker_restore_once
         self.preworker_restore_failed = False
         self.fail_snapshot_create = fail_snapshot_create
+        self.fail_candidate_restore_on_calls = set(fail_candidate_restore_on_calls or ())
+        self.destroy_before_candidate_restore_failure = destroy_before_candidate_restore_failure
+        self.candidate_restore_calls = 0
         self.events: list[tuple] = []
 
     def __enter__(self):
@@ -2129,6 +2304,12 @@ class _DeltaSandbox:
 
     def restore_workspace_snapshot(self, snapshot_id: str) -> None:
         self.events.append(("restore_attempt", snapshot_id))
+        if snapshot_id.startswith("delta-candidate-"):
+            self.candidate_restore_calls += 1
+            if self.candidate_restore_calls in self.fail_candidate_restore_on_calls:
+                if self.destroy_before_candidate_restore_failure:
+                    self.workspace.clear()
+                raise RuntimeError("candidate archive restore failed after workspace cleanup")
         if self.fail_candidate_restore and snapshot_id.startswith("delta-candidate-"):
             raise RuntimeError("candidate archive cannot be restored")
         if (
@@ -2374,6 +2555,11 @@ def test_delta_isolation_candidate_restore_failure_rolls_back_original_qa_failur
         lambda _sandbox: SimpleNamespace(ok=True),
     )
     monkeypatch.setattr(
+        _graph_wrappers,
+        "apply_multi_package_action",
+        _apply_fake_delta_action,
+    )
+    monkeypatch.setattr(
         _graph_wrappers._qa_test_parsing,
         "_run_unit_tests",
         lambda _sandbox: SimpleNamespace(ok=False),
@@ -2431,6 +2617,42 @@ def test_delta_isolation_archive_removal_failure_clears_attribution(tmp_path, mo
     assert sandbox.workspace == candidate
     assert "batch-delta" in archives
     assert any(snapshot_id.startswith("delta-candidate-") for snapshot_id in archives)
+
+
+def test_destructive_final_candidate_restore_failure_clears_attribution(tmp_path, monkeypatch):
+    state, tasks, action, _groups, _snapshots = _delta_test_setup(tmp_path)
+    baseline = {"pkg-a": "1.0.0", "pkg-b": "1.0.0"}
+    candidate = {"pkg-a": "2.0.0", "pkg-b": "2.0.0"}
+    archives = {"batch-delta": baseline.copy()}
+    # The singleton probe restores the candidate successfully; the final
+    # restore then destroys the live workspace before raising.
+    sandbox = _DeltaSandbox(
+        candidate.copy(),
+        archives,
+        fail_candidate_restore_on_calls={2},
+        destroy_before_candidate_restore_failure=True,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
+
+    result = _graph_wrappers.run_delta_isolation_canaries(
+        state,
+        tasks,
+        action,
+        lambda _sandbox, _action: "FAIL",
+        ranked_tasks=tasks,
+        max_canary_probes=1,
+    )
+
+    candidate_id = next(name for name in archives if name.startswith("delta-candidate-"))
+    assert result["status"] == "INCONCLUSIVE"
+    assert result["candidate_restored"] is False
+    assert result["responsible_task_ids"] == []
+    assert sandbox.workspace == {}
+    assert archives[candidate_id] == candidate
 
 
 def test_delta_isolation_snapshot_creation_failure_never_probes(tmp_path, monkeypatch):
@@ -2697,7 +2919,11 @@ def test_qa_delta_isolation_attribution_projects_provenance_and_escalates_only_a
     result = run_qa_critic_from_orchestrator(state)
 
     isolation = result["delta_isolation_by_cluster"]["cluster-delta"]
-    assert isolation["status"] == "IDENTIFIED"
+    assert isolation["status"] == "IDENTIFIED", (
+        isolation.get("diagnostic"),
+        isolation.get("tested_subsets"),
+        isolation.get("executions"),
+    )
     assert isolation["responsible_task_ids"] == ["task-b"]
     assert isolation["candidate_restored"] is True
     assert isolation["executions"] == 2
@@ -3248,6 +3474,606 @@ def test_socket_stack_delta_fixture_exercises_three_task_blame_and_replan(
     assert stale_request.forced_singleton_task_ids == []
     assert stale_request.triggering_attempt_id is None
     assert stale_request.source_portfolio_plan_id is None
+
+
+def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_path, monkeypatch):
+    """Protect the jws/base64url atomic failure and unaffected singleton outcomes."""
+    from remediation_engine.contracts.solver_models import (
+        SolverFindingRequirement,
+        SolverPackageOccurrence,
+        SolverSubgraph,
+        SolverTarget,
+        SolverTaskDecision,
+    )
+    from remediation_engine.orchestration.graph_wrappers import (
+        run_qa_critic_from_orchestrator,
+        run_update_subagent_from_orchestrator,
+    )
+    from remediation_engine.orchestration.portfolio_orchestrator import (
+        repository_fingerprint,
+    )
+    from remediation_engine.orchestration.state import initial_orchestrator_state
+    from remediation_engine.solver.graph import cluster_packages
+    from remediation_engine.solver.subgraph import _build_ancestry_edges
+
+    package_rows = [
+        ("jws", "task-jws", "3.2.2", "3.2.3", "GHSA-JWS"),
+        ("base64url", "task-base64url", "2.0.1", "3.0.0", "GHSA-BASE64URL"),
+        ("got", "task-got", "11.8.6", "12.0.0", "GHSA-GOT"),
+        ("esbuild", "task-esbuild", "0.24.0", "0.25.0", "GHSA-ESBUILD"),
+    ]
+    targets = [
+        SolverTarget(
+            occurrence_id=f"package.json::{package}",
+            task_id=task_id,
+            group_id=f"group-{task_id}",
+            package_name=package,
+            target_package_name=package,
+            manifest_path="package.json",
+            lockfile_package_key=(
+                "node_modules/jws/node_modules/base64url"
+                if package == "base64url"
+                else f"node_modules/{package}"
+            ),
+            installed_version=installed,
+            dependency_ancestry=(["jws", "base64url"] if package == "base64url" else []),
+            finding_ids=[finding_id],
+            is_finding_backed=True,
+        )
+        for package, task_id, installed, _target, finding_id in package_rows
+    ]
+    targets_by_package = {target.package_name: target for target in targets}
+    findings = [
+        SolverFindingRequirement(
+            finding_id=finding_id,
+            ghsa_id=finding_id,
+            severity="HIGH",
+            vulnerable_package=package,
+            target_occurrence_id=targets_by_package[package].occurrence_id,
+            vulnerable_occurrence_id=targets_by_package[package].occurrence_id,
+            fixed_version=target_version,
+        )
+        for package, _task_id, _installed, target_version, finding_id in package_rows
+    ]
+    ancestry_edges = _build_ancestry_edges(
+        [targets_by_package["jws"], targets_by_package["base64url"]]
+    )
+    assert len(ancestry_edges) == 1
+    ancestry_edges = [ancestry_edges[0].model_copy(update={"edge_kind": "dependency_ancestry"})]
+    subgraph = SolverSubgraph(
+        targets=targets,
+        occurrences=[
+            SolverPackageOccurrence(
+                occurrence_id=target.occurrence_id,
+                manifest_path=target.manifest_path,
+                package_name=target.target_package_name,
+                lockfile_package_key=target.lockfile_package_key,
+                installed_version=target.installed_version,
+                dependency_type=target.dependency_type,
+                is_direct=target.package_name != "base64url",
+                ancestry=target.dependency_ancestry,
+            )
+            for target in targets
+        ],
+        findings=findings,
+        edges=ancestry_edges,
+    )
+    target_versions = {
+        package: target for package, _task, _installed, target, _finding in package_rows
+    }
+    decisions = [
+        SolverTaskDecision(
+            task_id=target.task_id, selected_version=target_versions[target.package_name]
+        )
+        for target in targets
+    ]
+    batches, _edges, diagnostics = cluster_packages(
+        subgraph,
+        decisions,
+        forced_singleton_task_ids=(),
+        peer_conflict_pairs=(),
+    )
+    assert diagnostics == []
+    batch_packages = {
+        frozenset(mutation.package_name for mutation in batch.mutations): batch for batch in batches
+    }
+    initial_atomic_batch = batch_packages[frozenset({"jws", "base64url"})]
+    assert initial_atomic_batch.atomic and initial_atomic_batch.dispatchable
+    assert frozenset({"got"}) in batch_packages
+    assert frozenset({"esbuild"}) in batch_packages
+    assert sorted(len(packages) for packages in batch_packages) == [1, 1, 2]
+
+    groups = []
+    tasks_by_package = {}
+    for package, task_id, installed, target_version, finding_id in package_rows:
+        base_group = _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
+        issue = base_group.issues[0].model_copy(
+            update={
+                "package_name": package,
+                "package_version": installed,
+                "file_path": "package.json",
+                "cve_id": f"CVE-2026-{finding_id}",
+            }
+        )
+        group = base_group.model_copy(
+            update={
+                "group_id": f"sca:package.json:{package}",
+                "vulnerable_component": package,
+                "file_path": "package.json",
+                "file_paths": ["package.json"],
+                "cve_ids": [issue.cve_id],
+                "versions": [installed],
+                "representative_issue_id": issue.id,
+                "issues": [issue],
+                "fix_plan": FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version=target_version,
+                    instruction=f"Update {package} to {target_version}.",
+                    strategy_used="osv_api",
+                ),
+            }
+        )
+        task = build_initial_remediation_task(group, task_id).model_copy(
+            update={
+                "target_package_name": package,
+                "target_dependency_type": "dependencies",
+                "selected_version": target_version,
+                "allowed_target_versions": [target_version],
+                "allowed_dependency_types": ["dependencies"],
+                "portfolio_plan_id": "portfolio-four-package",
+                "task_revision": 1,
+                "strategy": RoutingStrategy.VERSION_BUMP,
+                "strategy_stage": SCARemediationStage.OSV_MINIMUM,
+                "qa_policy": QAPolicy.VERSION_BUMP,
+                "instruction": f"Update {package} to {target_version}.",
+            }
+        )
+        groups.append(group)
+        tasks_by_package[package] = task
+
+    baseline = {package: installed for package, _task, installed, _target, _finding in package_rows}
+    host_manifest = tmp_path / "package.json"
+    host_manifest.write_text(
+        json.dumps({"name": "fixture", "dependencies": baseline}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    committed_repository_fingerprint = repository_fingerprint(tmp_path)
+
+    def fixture_portfolio_plan(task_queue, plan_batches):
+        """Build committed plan evidence for the fixture's deterministic batches."""
+        current_tasks = list(task_queue.values())
+        task_ids = [task.task_id for task in current_tasks]
+        decisions = []
+        for task in current_tasks:
+            package = task.target_package_name
+            solver_target = targets_by_package[package]
+            decisions.append(
+                SimpleNamespace(
+                    task_id=task.task_id,
+                    selected_strategy="version_bump",
+                    selected_version=target_versions[package],
+                    allowed_alternative_versions=[],
+                    allowed_dependency_types=list(
+                        task.allowed_dependency_types or ["dependencies"]
+                    ),
+                    strategy_stage=task.strategy_stage.value,
+                    selected_plan_issue_ids=[],
+                    installed_version=solver_target.installed_version,
+                    target_occurrence_id=f"package.json::{package}",
+                    target_group_id=task.parent_group_id,
+                    target_package_name=package,
+                    manifest_path="package.json",
+                    lockfile_package_key=solver_target.lockfile_package_key,
+                    dependency_type="dependencies",
+                )
+            )
+        clusters = [
+            SimpleNamespace(
+                cluster_id=batch.batch_id,
+                task_ids=list(batch.task_ids),
+                dispatchable=True,
+                dependencies=[],
+            )
+            for batch in plan_batches
+        ]
+        cluster_order = [cluster.cluster_id for cluster in clusters]
+        task_to_cluster = {
+            task_id: cluster.cluster_id for cluster in clusters for task_id in cluster.task_ids
+        }
+        return SimpleNamespace(
+            plan_id="portfolio-four-package",
+            portfolio_plan_id="portfolio-four-package",
+            task_ids=task_ids,
+            clusters=clusters,
+            cluster_order=cluster_order,
+            task_order=task_ids,
+            task_to_cluster=task_to_cluster,
+            diagnostics=[],
+            planned_task_revisions={
+                task_id: task_queue[task_id].task_revision for task_id in task_ids
+            },
+            task_strategies={task_id: task_queue[task_id].strategy for task_id in task_ids},
+            solver_plan=SimpleNamespace(selected_plan=SimpleNamespace(task_decisions=decisions)),
+            repository_fingerprint=committed_repository_fingerprint,
+        )
+
+    class FixtureDiffSandbox(_DeltaSandbox):
+        def read_file(self, relative_path):
+            if relative_path != "package.json":
+                return None
+            return (
+                json.dumps(
+                    {"name": "fixture", "dependencies": dict(self.workspace)},
+                    indent=2,
+                )
+                + "\n"
+            )
+
+        def cleanup_workspace_snapshots(self):
+            self.archives.clear()
+
+    sandbox = FixtureDiffSandbox(baseline.copy(), {})
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+
+    def action_for(batch, queue, attempt_suffix):
+        task_ids = list(batch.task_ids)
+        cluster_id = batch.batch_id if len(task_ids) > 1 else None
+        committed = dict(queue)
+        for task_id in task_ids:
+            prior = queue[task_id]
+            target_version = next(
+                row[3] for row in package_rows if row[0] == prior.target_package_name
+            )
+            committed[task_id] = prior.model_copy(
+                update={
+                    "task_revision": prior.task_revision + 1,
+                    "current_attempt_id": f"attempt-{task_id}-{attempt_suffix}",
+                    "status": TaskStatus.PENDING,
+                    "selected_version": target_version,
+                    "allowed_target_versions": [target_version],
+                    "allowed_dependency_types": ["dependencies"],
+                    "instruction": f"Update {prior.target_package_name} to {target_version}.",
+                }
+            )
+        action = MultiPackageAction(
+            cluster_id=cluster_id,
+            dispatch_batch_id=batch.batch_id,
+            selected_strategy="version_bump",
+            package_mutations=[
+                PackageMutation(
+                    task_id=task_id,
+                    package_name=committed[task_id].target_package_name,
+                    target_version=committed[task_id].selected_version,
+                    dependency_type="dependencies",
+                )
+                for task_id in task_ids
+            ],
+            rationale="Fixture batch from the finding-backed dependency plan.",
+        )
+        digest = instruction_digest(action.model_dump_json())
+        snapshots = {}
+        for task_id in task_ids:
+            task = committed[task_id]
+            attempt_id = task.current_attempt_id
+            snapshots[attempt_id] = TaskAttemptSnapshot(
+                attempt_id=attempt_id,
+                task_id=task_id,
+                state_revision=task.task_revision,
+                task_revision=task.task_revision,
+                cluster_id=cluster_id,
+                dispatch_batch_id=batch.batch_id,
+                action_digest=digest,
+                portfolio_plan_id="portfolio-four-package",
+                qa_policy=task.qa_policy,
+                strategy_stage=task.strategy_stage,
+                selected_version=task.selected_version,
+                allowed_target_versions=task.allowed_target_versions,
+                target_package_name=task.target_package_name,
+                target_dependency_type=task.target_dependency_type,
+                allowed_dependency_types=task.allowed_dependency_types,
+                instruction=task.instruction,
+                instruction_digest=instruction_digest(task.instruction),
+                dispatch_node="update_subagent",
+            )
+        return action, committed, snapshots
+
+    def worker_node(subagent_state):
+        worker_action = subagent_state["multi_package_action"]
+        _apply_fake_delta_action(sandbox, worker_action, set())
+        target_snapshots = subagent_state["target_attempt_snapshots"]
+        results = {}
+        for task in subagent_state["target_tasks"]:
+            snap = target_snapshots[task.task_id]
+            results[snap.attempt_id] = WorkerAttemptResult(
+                attempt_id=snap.attempt_id,
+                task_id=task.task_id,
+                task_revision=task.task_revision,
+                cluster_id=snap.cluster_id,
+                dispatch_batch_id=snap.dispatch_batch_id,
+                action_digest=snap.action_digest,
+                status=AgentActionStatus.SUCCESS,
+                executed_versions=[snap.selected_version],
+                changed_files=["package.json"],
+                execution_diagnostics=WorkerExecutionDiagnostics(
+                    validation_passed=True,
+                    executed_versions=[snap.selected_version],
+                    effective_target_version=snap.selected_version,
+                    effective_dependency_type="dependencies",
+                ),
+                instruction_digest=snap.instruction_digest,
+            )
+        return {"worker_results_by_attempt": results, "errors": []}
+
+    def commit_dispatch(prior_state, batch, suffix):
+        action, committed_queue, snapshots = action_for(batch, prior_state["task_queue"], suffix)
+        dispatch_state = {
+            **prior_state,
+            "task_queue": committed_queue,
+            "active_target_task_ids": list(batch.task_ids),
+            "active_cluster_id": action.cluster_id,
+            "active_dispatch_batch_id": action.dispatch_batch_id,
+            "active_multi_package_action": action,
+            "attempt_snapshots_by_id": {
+                **prior_state.get("attempt_snapshots_by_id", {}),
+                **snapshots,
+            },
+            "portfolio_plan": prior_state.get("portfolio_plan"),
+            "portfolio_dirty": False,
+        }
+        with patch(
+            "remediation_engine.orchestration.graph.run_update_subagent_node",
+            side_effect=worker_node,
+        ):
+            worker_projection = run_update_subagent_from_orchestrator(dispatch_state)
+        worker_state = {**dispatch_state, **worker_projection}
+        return dispatch_state, {**worker_state, **run_supervisor_node(worker_state)}
+
+    state = initial_orchestrator_state(str(tmp_path), groups)
+    state.update(
+        {
+            "task_queue": {task.task_id: task for task in tasks_by_package.values()},
+            "portfolio_plan": fixture_portfolio_plan(
+                {task.task_id: task for task in tasks_by_package.values()}, batches
+            ),
+            "portfolio_dirty": False,
+            "workspace_volume": "workspace-four-package",
+            "delta_isolation_by_cluster": {},
+        }
+    )
+    first_dispatch, after_worker = commit_dispatch(state, initial_atomic_batch, "atomic")
+    failed_evaluations = {
+        task_id: QAEvaluation(
+            task_id=task_id,
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback="Atomic test batch failed.",
+            failure_evidence=QAFailureEvidence(
+                raw_excerpt="atomic package integration failed",
+                exact_diagnostics=["atomic integration suite failed"],
+                failed_tests=["integration test"],
+                attempt_id=after_worker["task_queue"][task_id].current_attempt_id,
+                task_revision=after_worker["task_queue"][task_id].task_revision,
+            ),
+            deterministic_gates=QADeterministicGates(
+                status="fail",
+                install_passed=True,
+                scanner_execution_status="success",
+                tests_passed=False,
+                diagnostics=["integration test failed"],
+            ),
+            test_attribution=QATestAttribution(
+                verdict="inconclusive",
+                failed_tests=["integration test"],
+            ),
+        )
+        for task_id in first_dispatch["active_target_task_ids"]
+    }
+    fake_client = SimpleNamespace(
+        containers=SimpleNamespace(list=lambda **_kwargs: []),
+        volumes=SimpleNamespace(get=lambda _name: SimpleNamespace(remove=lambda **_kwargs: None)),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.DockerSandbox",
+        lambda **_kwargs: sandbox,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.get_runtime_settings",
+        lambda: AppSettings(max_delta_canary_probes=2, remedy_disable_post_qa_triage=True),
+    )
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_install",
+        lambda _sandbox: SimpleNamespace(ok=True),
+    )
+    monkeypatch.setattr(
+        _graph_wrappers,
+        "apply_multi_package_action",
+        _apply_fake_delta_action,
+    )
+    monkeypatch.setattr(
+        _graph_wrappers._qa_test_parsing,
+        "_run_unit_tests",
+        lambda active_sandbox: SimpleNamespace(
+            ok=[
+                package
+                for package, target in target_versions.items()
+                if active_sandbox.workspace[package] == target
+            ]
+            == ["base64url"]
+        ),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        lambda _state: {
+            "qa_evaluations": failed_evaluations,
+            "eval_status": "some_failed",
+            "status": "qa_completed",
+            "errors": [],
+        },
+    )
+    planned_isolated_batches, _planned_edges, planned_diagnostics = cluster_packages(
+        subgraph,
+        decisions,
+        forced_singleton_task_ids=("task-jws",),
+        peer_conflict_pairs=(),
+    )
+    assert planned_diagnostics == [
+        "forced singleton prevented dependency_ancestry coupling between "
+        "'package.json::jws' and 'package.json::base64url'"
+    ]
+
+    replan_tool_inputs = []
+
+    def replan_fixture_portfolio(tool_input):
+        replan_tool_inputs.append(tool_input)
+        return {
+            "status": "portfolio_ready",
+            "next_routing_step": "supervisor",
+            "errors": [],
+            "portfolio_plan": fixture_portfolio_plan(
+                tool_input["task_queue"], planned_isolated_batches
+            ),
+            "portfolio_solver_plan": None,
+            "portfolio_iteration": tool_input["portfolio_iteration"],
+            "portfolio_replan_request": None,
+            "portfolio_replan_history": tool_input.get("portfolio_replan_history", {}),
+            "portfolio_dirty": False,
+            "portfolio_escalation": None,
+            "valid_groups": tool_input["valid_groups"],
+            "task_queue": tool_input["task_queue"],
+            "active_target_task_ids": [],
+            "active_cluster_id": None,
+            "active_dispatch_batch_id": None,
+            "active_multi_package_action": None,
+        }
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        replan_fixture_portfolio,
+    )
+    monkeypatch.setattr(
+        _graph_wrappers,
+        "_qa_workspace_graph_digest",
+        lambda *_args, **_kwargs: "fixture-graph-digest",
+    )
+    with (
+        patch(
+            "remediation_engine.orchestration.teardown_node.DockerSandbox",
+            lambda **_kwargs: sandbox,
+        ),
+        patch(
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            lambda: fake_client,
+        ),
+        patch(
+            "remediation_engine.orchestration.teardown_node._close_client",
+            lambda _client: None,
+        ),
+    ):
+        failed_qa = run_qa_critic_from_orchestrator(after_worker)
+    isolation = failed_qa["delta_isolation_by_cluster"][initial_atomic_batch.batch_id]
+    assert isolation["status"] == "IDENTIFIED", (
+        isolation.get("diagnostic"),
+        isolation.get("tested_subsets"),
+        isolation.get("executions"),
+    )
+    assert isolation["responsible_task_ids"] == ["task-jws"]
+    assert isolation["candidate_restored"] is True
+    assert sandbox.workspace == baseline
+    replan_state = {**after_worker, **failed_qa, "portfolio_plan": None}
+    after_replan = {**replan_state, **run_supervisor_node(replan_state)}
+    replan_request = replan_tool_inputs[0]["portfolio_replan_request"]
+    assert replan_request.forced_singleton_task_ids == ["task-jws"]
+    assert after_replan["portfolio_replan_request"] is None
+    assert after_replan["task_queue"]["task-base64url"].status == TaskStatus.PENDING
+    assert after_replan["task_queue"]["task-base64url"].retry_count == 0
+    assert after_replan["task_queue"]["task-jws"].status == TaskStatus.NEEDS_RETRY
+
+    isolated_batches, _edges, diagnostics = cluster_packages(
+        subgraph,
+        decisions,
+        forced_singleton_task_ids=replan_request.forced_singleton_task_ids,
+        peer_conflict_pairs=(),
+    )
+    assert diagnostics == [
+        "forced singleton prevented dependency_ancestry coupling between "
+        "'package.json::jws' and 'package.json::base64url'"
+    ]
+    assert sorted(len(batch.task_ids) for batch in isolated_batches) == [1, 1, 1, 1]
+    final_state = {
+        **after_replan,
+        "portfolio_plan": fixture_portfolio_plan(after_replan["task_queue"], isolated_batches),
+        "portfolio_dirty": False,
+    }
+    for package in ("base64url", "got", "esbuild"):
+        batch = next(
+            batch
+            for batch in isolated_batches
+            if tasks_by_package[package].task_id in batch.task_ids
+        )
+        dispatch_state, worker_supervisor = commit_dispatch(
+            final_state, batch, f"accepted-{package}"
+        )
+        passing = {
+            task_id: QAEvaluation(task_id=task_id, passed=True)
+            for task_id in dispatch_state["active_target_task_ids"]
+        }
+        monkeypatch.setattr(
+            "remediation_engine.orchestration.graph.run_qa_critic_node",
+            lambda _state, evaluations=passing: {
+                "qa_evaluations": evaluations,
+                "eval_status": "all_passed",
+                "status": "qa_completed",
+                "errors": [],
+            },
+        )
+        qa_state = {**worker_supervisor, **run_qa_critic_from_orchestrator(worker_supervisor)}
+        final_state = {**qa_state, **run_supervisor_node(qa_state)}
+        assert final_state["task_queue"][f"task-{package}"].status == TaskStatus.QA_PASSED, (
+            qa_state.get("status"),
+            qa_state.get("active_target_task_ids"),
+            qa_state.get("qa_evaluations"),
+            qa_state.get("qa_results_by_attempt"),
+            final_state.get("consistency_events"),
+        )
+
+    assert sandbox.workspace["jws"] == baseline["jws"]
+    assert {package: sandbox.workspace[package] for package in ("base64url", "got", "esbuild")} == {
+        package: target_versions[package] for package in ("base64url", "got", "esbuild")
+    }
+    final_state.update(
+        {
+            "repo_root": str(tmp_path),
+            "valid_groups": groups,
+            "workspace_volume": "workspace-four-package",
+            "changed_files": ["package.json"],
+            "active_target_task_ids": [],
+            "status": "supervisor_routed",
+        }
+    )
+    with (
+        patch(
+            "remediation_engine.orchestration.teardown_node.DockerSandbox",
+            lambda **_kwargs: sandbox,
+        ),
+        patch(
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            lambda: fake_client,
+        ),
+        patch(
+            "remediation_engine.orchestration.teardown_node._close_client",
+            lambda _client: None,
+        ),
+    ):
+        teardown = run_teardown_node(final_state)
+    patch_text = teardown["diff"]
+    assert '"base64url": "3.0.0"' in patch_text
+    assert '"got": "12.0.0"' in patch_text
+    assert '"esbuild": "0.25.0"' in patch_text
+    assert '"jws": "3.2.3"' not in patch_text
 
 
 def _socket_stack_new_dispatch(case, *, batch_id, attempt_prefix):
