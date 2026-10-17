@@ -26,6 +26,12 @@ from langsmith import traceable
 from semantic_version import NpmSpec, Version
 
 from remediation_engine.contracts.version_policy import RegistryCandidate
+from remediation_engine.tools.npm_graph import _normalize_npm_operator_whitespace
+from remediation_engine.tools.registry_cache import (
+    PackumentFetcher,
+    RegistryPackumentCache,
+    load_or_fetch_packument,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +75,8 @@ def _requirement_matches(requirement: str | None, version: Version) -> bool:
     if not requirement:
         return False
     try:
-        return NpmSpec(requirement).match(version)
+        normalized = _normalize_npm_operator_whitespace(requirement)
+        return bool(normalized) and NpmSpec(normalized).match(version)
     except (TypeError, ValueError):
         return False
 
@@ -289,20 +296,31 @@ def select_npm_parent_version(
 # ---------------------------------------------------------------------------
 
 
-def _fetch_package_data(package_name: str) -> dict[str, Any]:
-    """Fetch raw JSON from the npm registry for *package_name*.
+def _fetch_package_data(
+    package_name: str,
+    *,
+    fetcher: PackumentFetcher | None = None,
+    cache: RegistryPackumentCache | None = None,
+) -> dict[str, Any]:
+    """Fetch raw JSON, optionally using an injected fetcher and cache.
 
-    Raises ``requests.RequestException`` on network errors.
-    Raises ``json.JSONDecodeError`` on malformed JSON.
-    Raises ``ValueError`` with message "404" if the package is not found.
+    The keyword-only seams are intentionally not part of any LangChain tool
+    schema.  With no injected arguments this retains the direct network
+    behavior used by existing callers.
     """
-    encoded = quote(package_name, safe="")
-    url = f"{_NPM_REGISTRY_URL}/{encoded}"
-    response = requests.get(url, timeout=_REQUEST_TIMEOUT_SECONDS)
-    if response.status_code == 404:
-        raise ValueError("404")
-    response.raise_for_status()
-    return response.json()
+    if fetcher is None:
+
+        def fetch_from_registry(name: str) -> dict[str, Any]:
+            encoded = quote(name, safe="")
+            url = f"{_NPM_REGISTRY_URL}/{encoded}"
+            response = requests.get(url, timeout=_REQUEST_TIMEOUT_SECONDS)
+            if response.status_code == 404:
+                raise ValueError("404")
+            response.raise_for_status()
+            return response.json()
+
+        fetcher = fetch_from_registry
+    return load_or_fetch_packument(package_name, fetcher, cache=cache)
 
 
 @traceable(run_type="tool", name="supervisor.fetch_registry_candidates")
@@ -310,6 +328,9 @@ def fetch_registry_candidates(
     package_name: str,
     security_floor: str,
     attempted_versions: set[str] | None = None,
+    *,
+    fetcher: PackumentFetcher | None = None,
+    cache: RegistryPackumentCache | None = None,
 ) -> list[RegistryCandidate]:
     """Fetch a small stable npm candidate set as typed policy inputs.
 
@@ -343,7 +364,11 @@ def fetch_registry_candidates(
         if str(version).strip()
     }
     try:
-        data = _fetch_package_data(package_name)
+        if fetcher is None and cache is None:
+            # Keep the one-argument private seam intact for existing mocks.
+            data = _fetch_package_data(package_name)
+        else:
+            data = _fetch_package_data(package_name, fetcher=fetcher, cache=cache)
     except requests.RequestException as exc:
         raise ValueError(f"Could not fetch registry data for {package_name}: {exc}") from exc
     all_candidates: list[RegistryCandidate] = []

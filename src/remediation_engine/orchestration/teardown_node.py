@@ -10,6 +10,7 @@ from __future__ import annotations
 import difflib
 import logging
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from remediation_engine.runtime.path_policy import (
     resolve_repository_path,
 )
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox, get_docker_client
+from remediation_engine.tools.npm_graph import lockfile_key_matches_package
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +53,14 @@ def _read_host_text(repo_root: Path, rel_path: str) -> str:
     return file_path.read_text(encoding="utf-8")
 
 
-def _build_diff(rel_path: str, before_text: str, after_text: str) -> str:
+def _build_diff(
+    rel_path: str,
+    before_text: str,
+    after_text: str,
+    *,
+    before_exists: bool = True,
+    after_exists: bool = True,
+) -> str:
     """Build a unified diff with standard missing-final-newline markers."""
     rel_path = normalize_workspace_path(rel_path, allow_workspace_prefix=False)
     before_has_no_final_newline = bool(before_text) and not before_text.endswith(("\n", "\r"))
@@ -69,8 +78,8 @@ def _build_diff(rel_path: str, before_text: str, after_text: str) -> str:
     for line in difflib.unified_diff(
         before_lines,
         after_lines,
-        fromfile=f"a/{rel_path}",
-        tofile=f"b/{rel_path}",
+        fromfile=f"a/{rel_path}" if before_exists else "/dev/null",
+        tofile=f"b/{rel_path}" if after_exists else "/dev/null",
     ):
         rendered.append(line)
         if line.startswith(("---", "+++", "@@")) or not line:
@@ -207,6 +216,182 @@ def _cleanup_workspace_volume(client: Any, workspace_volume: str) -> tuple[bool,
     return False, errors
 
 
+def _cleanup_run_owned_workspace_volume(workspace_volume: str) -> tuple[bool, list[str]]:
+    """Remove a run-owned workspace volume outside the normal teardown node.
+
+    Args:
+        workspace_volume: Volume name returned by the workspace builder.
+
+    Returns:
+        Whether Docker confirmed removal and any cleanup diagnostics.
+
+    Side Effects:
+        Connects to Docker, removes containers attached to this run's volume,
+        removes the volume, and closes the Docker client.
+    """
+    if not workspace_volume.startswith("agent_workspace_"):
+        return False, [
+            f"teardown_node: refused emergency cleanup of unexpected volume name '{workspace_volume}'"
+        ]
+    try:
+        client = get_docker_client()
+    except Exception as exc:  # noqa: BLE001 - cleanup cannot mask the graph failure
+        return False, [
+            f"teardown_node: could not connect to Docker for emergency cleanup of "
+            f"'{workspace_volume}' - {exc}"
+        ]
+
+    removed = False
+    errors: list[str] = []
+    try:
+        removed, errors = _cleanup_workspace_volume(client, workspace_volume)
+    except BaseException as exc:  # noqa: BLE001 - client closure also covers interrupts
+        errors.append(f"teardown_node: emergency cleanup of '{workspace_volume}' failed - {exc}")
+    finally:
+        try:
+            _close_client(client)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"teardown_node: emergency Docker client close failed - {exc}")
+    return removed, errors
+
+
+def _clear_active_workspace_volume(workspace_volume: str | None) -> None:
+    """Clear the current run's resource record after verified volume removal."""
+    if not workspace_volume:
+        return
+    from remediation_engine.orchestration.trajectory_exporter import (
+        get_active_trajectory_recorder,
+    )
+
+    recorder = get_active_trajectory_recorder()
+    if recorder is not None:
+        recorder.clear_workspace_volume(workspace_volume)
+
+
+def _lockfile_dependencies_contain(
+    dependencies: Any,
+    unfixable_packages: set[str],
+    parent_key: str = "",
+) -> bool:
+    """Return whether a v1/v2 dependency subtree contains an unresolved package."""
+    if not isinstance(dependencies, dict):
+        return False
+    for package_name, entry in dependencies.items():
+        physical_key = (
+            f"{parent_key}/node_modules/{package_name}"
+            if parent_key
+            else f"node_modules/{package_name}"
+        )
+        if any(
+            lockfile_key_matches_package(physical_key, unfixable)
+            for unfixable in unfixable_packages
+        ):
+            return True
+        nested = entry.get("dependencies") if isinstance(entry, dict) else None
+        if _lockfile_dependencies_contain(nested, unfixable_packages, physical_key):
+            return True
+    return False
+
+
+def _restore_npm_lockfile_dependencies(
+    original_dependencies: dict[str, Any],
+    updated_dependencies: dict[str, Any],
+    unfixable_packages: set[str],
+    parent_key: str = "",
+) -> None:
+    """Restore matching v1/v2 package entries recursively from host JSON."""
+    for package_name in sorted(set(original_dependencies) | set(updated_dependencies)):
+        physical_key = (
+            f"{parent_key}/node_modules/{package_name}"
+            if parent_key
+            else f"node_modules/{package_name}"
+        )
+        original_entry = original_dependencies.get(package_name)
+        updated_entry = updated_dependencies.get(package_name)
+        if any(
+            lockfile_key_matches_package(physical_key, unfixable)
+            for unfixable in unfixable_packages
+        ):
+            if package_name in original_dependencies:
+                updated_dependencies[package_name] = deepcopy(original_entry)
+            else:
+                updated_dependencies.pop(package_name, None)
+            continue
+        if not isinstance(updated_entry, dict):
+            if isinstance(original_entry, dict) and _lockfile_dependencies_contain(
+                original_entry.get("dependencies"),
+                unfixable_packages,
+                physical_key,
+            ):
+                # Keep the ancestor needed to represent the restored physical
+                # nested package path when the candidate removed that ancestor.
+                updated_dependencies[package_name] = deepcopy(original_entry)
+            continue
+        original_nested = (
+            original_entry.get("dependencies") if isinstance(original_entry, dict) else None
+        )
+        updated_nested = updated_entry.get("dependencies")
+        if isinstance(original_nested, dict) or isinstance(updated_nested, dict):
+            if not isinstance(updated_nested, dict):
+                updated_nested = {}
+                updated_entry["dependencies"] = updated_nested
+            _restore_npm_lockfile_dependencies(
+                original_nested if isinstance(original_nested, dict) else {},
+                updated_nested,
+                unfixable_packages,
+                physical_key,
+            )
+            if not updated_nested and not isinstance(original_nested, dict):
+                updated_entry.pop("dependencies", None)
+
+
+def _restore_npm_lockfile_packages(
+    original_packages: dict[str, Any],
+    updated_packages: dict[str, Any],
+    unfixable_packages: set[str],
+) -> None:
+    """Restore matching v3 physical entries and nested package descendants."""
+    package_keys = {str(key) for key in original_packages} | {str(key) for key in updated_packages}
+    for package_name in sorted(unfixable_packages):
+        roots = {key for key in package_keys if lockfile_key_matches_package(key, package_name)}
+        affected = set(roots)
+        root_prefixes = {key.replace("\\", "/").strip("/") + "/node_modules/" for key in roots}
+        for key in package_keys:
+            normalized = key.replace("\\", "/").strip("/")
+            if any(normalized.startswith(prefix) for prefix in root_prefixes):
+                affected.add(key)
+        for key in sorted(affected):
+            if key in original_packages:
+                updated_packages[key] = deepcopy(original_packages[key])
+            else:
+                updated_packages.pop(key, None)
+
+    original_root = original_packages.get("")
+    updated_root = updated_packages.get("")
+    if not isinstance(original_root, dict) or not isinstance(updated_root, dict):
+        return
+    for section in (
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ):
+        original_entries = original_root.get(section)
+        updated_entries = updated_root.get(section)
+        if not isinstance(original_entries, dict) and not isinstance(updated_entries, dict):
+            continue
+        if not isinstance(updated_entries, dict):
+            updated_entries = {}
+            updated_root[section] = updated_entries
+        for package_name in sorted(unfixable_packages):
+            if isinstance(original_entries, dict) and package_name in original_entries:
+                updated_entries[package_name] = deepcopy(original_entries[package_name])
+            else:
+                updated_entries.pop(package_name, None)
+        if not updated_entries and not isinstance(original_entries, dict):
+            updated_root.pop(section, None)
+
+
 def _revert_unfixable_packages_in_json(
     original_text: str,
     updated_text: str,
@@ -227,26 +412,36 @@ def _revert_unfixable_packages_in_json(
                     indent = "\t"
                 break
 
-        dep_keys = {
+        dependency_sections = (
             "dependencies",
             "devDependencies",
             "peerDependencies",
             "optionalDependencies",
             "overrides",
             "resolutions",
-        }
-
-        for pkg in unfixable_packages:
-            for key in dep_keys:
-                if key in upd_obj and isinstance(upd_obj[key], dict) and pkg in upd_obj[key]:
+        )
+        lockfile_like = any(
+            "lockfileVersion" in document or "packages" in document
+            for document in (orig_obj, upd_obj)
+            if isinstance(document, dict)
+        )
+        for package_name in sorted(unfixable_packages):
+            for key in dependency_sections:
+                if lockfile_like and key == "dependencies":
+                    continue
+                if (
+                    key in upd_obj
+                    and isinstance(upd_obj[key], dict)
+                    and package_name in upd_obj[key]
+                ):
                     if (
                         key in orig_obj
                         and isinstance(orig_obj.get(key), dict)
-                        and pkg in orig_obj[key]
+                        and package_name in orig_obj[key]
                     ):
-                        upd_obj[key][pkg] = orig_obj[key][pkg]
+                        upd_obj[key][package_name] = deepcopy(orig_obj[key][package_name])
                     else:
-                        del upd_obj[key][pkg]
+                        del upd_obj[key][package_name]
 
                     if not upd_obj[key] and (key not in orig_obj or not orig_obj[key]):
                         del upd_obj[key]
@@ -255,21 +450,51 @@ def _revert_unfixable_packages_in_json(
                 "pnpm" in upd_obj
                 and isinstance(upd_obj["pnpm"], dict)
                 and "overrides" in upd_obj["pnpm"]
-                and pkg in upd_obj["pnpm"]["overrides"]
+                and package_name in upd_obj["pnpm"]["overrides"]
             ):
                 if (
                     "pnpm" in orig_obj
                     and isinstance(orig_obj.get("pnpm"), dict)
                     and "overrides" in orig_obj["pnpm"]
-                    and pkg in orig_obj["pnpm"]["overrides"]
+                    and package_name in orig_obj["pnpm"]["overrides"]
                 ):
-                    upd_obj["pnpm"]["overrides"][pkg] = orig_obj["pnpm"]["overrides"][pkg]
+                    upd_obj["pnpm"]["overrides"][package_name] = deepcopy(
+                        orig_obj["pnpm"]["overrides"][package_name]
+                    )
                 else:
-                    del upd_obj["pnpm"]["overrides"][pkg]
+                    del upd_obj["pnpm"]["overrides"][package_name]
                 if not upd_obj["pnpm"]["overrides"] and (
                     "pnpm" not in orig_obj or "overrides" not in orig_obj.get("pnpm", {})
                 ):
                     del upd_obj["pnpm"]["overrides"]
+
+        original_packages = orig_obj.get("packages")
+        updated_packages = upd_obj.get("packages")
+        if "packages" in orig_obj and not isinstance(original_packages, dict):
+            raise ValueError("host npm lockfile packages field is not an object")
+        if "packages" in upd_obj and not isinstance(updated_packages, dict):
+            raise ValueError("workspace npm lockfile packages field is not an object")
+        if isinstance(updated_packages, dict):
+            _restore_npm_lockfile_packages(
+                original_packages if isinstance(original_packages, dict) else {},
+                updated_packages,
+                unfixable_packages,
+            )
+
+        lockfile_version = upd_obj.get("lockfileVersion", orig_obj.get("lockfileVersion"))
+        if lockfile_version in {1, 2}:
+            original_dependencies = orig_obj.get("dependencies")
+            updated_dependencies = upd_obj.get("dependencies")
+            if "dependencies" in orig_obj and not isinstance(original_dependencies, dict):
+                raise ValueError("host npm lockfile dependencies field is not an object")
+            if "dependencies" in upd_obj and not isinstance(updated_dependencies, dict):
+                raise ValueError("workspace npm lockfile dependencies field is not an object")
+            if isinstance(updated_dependencies, dict):
+                _restore_npm_lockfile_dependencies(
+                    original_dependencies if isinstance(original_dependencies, dict) else {},
+                    updated_dependencies,
+                    unfixable_packages,
+                )
 
         return json.dumps(upd_obj, indent=indent) + "\n"
     except Exception as exc:
@@ -298,17 +523,29 @@ def run_teardown_node(state: OrchestratorState) -> dict[str, Any]:
         Reads changed files from the Docker workspace and attempts to remove
         attached containers and the run-owned workspace volume.
     """
+    workspace_volume = state.get("workspace_volume")
     try:
-        return _run_teardown_node_impl(state)
-    except Exception as exc:  # noqa: BLE001
+        result = _run_teardown_node_impl(state)
+        if result.get("workspace_volume") is None:
+            _clear_active_workspace_volume(workspace_volume)
+        return result
+    except BaseException as exc:  # noqa: BLE001 - clean up before propagating interrupts
+        workspace_volume = state.get("workspace_volume")
+        cleanup_errors: list[str] = []
+        volume_removed = not bool(workspace_volume)
+        if isinstance(workspace_volume, str) and workspace_volume:
+            volume_removed, cleanup_errors = _cleanup_run_owned_workspace_volume(workspace_volume)
+            if volume_removed:
+                _clear_active_workspace_volume(workspace_volume)
+        if not isinstance(exc, Exception):
+            raise
         logger.exception("teardown_node: unexpected teardown failure.")
         return {
             "status": "completed_with_errors",
-            "workspace_volume": state.get("workspace_volume"),
+            "workspace_volume": None if volume_removed else workspace_volume,
             "changed_files": ChangedFilesProjection(),
             "diff": "",
-            "errors": list(state.get("errors", []) or [])
-            + [f"teardown_node: unexpected teardown failure - {exc}"],
+            "errors": [f"teardown_node: unexpected teardown failure - {exc}", *cleanup_errors],
         }
 
 
@@ -485,6 +722,7 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                                 continue
                             host_path = resolve_repository_path(repo_root, rel_path)
                             host_exists = host_path.is_file()
+                            workspace_file_exists = updated_text is not None
                             if updated_text is None and not host_exists:
                                 continue
                             if updated_text is None:
@@ -505,7 +743,13 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                                     errors,
                                 )
 
-                            diff_text = _build_diff(rel_path, original_text, updated_text)
+                            diff_text = _build_diff(
+                                rel_path,
+                                original_text,
+                                updated_text,
+                                before_exists=host_exists,
+                                after_exists=workspace_file_exists,
+                            )
                             if diff_text:
                                 diff_chunks.append(diff_text)
                                 changed_files.append(rel_path)

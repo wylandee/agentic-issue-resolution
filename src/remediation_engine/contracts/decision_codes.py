@@ -27,6 +27,7 @@ class DecisionCode(str, Enum):  # noqa: UP042
     FINAL_FULL_SCAN_REQUIRED = "FINAL_FULL_SCAN_REQUIRED"
     NO_VALID_GROUPS = "NO_VALID_GROUPS"
     INVALID_LLM_DECISION = "INVALID_LLM_DECISION"
+    PORTFOLIO_PLAN_REQUIRED = "PORTFOLIO_PLAN_REQUIRED"
     PIVOT_TO_WORKAROUND = "PIVOT_TO_WORKAROUND"
     TACTICAL_ACTION_REJECTED = "TACTICAL_ACTION_REJECTED"
     REGISTRY_VERIFICATION_PENDING = "REGISTRY_VERIFICATION_PENDING"
@@ -48,6 +49,7 @@ VALID_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
         ("optimistically_fixed", "qa_passed"),
         ("optimistically_fixed", "needs_retry"),
         ("optimistically_fixed", "inconclusive"),
+        ("optimistically_fixed", "pending"),
         # The final NO_FIX mitigation stage is terminalized directly after
         # its QA failure; there is no third worker stage to dispatch.
         ("optimistically_fixed", "unfixable"),

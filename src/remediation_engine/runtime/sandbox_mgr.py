@@ -14,6 +14,7 @@ context-manager that:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
@@ -23,8 +24,8 @@ import tarfile
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable
-from pathlib import Path
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path, PurePosixPath
 from threading import RLock
 
 from langsmith import traceable
@@ -179,6 +180,51 @@ class WorkspaceReadCache:
                 "invalidations": self._invalidations,
                 "last_invalidation_reason": self._last_invalidation_reason,
             }
+
+
+_DEFAULT_READ_FILES_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_READ_FILES = 10_000
+_MAX_CONTAINER_PATH_CHECK_COMMAND_BYTES = 32_768
+
+
+class _ReadFilesResult(dict[str, str]):
+    """Document mapping with private bounded data for the trace callback."""
+
+    __slots__ = ("total_bytes", "duration_seconds", "digest")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.total_bytes = 0
+        self.duration_seconds = 0.0
+        self.digest = ""
+
+
+def _trace_read_files_inputs(inputs: dict[str, object]) -> dict[str, int]:
+    """Keep batched read inputs free of workspace paths."""
+    paths = inputs.get("paths", ())
+    if isinstance(paths, (str, bytes)) or not isinstance(paths, Sequence):
+        return {"file_count": 0}
+    return {"file_count": min(len(paths), _MAX_READ_FILES + 1)}
+
+
+def _trace_read_files_outputs(output: object) -> dict[str, object]:
+    """Emit bounded read measurements without document contents or paths."""
+    if not isinstance(output, _ReadFilesResult):
+        return {"file_count": 0, "total_bytes": 0, "duration_seconds": 0.0, "digest": ""}
+    return {
+        "file_count": len(output),
+        "total_bytes": output.total_bytes,
+        "duration_seconds": round(output.duration_seconds, 3),
+        "digest": output.digest,
+    }
+
+
+def _trace_write_files_inputs(inputs: dict[str, object]) -> dict[str, int]:
+    """Keep batched write traces free of workspace paths and file contents."""
+    files = inputs.get("files")
+    if not isinstance(files, Mapping):
+        return {"file_count": 0}
+    return {"file_count": len(files)}
 
 
 def _workspace_snapshot_archive(snapshot_id: str) -> str:
@@ -410,17 +456,40 @@ class DockerSandbox:
 
     def _assert_container_path(self, absolute_path: str) -> None:
         """Reject a container path whose existing symlinks leave ``/workspace``."""
+        self._assert_container_paths((absolute_path,))
+
+    def _assert_container_paths(self, absolute_paths: Sequence[str]) -> None:
+        """Reject paths whose existing symlinks leave ``/workspace``."""
         if self._container is None:
             raise RuntimeError("Sandbox is not running.")
-        quoted_path = shlex.quote(absolute_path)
-        command = (
-            f"resolved=$(realpath -m -- {quoted_path}) || exit 1; "
-            'case "$resolved" in /workspace|/workspace/*) exit 0 ;; *) exit 1 ;; esac'
-        )
-        result = self._container.exec_run(["/bin/sh", "-lc", command])
-        exit_code = result[0] if isinstance(result, tuple) else getattr(result, "exit_code", 1)
-        if exit_code != 0:
-            raise WorkspacePathError(f"container path resolves outside /workspace: {absolute_path}")
+
+        batches: list[list[str]] = []
+        current_batch: list[str] = []
+        current_size = 0
+        for absolute_path in absolute_paths:
+            quoted_path = shlex.quote(absolute_path)
+            path_size = len(quoted_path.encode("utf-8")) + 1
+            if current_batch and current_size + path_size > _MAX_CONTAINER_PATH_CHECK_COMMAND_BYTES:
+                batches.append(current_batch)
+                current_batch = []
+                current_size = 0
+            current_batch.append(quoted_path)
+            current_size += path_size
+        if current_batch:
+            batches.append(current_batch)
+
+        for batch in batches:
+            quoted_paths = " ".join(batch)
+            command = (
+                f"for path in {quoted_paths}; do "
+                'resolved=$(realpath -m -- "$path") || exit 1; '
+                'case "$resolved" in /workspace|/workspace/*) : ;; *) exit 1 ;; esac; '
+                "done"
+            )
+            result = self._container.exec_run(["/bin/sh", "-lc", command])
+            exit_code = result[0] if isinstance(result, tuple) else getattr(result, "exit_code", 1)
+            if exit_code != 0:
+                raise WorkspacePathError("one or more container paths resolve outside /workspace")
 
     @traceable(run_type="tool", name="docker_sandbox.run")
     def run(
@@ -600,13 +669,115 @@ class DockerSandbox:
         self._container.put_archive(parent_dir, buf.read())
         logger.debug("DockerSandbox: wrote %d bytes to %s.", len(encoded), abs_path)
 
-    def read_file(self, file_path: str) -> str | None:
-        """Read *file_path*, avoiding duplicate traced container reads.
+    @traceable(
+        run_type="tool",
+        name="docker_sandbox.write_files",
+        process_inputs=_trace_write_files_inputs,
+    )
+    def write_files(self, files: Mapping[str, str]) -> None:
+        """Write multiple workspace files with one Docker archive upload.
 
-        The public cache lookup is intentionally outside the trace decorator.
-        Only a cache miss reaches :meth:`_read_file_from_container`, so repeat
-        reads from workaround and QA tools do not become trace spam.
+        Args:
+            files: Mapping of workspace-relative paths to UTF-8 text contents.
+
+        Raises:
+            RuntimeError: If the sandbox is not running.
+            TypeError: If any file content is not text.
+            WorkspacePathError: If paths are unsafe, collide after normalization,
+                or escape the workspace through parent symlinks.
         """
+        if not self._alive or self._container is None:
+            raise RuntimeError("Sandbox is not running.")
+        normalized_files: dict[str, str] = {}
+        parent_dirs: set[str] = set()
+        for file_path, content in files.items():
+            relative_path = normalize_workspace_path(file_path)
+            if not isinstance(content, str):
+                raise TypeError("workspace file contents must be text.")
+            if relative_path in normalized_files:
+                raise WorkspacePathError(f"duplicate normalized workspace path: {relative_path!r}")
+            normalized_files[relative_path] = content
+            parent = PurePosixPath(relative_path).parent
+            while parent != PurePosixPath("."):
+                parent_dirs.add(parent.as_posix())
+                parent = parent.parent
+
+        if not normalized_files:
+            return
+
+        conflicting_paths = set(normalized_files).intersection(parent_dirs)
+        if conflicting_paths:
+            raise WorkspacePathError(
+                f"workspace path is both a file and a directory: {min(conflicting_paths)!r}"
+            )
+
+        ordered_directories = sorted(parent_dirs, key=lambda path: (path.count("/"), path))
+        parent_paths = tuple(f"/workspace/{path}" for path in ordered_directories) or (
+            "/workspace",
+        )
+        self._assert_container_paths(parent_paths)
+
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            for directory in ordered_directories:
+                directory_info = tarfile.TarInfo(name=f"{directory}/")
+                directory_info.type = tarfile.DIRTYPE
+                directory_info.mode = 0o755
+                directory_info.mtime = 0
+                archive.addfile(directory_info)
+            for relative_path, content in normalized_files.items():
+                encoded = content.encode("utf-8")
+                file_info = tarfile.TarInfo(name=relative_path)
+                file_info.size = len(encoded)
+                archive.addfile(file_info, io.BytesIO(encoded))
+
+        self.invalidate_read_cache("write_files")
+        self._container.put_archive("/workspace", buffer.getvalue())
+        logger.debug(
+            "DockerSandbox: wrote %d files in one archive.",
+            len(normalized_files),
+        )
+
+    def _read_file_bytes_untraced(
+        self,
+        relative_path: str,
+        *,
+        containment_checked: bool = False,
+        regular_only: bool = False,
+    ) -> bytes | None:
+        """Read one normalized file without creating a trace span."""
+        if not self._alive or self._container is None:
+            logger.warning("DockerSandbox.read_file: sandbox is not running.")
+            return None
+        abs_path = f"/workspace/{relative_path}"
+        try:
+            if not containment_checked:
+                self._assert_container_path(abs_path)
+            stream, _stat = self._container.get_archive(abs_path)
+        except WorkspacePathError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DockerSandbox.read_file: could not retrieve %s — %s", abs_path, exc)
+            return None
+        raw = b"".join(chunk for chunk in stream)
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tf:
+                members = tf.getmembers()
+                member = members[0] if members else None
+                if member is None or (regular_only and not member.isfile()):
+                    logger.warning("DockerSandbox.read_file: %s is not a regular file.", abs_path)
+                    return None
+                extracted = tf.extractfile(member)
+                if extracted is None:
+                    logger.warning("DockerSandbox.read_file: %s is not a regular file.", abs_path)
+                    return None
+                return extracted.read()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DockerSandbox.read_file: failed to extract %s — %s", abs_path, exc)
+            return None
+
+    def read_file(self, file_path: str) -> str | None:
+        """Read one workspace file through the bounded, revision-aware cache."""
         relative_path = normalize_workspace_path(file_path)
         return self._read_cache.get_or_load(
             self._read_scope,
@@ -616,35 +787,90 @@ class DockerSandbox:
 
     @traceable(run_type="tool", name="docker_sandbox.read_file")
     def _read_file_from_container(self, relative_path: str) -> str | None:
-        """Read one normalized path from ``/workspace`` through Docker."""
+        """Read one normalized workspace path after a cache miss."""
+        content = self._read_file_bytes_untraced(relative_path)
+        return content.decode("utf-8", errors="replace") if content is not None else None
+
+    @traceable(
+        run_type="tool",
+        name="docker_sandbox.read_files",
+        process_inputs=_trace_read_files_inputs,
+        process_outputs=_trace_read_files_outputs,
+    )
+    def read_files(
+        self,
+        paths: Sequence[str],
+        *,
+        max_total_bytes: int = _DEFAULT_READ_FILES_MAX_TOTAL_BYTES,
+    ) -> dict[str, str] | None:
+        """Read a bounded set of regular workspace files in one trace span.
+
+        Args:
+            paths: Workspace-relative paths to read. Duplicate normalized paths
+                are read once.
+            max_total_bytes: Total raw file-byte cap, never a truncation limit.
+                Tests may lower the cap but cannot raise the hard limit.
+
+        Returns:
+            A complete path-to-text mapping, or ``None`` if any path is missing
+            or is not a regular file. No partial mapping is returned.
+
+        Raises:
+            WorkspacePathError: If a path is unsafe or resolves outside the workspace.
+            ValueError: If the path count or byte cap is invalid or exceeded.
+        """
+        started = time.monotonic()
         if not self._alive or self._container is None:
-            logger.warning("DockerSandbox.read_file: sandbox is not running.")
+            logger.warning("DockerSandbox.read_files: sandbox is not running.")
             return None
-
-        abs_path = f"/workspace/{relative_path}"
-
+        if isinstance(paths, (str, bytes)) or not isinstance(paths, Sequence):
+            raise ValueError("paths must be a sequence of workspace-relative paths.")
+        if (
+            isinstance(max_total_bytes, bool)
+            or not isinstance(max_total_bytes, int)
+            or max_total_bytes < 0
+            or max_total_bytes > _DEFAULT_READ_FILES_MAX_TOTAL_BYTES
+        ):
+            raise ValueError("max_total_bytes must be within the hard batch-read limit.")
+        if len(paths) > _MAX_READ_FILES:
+            raise ValueError(f"batched workspace read exceeds {_MAX_READ_FILES} files.")
+        if any(len(str(path)) > 4096 for path in paths):
+            raise ValueError("batched workspace read contains an overlong path.")
         try:
-            self._assert_container_path(abs_path)
-            stream, _stat = self._container.get_archive(abs_path)
+            normalized_paths = sorted({normalize_workspace_path(path) for path in paths})
         except WorkspacePathError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("DockerSandbox.read_file: could not retrieve %s â€” %s", abs_path, exc)
-            return None
-
-        raw = b"".join(chunk for chunk in stream)
-
+            raise WorkspacePathError("batched workspace read contains an unsafe path") from None
+        if len(normalized_paths) > _MAX_READ_FILES:
+            raise ValueError(f"batched workspace read exceeds {_MAX_READ_FILES} files.")
         try:
-            with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tf:
-                member = tf.getmembers()[0]
-                extracted = tf.extractfile(member)
-                if extracted is None:
-                    logger.warning("DockerSandbox.read_file: %s is not a regular file.", abs_path)
-                    return None
-                return extracted.read().decode("utf-8", errors="replace")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("DockerSandbox.read_file: failed to extract %s â€” %s", abs_path, exc)
-            return None
+            for relative_path in normalized_paths:
+                self._assert_container_path(f"/workspace/{relative_path}")
+        except WorkspacePathError:
+            raise WorkspacePathError(
+                "batched workspace read path resolves outside the workspace"
+            ) from None
+
+        documents = _ReadFilesResult()
+        digest = hashlib.sha256()
+        total_bytes = 0
+        for relative_path in normalized_paths:
+            content_bytes = self._read_file_bytes_untraced(
+                relative_path, containment_checked=True, regular_only=True
+            )
+            if content_bytes is None:
+                return None
+            total_bytes += len(content_bytes)
+            if total_bytes > max_total_bytes:
+                raise ValueError("batched workspace read exceeds its total-byte limit.")
+            documents[relative_path] = content_bytes.decode("utf-8", errors="replace")
+            digest.update(relative_path.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(content_bytes)
+            digest.update(b"\0")
+        documents.total_bytes = total_bytes
+        documents.duration_seconds = max(0.0, time.monotonic() - started)
+        documents.digest = digest.hexdigest()[:24]
+        return documents
 
     @traceable(run_type="tool", name="docker_sandbox.create_workspace_snapshot")
     def create_workspace_snapshot(self, snapshot_id: str) -> None:

@@ -26,8 +26,8 @@ attempt snapshots. Expected checkpoints are:
    critical, high, medium, then low.
 4. `QA_READY` routes the active update task batch to QA, preserving task-keyed
    evaluation and attempt evidence.
-5. When every task is terminal, `NO_ACTIONABLE_TASKS` routes to teardown and
-   the final full scan is gated by Supervisor.
+5. When every task is terminal, `NO_ACTIONABLE_TASKS` routes to teardown unless
+   `REMEDY_FINAL_FULL_SCAN_ENABLED=true` enables the optional final full scan.
 
 The deterministic property applies to fixture loading and Supervisor routing,
 not to the whole execution. Workers, deterministic QA install/scan/tests, and

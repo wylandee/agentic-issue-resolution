@@ -5,7 +5,7 @@ Responsibilities
 ----------------
 * Resolve repo-relative file paths to absolute paths within a repo root.
 * Load raw source bytes from disk (no network, no side effects).
-* Build and cache tree-sitter ``Language`` / ``Parser`` objects for JS/TS and Python.
+* Build and cache tree-sitter ``Language`` / ``Parser`` objects for JS/TS/TSX.
 * Parse source bytes into a ``tree_sitter.Tree``, with a safe fallback.
 * Walk an AST to find the enclosing function/class/method at a given line.
 * Extract import statements from the top-level of a file.
@@ -21,8 +21,9 @@ Design constraints
 
 Language support
 ----------------
-JavaScript (.js, .jsx), TypeScript (.ts, .tsx), and Python (.py) use tree-sitter.
-The Python grammar is loaded independently so its failure does not disable JS/TS.
+v1 targets JavaScript (.js, .jsx) and TypeScript (.ts, .tsx).  The helpers are
+written to be language-extensible: pass the correct ``Language`` object and the
+same logic applies.
 """
 
 from __future__ import annotations
@@ -45,57 +46,32 @@ log = logging.getLogger(__name__)
 _JS_LANG: object = None
 _TS_LANG: object = None
 _TSX_LANG: object = None
-_PY_LANG: object = None
-_TREE_SITTER_CORE_AVAILABLE: bool = False
 _TREE_SITTER_AVAILABLE: bool = False
-_PYTHON_TREE_SITTER_AVAILABLE: bool = False
 
 try:
+    import tree_sitter_javascript as _tsjs
+    import tree_sitter_typescript as _tsts
     from tree_sitter import Language, Node, Parser, Tree
 
-    _TREE_SITTER_CORE_AVAILABLE = True
+    _JS_LANG = Language(_tsjs.language())
+    _TS_LANG = Language(_tsts.language_typescript())
+    _TSX_LANG = Language(_tsts.language_tsx())
+    _TREE_SITTER_AVAILABLE = True
 except Exception as _ts_err:  # pragma: no cover
-    log.warning(
-        "tree-sitter core unavailable â€” AST localization will be skipped: %s",
-        _ts_err,
-    )
-
-if _TREE_SITTER_CORE_AVAILABLE:
-    try:
-        import tree_sitter_javascript as _tsjs
-        import tree_sitter_typescript as _tsts
-
-        _JS_LANG = Language(_tsjs.language())
-        _TS_LANG = Language(_tsts.language_typescript())
-        _TSX_LANG = Language(_tsts.language_tsx())
-        _TREE_SITTER_AVAILABLE = True
-    except Exception as _js_ts_err:  # pragma: no cover
-        log.warning("tree-sitter JavaScript/TypeScript grammars unavailable: %s", _js_ts_err)
-
-    try:
-        import tree_sitter_python as _tspy
-
-        _PY_LANG = Language(_tspy.language())
-        _PYTHON_TREE_SITTER_AVAILABLE = True
-    except Exception as _py_err:  # pragma: no cover
-        log.warning("tree-sitter Python grammar unavailable: %s", _py_err)
+    log.warning("tree-sitter unavailable â€” AST localization will be skipped: %s", _ts_err)
 
 
 # Mapping of file extension â†’ Language object
 _EXT_TO_LANG = {}
 if _TREE_SITTER_AVAILABLE:
-    _EXT_TO_LANG.update(
-        {
-            ".js": _JS_LANG,
-            ".jsx": _JS_LANG,
-            ".ts": _TS_LANG,
-            ".tsx": _TSX_LANG,
-            ".mjs": _JS_LANG,
-            ".cjs": _JS_LANG,
-        }
-    )
-if _PYTHON_TREE_SITTER_AVAILABLE:
-    _EXT_TO_LANG[".py"] = _PY_LANG
+    _EXT_TO_LANG = {
+        ".js": _JS_LANG,
+        ".jsx": _JS_LANG,
+        ".ts": _TS_LANG,
+        ".tsx": _TSX_LANG,
+        ".mjs": _JS_LANG,
+        ".cjs": _JS_LANG,
+    }
 
 
 def language_for_path(file_path: str) -> object | None:
@@ -175,7 +151,7 @@ def parse_source(source_bytes: bytes, language: object) -> Tree | None:  # type:
     A parse result is always returned by tree-sitter (even for invalid code), so
     ``None`` is only returned when tree-sitter is unavailable.
     """
-    if not _TREE_SITTER_CORE_AVAILABLE:
+    if not _TREE_SITTER_AVAILABLE:
         return None
     try:
         parser = Parser(language)  # type: ignore[arg-type]
@@ -189,6 +165,7 @@ def parse_source(source_bytes: bytes, language: object) -> Tree | None:  # type:
 # AST helpers
 # ---------------------------------------------------------------------------
 
+# Node types that represent "enclosing scopes" for SAST findings.
 _ENCLOSING_TYPES: tuple[str, ...] = (
     "function_declaration",
     "function_expression",
@@ -198,9 +175,6 @@ _ENCLOSING_TYPES: tuple[str, ...] = (
     "method_definition",
     "class_declaration",
     "class_expression",
-    "function_definition",
-    "class_definition",
-    "decorated_definition",
 )
 
 
@@ -209,31 +183,9 @@ def _node_contains_line(node: Node, zero_indexed_line: int) -> bool:  # type: ig
     return node.start_point[0] <= zero_indexed_line <= node.end_point[0]
 
 
-def _definition_node(node: Node) -> Node:  # type: ignore[name-defined]
-    """Return the function/class declaration wrapped by a Python decorator node."""
-    if node.type == "decorated_definition":
-        for child in node.children:
-            if child.type in ("function_definition", "class_definition"):
-                return child
-    return node
-
-
-def _normalized_definition_node(node: Node) -> Node:  # type: ignore[name-defined]
-    """Use the outer Python decorated definition as the symbol's source span."""
-    if (
-        node.type in ("function_definition", "class_definition")
-        and node.parent is not None
-        and node.parent.type == "decorated_definition"
-    ):
-        return node.parent
-    return node
-
-
 def _extract_node_name(node: Node) -> str | None:  # type: ignore[name-defined]
     """Best-effort extraction of a human-readable name for *node*."""
-    node = _definition_node(node)
-
-    # Standard named fields used by JS/TS/Python grammars
+    # Standard named fields used by JS/TS grammars
     for field in ("name", "key"):
         child = node.child_by_field_name(field)
         if child is not None and child.text:
@@ -256,7 +208,7 @@ def _extract_node_name(node: Node) -> str | None:  # type: ignore[name-defined]
 
 # Schema enum labels for each enclosing node type
 _TYPE_ENUM_MAP: dict = {}
-if _TREE_SITTER_CORE_AVAILABLE:
+if _TREE_SITTER_AVAILABLE:
     from remediation_engine.contracts.schemas import ASTNodeType
 
     _TYPE_ENUM_MAP = {
@@ -268,26 +220,7 @@ if _TREE_SITTER_CORE_AVAILABLE:
         "method_definition": ASTNodeType.METHOD,
         "class_declaration": ASTNodeType.CLASS,
         "class_expression": ASTNodeType.CLASS,
-        "function_definition": ASTNodeType.FUNCTION,
-        "class_definition": ASTNodeType.CLASS,
     }
-
-
-def _symbol_enum_type(node: Node) -> ASTNodeType:  # type: ignore[name-defined]
-    """Map a symbol node to the stable, language-neutral AST node enum."""
-    definition = _definition_node(node)
-    if definition.type == "function_definition":
-        scope = definition.parent
-        if scope is not None and scope.type == "decorated_definition":
-            scope = scope.parent
-        if (
-            scope is not None
-            and scope.type == "block"
-            and scope.parent is not None
-            and scope.parent.type == "class_definition"
-        ):
-            return ASTNodeType.METHOD
-    return _TYPE_ENUM_MAP.get(definition.type, ASTNodeType.UNKNOWN)
 
 
 def find_enclosing_symbol(
@@ -304,7 +237,7 @@ def find_enclosing_symbol(
         A ``(symbol_name, ASTNodeType)`` tuple.  Both values are ``None`` /
         ``ASTNodeType.UNKNOWN`` when nothing is found.
     """
-    if not _TREE_SITTER_CORE_AVAILABLE:
+    if not _TREE_SITTER_AVAILABLE:
         from remediation_engine.contracts.schemas import ASTNodeType
 
         return None, ASTNodeType.UNKNOWN
@@ -326,14 +259,13 @@ def find_enclosing_symbol(
         if node.type not in _ENCLOSING_TYPES:
             continue
 
-        symbol_node = _normalized_definition_node(node)
-        node_size = symbol_node.end_point[0] - symbol_node.start_point[0]
+        node_size = node.end_point[0] - node.start_point[0]
         # Prefer innermost (smallest) enclosing node
         if best_size == -1 or node_size <= best_size:
-            name = _extract_node_name(symbol_node)
+            name = _extract_node_name(node)
             if name:
                 best_name = name
-                best_type = _symbol_enum_type(symbol_node)
+                best_type = _TYPE_ENUM_MAP.get(node.type, ASTNodeType.UNKNOWN)
                 best_size = node_size
 
     return best_name, best_type
@@ -349,8 +281,6 @@ _NAMED_TYPES: tuple[str, ...] = (
     "method_definition",
     "class_declaration",
     "class_expression",
-    "function_definition",
-    "class_definition",
 )
 
 
@@ -384,7 +314,7 @@ def find_named_symbol(
         Raises ``ValueError`` on ambiguous matches that cannot be resolved
         by *line_hint*.
     """
-    if not _TREE_SITTER_CORE_AVAILABLE:
+    if not _TREE_SITTER_AVAILABLE:
         raise RuntimeError("tree-sitter is unavailable.")
 
     candidates: list[dict[str, Any]] = []
@@ -401,19 +331,18 @@ def find_named_symbol(
         if name != symbol_name:
             continue
 
-        symbol_node = _normalized_definition_node(node)
-        raw = symbol_node.text
+        raw = node.text
         node_text = (
             raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw or "")
         )
         candidates.append(
             {
                 "symbol_name": name,
-                "node_type": symbol_node.type,
-                "start_line": symbol_node.start_point[0] + 1,  # 1-indexed
-                "end_line": symbol_node.end_point[0] + 1,  # 1-indexed
-                "start_byte": symbol_node.start_byte,
-                "end_byte": symbol_node.end_byte,
+                "node_type": node.type,
+                "start_line": node.start_point[0] + 1,  # 1-indexed
+                "end_line": node.end_point[0] + 1,  # 1-indexed
+                "start_byte": node.start_byte,
+                "end_byte": node.end_byte,
                 "text": node_text,
             }
         )
@@ -449,19 +378,30 @@ def find_named_symbol(
 
 
 def extract_imports(root: Node, source_bytes: bytes) -> list[str]:  # type: ignore[name-defined]
-    """Return top-level JS/Python imports and CommonJS require statements.
+    """Return top-level import/require statements as stripped text strings.
 
-    Captures ES6 ``import`` declarations, Python ``import``/``from`` statements,
-    and ``const x = require(...)`` expression statements.
+    Captures:
+    - ES6 ``import`` declarations
+    - ``const x = require(...)`` expression statements
     """
-    if not _TREE_SITTER_CORE_AVAILABLE:
+    return _extract_import_statements(root)[:20]
+
+
+def extract_all_imports(root: Node, source_bytes: bytes) -> list[str]:  # type: ignore[name-defined]
+    """Return every top-level import/require statement for deterministic analysis."""
+    return _extract_import_statements(root)
+
+
+def _extract_import_statements(root: Node) -> list[str]:  # type: ignore[name-defined]
+    """Extract top-level JavaScript and TypeScript imports without a size cap."""
+    if not _TREE_SITTER_AVAILABLE:
         return []
 
     results: list[str] = []
 
     for child in root.children:
         node_type = child.type
-        if node_type in ("import_statement", "import_from_statement"):
+        if node_type == "import_statement":
             text = child.text
             if isinstance(text, bytes):
                 text = text.decode("utf-8", errors="replace")
@@ -474,7 +414,7 @@ def extract_imports(root: Node, source_bytes: bytes) -> list[str]:  # type: igno
             if "require(" in raw:
                 results.append(raw.strip())
 
-    return results[:20]  # cap at 20 to stay context-sized
+    return results
 
 
 def extract_sink_expression(
@@ -482,12 +422,12 @@ def extract_sink_expression(
     one_indexed_line: int,
     source_bytes: bytes,
 ) -> str | None:
-    """Return the innermost call expression on *one_indexed_line*, if any.
+    """Return the text of the call-expression node at *one_indexed_line*, if any.
 
-    Recognizes JavaScript/TypeScript ``call_expression`` and Python ``call``
-    nodes. Falls back to the stripped source line when no call is present.
+    Walks the AST looking for the innermost ``call_expression`` whose start line
+    matches the finding.  Falls back to returning the stripped source line.
     """
-    if not _TREE_SITTER_CORE_AVAILABLE:
+    if not _TREE_SITTER_AVAILABLE:
         return None
 
     target = one_indexed_line - 1  # 0-indexed
@@ -502,7 +442,7 @@ def extract_sink_expression(
             continue
         stack.extend(node.children)
 
-        if node.type not in ("call_expression", "call"):
+        if node.type != "call_expression":
             continue
 
         size = node.end_point[0] - node.start_point[0]

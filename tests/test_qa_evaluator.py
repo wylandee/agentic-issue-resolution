@@ -11,6 +11,7 @@ from remediation_engine.contracts.schemas import (
     FailureCategory,
     FixPlanStatus,
     NoFixMitigationStage,
+    ODCScanEvidence,
     QACriticLLMOutput,
     QADependencyEvidence,
     QAEvaluation,
@@ -93,7 +94,7 @@ class TestGroupScanAttribution:
         assert _group_scan_status(scan_result, group_a) == "still_flagged"
         assert _group_scan_status(scan_result, group_b) == "cleared"
 
-    def test_investigator_prompt_includes_global_new_findings(self):
+    def test_investigator_prompt_excludes_unrelated_global_findings(self):
         group = _make_group(group_id="group-a")
         results = _make_fully_populated_results(ok=True)
         results.scan = _SecurityScanResult(
@@ -102,6 +103,14 @@ class TestGroupScanAttribution:
             remaining_identifiers=set(),
             found_identifiers={"CVE-2025-10001"},
             new_identifiers={"CVE-2025-10001"},
+        )
+        results.scan_evidence_by_task["task-a"] = ODCScanEvidence(
+            requested_scope="targeted",
+            effective_scope="targeted",
+            covered_task_ids=["task-a"],
+            found_identifiers=["CVE-2025-20002"],
+            new_identifiers=["CVE-2025-20002"],
+            complete=True,
         )
 
         investigator_prompt = _build_individual_investigator_prompt(
@@ -112,8 +121,11 @@ class TestGroupScanAttribution:
             group_remaining_ids=[],
             candidate_changed_files=[],
             action_summaries=[],
+            task_scan_evidence=results.scan_evidence_by_task["task-a"],
         )
-        assert "CVE-2025-10001" in investigator_prompt
+        assert "CVE-2025-20002" in investigator_prompt
+        assert "CVE-2025-10001" not in investigator_prompt
+        assert "Repository-wide scanner findings are intentionally excluded" in investigator_prompt
 
 
 def test_dynamic_context_retains_compaction_proof_dependency_evidence():
@@ -152,6 +164,37 @@ def test_dynamic_context_retains_compaction_proof_dependency_evidence():
     assert '"status":"verified"' in context
     assert '"expected_version":"4.17.21"' in context
     assert "package-lock.json#resolved/lodash" in context
+
+
+def test_dynamic_context_renders_install_and_test_tuple_statuses():
+    """Render tuple-backed install and test outcomes from their boolean field."""
+    group = _make_group(group_id="group-a")
+
+    passing_context = _build_qa_dynamic_context(
+        group=group,
+        task_id="task-a",
+        strategy="version_bump",
+        results=_make_fully_populated_results(ok=True),
+        group_remaining_ids=[],
+        candidate_changed_files=[],
+        action_summaries=[],
+        qa_policy=QAPolicy.VERSION_BUMP,
+    )
+    assert "- Install: PASS" in passing_context
+    assert "- Unit tests: PASS" in passing_context
+
+    failing_context = _build_qa_dynamic_context(
+        group=group,
+        task_id="task-a",
+        strategy="version_bump",
+        results=_make_fully_populated_results(ok=False),
+        group_remaining_ids=[],
+        candidate_changed_files=[],
+        action_summaries=[],
+        qa_policy=QAPolicy.VERSION_BUMP,
+    )
+    assert "- Install: FAIL" in failing_context
+    assert "- Unit tests: FAIL" in failing_context
 
 
 class TestRunGlobalExecution:
@@ -341,11 +384,26 @@ class TestBuildIndividualInvestigatorPrompt:
         assert "free-form" in lower
         assert "emit_qa_evaluation" in lower
         assert "use responsible, exonerated, or inconclusive" not in lower
+        assert "responsible_group_ids must be a non-empty list" in lower
+        assert "exact failed test names" in lower
+        assert "do not blame every group in a batch" in lower
 
         description = _build_qa_terminal_tool().description
         for enum_type in (FailureCategory, SecurityReviewVerdict, TestAttributionVerdict):
             for member in enum_type:
                 assert member.value in description
+        assert "responsible_group_ids" in description
+        assert "exact group IDs" in description
+
+        attribution_schema = QATestAttribution.model_json_schema()
+        assert (
+            "Exact group_id values"
+            in attribution_schema["properties"]["responsible_group_ids"]["description"]
+        )
+        assert (
+            "Exact failing test names"
+            in attribution_schema["properties"]["failed_tests"]["description"]
+        )
 
     def test_prompt_uses_status_metadata_without_raw_log_bodies(self):
         results = _QAExecutionResults(
@@ -499,6 +557,96 @@ class TestRunIndividualInvestigations:
         assert invs["task-1"].evaluation.passed is True
         assert invs["task-2"].evaluation is not None
         assert invs["task-2"].evaluation.passed is True
+
+    def test_investigator_receives_only_its_task_scanner_projection(self):
+        group = _make_group(group_id="g1")
+        context = _task_context(group, "task-1")
+        results = _make_fully_populated_results(ok=True)
+        results.scan = _SecurityScanResult(
+            ok=True,
+            summary="scan ok",
+            remaining_identifiers=set(),
+            found_identifiers={"CVE-2025-10001"},
+            new_identifiers={"CVE-2025-10001"},
+        )
+        results.scan_evidence_by_task["task-1"] = ODCScanEvidence(
+            requested_scope="targeted",
+            effective_scope="targeted",
+            covered_task_ids=["task-1"],
+            found_identifiers=["CVE-2025-20002"],
+            new_identifiers=["CVE-2025-20002"],
+            complete=True,
+        )
+        with (
+            patch("langchain_openai.ChatOpenAI"),
+            patch(
+                "remediation_engine.orchestration.qa_evaluator.run_bounded_subagent_loop",
+                return_value=self._lr(evaluation=QACriticLLMOutput(task_id="task-1", passed=True)),
+            ) as investigator,
+            patch(
+                "remediation_engine.orchestration.qa_evaluator.build_qa_review_toolbelt",
+                return_value=[],
+            ),
+        ):
+            _run_individual_investigations(
+                task_contexts=[context],
+                task_strategies={"task-1": "version_bump"},
+                action_summaries=[],
+                changed_files_by_task={"task-1": []},
+                sandbox=MagicMock(),
+                repo_root=None,
+                results=results,
+                task_policies={"task-1": QAPolicy.VERSION_BUMP},
+            )
+
+        prompt = investigator.call_args.kwargs["initial_messages"][1].content
+        assert "CVE-2025-20002" in prompt
+        assert "CVE-2025-10001" not in prompt
+
+    def test_missing_task_projection_does_not_fall_back_to_report_wide_scan(self):
+        group = _make_group(group_id="g1", cve_ids=["CVE-2025-10001"])
+        context = _task_context(group, "task-1")
+        results = _make_fully_populated_results(ok=True)
+        results.scan = _SecurityScanResult(
+            ok=True,
+            summary="scan ok",
+            remaining_identifiers={"CVE-2025-10001"},
+            found_identifiers={"CVE-2025-10001"},
+            new_identifiers=set(),
+        )
+        results.scan_evidence = ODCScanEvidence(
+            requested_scope="targeted",
+            effective_scope="targeted",
+            covered_task_ids=["task-1"],
+            found_identifiers=["CVE-2025-10001"],
+            remaining_target_identifiers=["CVE-2025-10001"],
+            complete=True,
+        )
+        with (
+            patch("langchain_openai.ChatOpenAI"),
+            patch(
+                "remediation_engine.orchestration.qa_evaluator.run_bounded_subagent_loop",
+                return_value=self._lr(evaluation=QACriticLLMOutput(task_id="task-1", passed=True)),
+            ) as investigator,
+            patch(
+                "remediation_engine.orchestration.qa_evaluator.build_qa_review_toolbelt",
+                return_value=[],
+            ),
+        ):
+            _run_individual_investigations(
+                task_contexts=[context],
+                task_strategies={"task-1": "version_bump"},
+                action_summaries=[],
+                changed_files_by_task={"task-1": []},
+                sandbox=MagicMock(),
+                repo_root=None,
+                results=results,
+                task_policies={"task-1": QAPolicy.VERSION_BUMP},
+            )
+
+        prompt = investigator.call_args.kwargs["initial_messages"][1].content
+        assert "Task-scoped scanner coverage: incomplete" in prompt
+        assert "- Remaining identifier count: 0" in prompt
 
     def test_crash_produces_fallback(self):
         group = _make_group(group_id="g1")
@@ -677,7 +825,7 @@ class TestApplyGuardrails:
 
     def test_no_fix_stage_two_derives_code_workaround_strategy(self):
         group = _make_group(
-            group_id="sca:package.json:notevil:NO_FIX",
+            group_id="sca:package.json:notevil",
             cve_ids=["CVE-2021-23771"],
             ghsa_ids=[],
             fix_plan_status=FixPlanStatus.NO_FIX,
@@ -701,7 +849,7 @@ class TestApplyGuardrails:
 
     def test_no_fix_stage_one_remains_strict(self):
         group = _make_group(
-            group_id="sca:package.json:notevil:NO_FIX",
+            group_id="sca:package.json:notevil",
             cve_ids=["CVE-2021-23771"],
             ghsa_ids=[],
             fix_plan_status=FixPlanStatus.NO_FIX,

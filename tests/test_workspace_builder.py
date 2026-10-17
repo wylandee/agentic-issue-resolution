@@ -10,7 +10,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import CommandResult
-from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
+from remediation_engine.orchestration.trajectory_exporter import (
+    TrajectoryRecorder,
+    use_trajectory_recorder,
+)
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 
 _VOLUME_HEX = "deadbeefcafebabe"
@@ -32,6 +35,28 @@ def _volume_name_patch():
 
 
 class TestWorkspaceBuilderNode:
+    def test_created_volume_is_registered_on_the_active_run_recorder(self, tmp_path):
+        recorder = TrajectoryRecorder()
+        client = MagicMock()
+        sandbox = _sandbox_mock()
+
+        with (
+            _volume_name_patch(),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
+                return_value=sandbox,
+            ),
+            use_trajectory_recorder(recorder),
+        ):
+            result = run_workspace_builder_node({"repo_root": str(tmp_path)})
+
+        assert result["workspace_volume"] == "agent_workspace_deadbeef"
+        assert recorder.workspace_volume == result["workspace_volume"]
+
     def test_success_creates_named_volume_copies_repo_and_returns_ready_projection(self, tmp_path):
         """The builder provisions one volume and hands the repository to the sandbox."""
         (tmp_path / "package.json").write_text("{}", encoding="utf-8")
@@ -58,11 +83,7 @@ class TestWorkspaceBuilderNode:
         volume_name = f"agent_workspace_{_VOLUME_HEX[:8]}"
         client.volumes.create.assert_called_once_with(name=volume_name)
         client.close.assert_called_once_with()
-        sandbox_type.assert_called_once_with(
-            str(tmp_path),
-            image="node:22",
-            workspace_volume=volume_name,
-        )
+        sandbox_type.assert_called_once_with(tmp_path, workspace_volume=volume_name)
         sandbox.__enter__.assert_called_once_with()
         sandbox.__exit__.assert_called_once()
         assert [call.args[0] for call in sandbox.run.call_args_list] == [
@@ -70,7 +91,10 @@ class TestWorkspaceBuilderNode:
             "cd packages/web && npm install --package-lock=true",
         ]
         assert all(call.kwargs == {"timeout": 900} for call in sandbox.run.call_args_list)
-        assert result == {"workspace_volume": volume_name, "status": "workspace_ready"}
+        assert result["workspace_volume"] == volume_name
+        assert result["status"] == "workspace_ready"
+        assert result["accepted_package_inventory_by_lockfile"] == {}
+        assert result["package_inventory_baseline_complete"] is True
 
     def test_volume_creation_failure_closes_client_and_does_not_start_sandbox(self, tmp_path):
         """A failed volume transaction reports failure and releases its client."""
@@ -154,6 +178,96 @@ class TestWorkspaceBuilderNode:
         assert "npm install failed in ." in result["errors"][0]
         assert "npm ERR! install failed" in result["errors"][0]
         sandbox.__exit__.assert_called_once()
+
+# Stage-2 behavior retained during the architecture merge.
+from remediation_engine.language import LANGUAGE_CONFIGS
+
+from remediation_engine.language import ProjectLanguage
+
+class TestWorkspaceBuilderNodeStage2Parity:
+    def test_incompatible_python_requirement_fails_before_setup_but_keeps_volume(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "future-only"\nrequires-python = ">=3.12"\n',
+            encoding="utf-8",
+        )
+        client = MagicMock()
+        sandbox_type = MagicMock()
+        with (
+            _volume_name_patch(),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
+                sandbox_type,
+            ),
+        ):
+            result = run_workspace_builder_node(
+                {"repo_root": str(tmp_path), "project_language": ProjectLanguage.PYTHON}
+            )
+
+        assert result["status"] == "workspace_build_failed"
+        assert result["workspace_volume"] == f"agent_workspace_{_VOLUME_HEX[:8]}"
+        assert "incompatible with Python 3.11" in result["errors"][0]
+        sandbox_type.assert_not_called()
+
+    def test_pipfile_without_lock_runs_pipenv_install(self, tmp_path):
+        (tmp_path / "Pipfile").write_text(
+            '[requires]\npython_version = "3.11"\n[packages]\nrequests = "*"\n',
+            encoding="utf-8",
+        )
+        client = MagicMock()
+        sandbox = _sandbox_mock()
+        with (
+            _volume_name_patch(),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
+                return_value=sandbox,
+            ),
+        ):
+            result = run_workspace_builder_node(
+                {"repo_root": str(tmp_path), "project_language": ProjectLanguage.PYTHON}
+            )
+
+        commands = [call.args[0] for call in sandbox.run.call_args_list]
+        assert "PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv install --dev" in commands
+
+        assert ".remedy-pipenv/bin/python -m pip install --upgrade pip==26.2.1" in commands
+        assert ".venv/bin/python -m pip install --upgrade pip==26.2.1" in commands
+        assert not any(command.endswith("pipenv sync --dev") for command in commands)
+        assert result["status"] == "workspace_ready"
+
+    def test_poetry_only_project_fails_boundedly_and_retains_volume_for_teardown(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text(
+            '[tool.poetry.dependencies]\npython = "^3.11"\nrequests = "^2.31"\n',
+            encoding="utf-8",
+        )
+        client = MagicMock()
+        sandbox_type = MagicMock()
+        with (
+            _volume_name_patch(),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
+                sandbox_type,
+            ),
+        ):
+            result = run_workspace_builder_node(
+                {"repo_root": str(tmp_path), "project_language": ProjectLanguage.PYTHON}
+            )
+
+        assert result["status"] == "workspace_build_failed"
+        assert result["workspace_volume"] == f"agent_workspace_{_VOLUME_HEX[:8]}"
+        assert "Poetry-managed Python dependencies are unsupported" in result["errors"][0]
+        sandbox_type.assert_not_called()
 
     def test_python_pipfile_is_authoritative_and_uses_persistent_volume_environments(
         self, tmp_path
@@ -245,93 +359,6 @@ class TestWorkspaceBuilderNode:
         ]
         assert result["status"] == "workspace_ready"
 
-    def test_python_tool_only_pyproject_installs_pytest_without_editable_install(self, tmp_path):
-        (tmp_path / "pyproject.toml").write_text(
-            '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
-            encoding="utf-8",
-        )
-        client = MagicMock()
-        sandbox = _sandbox_mock()
-        with (
-            _volume_name_patch(),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.get_docker_client",
-                return_value=client,
-            ),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
-                return_value=sandbox,
-            ),
-        ):
-            result = run_workspace_builder_node(
-                {"repo_root": str(tmp_path), "project_language": ProjectLanguage.PYTHON}
-            )
-
-        assert [call.args[0] for call in sandbox.run.call_args_list] == [
-            "rm -rf .venv .remedy-pipenv",
-            "python -m venv .venv",
-            ".venv/bin/python -m pip install --upgrade pip==26.2.1",
-            (
-                "if ! .venv/bin/python -c 'import pytest' >/dev/null 2>&1; "
-                "then .venv/bin/python -m pip install pytest; fi"
-            ),
-        ]
-        assert result["status"] == "workspace_ready"
-
-    def test_poetry_only_project_fails_boundedly_and_retains_volume_for_teardown(self, tmp_path):
-        (tmp_path / "pyproject.toml").write_text(
-            '[tool.poetry.dependencies]\npython = "^3.11"\nrequests = "^2.31"\n',
-            encoding="utf-8",
-        )
-        client = MagicMock()
-        sandbox_type = MagicMock()
-        with (
-            _volume_name_patch(),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.get_docker_client",
-                return_value=client,
-            ),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
-                sandbox_type,
-            ),
-        ):
-            result = run_workspace_builder_node(
-                {"repo_root": str(tmp_path), "project_language": ProjectLanguage.PYTHON}
-            )
-
-        assert result["status"] == "workspace_build_failed"
-        assert result["workspace_volume"] == f"agent_workspace_{_VOLUME_HEX[:8]}"
-        assert "Poetry-managed Python dependencies are unsupported" in result["errors"][0]
-        sandbox_type.assert_not_called()
-
-    def test_incompatible_python_requirement_fails_before_setup_but_keeps_volume(self, tmp_path):
-        (tmp_path / "pyproject.toml").write_text(
-            '[project]\nname = "future-only"\nrequires-python = ">=3.12"\n',
-            encoding="utf-8",
-        )
-        client = MagicMock()
-        sandbox_type = MagicMock()
-        with (
-            _volume_name_patch(),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.get_docker_client",
-                return_value=client,
-            ),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
-                sandbox_type,
-            ),
-        ):
-            result = run_workspace_builder_node(
-                {"repo_root": str(tmp_path), "project_language": ProjectLanguage.PYTHON}
-            )
-
-        assert result["status"] == "workspace_build_failed"
-        assert result["workspace_volume"] == f"agent_workspace_{_VOLUME_HEX[:8]}"
-        assert "incompatible with Python 3.11" in result["errors"][0]
-        sandbox_type.assert_not_called()
-
     def test_python_setup_command_failure_keeps_volume_and_bounded_diagnostics(self, tmp_path):
         (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
         client = MagicMock()
@@ -364,9 +391,9 @@ class TestWorkspaceBuilderNode:
         assert "pip installation failed" in result["errors"][0]
         sandbox.__exit__.assert_called_once()
 
-    def test_pipfile_without_lock_runs_pipenv_install(self, tmp_path):
-        (tmp_path / "Pipfile").write_text(
-            '[requires]\npython_version = "3.11"\n[packages]\nrequests = "*"\n',
+    def test_python_tool_only_pyproject_installs_pytest_without_editable_install(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text(
+            '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
             encoding="utf-8",
         )
         client = MagicMock()
@@ -386,12 +413,15 @@ class TestWorkspaceBuilderNode:
                 {"repo_root": str(tmp_path), "project_language": ProjectLanguage.PYTHON}
             )
 
-        commands = [call.args[0] for call in sandbox.run.call_args_list]
-        assert "PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv install --dev" in commands
-
-        assert ".remedy-pipenv/bin/python -m pip install --upgrade pip==26.2.1" in commands
-        assert ".venv/bin/python -m pip install --upgrade pip==26.2.1" in commands
-        assert not any(command.endswith("pipenv sync --dev") for command in commands)
+        assert [call.args[0] for call in sandbox.run.call_args_list] == [
+            "rm -rf .venv .remedy-pipenv",
+            "python -m venv .venv",
+            ".venv/bin/python -m pip install --upgrade pip==26.2.1",
+            (
+                "if ! .venv/bin/python -c 'import pytest' >/dev/null 2>&1; "
+                "then .venv/bin/python -m pip install pytest; fi"
+            ),
+        ]
         assert result["status"] == "workspace_ready"
 
     def test_static_setup_cfg_metadata_installs_project_editably(self, tmp_path):

@@ -8,26 +8,21 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-from remediation_engine.contracts.schemas import CommandResult, NoFixMitigationStage
-from remediation_engine.language import ProjectLanguage
-from remediation_engine.orchestration._tool_support import (
-    _is_test_file_path,
-    _runtime_smoke_bootstrap_reason,
-    _runtime_smoke_path_error,
+from remediation_engine.contracts.schemas import (
+    CommandResult,
+    MultiPackageAction,
+    PackageMutation,
+    TacticalStrategy,
 )
 from remediation_engine.orchestration.remedy_tools import (
     _make_deterministic_replace_ast_symbol_tool,
-    _make_deterministic_search_replace_tool,
     _make_read_repository_map_tool,
     _make_run_targeted_test_tool,
     _make_validate_code_syntax_tool,
-    _make_validate_workaround_tool,
+    build_multi_package_update_toolbelt,
     build_update_toolbelt,
     build_workaround_toolbelt,
 )
-from remediation_engine.orchestration.tools_manifest import _is_prohibited_target
 
 
 def _update_tool_map(
@@ -77,182 +72,137 @@ class TestToolbeltFactories:
 
         assert set(tools) == {"modify_and_validate_npm_dependency"}
 
-    def test_python_update_toolbelt_exposes_only_the_pypi_transaction(self):
+    def test_multi_package_update_toolbelt_exposes_only_committed_action(self):
         sandbox = MagicMock()
-        tools = build_update_toolbelt(
-            sandbox,
-            set(),
-            ["requirements.txt"],
-            {"requests": ["requirements.txt"]},
-            allowed_target_versions_by_package={"requests": ["2.32.0"]},
-            allowed_dependency_types_by_package={"requests": ["requirements"]},
-            language=ProjectLanguage.PYTHON,
-            package_ecosystem="pypi",
-        )
-
-        assert [tool.name for tool in tools] == ["modify_and_validate_python_dependency"]
-
-    def test_mismatched_update_toolbelt_pairing_fails_before_factories(self):
-        for language, ecosystem in (
-            (ProjectLanguage.NODEJS, "pypi"),
-            (ProjectLanguage.PYTHON, "npm"),
-        ):
-            with (
-                patch(
-                    "remediation_engine.orchestration.remedy_tools._make_modify_and_validate_npm_dependency_tool"
-                ) as npm_factory,
-                patch(
-                    "remediation_engine.orchestration.remedy_tools._make_modify_and_validate_python_dependency_tool"
-                ) as python_factory,
-                pytest.raises(
-                    ValueError,
-                    match="Unsupported project-language/package-ecosystem pairing\\.",
+        action = MultiPackageAction(
+            cluster_id="cluster-1",
+            dispatch_batch_id="batch-1",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-1",
+                    package_name="lodash",
+                    manifest_path="package.json",
+                    target_version="4.17.21",
+                    dependency_type="dependencies",
                 ),
-            ):
-                build_update_toolbelt(
-                    MagicMock(),
-                    set(),
-                    [],
-                    {},
-                    language=language,
-                    package_ecosystem=ecosystem,
-                )
-            npm_factory.assert_not_called()
-            python_factory.assert_not_called()
+                PackageMutation(
+                    task_id="task-2",
+                    package_name="axios",
+                    manifest_path="frontend/package.json",
+                    target_version="1.7.4",
+                    dependency_type="dependencies",
+                ),
+            ],
+            rationale="Keep peer-related updates atomic.",
+        )
+        execution_state = {}
 
-    def test_python_no_fix_exposes_only_python_removal_and_protects_manifests(self):
+        with patch(
+            "remediation_engine.orchestration.tools_manifest.apply_multi_package_action",
+            return_value=(True, ""),
+        ) as apply_action:
+            tools = build_multi_package_update_toolbelt(
+                sandbox,
+                set(),
+                action,
+                execution_state=execution_state,
+            )
+            tool_map = {tool.name: tool for tool in tools}
+            result = tool_map["modify_batch_npm_dependencies"].invoke({})
+            repeated = tool_map["modify_batch_npm_dependencies"].invoke({})
+
+        assert set(tool_map) == {"modify_batch_npm_dependencies"}
+        assert result.startswith("SUCCESS:")
+        assert execution_state["multi_package_action_executed"] is True
+        assert execution_state["multi_package_action_succeeded"] is True
+        assert repeated.startswith("ERROR_CODE: MULTI_PACKAGE_ACTION_ALREADY_EXECUTED:")
+        apply_action.assert_called_once()
+        assert apply_action.call_args.args[:3] == (sandbox, action, set())
+
+    def test_multi_package_transaction_syncs_lockfile_cleanly_without_positional_specs(self):
+        from remediation_engine.orchestration.tools_manifest import apply_multi_package_action
+
         sandbox = MagicMock()
-        plan_state = {
-            "recorded": True,
-            "package_removal_planned": True,
-            "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
-        }
-        tools = build_workaround_toolbelt(
-            sandbox,
-            set(),
-            Path("/dummy/repo"),
-            plan_state=plan_state,
-            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
-            no_fix_package_name="requests",
-            no_fix_manifest_paths=["Pipfile"],
-            no_fix_package_manager="pipenv",
-            language=ProjectLanguage.PYTHON,
-        )
-        names = {tool.name for tool in tools}
-
-        assert "remove_no_fix_python_dependency" in names
-        assert "remove_no_fix_dependency" not in names
-        for path in (
-            "requirements.txt",
-            "requirements-dev.txt",
-            "pyproject.toml",
-            "setup.cfg",
-            "Pipfile",
-            "Pipfile.lock",
-            "setup.py",
-        ):
-            assert _is_prohibited_target(path)
-
-    def test_python_no_fix_validation_reads_python_manifest(self):
-        files = {"requirements.txt": "requests==2.31.0\n"}
-        sandbox = MagicMock()
-        sandbox.read_file.side_effect = lambda path: files.get(path)
-        plan_state = {
-            "recorded": True,
-            "local_investigation_complete": True,
-            "package_removal_planned": True,
-            "no_fix_package_removed": True,
-            "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
-            "no_fix_package_name": "requests",
-        }
-        toolbelt = build_workaround_toolbelt(
-            sandbox,
-            {"requirements.txt"},
-            Path("/tmp/repo"),
-            plan_state=plan_state,
-            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
-            no_fix_package_name="requests",
-            no_fix_manifest_paths=["requirements.txt"],
-            no_fix_package_manager="pip",
-            language=ProjectLanguage.PYTHON,
-        )
-        validator = next(tool for tool in toolbelt if tool.name == "validate_python_workaround")
-
-        result = validator.invoke(
-            {"modified_files": ["requirements.txt"], "runtime_smoke_file": "src/app.py"}
-        )
-
-        assert "vulnerable package remains in a direct declaration" in result
-        sandbox.run.assert_not_called()
-
-    def test_python_no_fix_validation_requests_python_removal_tool(self):
-        plan_state = {
-            "recorded": True,
-            "local_investigation_complete": True,
-            "package_removal_planned": True,
-            "no_fix_package_removed": False,
-            "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
-            "no_fix_package_name": "requests",
-        }
-        toolbelt = build_workaround_toolbelt(
-            MagicMock(),
-            {"src/app.py"},
-            Path("/tmp/repo"),
-            plan_state=plan_state,
-            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
-            no_fix_package_name="requests",
-            no_fix_manifest_paths=["requirements.txt"],
-            no_fix_package_manager="pip",
-            language=ProjectLanguage.PYTHON,
-        )
-        validator = next(tool for tool in toolbelt if tool.name == "validate_python_workaround")
-
-        result = validator.invoke(
-            {"modified_files": ["src/app.py"], "runtime_smoke_file": "src/app.py"}
-        )
-
-        assert result.startswith("FAILURE: [PACKAGE_REMOVAL]")
-        assert "remove_no_fix_python_dependency" in result
-        assert "remove_no_fix_dependency" not in result
-
-    def test_python_workaround_toolbelt_exposes_only_python_validation_tools(self):
-        tools = build_workaround_toolbelt(
-            MagicMock(),
-            set(),
-            Path("/dummy/repo"),
-            language=ProjectLanguage.PYTHON,
-        )
-        names = {tool.name for tool in tools}
-
-        assert {
-            "validate_python_syntax",
-            "run_targeted_python_test",
-            "validate_python_workaround",
-        } <= names
-        assert (
-            not {
-                "validate_code_syntax",
-                "run_targeted_test",
-                "validate_workaround",
-                "modify_and_validate_npm_dependency",
-                "remove_no_fix_dependency",
+        baseline_manifest = json.dumps({"dependencies": {"lodash": "4.17.20", "axios": "1.7.3"}})
+        updated_manifest = json.dumps({"dependencies": {"lodash": "4.17.21", "axios": "1.7.4"}})
+        baseline_lockfile = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/lodash": {"version": "4.17.20"},
+                    "node_modules/axios": {"version": "1.7.3"},
+                },
             }
-            & names
         )
-
-    def test_update_toolbelts_never_expose_the_other_package_manager(self):
-        node_tools = _update_tool_map(MagicMock())
-        python_tools = build_update_toolbelt(
-            MagicMock(),
-            set(),
-            ["requirements.txt"],
-            {"requests": ["requirements.txt"]},
-            language=ProjectLanguage.PYTHON,
-            package_ecosystem="pypi",
+        updated_lockfile = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/lodash": {"version": "4.17.21"},
+                    "node_modules/axios": {"version": "1.7.4"},
+                },
+            }
         )
+        edited = False
 
-        assert set(node_tools) == {"modify_and_validate_npm_dependency"}
-        assert [tool.name for tool in python_tools] == ["modify_and_validate_python_dependency"]
+        def run(command: str, timeout: float | None = None) -> CommandResult:
+            nonlocal edited
+            if "npm pkg set" in command:
+                edited = True
+            return CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=0.1)
+
+        def read_file(path: str) -> str | None:
+            if path == "frontend/package.json":
+                return updated_manifest if edited else baseline_manifest
+            if path == "frontend/package-lock.json":
+                return updated_lockfile if edited else baseline_lockfile
+            return None
+
+        sandbox.run.side_effect = run
+        sandbox.read_file.side_effect = read_file
+        action = MultiPackageAction(
+            cluster_id="cluster-1",
+            dispatch_batch_id="batch-1",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-lodash",
+                    package_name="lodash",
+                    manifest_path="frontend/package.json",
+                    target_version="4.17.21",
+                    dependency_type="dependencies",
+                ),
+                PackageMutation(
+                    task_id="task-axios",
+                    package_name="axios",
+                    manifest_path="frontend/package.json",
+                    target_version="1.7.4",
+                    dependency_type="dependencies",
+                ),
+            ],
+            rationale="Update peer-related direct dependencies together.",
+        )
+        touched_files: set[str] = set()
+
+        succeeded, error = apply_multi_package_action(sandbox, action, touched_files)
+
+        assert succeeded is True
+        assert error == ""
+        commands = [call.args[0] for call in sandbox.run.call_args_list]
+        sync_commands = [command for command in commands if "npm install" in command]
+        assert len(sync_commands) == 2
+        assert sum("--dry-run" in command for command in sync_commands) == 1
+        assert all("--legacy-peer-deps" in command for command in sync_commands)
+        assert all("--no-audit" in command for command in sync_commands)
+        assert all("--no-fund" in command for command in sync_commands)
+        assert touched_files == {"frontend/package-lock.json", "frontend/package.json"}
+        assert not any("axios" in command for command in sync_commands)
+        assert not any("lodash" in command for command in sync_commands)
+        assert sync_commands[1] == (
+            "cd /workspace/frontend && npm install --package-lock-only --ignore-scripts "
+            "--legacy-peer-deps --no-audit --no-fund"
+        )
 
     def test_workaround_toolbelt_is_strictly_scoped(self):
         sandbox = MagicMock()
@@ -779,11 +729,49 @@ class TestModifyAndValidateNpmDependency:
         assert "dependencies" in result
         assert "4.17.21" in result
         assert touched_files == {"frontend/package.json"}
-        assert sandbox.run.call_count == 2
-        edit_command, sync_command = [call.args[0] for call in sandbox.run.call_args_list]
+        assert sandbox.run.call_count == 3
+        edit_command, preflight_command, sync_command = [
+            call.args[0] for call in sandbox.run.call_args_list
+        ]
         assert "npm pkg set" in edit_command
         assert "cd /workspace/frontend" in edit_command
-        assert "npm install --package-lock-only --ignore-scripts" in sync_command
+        assert "npm install --package-lock-only --ignore-scripts" in preflight_command
+        assert "--dry-run" in preflight_command
+        assert "--legacy-peer-deps" in preflight_command
+        assert "--dry-run" not in sync_command
+        assert "--legacy-peer-deps" in sync_command
+
+    def test_nested_manifest_validates_its_own_lockfile_not_root_lockfile(self):
+        from remediation_engine.orchestration.tools_manifest import (
+            _PackageCheckpoint,
+            _verify_lockfile_mutations,
+        )
+
+        sandbox = MagicMock()
+        root_lock = '{"lockfileVersion": 3, "packages": {}}'
+        frontend_lock = (
+            '{"lockfileVersion": 3, "packages": {"node_modules/axios": {"version": "1.7.4"}}}'
+        )
+        sandbox.read_file.side_effect = lambda path: {
+            "package-lock.json": root_lock,
+            "frontend/package-lock.json": frontend_lock,
+        }.get(path)
+        checkpoint = _PackageCheckpoint(
+            files={
+                "package-lock.json": root_lock,
+                "frontend/package-lock.json": frontend_lock,
+            },
+            touched_files_before=set(),
+        )
+        mutation = PackageMutation(
+            task_id="task-1",
+            package_name="axios",
+            manifest_path="frontend/package.json",
+            target_version="1.7.4",
+            dependency_type="dependencies",
+        )
+
+        _verify_lockfile_mutations(sandbox, checkpoint, [mutation])
 
     def test_rejects_manifest_outside_allowed_batch_targets(self):
         sandbox = MagicMock()
@@ -834,7 +822,7 @@ class TestModifyAndValidateNpmDependency:
         assert result.startswith("SUCCESS:")
         assert "frontend/package.json" in result
         assert touched_files == {"frontend/package.json"}
-        assert sandbox.run.call_count == 2
+        assert sandbox.run.call_count == 3
 
     def test_rejects_unknown_package_name_for_batch(self):
         sandbox = MagicMock()
@@ -912,6 +900,7 @@ class TestModifyAndValidateNpmDependency:
         sandbox.run.side_effect = [
             success,
             failure,
+            success,
             success,
             success,
             success,
@@ -1170,7 +1159,7 @@ class TestCombinedManifestTransaction:
         assert axios_result.startswith("SUCCESS:")
         assert execution_state["validation_calls"] == 2
         assert execution_state["manifest_transaction_attempts"] == 2
-        assert sandbox.run.call_count == 4
+        assert sandbox.run.call_count == 6
 
     def test_success_runs_sync_for_each_manifest_directory(self):
         sandbox = MagicMock()
@@ -1200,10 +1189,13 @@ class TestCombinedManifestTransaction:
         )
 
         assert result.startswith("SUCCESS:")
-        assert sandbox.run.call_count == 3
+        assert sandbox.run.call_count == 5
         commands = [call.args[0] for call in sandbox.run.call_args_list]
         assert "npm pkg set" in commands[0]
         assert all("--package-lock-only --ignore-scripts" in cmd for cmd in commands[1:])
+        assert sum("--dry-run" in cmd for cmd in commands[1:]) == 2
+        assert sum("--dry-run" not in cmd for cmd in commands[1:]) == 2
+        assert all("--legacy-peer-deps" in cmd for cmd in commands[1:])
         assert any("cd /workspace/frontend" in cmd for cmd in commands[1:])
 
     def test_sync_failure_surfaces_stderr_and_restores_checkpoint(self):
@@ -1234,6 +1226,14 @@ class TestCombinedManifestTransaction:
         assert "partial" in result
         assert "Rollback" in result
         assert touched_files == set()
+        assert sandbox.run.call_count == 4
+        commands = [call.args[0] for call in sandbox.run.call_args_list]
+        assert "npm pkg set" in commands[0]
+        assert "--dry-run" in commands[1]
+        assert "--legacy-peer-deps" in commands[1]
+        assert not any(
+            "npm install" in command and "--dry-run" not in command for command in commands
+        )
         sandbox.write_file.assert_called_once_with("package.json", baseline)
 
 
@@ -1453,7 +1453,534 @@ class TestReadWebPage:
         assert "Use expressjwt from the named export" in res
 
 
-class TestPythonWorkaroundSupport:
+def test_lockfile_verification_accepts_pruned_transitive_override_target():
+    from remediation_engine.orchestration.tools_manifest import (
+        _PackageCheckpoint,
+        _verify_lockfile_mutations,
+    )
+
+    original_manifest = json.dumps({"dependencies": {"express-jwt": "0.1.3"}})
+    original_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/express-jwt": {"version": "0.1.3"},
+                "node_modules/base64url": {"version": "0.0.6"},
+            },
+        }
+    )
+    updated_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {"node_modules/express-jwt": {"version": "6.0.0"}},
+        }
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = updated_lockfile
+    checkpoint = _PackageCheckpoint(
+        files={
+            "package.json": original_manifest,
+            "package-lock.json": original_lockfile,
+        },
+        touched_files_before=set(),
+    )
+    mutation = PackageMutation(
+        task_id="task-base64url",
+        package_name="base64url",
+        manifest_path="package.json",
+        target_version="3.0.0",
+        dependency_type="overrides",
+    )
+
+    _verify_lockfile_mutations(sandbox, checkpoint, [mutation])
+
+
+def test_lockfile_verification_does_not_hide_missing_override_target():
+    import pytest
+
+    from remediation_engine.orchestration.tools_manifest import (
+        _PackageCheckpoint,
+        _verify_lockfile_mutations,
+    )
+
+    manifest = json.dumps({"dependencies": {"express-jwt": "0.1.3"}})
+    lockfile = json.dumps(
+        {"lockfileVersion": 3, "packages": {"node_modules/express-jwt": {"version": "0.1.3"}}}
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = lockfile
+    checkpoint = _PackageCheckpoint(
+        files={"package.json": manifest, "package-lock.json": lockfile},
+        touched_files_before=set(),
+    )
+    mutation = PackageMutation(
+        task_id="task-base64url",
+        package_name="base64url",
+        manifest_path="package.json",
+        target_version="3.0.0",
+        dependency_type="overrides",
+    )
+
+    with pytest.raises(RuntimeError, match="no package entry"):
+        _verify_lockfile_mutations(sandbox, checkpoint, [mutation])
+
+
+def test_multi_package_override_accepts_transitive_target_pruned_by_parent_update():
+    from remediation_engine.orchestration.tools_manifest import apply_multi_package_action
+
+    sandbox = MagicMock()
+    baseline_manifest = json.dumps({"dependencies": {"express-jwt": "0.1.3"}})
+    updated_manifest = json.dumps(
+        {
+            "dependencies": {"express-jwt": "6.0.0"},
+            "overrides": {"base64url": "3.0.0"},
+        }
+    )
+    baseline_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/express-jwt": {"version": "0.1.3"},
+                "node_modules/base64url": {"version": "0.0.6"},
+            },
+        }
+    )
+    updated_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {"node_modules/express-jwt": {"version": "6.0.0"}},
+        }
+    )
+    edited = False
+
+    def run(_command: str, timeout: float | None = None) -> CommandResult:
+        nonlocal edited
+        if "npm pkg set" in _command:
+            edited = True
+        return CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=0.1)
+
+    def read_file(path: str) -> str | None:
+        if path == "package.json":
+            return updated_manifest if edited else baseline_manifest
+        if path == "package-lock.json":
+            return updated_lockfile if edited else baseline_lockfile
+        return None
+
+    sandbox.run.side_effect = run
+    sandbox.read_file.side_effect = read_file
+    action = MultiPackageAction(
+        cluster_id="cluster-transitive",
+        dispatch_batch_id="batch-transitive",
+        selected_strategy=TacticalStrategy.VERSION_BUMP,
+        package_mutations=[
+            PackageMutation(
+                task_id="task-base64url",
+                package_name="base64url",
+                manifest_path="package.json",
+                target_version="3.0.0",
+                dependency_type="overrides",
+            ),
+            PackageMutation(
+                task_id="task-express-jwt",
+                package_name="express-jwt",
+                manifest_path="package.json",
+                target_version="6.0.0",
+                dependency_type="dependencies",
+            ),
+        ],
+        rationale="Upgrade the direct parent and retain the child override safely.",
+    )
+
+    succeeded, error = apply_multi_package_action(sandbox, action, set())
+
+    assert succeeded is True
+    assert error == ""
+
+
+def test_failed_package_checkpoint_restore_retains_anchor_and_unresolved_paths():
+    from remediation_engine.orchestration.tools_manifest import (
+        _PackageCheckpoint,
+        rollback_pending_package_updates,
+    )
+
+    sandbox = MagicMock()
+    sandbox.run.return_value = CommandResult(
+        exit_code=1,
+        stdout="",
+        stderr="cannot remove generated lockfile",
+        duration_seconds=0.1,
+    )
+    checkpoint = _PackageCheckpoint(
+        files={"package.json": '{"dependencies":{}}', "package-lock.json": None},
+        touched_files_before={"prior.js"},
+    )
+    checkpoints = {"demo-package": checkpoint}
+    touched_files = {"package.json", "package-lock.json", "other.js", "prior.js"}
+
+    errors = rollback_pending_package_updates(sandbox, checkpoints, touched_files)
+
+    assert errors and "package-lock.json" in errors[0]
+    assert checkpoints == {"demo-package": checkpoint}
+    assert touched_files == {"package-lock.json", "other.js", "prior.js"}
+    sandbox.write_file.assert_called_once_with("package.json", '{"dependencies":{}}')
+
+# Stage-2 behavior retained during the architecture merge.
+import pytest
+
+from remediation_engine.contracts.schemas import NoFixMitigationStage
+
+from remediation_engine.language import ProjectLanguage
+
+from remediation_engine.orchestration._tool_support import _is_test_file_path
+
+from remediation_engine.orchestration._tool_support import _runtime_smoke_bootstrap_reason
+
+from remediation_engine.orchestration._tool_support import _runtime_smoke_path_error
+
+from remediation_engine.orchestration.remedy_tools import _make_deterministic_search_replace_tool
+
+from remediation_engine.orchestration.remedy_tools import _make_validate_workaround_tool
+
+from remediation_engine.orchestration.tools_manifest import _is_prohibited_target
+
+class TestToolbeltFactoriesStage2Parity:
+    def test_mismatched_update_toolbelt_pairing_fails_before_factories(self):
+        for language, ecosystem in (
+            (ProjectLanguage.NODEJS, "pypi"),
+            (ProjectLanguage.PYTHON, "npm"),
+        ):
+            with (
+                patch(
+                    "remediation_engine.orchestration.remedy_tools._make_modify_and_validate_npm_dependency_tool"
+                ) as npm_factory,
+                patch(
+                    "remediation_engine.orchestration.remedy_tools._make_modify_and_validate_python_dependency_tool"
+                ) as python_factory,
+                pytest.raises(
+                    ValueError,
+                    match="Unsupported project-language/package-ecosystem pairing\\.",
+                ),
+            ):
+                build_update_toolbelt(
+                    MagicMock(),
+                    set(),
+                    [],
+                    {},
+                    language=language,
+                    package_ecosystem=ecosystem,
+                )
+            npm_factory.assert_not_called()
+            python_factory.assert_not_called()
+
+    def test_python_no_fix_exposes_only_python_removal_and_protects_manifests(self):
+        sandbox = MagicMock()
+        plan_state = {
+            "recorded": True,
+            "package_removal_planned": True,
+            "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
+        }
+        tools = build_workaround_toolbelt(
+            sandbox,
+            set(),
+            Path("/dummy/repo"),
+            plan_state=plan_state,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            no_fix_package_name="requests",
+            no_fix_manifest_paths=["Pipfile"],
+            no_fix_package_manager="pipenv",
+            language=ProjectLanguage.PYTHON,
+        )
+        names = {tool.name for tool in tools}
+
+        assert "remove_no_fix_python_dependency" in names
+        assert "remove_no_fix_dependency" not in names
+        for path in (
+            "requirements.txt",
+            "requirements-dev.txt",
+            "pyproject.toml",
+            "setup.cfg",
+            "Pipfile",
+            "Pipfile.lock",
+            "setup.py",
+        ):
+            assert _is_prohibited_target(path)
+
+    def test_python_no_fix_validation_reads_python_manifest(self):
+        files = {"requirements.txt": "requests==2.31.0\n"}
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: files.get(path)
+        plan_state = {
+            "recorded": True,
+            "local_investigation_complete": True,
+            "package_removal_planned": True,
+            "no_fix_package_removed": True,
+            "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
+            "no_fix_package_name": "requests",
+        }
+        toolbelt = build_workaround_toolbelt(
+            sandbox,
+            {"requirements.txt"},
+            Path("/tmp/repo"),
+            plan_state=plan_state,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            no_fix_package_name="requests",
+            no_fix_manifest_paths=["requirements.txt"],
+            no_fix_package_manager="pip",
+            language=ProjectLanguage.PYTHON,
+        )
+        validator = next(tool for tool in toolbelt if tool.name == "validate_python_workaround")
+
+        result = validator.invoke(
+            {"modified_files": ["requirements.txt"], "runtime_smoke_file": "src/app.py"}
+        )
+
+        assert "vulnerable package remains in a direct declaration" in result
+        sandbox.run.assert_not_called()
+
+    def test_python_no_fix_validation_requests_python_removal_tool(self):
+        plan_state = {
+            "recorded": True,
+            "local_investigation_complete": True,
+            "package_removal_planned": True,
+            "no_fix_package_removed": False,
+            "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
+            "no_fix_package_name": "requests",
+        }
+        toolbelt = build_workaround_toolbelt(
+            MagicMock(),
+            {"src/app.py"},
+            Path("/tmp/repo"),
+            plan_state=plan_state,
+            no_fix_stage=NoFixMitigationStage.PACKAGE_REMOVAL,
+            no_fix_package_name="requests",
+            no_fix_manifest_paths=["requirements.txt"],
+            no_fix_package_manager="pip",
+            language=ProjectLanguage.PYTHON,
+        )
+        validator = next(tool for tool in toolbelt if tool.name == "validate_python_workaround")
+
+        result = validator.invoke(
+            {"modified_files": ["src/app.py"], "runtime_smoke_file": "src/app.py"}
+        )
+
+        assert result.startswith("FAILURE: [PACKAGE_REMOVAL]")
+        assert "remove_no_fix_python_dependency" in result
+        assert "remove_no_fix_dependency" not in result
+
+    def test_python_update_toolbelt_exposes_only_the_pypi_transaction(self):
+        sandbox = MagicMock()
+        tools = build_update_toolbelt(
+            sandbox,
+            set(),
+            ["requirements.txt"],
+            {"requests": ["requirements.txt"]},
+            allowed_target_versions_by_package={"requests": ["2.32.0"]},
+            allowed_dependency_types_by_package={"requests": ["requirements"]},
+            language=ProjectLanguage.PYTHON,
+            package_ecosystem="pypi",
+        )
+
+        assert [tool.name for tool in tools] == ["modify_and_validate_python_dependency"]
+
+    def test_python_workaround_toolbelt_exposes_only_python_validation_tools(self):
+        tools = build_workaround_toolbelt(
+            MagicMock(),
+            set(),
+            Path("/dummy/repo"),
+            language=ProjectLanguage.PYTHON,
+        )
+        names = {tool.name for tool in tools}
+
+        assert {
+            "validate_python_syntax",
+            "run_targeted_python_test",
+            "validate_python_workaround",
+        } <= names
+        assert (
+            not {
+                "validate_code_syntax",
+                "run_targeted_test",
+                "validate_workaround",
+                "modify_and_validate_npm_dependency",
+                "remove_no_fix_dependency",
+            }
+            & names
+        )
+
+    def test_update_toolbelts_never_expose_the_other_package_manager(self):
+        node_tools = _update_tool_map(MagicMock())
+        python_tools = build_update_toolbelt(
+            MagicMock(),
+            set(),
+            ["requirements.txt"],
+            {"requests": ["requirements.txt"]},
+            language=ProjectLanguage.PYTHON,
+            package_ecosystem="pypi",
+        )
+
+        assert set(node_tools) == {"modify_and_validate_npm_dependency"}
+        assert [tool.name for tool in python_tools] == ["modify_and_validate_python_dependency"]
+
+class TestPythonWorkaroundSupportStage2Parity:
+    def test_python_ast_replacement_requires_prior_file_inspection(self):
+        sandbox = MagicMock()
+        plan_state = {
+            "recorded": True,
+            "phase": "EXECUTE",
+            "planned_files": ["src/module.py"],
+            "inspected_files": set(),
+            "fallback_files": set(),
+        }
+        tool = _make_deterministic_replace_ast_symbol_tool(
+            sandbox,
+            set(),
+            plan_state,
+        )
+
+        result = tool.invoke(
+            {
+                "file_path": "src/module.py",
+                "symbol_name": "target",
+                "replacement": "return True",
+            }
+        )
+        assert "[MISSING_INSPECTION]" in result
+
+    def test_python_search_replace_rolls_back_syntax_errors(self):
+        original = "def helper():\n    return 1\n"
+        files = {"src/helper.py": original}
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: files.get(path)
+        sandbox.write_file.side_effect = lambda path, content: files.__setitem__(path, content)
+        state = {
+            "recorded": True,
+            "phase": "EXECUTE",
+            "planned_files": ["src/helper.py"],
+            "inspected_files": {"src/helper.py"},
+            "fallback_files": set(),
+        }
+        tool = _make_deterministic_search_replace_tool(sandbox, set(), state)
+
+        with patch(
+            "remediation_engine.orchestration.tools_validation._run_readonly",
+            return_value=CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr="SyntaxError: '(' was never closed",
+                duration_seconds=0.1,
+            ),
+        ) as syntax_run:
+            result = tool.invoke(
+                {
+                    "file_path": "src/helper.py",
+                    "old_text": "return 1",
+                    "new_text": "return (",
+                }
+            )
+
+        assert "invalid syntax" in result.lower()
+        assert files["src/helper.py"] == original
+        assert ".venv/bin/python -c" in syntax_run.call_args.args[1]
+
+    def test_python_syntax_and_runtime_smoke_accept_only_importable_python_sources(self):
+        sandbox = MagicMock()
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        syntax = _make_validate_code_syntax_tool(
+            sandbox,
+            language=ProjectLanguage.PYTHON,
+        )
+
+        assert syntax.invoke({"file_path": "src/module.py"}).startswith("SUCCESS:")
+        command = sandbox.run.call_args[0][0]
+        assert ".venv/bin/python -c" in command
+        assert "ast.parse" in command
+        sandbox.run.reset_mock()
+        assert syntax.invoke({"file_path": "src/module.js"}).startswith("ERROR:")
+        sandbox.run.assert_not_called()
+
+        assert _runtime_smoke_path_error(
+            "src/module.py",
+            language=ProjectLanguage.PYTHON,
+        ) == ("src/module.py", None)
+        assert _runtime_smoke_path_error("src/module.py")[0] is None
+        assert _is_test_file_path("test_helpers.py", language=ProjectLanguage.PYTHON)
+        assert _runtime_smoke_bootstrap_reason(
+            "src/app.py",
+            "app.run()",
+            language=ProjectLanguage.PYTHON,
+        )
+        assert _runtime_smoke_bootstrap_reason(
+            "setup.py",
+            "setup()",
+            language=ProjectLanguage.PYTHON,
+        )
+
+    def test_python_targeted_test_uses_pytest_and_rejects_other_suffixes(self):
+        sandbox = MagicMock()
+        sandbox.read_file.return_value = "def test_sample(): pass\n"
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="1 passed\n",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        tool = _make_run_targeted_test_tool(
+            sandbox,
+            preferred_test_files=["tests/test_sample.py"],
+            language=ProjectLanguage.PYTHON,
+        )
+
+        result = tool.invoke({"test_file": "tests/test_sample.py", "test_name": "test_sample"})
+        assert result.startswith("SUCCESS:")
+        command = sandbox.run.call_args[0][0]
+        assert ".venv/bin/python -m pytest" in command
+        assert "tests/test_sample.py::test_sample" in command
+        assert "node" not in command
+
+        sandbox.run.reset_mock()
+        rejected = tool.invoke({"test_file": "tests/test_sample.test.js"})
+        assert rejected.startswith("ERROR: [INVALID_VALIDATION_INPUT]")
+        sandbox.run.assert_not_called()
+
+    def test_python_workaround_runtime_smoke_imports_module_and_runs_pytest(self):
+        sandbox = MagicMock()
+        sandbox.read_file.side_effect = lambda path: {
+            "src/service.py": "def helper():\n    return True\n",
+            "tests/test_service.py": "def test_helper():\n    assert True\n",
+        }.get(path)
+        sandbox.run.return_value = CommandResult(
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        validation = _make_validate_workaround_tool(
+            sandbox,
+            set(),
+            {},
+            preferred_test_files=["tests/test_service.py"],
+            language=ProjectLanguage.PYTHON,
+        )
+
+        result = validation.invoke(
+            {
+                "modified_files": ["src/service.py"],
+                "runtime_smoke_file": "src/service.py",
+                "targeted_test_file": "tests/test_service.py",
+            }
+        )
+        assert result.startswith("SUCCESS: Workaround validation gate passed")
+        commands = [call.args[0] for call in sandbox.run.call_args_list]
+        assert any(
+            ".venv/bin/python -m pytest -q tests/test_service.py" in command for command in commands
+        )
+        assert all(not command.startswith("node ") for command in commands)
+
     def test_python_workspace_map_and_search_include_python_and_exclude_generated_files(self):
         sandbox = MagicMock()
         sandbox.run.return_value = CommandResult(
@@ -1497,162 +2024,3 @@ class TestPythonWorkaroundSupport:
             ".remedy-pipenv",
         ):
             assert f"--exclude-dir={directory}" in search_command
-
-    def test_python_targeted_test_uses_pytest_and_rejects_other_suffixes(self):
-        sandbox = MagicMock()
-        sandbox.read_file.return_value = "def test_sample(): pass\n"
-        sandbox.run.return_value = CommandResult(
-            exit_code=0,
-            stdout="1 passed\n",
-            stderr="",
-            duration_seconds=0.1,
-        )
-        tool = _make_run_targeted_test_tool(
-            sandbox,
-            preferred_test_files=["tests/test_sample.py"],
-            language=ProjectLanguage.PYTHON,
-        )
-
-        result = tool.invoke({"test_file": "tests/test_sample.py", "test_name": "test_sample"})
-        assert result.startswith("SUCCESS:")
-        command = sandbox.run.call_args[0][0]
-        assert ".venv/bin/python -m pytest" in command
-        assert "tests/test_sample.py::test_sample" in command
-        assert "node" not in command
-
-        sandbox.run.reset_mock()
-        rejected = tool.invoke({"test_file": "tests/test_sample.test.js"})
-        assert rejected.startswith("ERROR: [INVALID_VALIDATION_INPUT]")
-        sandbox.run.assert_not_called()
-
-    def test_python_syntax_and_runtime_smoke_accept_only_importable_python_sources(self):
-        sandbox = MagicMock()
-        sandbox.run.return_value = CommandResult(
-            exit_code=0,
-            stdout="",
-            stderr="",
-            duration_seconds=0.1,
-        )
-        syntax = _make_validate_code_syntax_tool(
-            sandbox,
-            language=ProjectLanguage.PYTHON,
-        )
-
-        assert syntax.invoke({"file_path": "src/module.py"}).startswith("SUCCESS:")
-        command = sandbox.run.call_args[0][0]
-        assert ".venv/bin/python -c" in command
-        assert "ast.parse" in command
-        sandbox.run.reset_mock()
-        assert syntax.invoke({"file_path": "src/module.js"}).startswith("ERROR:")
-        sandbox.run.assert_not_called()
-
-        assert _runtime_smoke_path_error(
-            "src/module.py",
-            language=ProjectLanguage.PYTHON,
-        ) == ("src/module.py", None)
-        assert _runtime_smoke_path_error("src/module.py")[0] is None
-        assert _is_test_file_path("test_helpers.py", language=ProjectLanguage.PYTHON)
-        assert _runtime_smoke_bootstrap_reason(
-            "src/app.py",
-            "app.run()",
-            language=ProjectLanguage.PYTHON,
-        )
-        assert _runtime_smoke_bootstrap_reason(
-            "setup.py",
-            "setup()",
-            language=ProjectLanguage.PYTHON,
-        )
-
-    def test_python_ast_replacement_requires_prior_file_inspection(self):
-        sandbox = MagicMock()
-        plan_state = {
-            "recorded": True,
-            "phase": "EXECUTE",
-            "planned_files": ["src/module.py"],
-            "inspected_files": set(),
-            "fallback_files": set(),
-        }
-        tool = _make_deterministic_replace_ast_symbol_tool(
-            sandbox,
-            set(),
-            plan_state,
-        )
-
-        result = tool.invoke(
-            {
-                "file_path": "src/module.py",
-                "symbol_name": "target",
-                "replacement": "return True",
-            }
-        )
-        assert "[MISSING_INSPECTION]" in result
-
-    def test_python_workaround_runtime_smoke_imports_module_and_runs_pytest(self):
-        sandbox = MagicMock()
-        sandbox.read_file.side_effect = lambda path: {
-            "src/service.py": "def helper():\n    return True\n",
-            "tests/test_service.py": "def test_helper():\n    assert True\n",
-        }.get(path)
-        sandbox.run.return_value = CommandResult(
-            exit_code=0,
-            stdout="",
-            stderr="",
-            duration_seconds=0.1,
-        )
-        validation = _make_validate_workaround_tool(
-            sandbox,
-            set(),
-            {},
-            preferred_test_files=["tests/test_service.py"],
-            language=ProjectLanguage.PYTHON,
-        )
-
-        result = validation.invoke(
-            {
-                "modified_files": ["src/service.py"],
-                "runtime_smoke_file": "src/service.py",
-                "targeted_test_file": "tests/test_service.py",
-            }
-        )
-        assert result.startswith("SUCCESS: Workaround validation gate passed")
-        commands = [call.args[0] for call in sandbox.run.call_args_list]
-        assert any(
-            ".venv/bin/python -m pytest -q tests/test_service.py" in command for command in commands
-        )
-        assert all(not command.startswith("node ") for command in commands)
-
-    def test_python_search_replace_rolls_back_syntax_errors(self):
-        original = "def helper():\n    return 1\n"
-        files = {"src/helper.py": original}
-        sandbox = MagicMock()
-        sandbox.read_file.side_effect = lambda path: files.get(path)
-        sandbox.write_file.side_effect = lambda path, content: files.__setitem__(path, content)
-        state = {
-            "recorded": True,
-            "phase": "EXECUTE",
-            "planned_files": ["src/helper.py"],
-            "inspected_files": {"src/helper.py"},
-            "fallback_files": set(),
-        }
-        tool = _make_deterministic_search_replace_tool(sandbox, set(), state)
-
-        with patch(
-            "remediation_engine.orchestration.tools_validation._run_readonly",
-            return_value=CommandResult(
-                exit_code=1,
-                stdout="",
-                stderr="SyntaxError: '(' was never closed",
-                duration_seconds=0.1,
-            ),
-        ) as syntax_run:
-            result = tool.invoke(
-                {
-                    "file_path": "src/helper.py",
-                    "old_text": "return 1",
-                    "new_text": "return (",
-                }
-            )
-
-        assert "invalid syntax" in result.lower()
-        assert files["src/helper.py"] == original
-        assert ".venv/bin/python -c" in syntax_run.call_args.args[1]

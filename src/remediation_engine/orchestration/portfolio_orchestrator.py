@@ -1,0 +1,1597 @@
+"""Supervisor-invoked portfolio preparation and delta-attribution helpers."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+from uuid import NAMESPACE_URL, UUID, uuid5
+
+from remediation_engine.contracts.schemas import (
+    MAX_MULTI_PACKAGE_ACTION_SIZE,
+    FixPlan,
+    FixPlanStatus,
+    IssueSource,
+    IssueType,
+    LocalizedIssue,
+    MultiPackageAction,
+    PackageFixPlanCandidate,
+    PackageMutation,
+    PortfolioPlan,
+    RemediationTask,
+    RoutingStrategy,
+    SCARemediationStage,
+    Severity,
+    TaskStatus,
+    VulnerabilityGroup,
+    VulnerabilityIssue,
+)
+from remediation_engine.orchestration.portfolio_certifier import build_certified_portfolio_plan
+from remediation_engine.orchestration.portfolio_solver import (
+    apply_portfolio_plan as _apply_solver_portfolio_plan,
+)
+from remediation_engine.orchestration.portfolio_solver import (
+    build_portfolio_plan as _build_solver_portfolio_plan,
+)
+from remediation_engine.orchestration.portfolio_solver import (
+    prepare_portfolio_inputs as _prepare_solver_portfolio_inputs,
+)
+from remediation_engine.orchestration.task_utils import group_parent_context
+from remediation_engine.settings import DEFAULT_MAX_DELTA_CANARY_PROBES
+from remediation_engine.tools.npm_graph import npm_range_contains
+
+_TERMINAL_STATUSES = frozenset(
+    {
+        TaskStatus.QA_PASSED,
+        TaskStatus.UNFIXABLE,
+        TaskStatus.INCONCLUSIVE,
+        TaskStatus.PIVOTED,
+    }
+)
+_NAMESPACE_PREFIXES = ("@angular/", "@nestjs/")
+# A development scope may cross a workspace boundary or add a peer whose
+# currently selected target would otherwise violate its declared range. A
+# namespace is not a dependency constraint, and a compatible peer is only
+# validation evidence; neither should create another mutation task.
+_SCOPED_CLOSURE_RELATIONSHIPS = frozenset({"workspace", "peer"})
+_MANIFEST_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+_LOCKFILE_DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+_SYNTHETIC_TARGET_NAMESPACE = "remediation-engine:synthetic-package"
+_EXACT_VERSION_RE = re.compile(r"^[=vV]?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+
+
+@dataclass(frozen=True)
+class DeltaIsolationResult:
+    """Pure canary-attribution result for a failed package cluster."""
+
+    status: Literal["IDENTIFIED", "INTERACTION_FAILURE", "AMBIGUOUS", "INCONCLUSIVE"]
+    responsible_task_ids: tuple[str, ...] = ()
+    tested_subsets: tuple[tuple[str, ...], ...] = ()
+    executions: int = 0
+    diagnostic: str = ""
+
+
+@dataclass(frozen=True)
+class _DependencyRecord:
+    """One direct dependency declaration discovered in a package manifest."""
+
+    manifest_path: str
+    package_name: str
+    declaration_type: str
+    requested_spec: str
+    resolved_version: str | None
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """Return the manifest-occurrence identity for this dependency."""
+        return self.manifest_path, self.package_name
+
+
+def _digest(value: Any) -> str:
+    """Return a stable SHA-256 digest for JSON-compatible data."""
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _relative_manifest(repo_root: Path, value: str | None) -> str:
+    """Normalize a manifest path to a repository-relative POSIX path."""
+    if not value:
+        return "package.json"
+    path = value.replace("\\", "/").lstrip("/")
+    try:
+        candidate = Path(path)
+        if candidate.is_absolute():
+            path = candidate.relative_to(repo_root).as_posix()
+    except ValueError:
+        return ""
+    if not path or ".." in Path(path).parts:
+        return ""
+    return path
+
+
+def _group_manifest_path(group: VulnerabilityGroup, repo_root: Path) -> str:
+    """Resolve the single manifest path used by a package group."""
+    paths = {
+        _relative_manifest(repo_root, localized.manifest_file)
+        for localized in group.localized_issues
+        if localized.manifest_file
+    }
+    paths.update(_relative_manifest(repo_root, path) for path in group.file_paths)
+    if group.file_path:
+        paths.add(_relative_manifest(repo_root, group.file_path))
+    paths.discard("")
+    manifest_paths = sorted(path for path in paths if Path(path).name == "package.json")
+    return manifest_paths[0] if len(manifest_paths) == 1 and len(paths) == 1 else ""
+
+
+def _active_leaf_tasks(
+    task_queue: dict[str, RemediationTask],
+) -> tuple[list[RemediationTask], list[str]]:
+    """Return one active leaf task per package group and consistency errors."""
+    by_group: dict[str, list[RemediationTask]] = defaultdict(list)
+    for task in task_queue.values():
+        by_group[task.parent_group_id].append(task)
+
+    active: list[RemediationTask] = []
+    diagnostics: list[str] = []
+    for group_id, tasks in sorted(by_group.items()):
+        nonterminal = [task for task in tasks if task.status not in _TERMINAL_STATUSES]
+        if len(nonterminal) > 1:
+            diagnostics.append(
+                f"package group {group_id!r} has multiple nonterminal tasks; clustering disabled"
+            )
+            continue
+        if nonterminal:
+            active.append(nonterminal[0])
+            continue
+        # Terminal groups still belong in the DAG so downstream tasks can see
+        # that the prerequisite has completed, but they are not dispatchable.
+        active.append(max(tasks, key=lambda task: (task.task_revision, task.task_id)))
+    return active, diagnostics
+
+
+def active_leaf_task_ids(
+    task_queue: dict[str, RemediationTask],
+    group_ids: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    """Return deterministic active-leaf task IDs, optionally scoped to groups."""
+    allowed_groups = set(group_ids) if group_ids is not None else None
+    tasks, _diagnostics = _active_leaf_tasks(task_queue)
+    return tuple(
+        task.task_id
+        for task in tasks
+        if allowed_groups is None or task.parent_group_id in allowed_groups
+    )
+
+
+def _load_manifests(repo_root: Path) -> tuple[dict[str, dict[str, Any]], str]:
+    """Read npm manifests and return their contents plus a repository fingerprint.
+
+    The fingerprint also covers npm lockfiles because an externally changed
+    resolved graph can alter runtime and peer ordering without changing a
+    manifest declaration.
+    """
+    manifests: dict[str, dict[str, Any]] = {}
+    fingerprint_parts: list[tuple[str, str]] = []
+    candidate_paths = {
+        path
+        for filename in ("package.json", "package-lock.json", "npm-shrinkwrap.json")
+        for path in repo_root.rglob(filename)
+    }
+    for path in sorted(candidate_paths):
+        relative = path.relative_to(repo_root).as_posix()
+        if set(path.parts) & {".git", "node_modules", ".remedy-attempt-snapshots"}:
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        fingerprint_parts.append((relative, raw))
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if path.name == "package.json":
+            manifests[relative] = payload
+    return manifests, _digest(fingerprint_parts)
+
+
+def _lockfile_package_name(package_key: str) -> str | None:
+    """Extract the package name represented by an npm lockfile package key."""
+    normalized = package_key.replace("\\", "/")
+    marker = "node_modules/"
+    if marker not in normalized:
+        return None
+    package_path = normalized.rsplit(marker, 1)[-1].strip("/")
+    if not package_path:
+        return None
+    pieces = package_path.split("/")
+    if pieces[0].startswith("@"):
+        return "/".join(pieces[:2]) if len(pieces) >= 2 else None
+    return pieces[0]
+
+
+def _load_lockfile_packages(
+    repo_root: Path,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Read npm lockfile package metadata keyed by manifest occurrence.
+
+    Only direct package metadata is consumed by synthetic-task discovery. The
+    shortest ``node_modules`` path wins so nested copies cannot change the
+    deterministic peer relationship used for a root dependency.
+    """
+    candidates: dict[tuple[str, str], list[tuple[int, str, dict[str, Any]]]] = defaultdict(list)
+    for filename in ("package-lock.json", "npm-shrinkwrap.json"):
+        for lockfile in sorted(repo_root.rglob(filename)):
+            if set(lockfile.parts) & {".git", "node_modules", ".remedy-attempt-snapshots"}:
+                continue
+            try:
+                payload = json.loads(lockfile.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            packages = payload.get("packages") if isinstance(payload, dict) else None
+            manifest_path = (lockfile.parent / "package.json").relative_to(repo_root).as_posix()
+            if isinstance(packages, dict):
+                for package_key, metadata in packages.items():
+                    if not isinstance(package_key, str) or not isinstance(metadata, dict):
+                        continue
+                    package_name = _lockfile_package_name(package_key)
+                    if not package_name:
+                        continue
+                    depth = package_key.replace("\\", "/").count("node_modules/")
+                    candidates[(manifest_path, package_name)].append((depth, package_key, metadata))
+                continue
+
+            # npm lockfile v1 stores the hoisted package graph under a nested
+            # ``dependencies`` object instead of ``packages``. Top-level
+            # entries are the deterministic metadata available for direct
+            # manifest declarations; nested copies are not needed for the
+            # package-centric portfolio graph.
+            dependencies = payload.get("dependencies") if isinstance(payload, dict) else None
+            if not isinstance(dependencies, dict):
+                continue
+            for package_name, metadata in dependencies.items():
+                if isinstance(package_name, str) and isinstance(metadata, dict):
+                    candidates[(manifest_path, package_name)].append((0, package_name, metadata))
+
+    return {
+        key: metadata
+        for key, values in candidates.items()
+        for _depth, _package_key, metadata in [min(values, key=lambda item: (item[0], item[1]))]
+    }
+
+
+def _manifest_dependency_records(
+    manifests: dict[str, dict[str, Any]],
+    lockfile_packages: dict[tuple[str, str], dict[str, Any]],
+) -> dict[tuple[str, str], _DependencyRecord]:
+    """Return one deterministic direct-dependency record per package occurrence."""
+    records: dict[tuple[str, str], _DependencyRecord] = {}
+    for manifest_path, manifest in sorted(manifests.items()):
+        for declaration_type in _MANIFEST_SECTIONS:
+            values = manifest.get(declaration_type, {})
+            if not isinstance(values, dict):
+                continue
+            for package_name in sorted(str(name).strip() for name in values if str(name).strip()):
+                key = (manifest_path, package_name)
+                if key in records:
+                    # npm permits a package to appear in multiple declaration
+                    # sections in malformed or generated manifests. Retain the
+                    # first section in the stable section order and let the
+                    # planner diagnose any resulting action mismatch.
+                    continue
+                requested = values.get(package_name)
+                requested_spec = str(requested).strip() if requested is not None else ""
+                metadata = lockfile_packages.get(key, {})
+                resolved = metadata.get("version")
+                if not isinstance(resolved, str) or not resolved.strip():
+                    resolved = (
+                        requested_spec.lstrip("=vV")
+                        if _EXACT_VERSION_RE.fullmatch(requested_spec)
+                        else None
+                    )
+                records[key] = _DependencyRecord(
+                    manifest_path=manifest_path,
+                    package_name=package_name,
+                    declaration_type=declaration_type,
+                    requested_spec=requested_spec,
+                    resolved_version=str(resolved).strip() if resolved else None,
+                )
+    return records
+
+
+def _metadata_dependency_names(metadata: dict[str, Any], section: str) -> set[str]:
+    """Return normalized dependency names from one lockfile package section."""
+    values = metadata.get(section, {})
+    if not isinstance(values, dict):
+        return set()
+    return {str(name).strip() for name in values if str(name).strip()}
+
+
+def _is_optional_peer(metadata: dict[str, Any], package_name: str) -> bool:
+    """Return whether a lockfile peer declaration is marked optional."""
+    peer_metadata = metadata.get("peerDependenciesMeta", {})
+    if not isinstance(peer_metadata, dict):
+        return False
+    details = peer_metadata.get(package_name)
+    return isinstance(details, dict) and details.get("optional") is True
+
+
+def _same_workspace_occurrence(
+    left_manifest: str,
+    right_manifest: str,
+    workspace_memberships: dict[str, set[str]],
+) -> bool:
+    """Return whether two manifest occurrences share a workspace root."""
+    if left_manifest == right_manifest:
+        return True
+    left_memberships = workspace_memberships.get(left_manifest, set())
+    right_memberships = workspace_memberships.get(right_manifest, set())
+    return bool(left_memberships and left_memberships & right_memberships)
+
+
+def _dependency_relationships(
+    records: dict[tuple[str, str], _DependencyRecord],
+    manifests: dict[str, dict[str, Any]],
+    lockfile_packages: dict[tuple[str, str], dict[str, Any]],
+) -> dict[tuple[str, str], dict[tuple[str, str], set[str]]]:
+    """Build the package relationship graph used to discover coordination packages.
+
+    Direct manifest declarations are the complete set of package occurrences
+    that can become portfolio nodes. Lockfile metadata adds relationships among
+    those occurrences without requiring a registry lookup. Runtime edges are
+    retained for discovery so a synthetic package can be materialized when it
+    is part of the same resolved dependency component as a finding-backed
+    package; the planner later uses runtime edges for ordering, not clustering.
+    """
+    relationships: dict[tuple[str, str], dict[tuple[str, str], set[str]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    workspace_memberships = _workspace_memberships(manifests)
+    records_by_name: dict[str, list[_DependencyRecord]] = defaultdict(list)
+    for record in records.values():
+        records_by_name[record.package_name].append(record)
+
+    def connect(
+        left: tuple[str, str],
+        right: tuple[str, str],
+        relationship: str,
+    ) -> None:
+        if left == right:
+            return
+        relationships[left][right].add(relationship)
+        relationships[right][left].add(relationship)
+
+    # Keep the existing Angular/Nest namespace heuristic. The manifest path is
+    # still part of each record key, so occurrences in independent manifests
+    # remain distinct tasks even when the namespace couples their ordering.
+    namespace_records = [
+        record
+        for record in records.values()
+        if any(record.package_name.startswith(prefix) for prefix in _NAMESPACE_PREFIXES)
+    ]
+    for index, left in enumerate(namespace_records):
+        for right in namespace_records[index + 1 :]:
+            if any(
+                left.package_name.startswith(prefix) and right.package_name.startswith(prefix)
+                for prefix in _NAMESPACE_PREFIXES
+            ):
+                connect(left.key, right.key, "namespace")
+
+    # Lockfile package metadata is the only reliable place to recover peer and
+    # runtime relationships for direct dependencies such as Hono and Angular.
+    # All discovery edges are undirected; the portfolio graph later records
+    # runtime direction and peer coupling in both directions.
+    for record in records.values():
+        metadata = lockfile_packages.get(record.key, {})
+        for section in _LOCKFILE_DEPENDENCY_SECTIONS:
+            for dependency_name in sorted(_metadata_dependency_names(metadata, section)):
+                if section != "peerDependencies":
+                    relationship = "runtime"
+                elif _is_optional_peer(metadata, dependency_name):
+                    relationship = "optional_peer"
+                else:
+                    relationship = "peer"
+                for dependency_record in records_by_name.get(dependency_name, []):
+                    if not _same_workspace_occurrence(
+                        record.manifest_path,
+                        dependency_record.manifest_path,
+                        workspace_memberships,
+                    ):
+                        continue
+                    connect(record.key, dependency_record.key, relationship)
+
+    # A workspace manifest can declare a local package in dependencies. Keep
+    # that explicit relationship even when the package is not namespaced.
+    for record in records.values():
+        manifest = manifests.get(record.manifest_path, {})
+        for declaration_type in _MANIFEST_SECTIONS:
+            if record.package_name not in _dependency_names(manifest, declaration_type):
+                continue
+            for local_record in records_by_name.get(record.package_name, []):
+                if local_record.manifest_path == record.manifest_path:
+                    continue
+                if _same_workspace_occurrence(
+                    record.manifest_path,
+                    local_record.manifest_path,
+                    workspace_memberships,
+                ):
+                    connect(record.key, local_record.key, "workspace")
+
+    return relationships
+
+
+def _peer_requires_synchronized_target(
+    left: tuple[str, str],
+    right: tuple[str, str],
+    records: dict[tuple[str, str], _DependencyRecord],
+    lockfile_packages: dict[tuple[str, str], dict[str, Any]],
+    target_versions: dict[tuple[str, str], set[str]],
+) -> bool:
+    """Return whether a peer edge may require a second mutation target.
+
+    A direct peer is coordination-relevant when any known selected or
+    candidate target version falls outside its declared peer range. Optional
+    peers remain validation evidence and do not expand the scoped mutation
+    graph.
+
+    Args:
+        left: One manifest/package occurrence in the relationship graph.
+        right: The other occurrence in the relationship graph.
+        records: Direct manifest dependency records keyed by occurrence.
+        lockfile_packages: Lockfile metadata keyed by occurrence.
+        target_versions: Selected versions or candidate hints for scoped
+            occurrences. Hints are used only to discover closure.
+
+    Returns:
+        ``True`` when a possible target version is outside the peer range.
+    """
+    for source_key, peer_key in ((left, right), (right, left)):
+        versions = target_versions.get(peer_key, set())
+        if not versions:
+            continue
+        metadata = lockfile_packages.get(source_key, {})
+        peer_dependencies = metadata.get("peerDependencies", {})
+        if not isinstance(peer_dependencies, dict):
+            continue
+        peer_name = records[peer_key].package_name
+        if _is_optional_peer(metadata, peer_name):
+            # Optional peers are compatibility evidence for npm/QA, not a
+            # reason to expand the requested mutation scope.
+            continue
+        required_range = peer_dependencies.get(peer_name)
+        if not isinstance(required_range, str) or not required_range.strip():
+            continue
+        results = [_npm_range_contains(required_range.strip(), version) for version in versions]
+        if any(result is False for result in results):
+            return True
+    return False
+
+
+def _scoped_peer_version_hints(group: VulnerabilityGroup) -> set[str]:
+    """Return triage version candidates used only to discover peer closure.
+
+    These candidates identify peers that could become incompatible with a
+    requested upgrade. They are not committed task selections; the portfolio
+    solver and Supervisor still choose the version.
+    """
+    plans = [group.fix_plan]
+    plans.extend(candidate.plan for candidate in group.fix_plan_candidates or ())
+    return {
+        version
+        for plan in plans
+        if plan is not None and plan.status == FixPlanStatus.VERSION_FOUND
+        if (version := (plan.fixed_version or "").strip())
+    }
+
+
+def _scoped_dependency_keys(
+    records: dict[tuple[str, str], _DependencyRecord],
+    relationships: dict[tuple[str, str], dict[tuple[str, str], set[str]]],
+    lockfile_packages: dict[tuple[str, str], dict[str, Any]],
+    target_packages: set[str],
+    peer_version_hints: dict[tuple[str, str], set[str]],
+) -> set[tuple[str, str]]:
+    """Return the mutation closure for a development package scope.
+
+    The closure starts at explicitly requested direct dependencies. It keeps
+    workspace coordination and adds peers when a possible target version
+    falls outside the peer's declared range. Namespace membership and already
+    compatible peers remain outside the mutation graph.
+
+    Args:
+        records: Direct manifest dependency records keyed by occurrence.
+        relationships: Undirected occurrence relationship graph.
+        lockfile_packages: Lockfile metadata keyed by occurrence.
+        target_packages: Explicit development package allowlist.
+        peer_version_hints: Candidate versions used to detect possible peer
+            incompatibility. These hints do not select a task version.
+
+    Returns:
+        Direct occurrence keys allowed to become finding or coordination tasks.
+    """
+    seeds = {key for key, record in records.items() if record.package_name in target_packages}
+    allowed = set(seeds)
+    known_versions = {
+        key: set(versions)
+        for key, versions in peer_version_hints.items()
+        if key in seeds and versions
+    }
+    pending = list(sorted(seeds))
+    while pending:
+        key = pending.pop(0)
+        for neighbor, kinds in sorted(relationships.get(key, {}).items()):
+            if neighbor in allowed:
+                continue
+            include = "workspace" in kinds
+            if not include and "peer" in kinds:
+                include = _peer_requires_synchronized_target(
+                    key,
+                    neighbor,
+                    records,
+                    lockfile_packages,
+                    known_versions,
+                )
+            if not include:
+                continue
+            allowed.add(neighbor)
+            # Propagate the alignment hint through a newly required peer so a
+            # second exact-peer hop can be discovered deterministically. The
+            # existing synthetic target validation still refuses an unsafe
+            # inherited version when its other peer requirements disagree.
+            if key in known_versions and neighbor not in known_versions:
+                known_versions[neighbor] = set(known_versions[key])
+            pending.append(neighbor)
+    return allowed
+
+
+def _synthetic_issue_id(manifest_path: str, package_name: str) -> UUID:
+    """Return a stable UUID for a no-CVE coordination finding."""
+    return uuid5(
+        NAMESPACE_URL,
+        f"{_SYNTHETIC_TARGET_NAMESPACE}:{manifest_path}:{package_name}",
+    )
+
+
+def _npm_range_contains(version_range: str, version: str) -> bool | None:
+    """Check an npm peer range through the shared neutral graph helper."""
+    return npm_range_contains(version_range, version)
+
+
+def _synthetic_target_version(
+    record: _DependencyRecord,
+    inherited_version: str | None,
+    relationships: dict[tuple[str, str], dict[tuple[str, str], set[str]]],
+    lockfile_packages: dict[tuple[str, str], dict[str, Any]],
+    coordinated_keys: set[tuple[str, str]] | None = None,
+) -> str | None:
+    """Choose a deterministic target hint for one synthetic dependency.
+
+    A package with no finding-backed seed is represented at its currently
+    resolved lockfile version. That is a coordination-only no-op and avoids
+    asking the Supervisor to invent a security version for a package that has
+    no finding. An inherited target is used only for namespace/workspace/peer
+    coupling, where synchronized versions are part of the relationship. Plain
+    runtime relationships affect ordering but must not copy one package's
+    fixed version onto another package.
+
+    When a scoped peer component is synchronized, peer ranges from another
+    member of that component describe the old installed generation. They are
+    skipped here and enforced later against the complete solver candidate set.
+    Ranges from packages outside the component remain validation constraints;
+    a current version is retained only when it satisfies those requirements.
+    """
+    current_version = record.resolved_version
+    relationship_kinds = {
+        relationship
+        for neighbor in relationships.get(record.key, {})
+        for relationship in relationships[record.key][neighbor]
+    }
+    aligned = bool(relationship_kinds & {"namespace", "workspace", "peer"})
+    if not inherited_version or not aligned:
+        return current_version
+
+    requirements: list[str] = []
+    for neighbor in relationships.get(record.key, {}):
+        metadata = lockfile_packages.get(neighbor, {})
+        if coordinated_keys is not None and neighbor in coordinated_keys:
+            continue
+        peer_dependencies = metadata.get("peerDependencies", {})
+        if not isinstance(peer_dependencies, dict):
+            continue
+        required_range = peer_dependencies.get(record.package_name)
+        if (
+            isinstance(required_range, str)
+            and required_range.strip()
+            and not _is_optional_peer(metadata, record.package_name)
+        ):
+            requirements.append(required_range.strip())
+    if not requirements:
+        return inherited_version
+
+    inherited_results = [
+        _npm_range_contains(required, inherited_version) for required in requirements
+    ]
+    if all(result is True for result in inherited_results):
+        return inherited_version
+
+    if current_version:
+        current_results = [
+            _npm_range_contains(required, current_version) for required in requirements
+        ]
+        if all(result is True for result in current_results):
+            return current_version
+    return None
+
+
+def _refresh_synthetic_group(
+    group: VulnerabilityGroup,
+    target_version: str,
+) -> VulnerabilityGroup:
+    """Refresh a synthetic group's committed target without changing identity."""
+    package_name = (group.vulnerable_component or "").strip()
+    instruction = (
+        f'Keep "{package_name}" at the Supervisor-committed coordination version '
+        f"{target_version}; do not select another version."
+    )
+    old_plan = group.fix_plan
+    plan = (
+        old_plan.model_copy(
+            update={
+                "fixed_version": target_version,
+                "workaround_snippets": None,
+                "instruction": instruction,
+                "strategy_used": "synthetic_portfolio_coordination",
+            }
+        )
+        if old_plan is not None
+        else FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version=target_version,
+            instruction=instruction,
+            strategy_used="synthetic_portfolio_coordination",
+        )
+    )
+    if old_plan is not None and old_plan.fixed_version == target_version:
+        return group
+
+    candidates = [
+        candidate.model_copy(
+            update={
+                "plan": candidate.plan.model_copy(
+                    update={
+                        "fixed_version": target_version,
+                        "workaround_snippets": None,
+                        "instruction": instruction,
+                        "strategy_used": "synthetic_portfolio_coordination",
+                    }
+                )
+            }
+        )
+        for candidate in group.fix_plan_candidates
+    ]
+    if not candidates:
+        candidates = [PackageFixPlanCandidate(issue_id=group.representative_issue_id, plan=plan)]
+
+    updated_issues = [
+        issue.model_copy(
+            update={
+                "fixed_version": target_version,
+                "raw_payload": {
+                    **(issue.raw_payload or {}),
+                    "target_version": target_version,
+                },
+            }
+        )
+        for issue in group.issues
+    ]
+    issue_by_id = {issue.id: issue for issue in updated_issues}
+    updated_localized = [
+        localized.model_copy(update={"issue": issue_by_id.get(localized.issue.id, localized.issue)})
+        for localized in group.localized_issues
+    ]
+    return group.model_copy(
+        deep=True,
+        update={
+            "issues": updated_issues,
+            "localized_issues": updated_localized,
+            "fix_plan_candidates": candidates,
+            "fix_plan": plan,
+        },
+    )
+
+
+def materialize_synthetic_dependency_tasks(
+    repo_root: str | Path,
+    groups: Iterable[VulnerabilityGroup],
+    task_queue: dict[str, RemediationTask],
+    target_packages: Iterable[str] | None = None,
+) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
+    """Create package tasks for direct dependencies without CVEs.
+
+    The helper is intentionally called at the outer Portfolio Orchestrator
+    boundary after finding-backed tasks have been materialized. It never
+    queries a registry or chooses a new security version. A synthetic task
+    uses the resolved manifest/lockfile version as a coordination-only target.
+    In development scope, only a workspace package or a peer whose selected
+    version would become incompatible is materialized alongside the requested
+    package.
+
+    Args:
+        repo_root: Repository containing npm manifests and optional lockfiles.
+        groups: Current triage groups, including previously materialized synthetic groups.
+        task_queue: Supervisor-owned task queue used to identify active seeds.
+        target_packages: Optional development package allowlist. When present,
+            only matching direct dependencies and their required mutation
+            closure are materialized. ``None`` or an empty iterable retains
+            full-repository behavior.
+
+    Returns:
+        A tuple containing the augmented groups, a copy-on-write task queue, and
+        deterministic diagnostics for package occurrences that could not be
+        safely materialized.
+    """
+    root = Path(repo_root).resolve()
+    group_list = list(groups)
+    manifests, _fingerprint = _load_manifests(root)
+    if not manifests:
+        return group_list, dict(task_queue), []
+    lockfile_packages = _load_lockfile_packages(root)
+    records = _manifest_dependency_records(manifests, lockfile_packages)
+    if not records:
+        return group_list, dict(task_queue), []
+
+    relationships = _dependency_relationships(records, manifests, lockfile_packages)
+    records_by_key = records
+    initial_groups_by_id = {
+        group.group_id: group for group in group_list if group.issue_type == IssueType.SCA
+    }
+
+    scoped_packages = {
+        value.strip()
+        for value in (target_packages or ())
+        if isinstance(value, str) and value.strip()
+    }
+
+    seed_versions: dict[tuple[str, str], set[str]] = defaultdict(set)
+    peer_version_hints: dict[tuple[str, str], set[str]] = defaultdict(set)
+    seed_keys = {
+        key for key, record in records_by_key.items() if record.package_name in scoped_packages
+    }
+    for task in task_queue.values():
+        group = initial_groups_by_id.get(task.parent_group_id)
+        if group is None or group.is_synthetic or task.strategy != RoutingStrategy.VERSION_BUMP:
+            continue
+        package_name = (group.vulnerable_component or "").strip()
+        manifest_path = _group_manifest_path(group, root)
+        key = (manifest_path, package_name)
+        if scoped_packages and key not in seed_keys:
+            continue
+        selected_version = (task.selected_version or "").strip()
+        if selected_version:
+            seed_versions[key].add(selected_version)
+            peer_version_hints[key].add(selected_version)
+        elif scoped_packages:
+            peer_version_hints[key].update(_scoped_peer_version_hints(group))
+            peer_version_hints[key].update(
+                version.strip()
+                for version in task.allowed_target_versions
+                if isinstance(version, str) and version.strip()
+            )
+
+    if scoped_packages:
+        all_keys = sorted(
+            _scoped_dependency_keys(
+                records_by_key,
+                relationships,
+                lockfile_packages,
+                scoped_packages,
+                peer_version_hints,
+            )
+        )
+    else:
+        all_keys = sorted(records_by_key)
+
+    # A scoped plan includes direct mutation closure plus explicitly selected
+    # finding-backed packages. Lockfile-only findings remain solver targets and
+    # are represented through package-manager overrides rather than dropped.
+    if scoped_packages:
+        explicitly_selected_finding_group_ids: set[str] = set()
+        for group in group_list:
+            if group.issue_type != IssueType.SCA or group.is_synthetic:
+                continue
+            package_identities = {
+                str(value).strip()
+                for value in (
+                    group.vulnerable_component,
+                    group.parent_package_name,
+                    *(issue.package_name for issue in group.issues),
+                    *(localized.issue.package_name for localized in group.localized_issues),
+                )
+                if isinstance(value, str) and value.strip()
+            }
+            has_finding_identity = any(
+                issue.cve_id or issue.ghsa_id or issue.finding_id for issue in group.issues
+            )
+            if package_identities.intersection(scoped_packages) and has_finding_identity:
+                explicitly_selected_finding_group_ids.add(group.group_id)
+        scope_occurrences = set(all_keys)
+        allowed_group_ids = explicitly_selected_finding_group_ids | {
+            group.group_id
+            for group in group_list
+            if group.issue_type != IssueType.SCA
+            or (
+                _group_manifest_path(group, root),
+                (group.vulnerable_component or "").strip(),
+            )
+            in scope_occurrences
+        }
+        group_list = [group for group in group_list if group.group_id in allowed_group_ids]
+        groups_by_id = {
+            group.group_id: group for group in group_list if group.issue_type == IssueType.SCA
+        }
+    else:
+        groups_by_id = initial_groups_by_id
+
+    # Find alignment components deterministically. Every direct dependency
+    # record is eligible for a synthetic package occurrence in full-repository
+    # mode. In a development scope, namespace membership is intentionally not
+    # an alignment relationship: only an actual workspace or peer constraint
+    # can synchronize a selected version.
+    diagnostics: list[str] = []
+    _alignment_parent, (alignment_find, alignment_union) = _union_find(all_keys)
+    alignment_relationships = (
+        _SCOPED_CLOSURE_RELATIONSHIPS if scoped_packages else {"namespace", "workspace", "peer"}
+    )
+    for left in all_keys:
+        for right, kinds in relationships.get(left, {}).items():
+            if right in all_keys and kinds & alignment_relationships:
+                alignment_union(left, right)
+    alignment_components: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for key in all_keys:
+        alignment_components[alignment_find(key)].append(key)
+    alignment_targets: dict[tuple[str, str], str] = {}
+    coordinated_component_by_key: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for component in sorted(
+        (tuple(sorted(values)) for values in alignment_components.values()),
+        key=lambda value: value[0],
+    ):
+        component_keys = set(component)
+        for key in component:
+            coordinated_component_by_key[key] = component_keys
+        seeded = [key for key in component if key in seed_versions]
+        versions = sorted({version for key in seeded for version in seed_versions[key]})
+        if len(versions) == 1:
+            for key in component:
+                alignment_targets[key] = versions[0]
+        elif len(versions) > 1:
+            diagnostics.append(
+                "synthetic dependency targets will use resolved versions for aligned package "
+                f"component {list(component)!r}: committed target versions disagree ({versions!r})"
+            )
+
+    augmented_groups = list(group_list)
+    if scoped_packages:
+        augmented_queue = {
+            task_id: task.model_copy()
+            for task_id, task in task_queue.items()
+            if task.parent_group_id in {group.group_id for group in augmented_groups}
+        }
+    else:
+        augmented_queue = {task_id: task.model_copy() for task_id, task in task_queue.items()}
+    if scoped_packages:
+        for task_id, task in sorted(augmented_queue.items()):
+            group = groups_by_id.get(task.parent_group_id)
+            if (
+                group is None
+                or group.is_synthetic
+                or group.issue_type != IssueType.SCA
+                or task.strategy != RoutingStrategy.VERSION_BUMP
+                or task.status != TaskStatus.PENDING
+                or task.current_attempt_id is not None
+                or task.retry_count > 0
+            ):
+                continue
+            package_name = (group.vulnerable_component or "").strip()
+            manifest_path = _group_manifest_path(group, root)
+            if (
+                not package_name
+                or package_name not in scoped_packages
+                or (manifest_path, package_name) in records_by_key
+            ):
+                continue
+            fixed_version = (
+                group.fix_plan.fixed_version.strip()
+                if group.fix_plan and group.fix_plan.fixed_version
+                else next(
+                    (
+                        str(issue.fixed_version).strip()
+                        for issue in group.issues
+                        if issue.fixed_version and str(issue.fixed_version).strip()
+                    ),
+                    None,
+                )
+            )
+            updates: dict[str, Any] = {
+                "target_package_name": package_name,
+                "target_dependency_type": "overrides",
+                "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
+                "parent_minimum_version": None,
+                "allowed_target_versions": [fixed_version] if fixed_version else [],
+                "allowed_dependency_types": ["overrides"],
+                "selected_version": fixed_version,
+                "instruction": (
+                    f'Provisional npm override candidate for "{package_name}" '
+                    f"in {manifest_path}; wait for the solver-approved plan before editing."
+                ),
+            }
+            if any(getattr(task, key) != value for key, value in updates.items()):
+                augmented_queue[task_id] = task.model_copy(update=updates)
+    next_task_index = 1
+
+    def allocate_task_id() -> str:
+        """Return the next unused deterministic task identifier."""
+        nonlocal next_task_index
+        while f"task-{next_task_index}" in augmented_queue:
+            next_task_index += 1
+        task_id = f"task-{next_task_index}"
+        next_task_index += 1
+        return task_id
+
+    existing_groups_by_key: dict[tuple[str, str], VulnerabilityGroup] = {}
+    for group in groups_by_id.values():
+        existing_groups_by_key[
+            (_group_manifest_path(group, root), (group.vulnerable_component or "").strip())
+        ] = group
+    committed_target_keys = {
+        (
+            _group_manifest_path(group, root),
+            (
+                task.target_package_name
+                or task.parent_package_name
+                or (group.vulnerable_component or "")
+            ).strip(),
+        )
+        for task in augmented_queue.values()
+        if (group := groups_by_id.get(task.parent_group_id)) is not None
+    }
+    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+
+    for key in all_keys:
+        record = records_by_key[key]
+        existing_group = existing_groups_by_key.get(key)
+        if key in committed_target_keys and (
+            existing_group is None or not existing_group.is_synthetic
+        ):
+            continue
+        inherited_version = alignment_targets.get(key)
+        if existing_group is not None and not existing_group.is_synthetic:
+            # Finding-backed groups already have authoritative triage evidence
+            # and must never be replaced by a synthetic group.
+            continue
+        target_version = _synthetic_target_version(
+            record,
+            inherited_version,
+            relationships,
+            lockfile_packages,
+            coordinated_keys=(coordinated_component_by_key.get(key) if scoped_packages else None),
+        )
+        if target_version is None:
+            reason = (
+                "no resolved lockfile version or exact manifest version is available"
+                if not record.resolved_version
+                else f"inherited target {inherited_version!r} is incompatible with its peer requirements"
+            )
+            diagnostics.append(
+                "synthetic dependency task skipped for "
+                f"{record.manifest_path}:{record.package_name}: {reason}"
+            )
+            continue
+        if existing_group is not None:
+            if not existing_group.is_synthetic:
+                continue
+            if (
+                existing_group.fix_plan is not None
+                and existing_group.fix_plan.fixed_version == target_version
+            ):
+                group_tasks = [
+                    task
+                    for task in augmented_queue.values()
+                    if task.parent_group_id == existing_group.group_id
+                ]
+                if group_tasks:
+                    continue
+                task_id = allocate_task_id()
+                augmented_queue[task_id] = build_initial_remediation_task(
+                    existing_group,
+                    task_id,
+                )
+                continue
+            group_tasks = [
+                task
+                for task in augmented_queue.values()
+                if task.parent_group_id == existing_group.group_id
+            ]
+            if any(
+                task.current_attempt_id is not None or task.status in _TERMINAL_STATUSES
+                for task in group_tasks
+            ):
+                diagnostics.append(
+                    "synthetic dependency target refresh deferred for "
+                    f"{record.manifest_path}:{record.package_name}: task is already committed"
+                )
+                continue
+            refreshed_group = _refresh_synthetic_group(existing_group, target_version)
+            group_index = next(
+                (
+                    index
+                    for index, candidate_group in enumerate(augmented_groups)
+                    if candidate_group.group_id == existing_group.group_id
+                ),
+                None,
+            )
+            if group_index is not None:
+                augmented_groups[group_index] = refreshed_group
+            existing_groups_by_key[key] = refreshed_group
+            groups_by_id[refreshed_group.group_id] = refreshed_group
+            if not group_tasks:
+                task_id = allocate_task_id()
+                augmented_queue[task_id] = build_initial_remediation_task(
+                    refreshed_group,
+                    task_id,
+                )
+            for task in group_tasks:
+                fresh_task = build_initial_remediation_task(
+                    refreshed_group,
+                    task.task_id,
+                )
+                updates = {
+                    "strategy": fresh_task.strategy,
+                    "qa_policy": fresh_task.qa_policy,
+                    "strategy_stage": fresh_task.strategy_stage,
+                    "selected_version": fresh_task.selected_version,
+                    "selected_plan_issue_ids": list(fresh_task.selected_plan_issue_ids),
+                    "instruction": fresh_task.instruction,
+                }
+                if any(getattr(task, name) != value for name, value in updates.items()):
+                    updates["task_revision"] = task.task_revision + 1
+                    augmented_queue[task.task_id] = task.model_copy(update=updates)
+            continue
+        issue_id = _synthetic_issue_id(record.manifest_path, record.package_name)
+        issue = VulnerabilityIssue(
+            id=issue_id,
+            source=IssueSource.SYNTHETIC,
+            issue_type=IssueType.SCA,
+            severity=Severity.UNKNOWN,
+            file_path=record.manifest_path,
+            package_name=record.package_name,
+            package_version=record.resolved_version,
+            fixed_version=target_version,
+            ecosystem="npm",
+            message=(
+                "Synthetic coordination finding: direct package occurrence has "
+                "no active CVE and is represented in the portfolio graph."
+            ),
+            raw_payload={
+                "synthetic": True,
+                "reason": "unflagged direct dependency",
+                "manifest_path": record.manifest_path,
+                "target_version": target_version,
+            },
+        )
+        localized = LocalizedIssue(
+            issue=issue,
+            manifest_file=record.manifest_path,
+            is_direct_dependency=True,
+            package_manager="npm",
+            declaration_type=record.declaration_type,
+            localization_confidence=1.0,
+        )
+        plan = FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version=target_version,
+            instruction=(
+                f'Keep "{record.package_name}" at the Supervisor-committed '
+                f"coordination version {target_version}; do not select another version."
+            ),
+            strategy_used="synthetic_portfolio_coordination",
+        )
+        group = VulnerabilityGroup(
+            group_id=f"sca:{record.manifest_path}:{record.package_name}",
+            issue_type=IssueType.SCA,
+            vulnerable_component=record.package_name,
+            file_path=record.manifest_path,
+            file_paths=[record.manifest_path],
+            versions=[record.resolved_version] if record.resolved_version else [],
+            sources=[IssueSource.SYNTHETIC],
+            representative_issue_id=issue_id,
+            issues=[issue],
+            localized_issues=[localized],
+            fix_plan_candidates=[PackageFixPlanCandidate(issue_id=issue_id, plan=plan)],
+            fix_plan=plan,
+            is_synthetic=True,
+        )
+        augmented_groups.append(group)
+        existing_groups_by_key[key] = group
+        task_id = allocate_task_id()
+        augmented_queue[task_id] = build_initial_remediation_task(group, task_id)
+
+    return augmented_groups, augmented_queue, sorted(set(diagnostics))
+
+
+def _dependency_names(manifest: dict[str, Any], section: str) -> set[str]:
+    """Return dependency names from one npm manifest section."""
+    values = manifest.get(section, {})
+    return set(values) if isinstance(values, dict) else set()
+
+
+def _workspace_patterns(manifest: dict[str, Any]) -> list[str]:
+    """Return npm workspace glob patterns from a manifest."""
+    workspaces = manifest.get("workspaces")
+    if isinstance(workspaces, list):
+        return sorted(str(value).strip() for value in workspaces if str(value).strip())
+    if isinstance(workspaces, dict) and isinstance(workspaces.get("packages"), list):
+        return sorted(str(value).strip() for value in workspaces["packages"] if str(value).strip())
+    return []
+
+
+def _workspace_memberships(
+    manifests: dict[str, dict[str, Any]],
+) -> dict[str, set[str]]:
+    """Return workspace-root membership for every discovered manifest path."""
+    memberships: dict[str, set[str]] = defaultdict(set)
+    for manifest_path, manifest in manifests.items():
+        base = Path(manifest_path).parent
+        if not _workspace_patterns(manifest):
+            continue
+        # Treat the workspace root itself as a member so a root dependency on
+        # a local workspace package forms a workspace edge too.
+        memberships[manifest_path].add(manifest_path)
+        for pattern in _workspace_patterns(manifest):
+            # ``PurePath.match`` is intentionally avoided here: npm patterns
+            # are relative to the declaring manifest and can contain ``**``.
+            candidate_pattern = (base / pattern / "package.json").as_posix()
+            for package_path, package_payload in manifests.items():
+                if Path(package_path).match(candidate_pattern) and isinstance(
+                    package_payload.get("name"), str
+                ):
+                    memberships[package_path].add(manifest_path)
+    return memberships
+
+
+def _union_find(items: Iterable[str]) -> tuple[dict[str, str], Any]:
+    """Create a small deterministic union-find structure."""
+    parent = {item: item for item in items}
+
+    def find(item: str) -> str:
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return
+        parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    return parent, (find, union)
+
+
+def _has_package_token(package_name: str, error_logs: str) -> bool:
+    """Return whether error logs contain one complete package token."""
+    normalized_name = package_name.strip()
+    if not normalized_name or not error_logs:
+        return False
+
+    package_pattern = re.compile(
+        rf"(?<![A-Za-z0-9._-]){re.escape(normalized_name)}(?![A-Za-z0-9._-])",
+        re.IGNORECASE,
+    )
+    scoped_spans = [
+        match.span() for match in re.finditer(r"@[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", error_logs)
+    ]
+    for match in package_pattern.finditer(error_logs):
+        if normalized_name.startswith("@") or not any(
+            start <= match.start() and match.end() <= end for start, end in scoped_spans
+        ):
+            return True
+    return False
+
+
+def _version_major_minor(version: str | None) -> tuple[int, int] | None:
+    """Parse the major/minor release numbers from one exact version."""
+    if not version:
+        return None
+    normalized = version.strip()
+    if not _EXACT_VERSION_RE.fullmatch(normalized):
+        return None
+    if normalized[0] in "=vV":
+        normalized = normalized[1:]
+    release = re.match(r"^(\d+)\.(\d+)\.\d+", normalized)
+    if release is None:
+        return None
+    return int(release.group(1)), int(release.group(2))
+
+
+def score_suspect_package(
+    package_name: str,
+    target_version: str,
+    base_version: str | None,
+    error_logs: str,
+) -> int:
+    """Score one mutated package using deterministic log and version evidence.
+
+    Args:
+        package_name: Exact package name from the proposed package mutation.
+        target_version: Mutation target version, not a task-selected hint.
+        base_version: Known installed version; invalid or absent values add no
+            version evidence.
+        error_logs: Combined QA error text to search for a package token.
+
+    Returns:
+        An integer suspicion score: 10 points for one case-insensitive,
+        complete package-token match; otherwise 3 points for a major-version
+        increase or 1 point for a same-major minor increase. Patch-only,
+        unchanged, downgrade, and invalid-version changes add no points.
+
+    This function is deterministic and performs no I/O or version selection.
+    """
+    score = 10 if _has_package_token(package_name, error_logs) else 0
+    target_release = _version_major_minor(target_version)
+    base_release = _version_major_minor(base_version)
+    if target_release is None or base_release is None:
+        return score
+    if target_release[0] > base_release[0]:
+        return score + 3
+    if target_release[0] == base_release[0] and target_release[1] > base_release[1]:
+        return score + 1
+    return score
+
+
+def _fallback_group_installed_version(
+    task: RemediationTask,
+    package_name: str,
+    groups_by_id: Mapping[str, VulnerabilityGroup],
+) -> str | None:
+    """Return an exact, unambiguous group baseline for a mutation package."""
+    if package_name == task.parent_package_name and task.parent_package_version is not None:
+        return task.parent_package_version
+
+    group = groups_by_id.get(task.parent_group_id)
+    if group is None:
+        return None
+    if package_name in group.dependency_versions:
+        return group.dependency_versions[package_name]
+
+    parent_name, parent_version, _ = group_parent_context(group)
+    if parent_name == package_name and parent_version is not None:
+        return parent_version
+
+    if package_name == group.vulnerable_component:
+        versions = set(group.versions)
+        if len(versions) == 1:
+            return next(iter(versions))
+    return None
+
+
+def rank_suspect_tasks_by_suspicion(
+    tasks: Sequence[RemediationTask],
+    action: MultiPackageAction,
+    error_logs: str,
+    groups_by_id: Mapping[str, VulnerabilityGroup] | None = None,
+    installed_versions_by_task: Mapping[str, str | None] | None = None,
+) -> list[tuple[RemediationTask, int]]:
+    """Rank mutated tasks by deterministic QA suspicion evidence.
+
+    Args:
+        tasks: Candidate tasks from the failed atomic dispatch.
+        action: Committed package mutations whose exact targets are scored.
+        error_logs: Aggregated QA diagnostics used for package-token evidence.
+        groups_by_id: Optional group evidence for an unambiguous installed
+            version fallback when no solver decision is supplied for a task.
+        installed_versions_by_task: Optional current-plan solver baselines.
+            A present key with a missing or invalid value deliberately prevents
+            fallback to weaker group evidence.
+
+    Returns:
+        ``(task, score)`` pairs sorted by descending score, then ascending
+        ``task_id``. Tasks with missing or duplicated mutations receive score
+        zero rather than being matched heuristically.
+
+    This function is pure: it performs no I/O, mutates no inputs, and never
+    selects or changes a remediation version.
+    """
+    mutations_by_task: dict[str, list[PackageMutation]] = defaultdict(list)
+    for mutation in action.package_mutations:
+        mutations_by_task[mutation.task_id].append(mutation)
+
+    groups = groups_by_id or {}
+    installed_versions = installed_versions_by_task or {}
+    ranked: list[tuple[RemediationTask, int]] = []
+    for task in tasks:
+        mutations = mutations_by_task.get(task.task_id, [])
+        if len(mutations) != 1:
+            ranked.append((task, 0))
+            continue
+        mutation = mutations[0]
+        if task.task_id in installed_versions:
+            base_version = installed_versions[task.task_id]
+        else:
+            base_version = _fallback_group_installed_version(task, mutation.package_name, groups)
+        ranked.append(
+            (
+                task,
+                score_suspect_package(
+                    mutation.package_name,
+                    mutation.target_version,
+                    base_version,
+                    error_logs,
+                ),
+            )
+        )
+    return sorted(ranked, key=lambda item: (-item[1], item[0].task_id))
+
+
+def isolate_delta_failure(
+    task_ids: Iterable[str],
+    probe: Callable[[tuple[str, ...]], Literal["PASS", "FAIL", "INCONCLUSIVE"]],
+    *,
+    ranked_suspect_task_ids: Sequence[str] | None = None,
+    max_canary_probes: int | None = None,
+) -> DeltaIsolationResult:
+    """Attribute a failed package cluster with legacy or bounded canaries.
+
+    With both new options omitted, the legacy exhaustive subset check and
+    recursive bisection remain unchanged and are limited to ten tasks. If
+    either option is supplied, only singleton canaries run: ranked IDs retain
+    their supplied order (or normalized task IDs are sorted when only a budget
+    is given), and the default/explicit positive budget caps those callbacks.
+    Bounded mode accepts at most ``MAX_MULTI_PACKAGE_ACTION_SIZE`` tasks,
+    never probes the full subset, and does not bisect an inconclusive run.
+    Its ``executions`` count singleton callbacks only.
+
+    The supplied probe must start each callback from the same baseline. Neither
+    mode turns attribution into a QA pass.
+    """
+    ordered = tuple(dict.fromkeys(sorted(str(task_id) for task_id in task_ids)))
+    if not ordered:
+        return DeltaIsolationResult("INCONCLUSIVE", diagnostic="no package tasks supplied")
+
+    bounded_mode = ranked_suspect_task_ids is not None or max_canary_probes is not None
+    if bounded_mode:
+        if len(ordered) > MAX_MULTI_PACKAGE_ACTION_SIZE:
+            return DeltaIsolationResult(
+                "INCONCLUSIVE",
+                diagnostic=(
+                    f"bounded delta isolation is limited to {MAX_MULTI_PACKAGE_ACTION_SIZE} tasks"
+                ),
+            )
+        budget = DEFAULT_MAX_DELTA_CANARY_PROBES if max_canary_probes is None else max_canary_probes
+        if budget <= 0:
+            return DeltaIsolationResult(
+                "INCONCLUSIVE", diagnostic="canary probe budget must be positive"
+            )
+        if ranked_suspect_task_ids is None:
+            candidates = ordered
+        else:
+            valid_task_ids = set(ordered)
+            candidates = tuple(
+                dict.fromkeys(
+                    str(task_id)
+                    for task_id in ranked_suspect_task_ids
+                    if str(task_id) in valid_task_ids
+                )
+            )
+            if not candidates:
+                return DeltaIsolationResult(
+                    "INCONCLUSIVE",
+                    diagnostic="no valid ranked suspects supplied",
+                )
+
+        tested: list[tuple[str, ...]] = []
+        for task_id in candidates[:budget]:
+            subset = (task_id,)
+            tested.append(subset)
+            if probe(subset) == "FAIL":
+                return DeltaIsolationResult(
+                    "IDENTIFIED",
+                    responsible_task_ids=subset,
+                    tested_subsets=tuple(tested),
+                    executions=len(tested),
+                    diagnostic="singleton canary failed",
+                )
+        return DeltaIsolationResult(
+            "INCONCLUSIVE",
+            tested_subsets=tuple(tested),
+            executions=len(tested),
+            diagnostic="no singleton failure found within the canary probe budget",
+        )
+
+    if len(ordered) > 10:
+        return DeltaIsolationResult(
+            "INCONCLUSIVE", diagnostic="delta isolation is bounded at ten tasks"
+        )
+    tested: list[tuple[str, ...]] = []
+    outcomes: dict[tuple[str, ...], Literal["PASS", "FAIL", "INCONCLUSIVE"]] = {}
+    executions = 0
+
+    def run(subset: tuple[str, ...]) -> Literal["PASS", "FAIL", "INCONCLUSIVE"]:
+        nonlocal executions
+        if subset in outcomes:
+            return outcomes[subset]
+        executions += 1
+        tested.append(subset)
+        outcomes[subset] = probe(subset)
+        return outcomes[subset]
+
+    combined = run(ordered)
+    if combined != "FAIL":
+        return DeltaIsolationResult(
+            "INCONCLUSIVE",
+            tested_subsets=tuple(tested),
+            executions=executions,
+            diagnostic="combined cluster did not produce a reproducible failure",
+        )
+
+    def bisect(subset: tuple[str, ...]) -> DeltaIsolationResult:
+        if len(subset) == 1:
+            outcome = run(subset)
+            return DeltaIsolationResult(
+                "IDENTIFIED" if outcome == "FAIL" else "INCONCLUSIVE",
+                responsible_task_ids=subset if outcome == "FAIL" else (),
+                diagnostic="singleton canary failed"
+                if outcome == "FAIL"
+                else "singleton canary was inconclusive",
+            )
+        midpoint = len(subset) // 2
+        left, right = subset[:midpoint], subset[midpoint:]
+        left_result = run(left)
+        right_result = run(right)
+        if "INCONCLUSIVE" in {left_result, right_result}:
+            return DeltaIsolationResult("INCONCLUSIVE", diagnostic="a canary was inconclusive")
+        if left_result == "PASS" and right_result == "PASS":
+            return DeltaIsolationResult(
+                "INTERACTION_FAILURE", diagnostic="both halves passed; combined action failed"
+            )
+        if left_result == "FAIL" and right_result == "FAIL":
+            return DeltaIsolationResult("AMBIGUOUS", diagnostic="both halves failed")
+        failing_subset = left if left_result == "FAIL" else right
+        return bisect(failing_subset)
+
+    result = bisect(ordered)
+    return result.__class__(
+        status=result.status,
+        responsible_task_ids=result.responsible_task_ids,
+        tested_subsets=tuple(tested),
+        executions=executions,
+        diagnostic=result.diagnostic,
+    )
+
+
+def repository_fingerprint(repo_root: str | Path) -> str:
+    """Return the deterministic fingerprint used by portfolio plans."""
+    _manifests, fingerprint = _load_manifests(Path(repo_root).resolve())
+    return fingerprint
+
+
+__all__ = [
+    "DeltaIsolationResult",
+    "active_leaf_task_ids",
+    "build_portfolio_plan",
+    "isolate_delta_failure",
+    "materialize_synthetic_dependency_tasks",
+    "repository_fingerprint",
+]
+
+
+def prepare_portfolio_inputs(
+    repo_root: str | Path,
+    groups: Iterable[VulnerabilityGroup],
+    task_queue: dict[str, RemediationTask],
+    target_packages: Iterable[str] | None = None,
+) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
+    """Prepare the outer portfolio inputs using detached task/group objects.
+
+    Args:
+        repo_root: Repository whose manifests and lockfiles define the portfolio
+            scope.
+        groups: Post-triage vulnerability groups to prepare.
+        task_queue: Existing task projection to copy before preparation.
+        target_packages: Optional development package allowlist. When supplied,
+            synthetic dependency discovery is restricted to the selected
+            packages and their coordination closure.
+
+    Returns:
+        Detached prepared groups, task queue, and preparation diagnostics.
+    """
+    return _prepare_solver_portfolio_inputs(
+        repo_root,
+        groups,
+        task_queue,
+        target_packages=target_packages,
+    )
+
+
+def build_portfolio_plan(
+    repo_root: str | Path,
+    groups: Iterable[VulnerabilityGroup],
+    task_queue: dict[str, RemediationTask],
+    *,
+    target_packages: Iterable[str] | None = None,
+    peer_conflict_pairs: Iterable[tuple[str, str]] = (),
+    forced_singleton_task_ids: Iterable[str] = (),
+    settings: Any | None = None,
+    registry_fetcher: Any | None = None,
+    portfolio_iteration: int = 0,
+    portfolio_replan_request: Any | None = None,
+) -> PortfolioPlan:
+    """Build the solver-backed portfolio plan at the stable public boundary.
+
+    Args:
+        repo_root: Repository whose manifests and lockfiles define the graph.
+        groups: Prepared vulnerability and coordination groups.
+        task_queue: Supervisor-owned task projection.
+        target_packages: Optional development package scope.
+        peer_conflict_pairs: Explicit QA-discovered peer conflict pairs.
+        forced_singleton_task_ids: Tasks that must remain singleton batches.
+        settings: Solver and registry settings.
+        registry_fetcher: Optional fresh raw-packument fetcher for candidate selection.
+        portfolio_iteration: Current outer portfolio iteration.
+        portfolio_replan_request: Optional Supervisor replan constraints.
+
+    Returns:
+        An immutable solver-backed portfolio plan.
+    """
+    return _build_solver_portfolio_plan(
+        repo_root,
+        groups,
+        task_queue,
+        target_packages=target_packages,
+        peer_conflict_pairs=peer_conflict_pairs,
+        forced_singleton_task_ids=forced_singleton_task_ids,
+        settings=settings,
+        registry_fetcher=registry_fetcher,
+        portfolio_iteration=portfolio_iteration,
+        portfolio_replan_request=portfolio_replan_request,
+    )
+
+
+def apply_portfolio_plan(
+    plan: PortfolioPlan,
+    groups: Iterable[VulnerabilityGroup],
+    task_queue: dict[str, RemediationTask],
+) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
+    """Commit solver-approved decisions to detached task objects."""
+    return _apply_solver_portfolio_plan(plan, groups, task_queue)
+
+
+__all__ = [
+    "DeltaIsolationResult",
+    "active_leaf_task_ids",
+    "apply_portfolio_plan",
+    "build_portfolio_plan",
+    "build_certified_portfolio_plan",
+    "rank_suspect_tasks_by_suspicion",
+    "isolate_delta_failure",
+    "materialize_synthetic_dependency_tasks",
+    "prepare_portfolio_inputs",
+    "score_suspect_package",
+    "repository_fingerprint",
+]

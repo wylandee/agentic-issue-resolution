@@ -9,10 +9,15 @@ from remediation_engine.contracts.schemas import (
     FailureCategory,
     FixPlanStatus,
     NoFixMitigationStage,
+    ODCScanEvidence,
     QAEvaluation,
+    QAFailureEvidence,
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
+    ScanFallbackReason,
+    ScannerExecutionStatus,
+    ScanScope,
     TaskAttemptSnapshot,
     TaskStatus,
 )
@@ -212,6 +217,111 @@ class TestRunQACriticNode:
         assert call["scan_skip_reason"] == "no_fix_package_removal"
         assert result["new_vulnerability_status"] == "not_scanned"
         assert result["qa_evaluations"]["task-1"].passed is True
+
+    def test_no_matching_target_is_skipped_but_not_passed(self):
+        group = _make_group()
+        state = _make_minimal_state(groups=[group])
+        results = _make_fully_populated_results(ok=True)
+        results.scan_target_failures_by_task = {
+            "task-1": (
+                ScanFallbackReason.NO_MATCHING_TARGET,
+                "Task task-1 target selection failed for package-lock.json: no_matching_target",
+            )
+        }
+        patches = self._patch_node(group=group, results=results)
+
+        with patches["sandbox"], patches["global_exec"], patches["investigators"]:
+            result = run_qa_critic_node(state)
+
+        evaluation = result["qa_evaluations"]["task-1"]
+        gates = evaluation.deterministic_gates
+        assert result["eval_status"] == "failures_detected"
+        assert evaluation.passed is False
+        assert evaluation.evidence_inconclusive is True
+        assert evaluation.failure_category == FailureCategory.SECURITY_FLAG
+        assert gates is not None
+        assert gates.status == "fail"
+        assert gates.scanner_execution_status == ScannerExecutionStatus.SKIPPED
+        assert gates.target_scanner_cleared is None
+        assert any("scan skipped" in item for item in gates.diagnostics)
+        assert "not evidence" in evaluation.retry_feedback.lower()
+        assert not any("no_matching_target" in error for error in result["errors"])
+
+    def test_targeted_scan_failure_preserves_actionable_test_failure(self):
+        group = _make_group()
+        state = _make_minimal_state(groups=[group])
+        results = _make_fully_populated_results(ok=True)
+        results.tests = (False, "npm test FAILED")
+        results.test_raw_stdout = "not ok 1 - api authentication test\n"
+        results.test_exit_code = 1
+        results.scan_target_failures_by_task = {
+            "task-1": (
+                ScanFallbackReason.TARGETED_SCAN_FAILED,
+                "unresolved npm alias in lockfile closure",
+            )
+        }
+        failure_evidence = QAFailureEvidence(failed_tests=["api authentication test"])
+        evaluation = QAEvaluation(
+            task_id="task-1",
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback="The version update broke the API tests.",
+            failure_evidence=failure_evidence,
+        )
+        patches = self._patch_node(group=group, results=results, evaluations=[evaluation])
+
+        with patches["sandbox"], patches["global_exec"], patches["investigators"]:
+            result = run_qa_critic_node(state)
+
+        final = result["qa_evaluations"]["task-1"]
+        assert final.passed is False
+        assert final.evidence_inconclusive is False
+        assert final.failure_category == FailureCategory.BREAKING_CHANGE
+        assert final.failure_evidence is not None
+        assert final.failure_evidence.failed_tests == ["api authentication test"]
+        assert final.deterministic_gates is not None
+        assert final.deterministic_gates.tests_passed is False
+        assert final.deterministic_gates.scanner_execution_status == ScannerExecutionStatus.NOT_RUN
+        assert "coverage is also incomplete" in final.retry_feedback
+
+    def test_incomplete_scan_keeps_singleton_test_failure_actionable(self):
+        group = _make_group()
+        state = _make_minimal_state(groups=[group])
+        results = _make_fully_populated_results(ok=True)
+        results.tests = (False, "npm test FAILED (exit 1)")
+        results.test_exit_code = 1
+        results.test_raw_stdout = "not ok 1 - API auth test\n"
+        results.scan_evidence = ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            complete=False,
+            fallback_reason=ScanFallbackReason.TARGETED_SCAN_FAILED,
+        )
+        results.scan_target_failures_by_task = {
+            "task-1": (
+                ScanFallbackReason.TARGETED_SCAN_FAILED,
+                "unresolved npm alias in lockfile closure",
+            )
+        }
+        patches = self._patch_node(
+            group=group,
+            results=results,
+            evaluations=[QAEvaluation(task_id="task-1", passed=True)],
+        )
+
+        with patches["sandbox"], patches["global_exec"], patches["investigators"]:
+            result = run_qa_critic_node(state)
+
+        evaluation = result["qa_evaluations"]["task-1"]
+        assert evaluation.passed is False
+        assert evaluation.evidence_inconclusive is False
+        assert evaluation.failure_category == FailureCategory.BREAKING_CHANGE
+        assert evaluation.failure_evidence is not None
+        assert evaluation.deterministic_gates is not None
+        assert evaluation.deterministic_gates.tests_passed is False
+        assert evaluation.test_attribution is not None
+        assert evaluation.test_attribution.verdict.value == "responsible"
+        assert result["scan_evidence"].complete is False
 
     def test_same_parent_group_tasks_receive_isolated_task_evaluations(self):
         group = _make_group()

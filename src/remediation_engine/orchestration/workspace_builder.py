@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import configparser
+import json
 import logging
 import shlex
 import tomllib
@@ -22,6 +23,7 @@ from packaging.version import Version
 
 from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import OrchestratorState
+from remediation_engine.orchestration.trajectory_exporter import get_active_trajectory_recorder
 from remediation_engine.runtime.docker_client import close_docker_client
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox, get_docker_client
 
@@ -76,6 +78,46 @@ def _discover_package_directories(repo_root: Path) -> list[Path]:
     )
 
 
+def _collect_source_package_lock_inventory(
+    repo_root: Path,
+) -> tuple[dict[str, str], list[str]]:
+    """Read and fingerprint all source package-lock files before npm installs.
+
+    Args:
+        repo_root: Host repository root copied into the Docker workspace.
+
+    Returns:
+        A complete occurrence inventory and diagnostics. The inventory is
+        empty when any source lockfile cannot be parsed, preventing a partial
+        snapshot from being treated as authoritative.
+    """
+    from remediation_engine.orchestration._qa_runtime import _package_lock_inventory
+
+    lockfiles = sorted(
+        (
+            path
+            for path in repo_root.rglob("package-lock.json")
+            if path.is_file()
+            and not any(
+                part in _SKIP_PACKAGE_DIR_NAMES for part in path.relative_to(repo_root).parts
+            )
+        ),
+        key=lambda path: path.relative_to(repo_root).as_posix(),
+    )
+    inventory: dict[str, str] = {}
+    errors: list[str] = []
+    for lockfile_path in lockfiles:
+        relative_path = lockfile_path.relative_to(repo_root).as_posix()
+        try:
+            document = json.loads(lockfile_path.read_text(encoding="utf-8"))
+            if not isinstance(document, dict):
+                raise ValueError("package-lock root must be an object")
+            inventory.update(_package_lock_inventory(relative_path, document))
+        except (OSError, UnicodeError, ValueError) as exc:
+            errors.append(f"{relative_path}: {exc}")
+    return ({} if errors else inventory), errors
+
+
 def _install_workspace_dependencies(
     sandbox: DockerSandbox,
     package_directories: list[Path],
@@ -84,7 +126,7 @@ def _install_workspace_dependencies(
 
     Args:
         sandbox: Running Docker sandbox mounted at ``/workspace``.
-        package_directories: Relative package directories in parent-first
+        package_directories: Relative package-directory paths in parent-first
             order, as returned by :func:`_discover_package_directories`.
 
     Raises:
@@ -351,16 +393,26 @@ def _install_python_workspace(sandbox: DockerSandbox, commands: tuple[str, ...])
             f"{command[:180]}.\nstdout tail:\n{stdout_tail}\nstderr tail:\n{stderr_tail}"
         )
 
-
 def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
-    """
-    LangGraph node - Workspace Builder.
+    """Copy the source repository and install dependencies for its language.
 
-    Creates a named volume, copies the host repository into it, and installs
-    dependencies with the selected project language's runtime before workers
-    edit the initialized shared workspace.
+    The source package-lock inventory is captured before any npm install can
+    rewrite the workspace lockfiles. Invalid source lockfiles are reported as
+    incomplete inventory evidence without preventing ordinary setup. Python
+    metadata is inspected statically on the host; environment setup runs only
+    inside the language-specific Docker image.
     """
-    repo_root_str: str = state.get("repo_root", "")
+    repo_root_str = state.get("repo_root", "")
+    repo_root = Path(repo_root_str)
+    if not repo_root_str or not repo_root.is_dir():
+        msg = f"workspace_builder_node: repo_root '{repo_root_str}' is not a valid directory."
+        logger.error(msg)
+        return {
+            "status": "workspace_build_failed",
+            "workspace_volume": None,
+            "errors": [msg],
+        }
+
     raw_language = state.get("project_language", ProjectLanguage.NODEJS)
     project_language = (
         raw_language
@@ -368,13 +420,32 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
         else ProjectLanguage(raw_language or ProjectLanguage.NODEJS.value)
     )
     image = LANGUAGE_CONFIGS[project_language].docker_image
-    if not repo_root_str or not Path(repo_root_str).is_dir():
-        msg = f"workspace_builder_node: repo_root '{repo_root_str}' is not a valid directory."
-        logger.error(msg)
+    source_inventory, inventory_errors = _collect_source_package_lock_inventory(repo_root)
+    inventory_diagnostics = [
+        f"workspace_builder_node: source package-lock inventory failed: {error}"
+        for error in inventory_errors
+    ]
+    if inventory_errors:
+        logger.warning(
+            "workspace_builder_node: source package-lock inventory is incomplete: %s",
+            "; ".join(inventory_errors),
+        )
+
+    try:
+        python_setup_commands = (
+            _python_project_setup_plan(repo_root)
+            if project_language == ProjectLanguage.PYTHON
+            else ()
+        )
+    except Exception as exc:  # noqa: BLE001 - unsupported managers fail before volume creation
+        msg = f"workspace_builder_node: Python setup is unsupported - {exc}"
+        logger.warning(msg)
         return {
             "status": "workspace_build_failed",
             "workspace_volume": None,
-            "errors": [msg],
+            "accepted_package_inventory_by_lockfile": source_inventory,
+            "package_inventory_baseline_complete": not inventory_errors,
+            "errors": [msg, *inventory_diagnostics],
         }
 
     volume_name = f"agent_workspace_{uuid.uuid4().hex[:8]}"
@@ -384,27 +455,26 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
     try:
         client = get_docker_client()
         client.volumes.create(name=volume_name)
+        recorder = get_active_trajectory_recorder()
+        if recorder is not None:
+            recorder.register_workspace_volume(volume_name)
     except Exception as exc:  # noqa: BLE001
         msg = f"workspace_builder_node: failed to create workspace volume - {exc}"
         logger.exception("workspace_builder_node: workspace volume creation failed.")
         return {
             "status": "workspace_build_failed",
             "workspace_volume": None,
-            "errors": [msg],
+            "accepted_package_inventory_by_lockfile": source_inventory,
+            "package_inventory_baseline_complete": not inventory_errors,
+            "errors": [msg, *inventory_diagnostics],
         }
     finally:
         if client is not None:
             _close_client(client)
 
     try:
-        repo_root = Path(repo_root_str)
-        python_setup_commands = (
-            _python_project_setup_plan(repo_root)
-            if project_language == ProjectLanguage.PYTHON
-            else ()
-        )
         with DockerSandbox(
-            repo_root_str,
+            repo_root,
             image=image,
             workspace_volume=volume_name,
         ) as sandbox:
@@ -432,10 +502,15 @@ def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
         return {
             "status": "workspace_build_failed",
             "workspace_volume": volume_name,
-            "errors": [msg],
+            "accepted_package_inventory_by_lockfile": source_inventory,
+            "package_inventory_baseline_complete": not inventory_errors,
+            "errors": [msg, *inventory_diagnostics],
         }
 
     return {
         "workspace_volume": volume_name,
         "status": "workspace_ready",
+        "accepted_package_inventory_by_lockfile": source_inventory,
+        "package_inventory_baseline_complete": not inventory_errors,
+        "errors": inventory_diagnostics,
     }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import shutil
 import subprocess
@@ -15,13 +16,16 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from packageurl import PackageURL
+
 from remediation_engine.contracts.schemas import ScannerExecutionStatus, VulnerabilityIssue
-from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.tools.package_identity import package_name_from_purl
 
 from .qa_types import (
     _exception_stream,
+    _ODCReportedPackageOccurrence,
     _QALogRecord,
     _SecurityScanResult,
     _subprocess_text,
@@ -42,9 +46,21 @@ _ODC_INTERNAL_FULL_SCAN_EXCLUDES = (
     "**/.remedy-attempt-snapshots/**",
     "**/.odc-targeted/**",
 )
-_ODC_PYTHON_FULL_SCAN_EXCLUDES = (
-    "**/.remedy-pipenv/**",
-    "**/.venv/**",
+_ODC_SENSITIVE_OPTION_PATTERN = (
+    r"--[A-Za-z0-9_.-]*(?:api.?key|password|pass|secret|token|credential|authorization)"
+    r"[A-Za-z0-9_.-]*"
+)
+_ODC_REPR_ARGUMENT_RE = re.compile(
+    rf"(?i)(?P<quote>['\"])(?P<option>{_ODC_SENSITIVE_OPTION_PATTERN})(?P=quote)"
+    r"(?P<separator>\s*,\s*)(?P<value_quote>['\"])(?P<value>.*?)(?P=value_quote)"
+)
+_ODC_INLINE_ARGUMENT_RE = re.compile(
+    rf"(?i)(?P<prefix>{_ODC_SENSITIVE_OPTION_PATTERN}\s*=\s*)"
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;\]\)]+)"
+)
+_ODC_SEPARATE_ARGUMENT_RE = re.compile(
+    rf"(?i)(?P<prefix>{_ODC_SENSITIVE_OPTION_PATTERN}\s+)"
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;\]\)]+)"
 )
 
 
@@ -82,11 +98,16 @@ class _ODCScanTimeout(subprocess.TimeoutExpired):
         cleanup: _ODCCleanupResult,
         log_path: Path | None,
     ) -> None:
+        command = original.cmd
+        if isinstance(command, Sequence) and not isinstance(command, (str, bytes)):
+            safe_command: str | list[str] = _redact_odc_command(command)
+        else:
+            safe_command = _redact_odc_text(str(command))
         super().__init__(
-            original.cmd,
+            safe_command,
             original.timeout,
-            output=getattr(original, "output", None),
-            stderr=getattr(original, "stderr", None),
+            output=_redact_odc_text(_subprocess_text(getattr(original, "output", None))),
+            stderr=_redact_odc_text(_subprocess_text(getattr(original, "stderr", None))),
         )
         self.run_id = execution.run_id
         self.scope = execution.scope
@@ -108,13 +129,7 @@ def _new_odc_execution(scope: str) -> _ODCExecution:
 
 
 def _redact_odc_command(command: Sequence[str]) -> list[str]:
-    """Redact values for the small set of secret-bearing ODC options."""
-    sensitive_options = {
-        "--apikey",
-        "--nvdapikey",
-        "--proxypass",
-        "--password",
-    }
+    """Redact values for secret-bearing ODC options in split or inline form."""
     redacted: list[str] = []
     redact_next = False
     for argument in command:
@@ -122,10 +137,65 @@ def _redact_odc_command(command: Sequence[str]) -> list[str]:
             redacted.append("<redacted>")
             redact_next = False
             continue
-        redacted.append(argument)
-        if argument.lower() in sensitive_options:
+        option, separator, value = argument.partition("=")
+        if separator and _is_sensitive_odc_option(option):
+            redacted.append(f"{option}={'<redacted>' if value else ''}")
+            redact_next = not value
+        else:
+            redacted.append(argument)
+        if not separator and _is_sensitive_odc_option(argument):
             redact_next = True
     return redacted
+
+
+def _is_sensitive_odc_option(option: str) -> bool:
+    """Return whether an option name can carry a credential or token."""
+    if not option.startswith("--"):
+        return False
+    normalized = option.lstrip("-").replace("-", "").replace("_", "").casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "apikey",
+            "password",
+            "pass",
+            "secret",
+            "token",
+            "credential",
+            "authorization",
+        )
+    )
+
+
+def _redact_odc_text(value: str) -> str:
+    """Redact secret-bearing ODC option values embedded in diagnostic text."""
+    redacted = _ODC_REPR_ARGUMENT_RE.sub(
+        lambda match: (
+            f"{match.group('quote')}{match.group('option')}{match.group('quote')}"
+            f"{match.group('separator')}{match.group('value_quote')}<redacted>"
+            f"{match.group('value_quote')}"
+        ),
+        value,
+    )
+    redacted = _ODC_INLINE_ARGUMENT_RE.sub(
+        lambda match: f"{match.group('prefix')}<redacted>", redacted
+    )
+    return _ODC_SEPARATE_ARGUMENT_RE.sub(
+        lambda match: f"{match.group('prefix')}<redacted>", redacted
+    )
+
+
+def _redact_odc_exception(error: BaseException) -> str:
+    """Render an ODC exception without exposing its command or output secrets."""
+    message = str(error)
+    command = getattr(error, "cmd", None)
+    if command is not None:
+        if isinstance(command, Sequence) and not isinstance(command, (str, bytes)):
+            safe_command: str | list[str] = _redact_odc_command(command)
+        else:
+            safe_command = _redact_odc_text(str(command))
+        message = message.replace(repr(command), repr(safe_command))
+    return _redact_odc_text(message)
 
 
 def _cleanup_odc_container(container_name: str) -> _ODCCleanupResult:
@@ -209,11 +279,19 @@ def _write_odc_diagnostic_log(
     cleanup: _ODCCleanupResult | None = None,
 ) -> Path | None:
     """Persist one ODC invocation's command, output, and lifecycle evidence."""
-    stdout = _subprocess_text(
-        getattr(process, "stdout", None) if process is not None else getattr(error, "stdout", None)
+    stdout = _redact_odc_text(
+        _subprocess_text(
+            getattr(process, "stdout", None)
+            if process is not None
+            else getattr(error, "stdout", None)
+        )
     )
-    stderr = _subprocess_text(
-        getattr(process, "stderr", None) if process is not None else getattr(error, "stderr", None)
+    stderr = _redact_odc_text(
+        _subprocess_text(
+            getattr(process, "stderr", None)
+            if process is not None
+            else getattr(error, "stderr", None)
+        )
     )
     exit_code = getattr(process, "returncode", None) if process is not None else None
     cleanup_payload: dict[str, Any] | None = None
@@ -223,9 +301,9 @@ def _write_odc_diagnostic_log(
             "succeeded": cleanup.succeeded,
             "already_absent": cleanup.already_absent,
             "returncode": cleanup.returncode,
-            "stdout": cleanup.stdout,
-            "stderr": cleanup.stderr,
-            "error": cleanup.error,
+            "stdout": _redact_odc_text(cleanup.stdout),
+            "stderr": _redact_odc_text(cleanup.stderr),
+            "error": _redact_odc_text(cleanup.error) if cleanup.error else None,
         }
     payload = {
         "run_id": execution.run_id,
@@ -239,7 +317,7 @@ def _write_odc_diagnostic_log(
         "command": _redact_odc_command(command),
         "stdout": stdout,
         "stderr": stderr,
-        "error": str(error) if error is not None else None,
+        "error": _redact_odc_exception(error) if error is not None else None,
         "cleanup": cleanup_payload,
     }
     try:
@@ -302,22 +380,13 @@ def _odc_timeout_summary(exc: subprocess.TimeoutExpired) -> str:
 def _run_odc_process(
     workspace_volume: str,
     scan_subdir: str | None = None,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> subprocess.CompletedProcess[str]:
     """Run ODC with a unique container identity and durable diagnostics."""
     scope = "targeted" if scan_subdir else "full"
     execution = _new_odc_execution(scope)
-    cmd = (
-        _odc_command(workspace_volume, scan_subdir, execution.container_name)
-        if project_language == ProjectLanguage.NODEJS
-        else _odc_command(
-            workspace_volume,
-            scan_subdir,
-            execution.container_name,
-            project_language,
-        )
-    )
-    logger.info("qa_critic: running %s ODC in Docker: %s", scope, " ".join(cmd))
+    cmd = _odc_command(workspace_volume, scan_subdir, execution.container_name)
+    safe_command = shlex.join(_redact_odc_command(cmd))
+    logger.info("qa_critic: running %s ODC in Docker: %s", scope, safe_command)
     try:
         process = subprocess.run(
             cmd,
@@ -468,32 +537,162 @@ def _parse_report_issues(report_text: str) -> list[VulnerabilityIssue] | None:
         return None
 
 
-def _parse_report_python_packages(
-    report_text: str,
-) -> set[tuple[str, str]] | None:
-    """Extract PyPI package/version identities from a parseable ODC report."""
+def _normalise_odc_report_path(value: str) -> str | None:
+    """Return a workspace-relative report path, retaining targeted project identity."""
+    normalized = value.strip().replace("\\", "/").split("?", 1)[0].split("#", 1)[0]
+    if not normalized:
+        return None
+    targeted_marker = ".odc-targeted/"
+    if targeted_marker in normalized:
+        normalized = targeted_marker + normalized.split(targeted_marker, 1)[1]
+    elif normalized.startswith("/scan/"):
+        normalized = normalized[len("/scan/") :]
+    elif normalized.startswith("scan/"):
+        normalized = normalized[len("scan/") :]
+    else:
+        normalized = normalized.lstrip("/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized or normalized == ".." or normalized.startswith("../") or "/../" in normalized:
+        return None
+    return normalized
+
+
+def _parse_report_dependency_paths(report_text: str) -> list[str] | None:
+    """Extract primary and related dependency paths, including clean entries.
+
+    An empty list is a valid report with no dependency file coverage; ``None``
+    means the report could not prove a dependency list.
+    """
     try:
         report = json.loads(report_text)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("qa_critic: failed to decode ODC package inventory — %s", exc)
+    except (TypeError, json.JSONDecodeError):
         return None
+    if not isinstance(report, dict) or not isinstance(report.get("dependencies"), list):
+        return None
+
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add_path(raw_path: Any) -> None:
+        if not isinstance(raw_path, str):
+            return
+        normalized_path = _normalise_odc_report_path(raw_path)
+        if normalized_path and normalized_path not in seen:
+            seen.add(normalized_path)
+            paths.append(normalized_path)
+
+    for dependency in report["dependencies"]:
+        if not isinstance(dependency, dict):
+            continue
+        add_path(dependency.get("filePath"))
+        related_dependencies = dependency.get("relatedDependencies") or []
+        if isinstance(related_dependencies, list):
+            for related in related_dependencies:
+                if isinstance(related, dict):
+                    add_path(related.get("filePath"))
+    return paths
+
+
+def _parse_report_package_occurrences(
+    report_text: str,
+) -> list[_ODCReportedPackageOccurrence] | None:
+    """Parse PURL-backed package occurrences from primary and related entries."""
     try:
-        from remediation_engine.tools.odc_parser import parse_python_packages
-    except ImportError:
-        logger.warning("qa_critic: remediation_engine.tools.odc_parser not importable.")
+        report = json.loads(report_text)
+    except (TypeError, json.JSONDecodeError):
         return None
-    try:
-        return parse_python_packages(report)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("qa_critic: failed to parse ODC package inventory — %s", exc)
+    if not isinstance(report, dict) or not isinstance(report.get("dependencies"), list):
         return None
+
+    occurrences: list[_ODCReportedPackageOccurrence] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_packages(packages: Any, report_path: Any) -> None:
+        if not isinstance(packages, list):
+            return
+        normalized_path = (
+            _normalise_odc_report_path(report_path) if isinstance(report_path, str) else None
+        )
+        raw_path = (
+            report_path.strip().replace("\\", "/")
+            if isinstance(report_path, str) and report_path.strip()
+            else None
+        )
+        if raw_path is not None:
+            base_path, separator, query = raw_path.partition("?")
+            normalized_base = _normalise_odc_report_path(base_path)
+            occurrence_path = (
+                f"{normalized_base}?{query.split('#', 1)[0]}"
+                if normalized_base and separator
+                else normalized_base
+            )
+        else:
+            occurrence_path = None
+
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            purl = package.get("id")
+            if not isinstance(purl, str) or not purl.startswith("pkg:"):
+                continue
+            try:
+                parsed = PackageURL.from_string(purl)
+            except Exception:  # noqa: BLE001 - malformed package identity is not trusted
+                continue
+            package_name = package_name_from_purl(purl)
+            version = str(parsed.version or "").strip()
+            ecosystem = str(parsed.type or "").strip()
+            if not package_name or not version or not ecosystem:
+                continue
+            if occurrence_path is not None:
+                identity = (occurrence_path, purl)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            occurrences.append(
+                _ODCReportedPackageOccurrence(
+                    package_name=package_name,
+                    version=version,
+                    ecosystem=ecosystem,
+                    file_path=normalized_path,
+                    raw_file_path=raw_path,
+                )
+            )
+
+    for dependency in report["dependencies"]:
+        if not isinstance(dependency, dict):
+            continue
+        add_packages(dependency.get("packages") or [], dependency.get("filePath"))
+        related_dependencies = dependency.get("relatedDependencies") or []
+        if not isinstance(related_dependencies, list):
+            continue
+        for related in related_dependencies:
+            if not isinstance(related, dict):
+                continue
+            package_ids = related.get("packageIds")
+            if package_ids is None:
+                package_ids = related.get("packages")
+            add_packages(package_ids or [], related.get("filePath"))
+    return occurrences
+
+
+def _parse_report_package_identities(report_text: str) -> list[tuple[str, str]] | None:
+    """Extract npm package name/version pairs ODC actually enumerated."""
+    occurrences = _parse_report_package_occurrences(report_text)
+    if occurrences is None:
+        return None
+    return [
+        (occurrence.package_name.casefold(), occurrence.version)
+        for occurrence in occurrences
+        if occurrence.ecosystem.casefold() == "npm"
+    ]
 
 
 def _odc_command(
     workspace_volume: str,
     scan_subdir: str | None = None,
     container_name: str | None = None,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> list[str]:
     """Build a safe ODC Docker command for the full or targeted workspace."""
     scan_path = "/scan"
@@ -529,40 +728,27 @@ def _odc_command(
     ]
 
     if scan_subdir is None:
-        excludes = _ODC_INTERNAL_FULL_SCAN_EXCLUDES
-        if project_language == ProjectLanguage.PYTHON:
-            excludes = (*excludes, *_ODC_PYTHON_FULL_SCAN_EXCLUDES)
-        for pattern in excludes:
+        for pattern in _ODC_INTERNAL_FULL_SCAN_EXCLUDES:
             cmd.extend(["--exclude", pattern])
 
-    configured_args = get_runtime_settings().odc_extra_args
-    extra_args = shlex.split(configured_args) if configured_args else []
-    if project_language == ProjectLanguage.PYTHON and "--enableExperimental" not in extra_args:
-        extra_args.append("--enableExperimental")
-    cmd.extend(extra_args)
+    extra_args = get_runtime_settings().odc_extra_args
+    if extra_args:
+        cmd.extend(shlex.split(extra_args))
 
     return cmd
 
 
-def _run_odc(
-    workspace_volume: str,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
-) -> subprocess.CompletedProcess[str]:
+def _run_odc(workspace_volume: str) -> subprocess.CompletedProcess[str]:
     """Execute OWASP Dependency-Check in Docker against the shared workspace volume."""
-    if project_language == ProjectLanguage.NODEJS:
-        return _run_odc_process(workspace_volume)
-    return _run_odc_process(workspace_volume, project_language=project_language)
+    return _run_odc_process(workspace_volume)
 
 
 def _run_targeted_odc(
     workspace_volume: str,
     targeted_subdir: str,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> subprocess.CompletedProcess[str]:
     """Execute ODC against a validated workspace-relative targeted directory."""
-    if project_language == ProjectLanguage.NODEJS:
-        return _run_odc_process(workspace_volume, targeted_subdir)
-    return _run_odc_process(workspace_volume, targeted_subdir, project_language)
+    return _run_odc_process(workspace_volume, targeted_subdir)
 
 
 def _record_scan_result(
@@ -576,8 +762,9 @@ def _record_scan_result(
     error: str | None = None,
 ) -> _SecurityScanResult:
     """Attach private process metadata and one immutable scan log record."""
-    raw_stdout = _subprocess_text(stdout)
-    raw_stderr = _subprocess_text(stderr)
+    raw_stdout = _redact_odc_text(_subprocess_text(stdout))
+    raw_stderr = _redact_odc_text(_subprocess_text(stderr))
+    safe_error = _redact_odc_text(error) if error else None
     path = str(diagnostic_log_path) if diagnostic_log_path else None
     record = _QALogRecord(
         phase="scan",
@@ -585,10 +772,11 @@ def _record_scan_result(
         exit_code=exit_code,
         stdout=raw_stdout,
         stderr=raw_stderr,
-        error=error,
+        error=safe_error,
     )
     return replace(
         result,
+        summary=_redact_odc_text(result.summary),
         exit_code=exit_code,
         raw_stdout=raw_stdout,
         raw_stderr=raw_stderr,
@@ -602,7 +790,6 @@ def _run_security_scan(
     workspace_volume: str,
     target_identifiers: set[str],
     baseline_identifiers: set[str] | None = None,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _SecurityScanResult:
     """Run Dependency-Check and return typed scan evidence.
 
@@ -663,11 +850,7 @@ def _run_security_scan(
         )
 
     try:
-        proc = (
-            _run_odc(workspace_volume)
-            if project_language == ProjectLanguage.NODEJS
-            else _run_odc(workspace_volume, project_language)
-        )
+        proc = _run_odc(workspace_volume)
     except FileNotFoundError as exc:
         msg = (
             "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
@@ -746,9 +929,6 @@ def _run_security_scan(
     report_text = _read_report_from_workspace(sandbox)
     found_identifiers = _parse_report_identifiers(report_text) if report_text is not None else None
     found_issues = _parse_report_issues(report_text) if report_text is not None else None
-    scanned_packages = (
-        _parse_report_python_packages(report_text) if report_text is not None else set()
-    )
     # Legacy direct callers/tests may replace the identifier-only parser. In
     # that compatibility mode there is no typed issue snapshot to propagate,
     # but the identifier scan can still be evaluated normally.
@@ -827,7 +1007,6 @@ def _run_security_scan(
                 new_identifiers,
                 found_issues,
                 execution_status=ScannerExecutionStatus.SUCCESS,
-                scanned_packages=scanned_packages or set(),
             ),
             exit_code=exit_code,
             stdout=stdout,
@@ -848,7 +1027,6 @@ def _run_security_scan(
             new_identifiers,
             found_issues,
             execution_status=ScannerExecutionStatus.SUCCESS,
-            scanned_packages=scanned_packages or set(),
         ),
         exit_code=exit_code,
         stdout=stdout,
@@ -869,7 +1047,6 @@ def _run_targeted_security_scan(
     target_identifiers: set[str],
     baseline_identifiers: set[str],
     targeted_subdir: str,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _SecurityScanResult:
     """Run and classify ODC against a synthetic targeted workspace."""
     baseline = {
@@ -912,15 +1089,7 @@ def _run_targeted_security_scan(
         )
 
     try:
-        proc = (
-            _run_targeted_odc(workspace_volume, _validate_qa_path(targeted_subdir))
-            if project_language == ProjectLanguage.NODEJS
-            else _run_targeted_odc(
-                workspace_volume,
-                _validate_qa_path(targeted_subdir),
-                project_language,
-            )
-        )
+        proc = _run_targeted_odc(workspace_volume, _validate_qa_path(targeted_subdir))
     except FileNotFoundError as exc:
         msg = (
             "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
@@ -1002,8 +1171,20 @@ def _run_targeted_security_scan(
     report_text = _read_report_from_workspace(sandbox, report_dir)
     found_identifiers = _parse_report_identifiers(report_text) if report_text is not None else None
     found_issues = _parse_report_issues(report_text) if report_text is not None else None
-    scanned_packages = (
-        _parse_report_python_packages(report_text) if report_text is not None else None
+    reported_package_occurrences = (
+        _parse_report_package_occurrences(report_text) if report_text is not None else None
+    )
+    reported_packages = (
+        None
+        if reported_package_occurrences is None
+        else [
+            (occurrence.package_name.casefold(), occurrence.version)
+            for occurrence in reported_package_occurrences
+            if occurrence.ecosystem.casefold() == "npm"
+        ]
+    )
+    reported_paths = (
+        _parse_report_dependency_paths(report_text) if report_text is not None else None
     )
     if found_issues is None and found_identifiers is not None:
         found_issues = []
@@ -1028,7 +1209,7 @@ def _run_targeted_security_scan(
             diagnostic_log_path=diagnostic_log_path,
             error=summary,
         )
-    if found_identifiers is None or found_issues is None or scanned_packages is None:
+    if found_identifiers is None or found_issues is None:
         summary = (
             "FAILURE: Dependency-Check report was not parseable "
             f"(exit {exit_code}).\n"
@@ -1049,8 +1230,25 @@ def _run_targeted_security_scan(
             diagnostic_log_path=diagnostic_log_path,
             error=summary,
         )
-    # Match full-scan semantics: a nonzero ODC exit can still have a usable,
-    # parseable report. The caller validates the targeted package inventory.
+    if exit_code != 0:
+        summary = (
+            f"FAILURE: targeted Dependency-Check exited {exit_code}.\nstderr:\n{stderr[:2000]}"
+        )
+        return finish(
+            _SecurityScanResult(
+                False,
+                summary + report_location_note,
+                set(),
+                set(),
+                set(),
+                execution_status=ScannerExecutionStatus.UNPARSEABLE,
+            ),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            diagnostic_log_path=diagnostic_log_path,
+            error=summary,
+        )
 
     found = {identifier.upper().strip() for identifier in found_identifiers if identifier}
     remaining = {
@@ -1073,7 +1271,9 @@ def _run_targeted_security_scan(
                 new_identifiers,
                 found_issues,
                 execution_status=ScannerExecutionStatus.SUCCESS,
-                scanned_packages=scanned_packages,
+                reported_packages=reported_packages,
+                reported_paths=reported_paths,
+                reported_package_occurrences=reported_package_occurrences,
             ),
             exit_code=exit_code,
             stdout=stdout,
@@ -1093,10 +1293,33 @@ def _run_targeted_security_scan(
             new_identifiers,
             found_issues,
             execution_status=ScannerExecutionStatus.SUCCESS,
-            scanned_packages=scanned_packages,
+            reported_packages=reported_packages,
+            reported_paths=reported_paths,
+            reported_package_occurrences=reported_package_occurrences,
         ),
         exit_code=exit_code,
         stdout=stdout,
         stderr=stderr,
         diagnostic_log_path=diagnostic_log_path,
+    )
+
+
+def _run_incremental_security_scan(
+    sandbox: DockerSandbox,
+    workspace_volume: str,
+    scan_subdir: str,
+    baseline_identifiers: set[str],
+) -> _SecurityScanResult:
+    """Scan changed-input projects that have no task-target identifiers.
+
+    The targeted runner owns Docker execution, report parsing, package identity
+    extraction, and failure classification. Supplying no target identifiers
+    leaves only the immutable baseline subtraction as the result projection.
+    """
+    return _run_targeted_security_scan(
+        sandbox,
+        workspace_volume,
+        set(),
+        baseline_identifiers,
+        scan_subdir,
     )

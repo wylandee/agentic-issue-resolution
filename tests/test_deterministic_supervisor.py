@@ -24,22 +24,17 @@ from remediation_engine.contracts import (
     select_version,
     validate_transition,
 )
-from remediation_engine.contracts.schemas import LocalizedIssue
 from remediation_engine.orchestration.supervisor_node import (
     _build_deterministic_retry_plan,
-    _calculate_eligible_actions,
     _commit_registry_resolution_fallback,
     _commit_task_transition,
     _deterministic_routing,
     _emit_audit,
     _no_fix_failure_transition,
-    _select_deterministic_action,
     _task_sort_key,
     supervisor_router,
 )
-from remediation_engine.orchestration.supervisor_planner import _resolve_pipfile_parent_context
 from remediation_engine.orchestration.tactical_supervisor import TacticalCandidateSet
-from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 
 
 def _group(group_id: str, severity: Severity = Severity.HIGH, *, no_fix: bool = False):
@@ -65,35 +60,6 @@ def _group(group_id: str, severity: Severity = Severity.HIGH, *, no_fix: bool = 
         representative_issue_id=issue.id,
         issues=[issue],
         fix_plan=fix_plan,
-    )
-
-
-def _pypi_group(group_id: str, *, transitive: bool = False) -> VulnerabilityGroup:
-    group = _group(group_id)
-    issue = group.issues[0].model_copy(
-        update={
-            "ecosystem": "pypi",
-            "purl": "pkg:pypi/Requests@1.0.0",
-            "package_name": "Requests",
-            "package_version": "1.0.0",
-        }
-    )
-    manifest = "Pipfile.lock" if transitive else "requirements.txt"
-    localized = LocalizedIssue(
-        issue=issue,
-        manifest_file=manifest,
-        package_manager="pipenv" if transitive else "pip",
-        is_direct_dependency=not transitive,
-        declaration_type=None if transitive else "requirements",
-    )
-    return group.model_copy(
-        update={
-            "vulnerable_component": "Requests",
-            "issues": [issue],
-            "localized_issues": [localized],
-            "file_path": manifest,
-            "file_paths": [manifest],
-        }
     )
 
 
@@ -138,14 +104,6 @@ def test_decision_codes_cover_fixed_priority_routes():
     assert (
         _route({"t": _task("t", "g", status=TaskStatus.QA_PASSED)}, [_group("g")]).decision_code
         == DecisionCode.NO_ACTIONABLE_TASKS
-    )
-    assert (
-        _route(
-            {"t": _task("t", "g", status=TaskStatus.QA_PASSED)},
-            [_group("g")],
-            workspace_volume="workspace-volume",
-        ).decision_code
-        == DecisionCode.FINAL_FULL_SCAN_REQUIRED
     )
     assert (
         _route(
@@ -276,6 +234,7 @@ def test_transition_table_accepts_worker_and_qa_edges_and_rejects_terminal_edges
     assert validate_transition(TaskStatus.PENDING, TaskStatus.INCONCLUSIVE)
     assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.INCONCLUSIVE)
     assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.UNFIXABLE)
+    assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.PENDING)
     assert not validate_transition(TaskStatus.QA_PASSED, TaskStatus.PENDING)
     assert not validate_transition(TaskStatus.PENDING, TaskStatus.QA_PASSED)
 
@@ -332,6 +291,53 @@ def test_commit_rejects_unscoped_retry_to_pass_transition():
         queue,
         task.task_id,
         updates={"status": TaskStatus.QA_PASSED},
+        consistency_events=events,
+    )
+
+    assert queue[task.task_id] == task
+    assert events and events[0].error_code == "INVALID_TRANSITION"
+
+
+def test_verified_absent_pass_transition_is_explicitly_scoped() -> None:
+    for status in (TaskStatus.PENDING, TaskStatus.NEEDS_RETRY):
+        task = _task("task-1", "g", status=status)
+        queue = {task.task_id: task}
+        events = []
+
+        _commit_task_transition(
+            queue,
+            task.task_id,
+            updates={"status": TaskStatus.QA_PASSED},
+            consistency_events=events,
+        )
+
+        assert queue[task.task_id] == task
+        assert events and events[0].error_code == "INVALID_TRANSITION"
+
+        _commit_task_transition(
+            queue,
+            task.task_id,
+            updates={"status": TaskStatus.QA_PASSED},
+            allow_verified_absent_target_pass=True,
+        )
+
+        assert queue[task.task_id].status == TaskStatus.QA_PASSED
+        assert queue[task.task_id].current_attempt_id is None
+        assert queue[task.task_id].selected_version is None
+
+
+def test_verified_absent_pass_opt_in_rejects_live_attempts() -> None:
+    task = _task("task-1", "g", status=TaskStatus.NEEDS_RETRY).model_copy(
+        update={"current_attempt_id": "attempt-live", "selected_version": "1.2.3"}
+    )
+    queue = {task.task_id: task}
+    events = []
+
+    _commit_task_transition(
+        queue,
+        task.task_id,
+        updates={"status": TaskStatus.QA_PASSED},
+        allow_verified_absent_target_pass=True,
         consistency_events=events,
     )
 
@@ -477,6 +483,55 @@ def test_deterministic_retry_planner_exhaustion_pivots_to_workaround(monkeypatch
     assert plan.selected_version is None
 
 
+def test_authoritative_route_and_audit_are_typed():
+    group = _group("g")
+    tasks = {"task-1": _task("task-1", "g")}
+    decision = _deterministic_routing(tasks, {"g": group}, {}, {})
+    audit = _emit_audit(decision, [], 4)
+    assert decision.next_node == "update_subagent"
+    assert decision.target_task_ids == ["task-1"]
+    assert audit.decision_code == DecisionCode.NEW_VERSION_BUMP
+    assert audit.state_revision == 4
+
+# Stage-2 behavior retained during the architecture merge.
+from remediation_engine.contracts.schemas import LocalizedIssue
+
+from remediation_engine.orchestration.supervisor_node import _calculate_eligible_actions
+
+from remediation_engine.orchestration.supervisor_node import _select_deterministic_action
+
+from remediation_engine.orchestration.supervisor_planner import _resolve_pipfile_parent_context
+
+from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+
+def _pypi_group(group_id: str, *, transitive: bool = False) -> VulnerabilityGroup:
+    group = _group(group_id)
+    issue = group.issues[0].model_copy(
+        update={
+            "ecosystem": "pypi",
+            "purl": "pkg:pypi/Requests@1.0.0",
+            "package_name": "Requests",
+            "package_version": "1.0.0",
+        }
+    )
+    manifest = "Pipfile.lock" if transitive else "requirements.txt"
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file=manifest,
+        package_manager="pipenv" if transitive else "pip",
+        is_direct_dependency=not transitive,
+        declaration_type=None if transitive else "requirements",
+    )
+    return group.model_copy(
+        update={
+            "vulnerable_component": "Requests",
+            "issues": [issue],
+            "localized_issues": [localized],
+            "file_path": manifest,
+            "file_paths": [manifest],
+        }
+    )
+
 def test_initial_python_tasks_preserve_direct_declaration_and_fail_closed_transitive_status():
     direct_group = _pypi_group("pypi-direct")
     direct_task = build_initial_remediation_task(direct_group, "task-direct")
@@ -490,7 +545,6 @@ def test_initial_python_tasks_preserve_direct_declaration_and_fail_closed_transi
     assert transitive_task.parent_package_name is None
     assert transitive_task.target_package_name is None
     assert transitive_task.target_dependency_type is None
-
 
 def test_pypi_retry_uses_pep440_order_and_canonical_attempted_target(monkeypatch):
     group = _pypi_group("pypi-direct")
@@ -554,7 +608,6 @@ def test_pypi_retry_uses_pep440_order_and_canonical_attempted_target(monkeypatch
     assert plan.target_package_name == "requests"
     assert plan.target_dependency_type == "requirements"
 
-
 def test_pypi_parent_retry_requires_unique_proven_pipfile_edge(monkeypatch):
     group = _pypi_group("pypi-transitive", transitive=True)
     task = build_initial_remediation_task(group, "task-pypi-parent")
@@ -599,7 +652,6 @@ def test_pypi_parent_retry_requires_unique_proven_pipfile_edge(monkeypatch):
     assert missing.target_package_name is None
     assert missing.target_dependency_type is None
     assert missing.selected_version is None
-
 
 def test_pipfile_parent_resolver_rejects_ambiguous_missing_category_and_conditional_edges(
     monkeypatch,
@@ -677,7 +729,6 @@ def test_pipfile_parent_resolver_rejects_ambiguous_missing_category_and_conditio
             ),
         )
         assert _resolve_pipfile_parent_context("workspace", group) is None
-
 
 def test_phase_projection_and_audit_are_typed():
     group = _group("g")

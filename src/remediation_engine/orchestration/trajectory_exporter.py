@@ -26,6 +26,7 @@ from langchain_core.messages import BaseMessage
 from langchain_core.tracers.langchain import wait_for_all_tracers
 from langsmith import Client
 
+from remediation_engine.orchestration.report_persistence import write_text_atomic
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,15 @@ def _redact_string(value: str) -> str:
         return f"{prefix}[REDACTED]"
 
     return _SECRET_VALUE_RE.sub(replace, value)
+
+
+def _error_text(error: BaseException | str | None) -> str | None:
+    """Return a useful diagnostic even for exceptions with an empty message."""
+    if error is None:
+        return None
+    if isinstance(error, BaseException):
+        return str(error).strip() or type(error).__name__
+    return str(error).strip() or None
 
 
 def to_jsonable(value: Any, *, key: str | None = None) -> Any:
@@ -341,6 +351,7 @@ class TrajectoryRecorder(BaseCallbackHandler):
         self._token_data_available = False
         self._token_cost: float | None = None
         self._cached_input_tokens: int | None = None
+        self._workspace_volume: str | None = None
 
     def _start(
         self,
@@ -453,6 +464,24 @@ class TrajectoryRecorder(BaseCallbackHandler):
         """Return the number of spans recorded so far."""
         with self._lock:
             return self._sequence
+
+    @property
+    def workspace_volume(self) -> str | None:
+        """Return the run-owned volume explicitly registered by workspace setup."""
+        with self._lock:
+            return self._workspace_volume
+
+    def register_workspace_volume(self, volume_name: str) -> None:
+        """Record a volume created by this run's workspace-builder node."""
+        if volume_name.startswith("agent_workspace_"):
+            with self._lock:
+                self._workspace_volume = volume_name
+
+    def clear_workspace_volume(self, volume_name: str) -> None:
+        """Clear this run's volume record after Docker confirms its removal."""
+        with self._lock:
+            if self._workspace_volume == volume_name:
+                self._workspace_volume = None
 
     def has_span_since(self, sequence: int, run_type: str | None = None) -> bool:
         """Return whether a span of the requested type started after a sequence."""
@@ -1035,6 +1064,39 @@ def _render_markdown(
     return "\n".join(lines)
 
 
+def _write_trajectory_markdown(
+    *,
+    trace_id: str,
+    repo_root: str,
+    initial_state: Any,
+    final_state: Any,
+    spans: list[dict[str, Any]],
+    source: str,
+    langsmith_url: str | None,
+    warnings: Sequence[str],
+    run_error: BaseException | None,
+    output_file: Path,
+) -> None:
+    """Atomically write one local trajectory snapshot.
+
+    The caller may invoke this before any remote LangSmith lookup so a partial
+    local trajectory exists even when remote enrichment is interrupted.
+    """
+    markdown = _render_markdown(
+        trace_id=trace_id,
+        repo_root=repo_root,
+        initial_state=initial_state,
+        final_state=final_state,
+        spans=spans,
+        source=source,
+        langsmith_url=langsmith_url,
+        warnings=warnings,
+        run_error=_error_text(run_error),
+        trajectory_path=output_file,
+    )
+    write_text_atomic(output_file, markdown)
+
+
 def export_phase5_trajectory(
     *,
     trace_id: uuid.UUID | str,
@@ -1047,46 +1109,65 @@ def export_phase5_trajectory(
     run_error: BaseException | None = None,
     output_path: str | Path | None = None,
 ) -> Path:
-    """Write one Markdown trajectory, optionally to a reserved output path.
+    """Write a local trajectory before optionally enriching it from LangSmith.
 
-    A caller-supplied ``output_path`` lets a final report reference the exact
-    trajectory file that contains the finalized report fields.
+    The first write always uses the in-process recorder and does not require
+    network access.  LangSmith retrieval and the subsequent enriched rewrite
+    are best-effort; if they fail, the initial local snapshot remains valid.
     """
-    warnings: list[str] = []
-    spans = recorder.spans()
-    source = "local-fallback"
-    if langsmith_enabled:
-        try:
-            spans = fetch_langsmith_spans(trace_id)
-            source = "langsmith"
-            pending_spans = [span for span in spans if _display_span_status(span) == "pending"]
-            if pending_spans:
-                warnings.append(
-                    "LangSmith returned "
-                    f"{len(pending_spans)} span(s) without terminal status after export settling."
-                )
-        except Exception as exc:  # noqa: BLE001 - fallback is intentional
-            warning = f"LangSmith trace retrieval failed: {exc}"
-            warnings.append(warning)
-            logger.warning(warning)
-
     output_file = (
         Path(output_path) if output_path is not None else build_phase5_trajectory_path(trace_id)
     )
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    markdown = _render_markdown(
+
+    local_spans = recorder.spans()
+    _write_trajectory_markdown(
         trace_id=str(trace_id),
         repo_root=repo_root,
         initial_state=initial_state,
         final_state=final_state,
-        spans=spans,
-        source=source,
+        spans=local_spans,
+        source="local-fallback",
         langsmith_url=langsmith_url,
-        warnings=warnings,
-        run_error=str(run_error) if run_error else None,
-        trajectory_path=output_file,
+        warnings=(),
+        run_error=run_error,
+        output_file=output_file,
     )
-    temporary_path = output_file.with_suffix(".md.tmp")
-    temporary_path.write_text(markdown, encoding="utf-8")
-    temporary_path.replace(output_file)
+
+    if not langsmith_enabled:
+        return output_file
+
+    warnings: list[str] = []
+    spans = local_spans
+    source = "local-fallback"
+    try:
+        spans = fetch_langsmith_spans(trace_id)
+        source = "langsmith"
+        pending_spans = [span for span in spans if _display_span_status(span) == "pending"]
+        if pending_spans:
+            warnings.append(
+                "LangSmith returned "
+                f"{len(pending_spans)} span(s) without terminal status after export settling."
+            )
+    except Exception as exc:  # noqa: BLE001 - local snapshot already exists
+        warning = f"LangSmith trace retrieval failed: {exc}"
+        warnings.append(warning)
+        logger.warning(warning)
+
+    try:
+        _write_trajectory_markdown(
+            trace_id=str(trace_id),
+            repo_root=repo_root,
+            initial_state=initial_state,
+            final_state=final_state,
+            spans=spans,
+            source=source,
+            langsmith_url=langsmith_url,
+            warnings=warnings,
+            run_error=run_error,
+            output_file=output_file,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the first local snapshot
+        logger.warning("trajectory enrichment rewrite failed: %s", exc)
+
     return output_file

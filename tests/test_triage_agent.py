@@ -27,7 +27,8 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from remediation_engine.triage.agent import _build_triage_prompt, run_triage
+from remediation_engine.settings import AppSettings
+from remediation_engine.triage.agent import _build_triage_prompt, _llm_triage, run_triage
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -324,6 +325,33 @@ class TestLLMGuardrails:
         group = _group(_issue())
         result = run_triage(group, _context())
         assert result.triage_method == "deterministic"
+
+    def test_llm_constructor_receives_injected_key_without_environment(self, monkeypatch):
+        """The triage client uses bound credentials even when env lookup is empty."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        group = _group(_issue())
+        settings = AppSettings(openai_api_key="injected-test-key")
+        llm_result = self._make_llm_result(group, Severity.MEDIUM)
+        constructor_kwargs = {}
+
+        class FakeStructuredLLM:
+            def invoke(self, _prompt):
+                return llm_result
+
+        class FakeLLM:
+            def with_structured_output(self, _model):
+                return FakeStructuredLLM()
+
+        def fake_chat_openai(**kwargs):
+            constructor_kwargs.update(kwargs)
+            return FakeLLM()
+
+        monkeypatch.setattr("langchain_openai.ChatOpenAI", fake_chat_openai)
+
+        result = _llm_triage(group, _context(), settings=settings)
+
+        assert result is not None
+        assert constructor_kwargs["api_key"] == "injected-test-key"
 
 
 class TestTriagePrompt:

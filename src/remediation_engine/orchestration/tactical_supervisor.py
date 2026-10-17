@@ -16,9 +16,7 @@ from enum import StrEnum
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from packaging.version import InvalidVersion, Version
 from pydantic import ValidationError
-from semantic_version import Version as SemVerVersion
 
 from remediation_engine.contracts.schemas import (
     TACTICAL_SUPERVISOR_ACTION_ADAPTER,
@@ -40,20 +38,16 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     WorkerAttemptResult,
 )
-from remediation_engine.contracts.version_policy import RegistryCandidate, registry_version_key
-from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.contracts.version_policy import RegistryCandidate
+from remediation_engine.orchestration.runtime_context import (
+    get_runtime_settings,
+    openai_api_key_kwargs,
+)
 from remediation_engine.orchestration.supervisor_planner import (
-    _group_ecosystem,
-    _normalize_package_target,
-    _registry_report_value,
     _registry_report_versions,
     _registry_selected_version,
     _supervisor_fetch_registry_candidates,
     _supervisor_plan_npm_parent_version,
-    _supervisor_plan_parent_version,
-)
-from remediation_engine.orchestration.supervisor_planner import (
-    _normalise_candidate_version as _normalize_registry_version,
 )
 from remediation_engine.orchestration.supervisor_policy import _canonical_security_floor
 from remediation_engine.orchestration.task_utils import group_parent_context, is_transitive_group
@@ -362,14 +356,12 @@ def _override_dependency_type(group: VulnerabilityGroup) -> str:
 
 def _target_package_name(task: RemediationTask, group: VulnerabilityGroup) -> str | None:
     """Derive the only package that a tactical action may target."""
-    ecosystem = _group_ecosystem(group)
     if task.target_package_name:
-        return _normalize_package_target(task.target_package_name, ecosystem)
+        return task.target_package_name
     if is_transitive_group(group):
         parent_name, _, _ = group_parent_context(group)
-        return _normalize_package_target(parent_name, ecosystem) if parent_name else None
-    component = group.vulnerable_component
-    return _normalize_package_target(component, ecosystem) if component else None
+        return parent_name
+    return group.vulnerable_component or None
 
 
 def _target_dependency_type(task: RemediationTask, group: VulnerabilityGroup) -> str | None:
@@ -397,19 +389,14 @@ def _security_floor_error(group: VulnerabilityGroup) -> str | None:
 def _attempted_versions(
     task: RemediationTask,
     retry_diagnostics: UpdateRetryDiagnostics | None,
-    ecosystem: str = "npm",
 ) -> tuple[str, ...]:
-    """Collect canonical attempted versions without treating the current target as attempted."""
+    """Collect normalized attempted versions without treating the current target as attempted."""
     values = list(getattr(retry_diagnostics, "attempted_versions", []) or [])
     if retry_diagnostics is not None:
         for versions in retry_diagnostics.attempted_versions_by_target.values():
             values.extend(versions)
     return tuple(
-        dict.fromkeys(
-            normalized
-            for value in values
-            if (normalized := _normalise_candidate_version(value, ecosystem))
-        )
+        dict.fromkeys(str(value).strip().lstrip("vV") for value in values if str(value).strip())
     )
 
 
@@ -417,19 +404,17 @@ def allowed_tactical_strategies(
     task: RemediationTask,
     group: VulnerabilityGroup,
 ) -> tuple[TacticalStrategy, ...]:
-    """Return strategies that are semantically valid for the committed task."""
-    ecosystem = _group_ecosystem(group)
+    """Return strategies that are semantically valid for the committed task.
+
+    The strategy stage is part of the action contract.  In particular, a
+    package-override stage has an override authorization, not a direct-update
+    authorization, so advertising ``VERSION_BUMP`` there would invite the
+    model to select an action that cannot be verified or dispatched safely.
+    """
     if task.no_fix_stage is not None:
         return (TacticalStrategy.CODE_WORKAROUND,)
     if task.strategy == RoutingStrategy.CODE_WORKAROUND:
         return (TacticalStrategy.CODE_WORKAROUND,)
-    if ecosystem == "pypi":
-        if task.strategy_stage in {
-            SCARemediationStage.CODE_WORKAROUND,
-            SCARemediationStage.PACKAGE_OVERRIDE,
-        }:
-            return (TacticalStrategy.CODE_WORKAROUND,)
-        return (TacticalStrategy.VERSION_BUMP, TacticalStrategy.CODE_WORKAROUND)
     if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
         return (
             (TacticalStrategy.PACKAGE_OVERRIDE, TacticalStrategy.CODE_WORKAROUND)
@@ -578,18 +563,13 @@ def build_tactical_context(
         evaluation=evaluation,
         worker_result=worker_result,
         retry_diagnostics=retry_diagnostics,
-        candidate_versions=_stable_semver_versions(
-            candidate_versions,
-            ecosystem=_group_ecosystem(group),
-        ),
+        candidate_versions=_stable_semver_versions(candidate_versions),
         candidate_dependency_types=tuple(
             sorted(
                 {str(value).strip() for value in candidate_dependency_types if str(value).strip()}
             )
         ),
-        attempted_versions=tuple(
-            sorted(_attempted_versions(task, retry_diagnostics, ecosystem=_group_ecosystem(group)))
-        ),
+        attempted_versions=tuple(sorted(_attempted_versions(task, retry_diagnostics))),
         prior_attempts=tuple(
             sorted(
                 prior_attempts,
@@ -955,30 +935,11 @@ def registry_candidates_for_context(
     registry_provider: Callable[..., list[RegistryCandidate]] | None = None,
 ) -> tuple[tuple[str, ...], str | None]:
     """Fetch the bounded candidate whitelist for one tactical context."""
-    ecosystem = _group_ecosystem(context.group)
     if context.task.strategy == RoutingStrategy.CODE_WORKAROUND:
         return (), None
-    if ecosystem == "pypi" and is_transitive_group(context.group):
-        candidate_sets, error = registry_candidate_sets_for_context(
-            context,
-            registry_provider=registry_provider,
-        )
-        parent = next(
-            (
-                candidate
-                for candidate in candidate_sets
-                if candidate.strategy == TacticalStrategy.VERSION_BUMP
-            ),
-            None,
-        )
-        return (parent.versions if parent else ()), error
     if context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-        if (
-            ecosystem == "pypi"
-            or not is_transitive_group(context.group)
-            or not context.group.vulnerable_component
-        ):
-            return (), "Package override requires a transitive npm vulnerable child."
+        if not is_transitive_group(context.group) or not context.group.vulnerable_component:
+            return (), "Package override requires a transitive vulnerable child."
         package_name = context.group.vulnerable_component
         dependency_type = _override_dependency_type(context.group)
     else:
@@ -995,21 +956,19 @@ def registry_candidates_for_context(
     provider = registry_provider or _supervisor_fetch_registry_candidates
     approved_pool = _approved_candidate_pool(context, package_name, dependency_type)
     try:
+        # Positional invocation keeps this seam compatible with the small
+        # deterministic providers used by tests and local integrations while
+        # still passing the exact three Supervisor-owned values.  The real
+        # provider has the same positional contract.
         candidates = provider(
-            _normalize_package_target(package_name, ecosystem),
+            package_name,
             floor,
-            _candidate_query_attempts(
-                approved_pool,
-                context.attempted_versions,
-                ecosystem,
-            ),
-            ecosystem,
+            _candidate_query_attempts(approved_pool, context.attempted_versions),
         )
     except Exception as exc:  # noqa: BLE001
         return (), f"Registry verification unavailable: {exc}"
     versions = _current_candidate_versions(
         candidates,
-        ecosystem=ecosystem,
         approved_pool=approved_pool,
         attempted_versions=context.attempted_versions,
     )
@@ -1019,27 +978,18 @@ def registry_candidates_for_context(
 def _eligible_candidate_versions(
     candidates: Iterable[RegistryCandidate],
 ) -> tuple[str, ...]:
-    """Return the ecosystem's role-backed candidates in registry order."""
-    candidates = list(candidates)
-    ecosystems = {candidate.ecosystem for candidate in candidates}
-    if len(ecosystems) > 1:
-        return ()
-    ecosystem = next(iter(ecosystems), "npm")
+    """Return the three strategic stable candidates in ascending semver order.
+
+    The registry tool applies this policy for production calls.  Repeating the
+    role-aware projection here protects the tactical prompt when a test or
+    legacy provider returns a larger candidate list.
+    """
     eligible = [
         candidate
         for candidate in candidates
         if candidate.is_stable and candidate.security_floor_met and not candidate.already_attempted
     ]
-    eligible.sort(
-        key=lambda candidate: (
-            registry_version_key(
-                candidate.version,
-                candidate.ecosystem,
-                candidate.semver_key,
-            ),
-            candidate.version,
-        )
-    )
+    eligible.sort(key=lambda candidate: (candidate.semver_key, candidate.version))
     if not eligible:
         return ()
 
@@ -1056,26 +1006,18 @@ def _eligible_candidate_versions(
     same_major_latest = (
         max(
             same_major_candidates,
-            key=lambda candidate: (
-                registry_version_key(
-                    candidate.version,
-                    candidate.ecosystem,
-                    candidate.semver_key,
-                ),
-                candidate.version,
-            ),
+            key=lambda candidate: (candidate.semver_key, candidate.version),
         ).version
         if same_major_candidates
         else None
     )
-    latest_role = "pypi_latest" if ecosystem == "pypi" else "npm_latest"
-    latest = next(
-        (candidate.version for candidate in eligible if latest_role in candidate.selection_roles),
+    npm_latest = next(
+        (candidate.version for candidate in eligible if "npm_latest" in candidate.selection_roles),
         eligible[-1].version,
     )
     strategic_versions = {
         version
-        for version in (osv_minimum, same_major_latest, latest)
+        for version in (osv_minimum, same_major_latest, npm_latest)
         if version is not None and version in by_version
     }
     return tuple(
@@ -1083,42 +1025,16 @@ def _eligible_candidate_versions(
     )[:_MAX_CANDIDATES]
 
 
-def _stable_semver_versions(
-    values: Iterable[str],
-    ecosystem: str = "npm",
-) -> tuple[str, ...]:
-    """Normalize and source-order stable versions from planner output."""
-    parsed: list[tuple[tuple[int, object], str]] = []
+def _stable_semver_versions(values: Iterable[str]) -> tuple[str, ...]:
+    """Normalize and sort complete stable semantic versions from planner output."""
+    parsed: list[tuple[tuple[int, int, int], str]] = []
     for value in values:
-        normalized = _normalise_candidate_version(value, ecosystem)
-        if not normalized:
+        normalized = _normalise_version(value)
+        if normalized is None or not re.fullmatch(r"\d+\.\d+\.\d+", normalized):
             continue
-        if ecosystem == "pypi":
-            try:
-                version = Version(normalized)
-            except InvalidVersion:
-                continue
-            if version.is_prerelease or version.is_devrelease:
-                continue
-        elif not re.fullmatch(r"\d+\.\d+\.\d+", normalized):
-            continue
-        parsed.append(
-            (
-                registry_version_key(
-                    normalized,
-                    ecosystem,
-                    (_semver_key(normalized) if ecosystem == "npm" else None),
-                ),
-                normalized,
-            )
-        )
+        parsed.append((tuple(int(part) for part in normalized.split(".")), normalized))
     parsed.sort()
     return tuple(dict.fromkeys(version for _, version in parsed))[:_MAX_CANDIDATES]
-
-
-def _semver_key(value: str) -> tuple[int, int, int]:
-    parsed = SemVerVersion(value)
-    return parsed.major, parsed.minor, parsed.patch
 
 
 def _candidate_set(
@@ -1128,16 +1044,15 @@ def _candidate_set(
     floor: str,
     versions: Sequence[str],
     *,
-    ecosystem: str = "npm",
     peer_compatible: bool = True,
 ) -> TacticalCandidateSet:
     """Build one normalized strategy-specific candidate whitelist."""
-    ordered = _stable_semver_versions(versions, ecosystem)
+    ordered = _stable_semver_versions(versions)
     return TacticalCandidateSet(
         strategy=strategy,
-        target_package_name=_normalize_package_target(package_name, ecosystem),
+        target_package_name=package_name,
         dependency_type=dependency_type,
-        security_floor=_normalise_candidate_version(floor, ecosystem),
+        security_floor=floor,
         versions=ordered,
         canonical_version=ordered[0] if ordered else None,
         peer_compatible=peer_compatible,
@@ -1151,14 +1066,16 @@ def _normalise_context_candidate_sets(
     candidate_versions: Sequence[str],
     candidate_sets: Sequence[TacticalCandidateSet],
 ) -> tuple[TacticalCandidateSet, ...]:
-    """Return the single typed candidate authorization representation."""
-    ecosystem = _group_ecosystem(group)
+    """Return the single typed candidate authorization representation.
+
+    Older callers may still provide ``candidate_versions`` directly.  Convert
+    that input at the context boundary so prompts and verification never need
+    to consult an untyped version list.
+    """
     normalized = list(candidate_sets)
     if not normalized and candidate_versions:
-        if (
-            ecosystem != "pypi"
-            and task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
-            and is_transitive_group(group)
+        if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE and is_transitive_group(
+            group
         ):
             strategy = TacticalStrategy.PACKAGE_OVERRIDE
             target_package = group.vulnerable_component
@@ -1176,7 +1093,6 @@ def _normalise_context_candidate_sets(
                     dependency_type,
                     floor,
                     candidate_versions,
-                    ecosystem=ecosystem,
                 )
             )
     return tuple(
@@ -1191,9 +1107,9 @@ def _normalise_context_candidate_sets(
     )[:_MAX_CANDIDATES]
 
 
-def _normalise_candidate_version(value: Any, ecosystem: str = "npm") -> str:
-    """Return a canonical version for immutable authorization comparisons."""
-    return _normalize_registry_version(value, ecosystem)
+def _normalise_candidate_version(value: Any) -> str:
+    """Return a comparable candidate version without a leading ``v``."""
+    return str(value).strip().lstrip("vV")
 
 
 def _candidate_set_for_action(
@@ -1221,15 +1137,20 @@ def _approved_candidate_pool(
     package_name: str,
     dependency_type: str | None,
 ) -> tuple[str, ...]:
-    """Return the first Supervisor-approved candidate pool for this target."""
-    ecosystem = _group_ecosystem(context.group)
-    normalized_package = _normalize_package_target(package_name.strip(), ecosystem)
+    """Return the first Supervisor-approved candidate pool for this target.
+
+    Retry-time registry queries are allowed to revalidate the original pool,
+    but they must not widen it by replacing an attempted lowest candidate
+    with a newly discovered version.  The first matching immutable attempt
+    snapshot is the strongest provenance; retry diagnostics are the fallback
+    for callers that have not retained snapshots.
+    """
+    normalized_package = package_name.strip()
     normalized_type = (dependency_type or "").strip()
     for snapshot in context.prior_attempts:
         if snapshot.dispatch_node != "update_subagent":
             continue
-        snapshot_package = _normalize_package_target(snapshot.target_package_name, ecosystem)
-        if snapshot_package != normalized_package:
+        if snapshot.target_package_name != normalized_package:
             continue
         if (
             normalized_type
@@ -1239,24 +1160,22 @@ def _approved_candidate_pool(
             continue
         versions = tuple(
             dict.fromkeys(
-                normalized
+                _normalise_candidate_version(version)
                 for version in snapshot.allowed_target_versions
-                if (normalized := _normalise_candidate_version(version, ecosystem))
+                if _normalise_candidate_version(version)
             )
         )
         if versions:
             return versions
 
     diagnostics = context.retry_diagnostics
-    diagnostic_package = (
-        _normalize_package_target(diagnostics.target_package_name, ecosystem)
-        if diagnostics is not None and diagnostics.target_package_name
-        else None
-    )
     if (
         diagnostics is not None
         and diagnostics.candidate_versions_considered
-        and (not diagnostic_package or diagnostic_package == normalized_package)
+        and (
+            not diagnostics.target_package_name
+            or diagnostics.target_package_name == normalized_package
+        )
         and (
             not normalized_type
             or not diagnostics.target_dependency_type
@@ -1265,9 +1184,9 @@ def _approved_candidate_pool(
     ):
         return tuple(
             dict.fromkeys(
-                normalized
+                _normalise_candidate_version(version)
                 for version in diagnostics.candidate_versions_considered
-                if (normalized := _normalise_candidate_version(version, ecosystem))
+                if _normalise_candidate_version(version)
             )
         )
     return ()
@@ -1276,22 +1195,13 @@ def _approved_candidate_pool(
 def _current_candidate_versions(
     candidates: Iterable[RegistryCandidate],
     *,
-    ecosystem: str = "npm",
     approved_pool: Sequence[str] = (),
     attempted_versions: Iterable[str] = (),
 ) -> tuple[str, ...]:
     """Project registry candidates onto an immutable pool and retry state."""
     versions = _eligible_candidate_versions(candidates)
-    approved = {
-        normalized
-        for version in approved_pool
-        if (normalized := _normalise_candidate_version(version, ecosystem))
-    }
-    attempted = {
-        normalized
-        for version in attempted_versions
-        if (normalized := _normalise_candidate_version(version, ecosystem))
-    }
+    approved = {_normalise_candidate_version(version) for version in approved_pool}
+    attempted = {_normalise_candidate_version(version) for version in attempted_versions}
     if approved:
         versions = tuple(version for version in versions if version in approved)
     return tuple(version for version in versions if version not in attempted)
@@ -1300,16 +1210,15 @@ def _current_candidate_versions(
 def _candidate_query_attempts(
     approved_pool: Sequence[str],
     attempted_versions: Iterable[str],
-    ecosystem: str = "npm",
 ) -> set[str]:
     """Query the registry unfiltered when a prior pool must be revalidated."""
     return (
         set()
         if approved_pool
         else {
-            normalized
+            _normalise_candidate_version(version)
             for version in attempted_versions
-            if (normalized := _normalise_candidate_version(version, ecosystem))
+            if _normalise_candidate_version(version)
         }
     )
 
@@ -1319,10 +1228,15 @@ def registry_candidate_sets_for_context(
     *,
     registry_provider: Callable[..., list[RegistryCandidate]] | None = None,
 ) -> tuple[tuple[TacticalCandidateSet, ...], str | None]:
-    """Resolve verified candidate sets without crossing ecosystem boundaries."""
+    """Resolve separate verified whitelists for direct, parent, and child actions.
+
+    The parent package is used for a transitive version bump, while a package
+    override is always verified against the vulnerable child package.  This
+    distinction prevents a parent candidate from accidentally authorizing a
+    child override.
+    """
     if context.task.strategy == RoutingStrategy.CODE_WORKAROUND:
         return (), None
-    ecosystem = _group_ecosystem(context.group)
     floor = _security_floor(context.task, context.group)
     floor_error = _security_floor_error(context.group)
     if not floor or floor_error is not None:
@@ -1336,12 +1250,8 @@ def registry_candidate_sets_for_context(
     direct_package = _target_package_name(context.task, context.group)
     direct_type = _target_dependency_type(context.task, context.group)
     if context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-        if (
-            ecosystem == "pypi"
-            or not is_transitive_group(context.group)
-            or not context.group.vulnerable_component
-        ):
-            return (), "Package override requires a transitive npm vulnerable child."
+        if not is_transitive_group(context.group) or not context.group.vulnerable_component:
+            return (), "Package override requires a transitive vulnerable child."
         targets.append(
             (
                 TacticalStrategy.PACKAGE_OVERRIDE,
@@ -1352,11 +1262,7 @@ def registry_candidate_sets_for_context(
     else:
         if direct_package:
             targets.append((TacticalStrategy.VERSION_BUMP, direct_package, direct_type))
-        if (
-            ecosystem != "pypi"
-            and is_transitive_group(context.group)
-            and context.group.vulnerable_component
-        ):
+        if is_transitive_group(context.group) and context.group.vulnerable_component:
             targets.append(
                 (
                     TacticalStrategy.PACKAGE_OVERRIDE,
@@ -1368,142 +1274,55 @@ def registry_candidate_sets_for_context(
     try:
         for strategy, package_name, dependency_type in targets:
             assert package_name is not None
-            package_name = _normalize_package_target(package_name, ecosystem)
             approved_pool = _approved_candidate_pool(context, package_name, dependency_type)
             if strategy == TacticalStrategy.VERSION_BUMP and is_transitive_group(context.group):
-                if ecosystem == "pypi":
-                    parent_name = context.task.parent_package_name
-                    parent_version = context.task.parent_package_version
-                    parent_type = context.task.target_dependency_type
-                else:
-                    parent_name, parent_version, parent_type = group_parent_context(context.group)
+                parent_name, parent_version, _parent_type = group_parent_context(context.group)
                 if not parent_name or not parent_version or not context.group.vulnerable_component:
                     return (), "Parent compatibility evidence is unavailable."
-                parent_name = _normalize_package_target(parent_name, ecosystem)
-                child_name = _normalize_package_target(
-                    context.group.vulnerable_component, ecosystem
-                )
                 selection = {
                     SCARemediationStage.OSV_MINIMUM: "minimum",
                     SCARemediationStage.NPM_SAME_MAJOR: "same_major",
-                    SCARemediationStage.PYPI_SAME_MAJOR: "same_major",
                     SCARemediationStage.NPM_LATEST: "latest",
-                    SCARemediationStage.PYPI_LATEST: "latest",
                 }.get(context.task.strategy_stage, "minimum")
                 plan_input = {
                     "parent_package_name": parent_name,
-                    "child_package_name": child_name,
+                    "child_package_name": context.group.vulnerable_component,
                     "child_fixed_version": floor,
-                    "installed_parent_version": _normalise_candidate_version(
-                        parent_version,
-                        ecosystem,
-                    ),
+                    "installed_parent_version": parent_version,
                     "selection": selection,
                     "attempted_versions": ",".join(
-                        sorted(
-                            _candidate_query_attempts(
-                                approved_pool,
-                                context.attempted_versions,
-                                ecosystem,
-                            )
-                        )
+                        sorted(_candidate_query_attempts(approved_pool, context.attempted_versions))
                     ),
-                    "dependency_ancestry": ",".join(
-                        [parent_name, child_name]
-                        if ecosystem == "pypi"
-                        else context.group.dependency_ancestry
-                    ),
+                    "dependency_ancestry": ",".join(context.group.dependency_ancestry),
                 }
-                report = (
-                    _supervisor_plan_parent_version(plan_input, ecosystem)
-                    if ecosystem == "pypi"
-                    else _supervisor_plan_npm_parent_version(plan_input)
-                )
+                report = _supervisor_plan_npm_parent_version(plan_input)
                 report_versions = _registry_report_versions(
-                    report,
-                    "Eligible Candidates",
-                    ecosystem,
-                ) or _registry_report_versions(
-                    report,
-                    "Compatible Parent Versions",
-                    ecosystem,
-                )
-                selected_report_version = _registry_selected_version(report, ecosystem)
+                    report, "Eligible Candidates"
+                ) or _registry_report_versions(report, "Compatible Parent Versions")
                 report_versions = _stable_semver_versions(
-                    [
-                        *report_versions,
-                        *([selected_report_version] if selected_report_version else []),
-                    ],
-                    ecosystem,
+                    [*report_versions, _registry_selected_version(report)]
                 )
-                attempted = {
-                    normalized
-                    for version in context.attempted_versions
-                    if (normalized := _normalise_candidate_version(version, ecosystem))
-                }
                 if approved_pool:
                     approved = set(approved_pool)
+                    attempted = set(context.attempted_versions)
                     versions = tuple(
                         version
                         for version in report_versions
                         if version in approved and version not in attempted
                     )
                 else:
-                    versions = tuple(
-                        version for version in report_versions if version not in attempted
-                    )
-                if ecosystem == "pypi":
-                    if context.task.strategy_stage == SCARemediationStage.PYPI_LATEST:
-                        pypi_latest = _registry_report_value(
-                            report,
-                            "PyPI Latest",
-                            ecosystem,
-                        )
-                        versions = (
-                            (selected_report_version,)
-                            if selected_report_version
-                            and selected_report_version == pypi_latest
-                            and selected_report_version in versions
-                            else ()
-                        )
-                    elif context.task.strategy_stage == SCARemediationStage.PYPI_SAME_MAJOR:
-                        installed_major = Version(parent_version).release[0]
-                        versions = tuple(
-                            version
-                            for version in versions
-                            if Version(version).release[0] == installed_major
-                        )
-                package_name = parent_name
-                dependency_type = parent_type or dependency_type
+                    versions = report_versions
             else:
                 candidates = provider(
                     package_name,
                     floor,
-                    _candidate_query_attempts(
-                        approved_pool,
-                        context.attempted_versions,
-                        ecosystem,
-                    ),
-                    ecosystem,
+                    _candidate_query_attempts(approved_pool, context.attempted_versions),
                 )
                 versions = _current_candidate_versions(
                     candidates,
-                    ecosystem=ecosystem,
                     approved_pool=approved_pool,
                     attempted_versions=context.attempted_versions,
                 )
-                if ecosystem == "pypi":
-                    role = {
-                        SCARemediationStage.OSV_MINIMUM: "osv_minimum",
-                        SCARemediationStage.PYPI_SAME_MAJOR: "same_major",
-                        SCARemediationStage.PYPI_LATEST: "pypi_latest",
-                    }.get(context.task.strategy_stage)
-                    stage_versions = {
-                        candidate.version
-                        for candidate in candidates
-                        if role in candidate.selection_roles
-                    }
-                    versions = tuple(version for version in versions if version in stage_versions)
             result.append(
                 _candidate_set(
                     strategy,
@@ -1511,7 +1330,6 @@ def registry_candidate_sets_for_context(
                     dependency_type,
                     floor,
                     versions,
-                    ecosystem=ecosystem,
                 )
             )
     except Exception as exc:  # noqa: BLE001
@@ -1702,7 +1520,11 @@ def _model_action(
         if model_factory is None:
             from langchain_openai import ChatOpenAI  # type: ignore[import]
 
-            llm = ChatOpenAI(model=settings.remedy_llm_model, temperature=0)
+            llm = ChatOpenAI(
+                model=settings.remedy_llm_model,
+                temperature=0,
+                **openai_api_key_kwargs(settings),
+            )
         else:
             llm = model_factory(settings)
         # Do not use ``with_structured_output`` with the discriminated root
@@ -1739,11 +1561,11 @@ def _model_action(
         return None
 
 
-def _normalise_version(value: str | None, ecosystem: str = "npm") -> str | None:
+def _normalise_version(value: str | None) -> str | None:
     """Normalize a version value for exact whitelist comparison."""
     if value is None:
         return None
-    normalized = _normalise_candidate_version(value, ecosystem)
+    normalized = str(value).strip().lstrip("vV")
     return normalized or None
 
 
@@ -1781,13 +1603,7 @@ def _render_instruction(
                 "VALIDATION / SUCCESS CRITERIA: Validate the cumulative source patch, the targeted regression, and the relevant security behavior.",
             ]
         )
-    version = (
-        _normalise_version(
-            getattr(action, "target_version", None),
-            _group_ecosystem(context.group),
-        )
-        or "unknown"
-    )
+    version = _normalise_version(getattr(action, "target_version", None)) or "unknown"
     if strategy == TacticalStrategy.PACKAGE_OVERRIDE:
         operation = f"Set the vulnerable child {context.group.vulnerable_component} to exact version {version} using {target_type or _override_dependency_type(context.group)}; do not edit the parent declaration."
     else:
@@ -1795,6 +1611,7 @@ def _render_instruction(
     return "\n".join(
         [
             "OBJECTIVE: Apply the Supervisor-approved dependency remediation.",
+            f"STRATEGY STAGE {stage.value}",
             f"AUTHORIZED TARGET: {target_package}",
             f"EXACT VERSION OR HYPOTHESIS: {version}",
             f"DECLARATION TYPE: {target_type or 'committed dependency declaration'}",
@@ -1987,11 +1804,7 @@ def verify_tactical_action(
             instruction=instruction,
         )
 
-    ecosystem = _group_ecosystem(context.group)
-    selected_version = _normalise_version(
-        getattr(action, "target_version", None),
-        ecosystem,
-    )
+    selected_version = _normalise_version(getattr(action, "target_version", None))
     candidate_set = _candidate_set_for_action(
         context,
         action.selected_strategy,
@@ -2011,9 +1824,9 @@ def verify_tactical_action(
             strategy_stage=stage,
         )
     candidates = {
-        normalized
+        _normalise_candidate_version(value)
         for value in candidate_set.versions
-        if (normalized := _normalise_candidate_version(value, ecosystem))
+        if str(value).strip()
     }
     if not selected_version or selected_version not in candidates:
         return TacticalVerification(

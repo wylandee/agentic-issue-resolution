@@ -50,6 +50,7 @@ from remediation_engine.runtime.path_policy import (
     repository_relative_path,
     resolve_repository_path,
 )
+from remediation_engine.tools.npm_graph import _normalize_npm_operator_whitespace
 from remediation_engine.tools.package_identity import package_name_from_purl
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,8 @@ _LOCKFILE_PATH_RE = re.compile(
     r"[?#](?P<ancestry>.+)$",
     re.IGNORECASE,
 )
+
+_NPM_LOOSE_NUMERIC_RANGE_RE = re.compile(r"(?<![A-Za-z0-9])0+(\d+)(?=[.\-+|\s]|$)")
 
 
 # ---------------------------------------------------------------------------
@@ -282,8 +285,10 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Path | None:
     Walk up from the directory implied by the ODC file path to find the closest
     ``package.json`` that is still inside ``repo_root``.
 
-    For lockfile-path notation (``/src/package-lock.json?...``), the directory
-    of the lockfile is used as the starting point.
+    For lockfile-path notation (``/src/package-lock.json?...`` or
+    ``/scan/frontend/package-lock.json?...``), the directory of the lockfile is
+    used as the starting point after removing the scanner's virtual mount
+    prefix.
     """
     if not odc_file_path.strip():
         return None
@@ -291,9 +296,11 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Path | None:
     # Strip the lockfile ancestry suffix if present
     raw_path = odc_file_path.split("?")[0].split("#")[0].strip()
 
-    # Try to make it relative to repo_root. ODC often records paths with a
-    # leading /src/ that maps to the repo root, so we prefer the stripped form
-    # first and fall back to the raw form if needed.
+    # Try to make it relative to repo_root. ODC runs in a container where the
+    # repository is mounted at ``/scan`` (older runs used ``/src``), so those
+    # virtual roots are not repository directories and must be stripped before
+    # looking for the nearest manifest. Keep the raw variant as a fallback for
+    # scanners that already emit repository-relative paths.
     candidate_abs = Path(raw_path)
     has_root_prefix = raw_path.startswith(("/", "\\"))
     if candidate_abs.is_absolute() or has_root_prefix:
@@ -302,7 +309,11 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Path | None:
         rel_parts = candidate_abs.parts
 
     variants = [Path(*rel_parts)] if rel_parts else []
-    if rel_parts and rel_parts[0].lower() in {"src", repo_root.name.lower()}:
+    if rel_parts and rel_parts[0].lower() in {
+        "src",
+        "scan",
+        repo_root.name.lower(),
+    }:
         stripped = Path(*rel_parts[1:])
         if str(stripped):
             variants.insert(0, stripped)
@@ -347,8 +358,14 @@ def _find_nearest_manifest(repo_root: Path, odc_file_path: str) -> Path | None:
     current = start_dir
     while True:
         manifest = current / "package.json"
-        if manifest.exists():
-            return manifest
+        try:
+            safe_manifest = resolve_repository_path(
+                repo_resolved, manifest.relative_to(repo_resolved)
+            )
+        except (ValueError, WorkspacePathError):
+            safe_manifest = None
+        if safe_manifest is not None and safe_manifest.is_file():
+            return safe_manifest
         if current == repo_resolved or not current.is_relative_to(repo_resolved):
             break
         current = current.parent
@@ -448,11 +465,123 @@ def _lockfile_dependency_requirements(metadata: dict[str, Any]) -> dict[str, str
     }
 
 
+def _lockfile_package_candidate_keys(parent_key: str, package_name: str) -> list[str]:
+    """Return npm's package-local-to-root physical lookup order."""
+    parent_parts = [part for part in parent_key.split("/") if part]
+    scopes: list[list[str]] = [parent_parts + ["node_modules"]]
+    for index in range(len(parent_parts) - 1, -1, -1):
+        if parent_parts[index] == "node_modules":
+            scopes.append(parent_parts[: index + 1])
+    keys: list[str] = []
+    seen_keys: set[str] = set()
+    for scope in scopes:
+        key = "/".join([*scope, package_name])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            keys.append(key)
+    return keys
+
+
+def _parse_npm_alias_requirement(requirement: str) -> tuple[str, str | None] | None:
+    """Parse npm's ``npm:<package-name>@<range>`` alias requirement.
+
+    The package name can be scoped, in which case its leading ``@`` is not
+    the separator before the version range. A missing range is returned as
+    ``None`` because the lockfile still identifies the exact resolved node.
+
+    Args:
+        requirement: Dependency specifier from an npm lockfile edge.
+
+    Returns:
+        The aliased package name and optional version range, or ``None`` when
+        the specifier is not a well-formed npm alias.
+    """
+    value = requirement.strip()
+    if not value.startswith("npm:"):
+        return None
+
+    target = value.removeprefix("npm:")
+    separator = target.rfind("@")
+    if target.startswith("@"):
+        scope_separator = target.find("/")
+        if scope_separator <= 1:
+            return None
+        if separator > scope_separator:
+            package_name = target[:separator]
+            version_range = target[separator + 1 :]
+            if not version_range:
+                return None
+        else:
+            package_name = target
+            version_range = None
+    elif separator > 0:
+        package_name = target[:separator]
+        version_range = target[separator + 1 :]
+        if not version_range:
+            return None
+    else:
+        package_name = target
+        version_range = None
+
+    if not package_name or any(character.isspace() for character in package_name):
+        return None
+    return package_name, version_range
+
+
+def _normalize_npm_lockfile_range(value: str) -> str:
+    """Normalize leading-zero partial versions accepted by npm's loose parser.
+
+    ``semantic_version.NpmSpec`` is stricter than npm for forms such as
+    ``^4.00``. Normalize only numeric version components before matching; an
+    unrecognized range still fails closed in the caller.
+    """
+    normalized = _normalize_npm_operator_whitespace(value)
+    return _NPM_LOOSE_NUMERIC_RANGE_RE.sub(r"\1", normalized)
+
+
+def _lockfile_override_requirement(
+    overrides: dict[str, Any] | None,
+    package_name: str,
+    candidate_version: str,
+) -> str | None:
+    """Return one simple npm override applicable to a locked package version."""
+    if not isinstance(overrides, dict):
+        return None
+
+    replacements: set[str] = set()
+    versioned_prefix = f"{package_name}@"
+    for raw_selector, raw_replacement in overrides.items():
+        if not isinstance(raw_selector, str) or not isinstance(raw_replacement, str):
+            continue
+        selector = raw_selector.strip()
+        replacement = raw_replacement.strip()
+        if not selector or not replacement:
+            continue
+        if selector == package_name:
+            replacements.add(replacement)
+            continue
+        if not selector.startswith(versioned_prefix):
+            continue
+        selector_range = selector[len(versioned_prefix) :].strip()
+        if not selector_range:
+            continue
+        try:
+            applies = NpmSpec(_normalize_npm_lockfile_range(selector_range)).match(
+                Version(candidate_version)
+            )
+        except (TypeError, ValueError):
+            continue
+        if applies:
+            replacements.add(replacement)
+    return next(iter(replacements)) if len(replacements) == 1 else None
+
+
 def _lockfile_package_candidates(
     packages: dict[str, Any],
     parent_key: str,
     package_name: str,
     requirement: str,
+    overrides: dict[str, Any] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Resolve one dependency from an npm lockfile ``packages`` graph.
 
@@ -470,33 +599,63 @@ def _lockfile_package_candidates(
     Returns:
         Matching ``(package_key, metadata)`` pairs in npm resolution order.
     """
-    parent_parts = [part for part in parent_key.split("/") if part]
-    scopes: list[list[str]] = [parent_parts + ["node_modules"]]
-    for index in range(len(parent_parts) - 1, -1, -1):
-        if parent_parts[index] == "node_modules":
-            scopes.append(parent_parts[: index + 1])
-
     candidates: list[tuple[str, dict[str, Any]]] = []
-    seen_keys: set[str] = set()
-    for scope in scopes:
-        key = "/".join([*scope, package_name])
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
+    declared_alias = _parse_npm_alias_requirement(requirement)
+    for key in _lockfile_package_candidate_keys(parent_key, package_name):
         metadata = packages.get(key)
         if not isinstance(metadata, dict):
             continue
         version_text = str(metadata.get("version") or "").strip()
         if not version_text:
             continue
+
+        # An npm alias is installed under the dependency's alias key, while
+        # the package metadata records the real package name. Validate both
+        # identities before using the lockfile's resolved version.
+        effective_requirement = (
+            _lockfile_override_requirement(overrides, package_name, version_text) or requirement
+        )
+        effective_alias = _parse_npm_alias_requirement(effective_requirement)
+        alias = effective_alias or declared_alias
+        if alias is not None:
+            alias_name, alias_range = alias
+            if str(metadata.get("name") or "").strip() != alias_name:
+                continue
+            if declared_alias is not None and alias_name != declared_alias[0]:
+                continue
+            if effective_alias is not None and alias_range is not None:
+                try:
+                    if not NpmSpec(_normalize_npm_lockfile_range(alias_range)).match(
+                        Version(version_text)
+                    ):
+                        continue
+                except (TypeError, ValueError):
+                    # Unsupported alias ranges remain incomplete rather than
+                    # being mistaken for an exact package-version match.
+                    continue
+            elif effective_alias is None:
+                normalized_requirement = _normalize_npm_lockfile_range(effective_requirement)
+                try:
+                    if not NpmSpec(normalized_requirement).match(Version(version_text)):
+                        continue
+                except (TypeError, ValueError):
+                    if effective_requirement.strip() != version_text:
+                        continue
+            candidates.append((key, metadata))
+            continue
+
+        metadata_name = str(metadata.get("name") or "").strip()
+        if metadata_name and metadata_name != package_name:
+            continue
+
+        normalized_requirement = _normalize_npm_lockfile_range(effective_requirement)
         try:
-            if not NpmSpec(requirement).match(Version(version_text)):
+            if not NpmSpec(normalized_requirement).match(Version(version_text)):
                 continue
         except (TypeError, ValueError):
-            # Non-semver specs such as aliases and workspace ranges cannot be
-            # evaluated safely here. Keep an exact resolved-version match but
-            # otherwise leave the scanner path unchanged.
-            if requirement.strip() != version_text:
+            # Non-semver specs such as workspace ranges cannot be evaluated
+            # safely here. Keep an exact resolved-version match only.
+            if effective_requirement.strip() != version_text:
                 continue
         candidates.append((key, metadata))
     return candidates
@@ -749,8 +908,13 @@ def locate_dependency(
     manifest_path = _find_nearest_manifest(repo_path, odc_file_path) if odc_file_path else None
     if manifest_path is None:
         # Fall back to repo root
-        root_manifest = repo_path / "package.json"
-        manifest_path = root_manifest if root_manifest.exists() else None
+        try:
+            root_manifest = resolve_repository_path(repo_path, "package.json")
+        except WorkspacePathError:
+            root_manifest = None
+        manifest_path = (
+            root_manifest if root_manifest is not None and root_manifest.is_file() else None
+        )
 
     if manifest_path is None:
         return {

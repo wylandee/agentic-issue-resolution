@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterable
 from pathlib import Path
 
 from remediation_engine.contracts.schemas import IssueType, VulnerabilityGroup
+from remediation_engine.runtime.path_policy import WorkspacePathError, resolve_repository_path
 from remediation_engine.tools.code_map import (
-    extract_imports,
+    extract_all_imports,
     language_for_path,
     load_source_bytes,
     parse_source,
@@ -28,8 +30,31 @@ from remediation_engine.tools.code_map import (
 
 logger = logging.getLogger(__name__)
 
-_SOURCE_SUFFIXES = {".js", ".ts", ".jsx", ".tsx"}
+_SOURCE_SUFFIXES = {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}
 _EXCLUDED_PARTS = {"node_modules", ".git", "dist", "build"}
+_MODULE_SPECIFIER_PATTERNS = (
+    re.compile(r"\bfrom\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"\bimport\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"\brequire\s*\(\s*['\"]([^'\"]+)['\"]"),
+)
+
+
+def _imported_package_names(statement: str) -> set[str]:
+    """Return all npm package identities referenced by one import statement."""
+    packages: set[str] = set()
+    for pattern in _MODULE_SPECIFIER_PATTERNS:
+        for match in pattern.finditer(statement):
+            module = match.group(1)
+            if not module or module.startswith((".", "/", "#", "node:")):
+                continue
+            segments = module.split("/")
+            if segments[0].startswith("@"):
+                package_name = "/".join(segments[:2]) if len(segments) > 1 else None
+            else:
+                package_name = segments[0]
+            if package_name:
+                packages.add(package_name)
+    return packages
 
 
 def _is_pypi_issue_group(group: VulnerabilityGroup) -> bool:
@@ -44,7 +69,10 @@ def _is_pypi_issue_group(group: VulnerabilityGroup) -> bool:
 
 def _load_direct_dependencies(repo_root: Path) -> set[str]:
     """Best-effort load of direct dependencies from package.json."""
-    package_json = repo_root / "package.json"
+    try:
+        package_json = resolve_repository_path(repo_root, "package.json")
+    except WorkspacePathError:
+        return set()
     if not package_json.is_file():
         return set()
 
@@ -102,8 +130,12 @@ def _collect_global_imports(repo_root: Path) -> set[str]:
                 )
                 continue
 
-            imports = extract_imports(tree.root_node, source_bytes)
-            global_imports.update(imp for imp in imports if imp)
+            imports = extract_all_imports(tree.root_node, source_bytes)
+            global_imports.update(
+                package_name
+                for statement in imports
+                for package_name in _imported_package_names(statement)
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Reachability: failed to analyze %s: %s",
@@ -135,7 +167,7 @@ def analyze_reachability(groups: list[VulnerabilityGroup], repo_root: str | Path
 
     for group in npm_groups:
         component = (group.vulnerable_component or "").strip()
-        if component and any(component in imported for imported in global_imports):
+        if component and component in global_imports:
             group.is_reachable = True
         elif component in direct_deps:
             group.is_reachable = False

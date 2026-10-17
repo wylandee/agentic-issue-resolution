@@ -10,31 +10,45 @@ Tests have been updated to use the task-centric architecture:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
+from remediation_engine.contracts import DecisionCode
 from remediation_engine.contracts.schemas import (
+    MAX_MULTI_PACKAGE_ACTION_SIZE,
     AgentActionStatus,
     AgentActionSummary,
     FailureCategory,
     FixPlan,
     FixPlanStatus,
+    IncrementalScanRecord,
     IssueSource,
     IssueType,
+    MultiPackageAction,
+    ODCScanEvidence,
+    PackageMutation,
+    PackageScanOccurrence,
+    PeerConflictEvidence,
+    PortfolioPlan,
     QAAttemptResult,
+    QADeterministicGates,
     QAEvaluation,
     QAFailureEvidence,
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
+    ScanScope,
     SCARemediationStage,
     Severity,
     SupervisorDecision,
     SupervisorRetryPlan,
     TaskAttemptSnapshot,
+    TaskCluster,
+    TaskScanRecord,
     TaskSpawnRequest,
     TaskStatus,
     UpdateRetryDiagnostics,
@@ -44,18 +58,25 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from remediation_engine.contracts.solver_models import PortfolioReplanRequest
 from remediation_engine.contracts.version_policy import RegistryCandidate
 from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _authorize_update_dispatch,
     _build_consistency_event,
+    _calculate_cumulative_scan_metrics,
     _create_attempt_snapshot,
     _deterministic_routing,
+    _incremental_scan_coverage_complete,
     _materialize_spawn_requests,
     _normalize_target_task_ids_for_node,
     _ordered_update_candidates,
+    _peer_conflict_escalation,
     _repair_invalid_planner_plans,
+    _task_scan_record_from_qa_result,
     _validate_committed_state,
+    _validated_delta_replay_task_ids,
+    _verified_absent_package_tasks,
     instruction_digest,
     reconcile_phase5_state_before_teardown,
     run_supervisor_node,
@@ -217,25 +238,40 @@ def _base_state(groups, **overrides) -> dict:
     return state
 
 
-@pytest.fixture(autouse=True)
-def _mock_deterministic_registry(monkeypatch):
-    """Keep Supervisor retry tests inside the deterministic registry boundary."""
-
-    def candidates(_package_name, _security_floor, _attempted_versions=None):
-        return [
-            RegistryCandidate(
-                version="2.0.0",
-                semver_key=(2, 0, 0),
-                security_floor_met=True,
-                is_stable=True,
-                same_major=False,
-                already_attempted=False,
-            )
-        ]
-
+def _keep_portfolio_current(monkeypatch):
     monkeypatch.setattr(
         "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
-        candidates,
+        lambda *args, **kwargs: [],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+        lambda *args, **kwargs: False,
+    )
+
+
+def _stub_portfolio_plan_tool(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    portfolio_tool = MagicMock(return_value={"status": "portfolio_ready", "errors": []})
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        portfolio_tool,
+    )
+    return portfolio_tool
+
+
+def _portfolio_stub():
+    return SimpleNamespace(
+        portfolio_plan_id="portfolio-current",
+        task_ids=[],
+        clusters=[],
+        cluster_order=[],
+        task_order=[],
+        task_to_cluster={},
+        diagnostics=[],
     )
 
 
@@ -253,6 +289,13 @@ class TestSupervisorDecisionSchema:
             decision_reason="test",
         )
         assert decision.next_node == "update_subagent"
+        deferred = SupervisorDecision(
+            next_node="supervisor",
+            target_task_ids=[],
+            instructions="Reconcile a deferred task before selecting another action.",
+            decision_reason="Registry verification is temporarily unavailable.",
+        )
+        assert deferred.next_node == "supervisor"
 
     def test_workaround_subagent_rejects_zero_or_two_targets(self):
         with pytest.raises(ValidationError):
@@ -288,11 +331,11 @@ class TestSupervisorDecisionSchema:
         )
         assert decision.target_task_ids == ["t1", "t2"]
 
-    def test_update_subagent_rejects_more_than_ten_targets(self):
+    def test_update_subagent_rejects_more_than_configured_targets(self):
         with pytest.raises(ValidationError):
             SupervisorDecision(
                 next_node="update_subagent",
-                target_task_ids=[f"t{i}" for i in range(11)],
+                target_task_ids=[f"t{i}" for i in range(MAX_MULTI_PACKAGE_ACTION_SIZE + 1)],
                 instructions="test",
                 decision_reason="test",
             )
@@ -342,6 +385,33 @@ def test_deferred_consistency_action_is_mapped_to_typed_rejection():
     )
 
     assert event.action == "rejected"
+
+
+def test_registry_verification_pending_reenters_supervisor_without_forcing_final_scan(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    group = _sca_group("g-registry-pending", FixPlanStatus.VERSION_FOUND)
+    task = _make_task("task-registry-pending", group.group_id)
+    state = _base_state(
+        [group],
+        task_queue={task.task_id: task},
+        portfolio_plan=_portfolio_stub(),
+        portfolio_dirty=False,
+        workspace_volume="workspace-volume",
+        final_full_scan_enabled=False,
+    )
+    _keep_portfolio_current(monkeypatch)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.registry_candidate_sets_for_context",
+        lambda _context: ((), "registry temporarily unavailable"),
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["decision_code"] == DecisionCode.REGISTRY_VERIFICATION_PENDING
+    assert result["next_routing_step"] == "supervisor"
+    assert result["task_queue"][task.task_id].status == TaskStatus.INCONCLUSIVE
+    assert result["task_queue"][task.task_id].retry_count == task.retry_count
 
 
 def test_attempt_snapshot_allowlists_default_for_legacy_payloads():
@@ -470,6 +540,102 @@ def test_committed_state_rejects_active_empty_update_authorization():
     assert any("candidate authorization" in error for error in errors)
 
 
+def test_committed_state_refuses_snapshot_revision_rewind():
+    instruction = "Update test-pkg to 2.0.0."
+    task = _make_task("task-1", "g1").model_copy(
+        update={
+            "task_revision": 4,
+            "current_attempt_id": "attempt-current",
+            "selected_version": "2.0.0",
+            "instruction": instruction,
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-1",
+        task_revision=1,
+        selected_version="1.0.0",
+        instruction="Update test-pkg to 1.0.0.",
+        instruction_digest=instruction_digest("Update test-pkg to 1.0.0."),
+        dispatch_node="update_subagent",
+    )
+    queue = {"task-1": task}
+
+    events, errors = _validate_committed_state(
+        queue, {snapshot.attempt_id: snapshot}, {}, {}, [], "teardown"
+    )
+
+    assert queue["task-1"].task_revision == 4
+    assert queue["task-1"].selected_version == "2.0.0"
+    assert queue["task-1"].instruction == instruction
+    assert any(event.error_code == "TASK_SNAPSHOT_REVISION_REJECTED" for event in events)
+    assert any("snapshot repair was refused" in error for error in errors)
+
+
+def test_committed_state_rejects_foreign_task_snapshot_identity():
+    instruction = "Update test-pkg to 1.0.0."
+    task = _make_task("task-1", "g1").model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": "attempt-current",
+            "selected_version": "1.0.0",
+            "instruction": instruction,
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-foreign",
+        task_revision=1,
+        selected_version="9.9.9",
+        instruction="Update test-pkg to 9.9.9.",
+        instruction_digest=instruction_digest("Update test-pkg to 9.9.9."),
+        dispatch_node="update_subagent",
+    )
+    queue = {"task-1": task}
+
+    events, errors = _validate_committed_state(
+        queue, {snapshot.attempt_id: snapshot}, {}, {}, [], "teardown"
+    )
+
+    assert queue["task-1"].task_id == "task-1"
+    assert queue["task-1"].selected_version == "1.0.0"
+    assert queue["task-1"].instruction == instruction
+    assert any(event.error_code == "TASK_SNAPSHOT_IDENTITY_REJECTED" for event in events)
+    assert any("foreign task or attempt identity" in error for error in errors)
+
+
+def test_committed_state_repairs_mutated_inputs_for_same_snapshot_revision():
+    committed_instruction = "Update test-pkg to 1.0.0."
+    task = _make_task("task-1", "g1").model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": "attempt-current",
+            "selected_version": "2.0.0",
+            "instruction": "Update test-pkg to 2.0.0.",
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-1",
+        task_revision=1,
+        selected_version="1.0.0",
+        instruction=committed_instruction,
+        instruction_digest=instruction_digest(committed_instruction),
+        dispatch_node="update_subagent",
+    )
+    queue = {"task-1": task}
+
+    events, errors = _validate_committed_state(
+        queue, {snapshot.attempt_id: snapshot}, {}, {}, [], "teardown"
+    )
+
+    assert queue["task-1"].task_revision == 1
+    assert queue["task-1"].selected_version == "1.0.0"
+    assert queue["task-1"].instruction == committed_instruction
+    assert any(event.error_code == "TASK_SNAPSHOT_REPAIRED" for event in events)
+    assert not errors
+
+
 # ===========================================================================
 # derive_initial_strategy (now in task_utils)
 # ===========================================================================
@@ -514,6 +680,8 @@ class TestSupervisorRouterFunction:
             supervisor_router({"next_routing_step": "qa_critic", **active_targets}) == "qa_critic"
         )
         assert supervisor_router({"next_routing_step": "teardown"}) == "teardown"
+        assert supervisor_router({"next_routing_step": "supervisor"}) == "supervisor"
+        assert supervisor_router({"next_routing_step": "final_full_scan"}) == "final_full_scan"
 
     @pytest.mark.parametrize(
         "step",
@@ -533,6 +701,98 @@ class TestSupervisorRouterFunction:
     def test_missing_or_unknown_step_defaults_to_teardown(self):
         assert supervisor_router({}) == "teardown"
         assert supervisor_router({"next_routing_step": "invalid"}) == "teardown"
+
+
+@pytest.mark.parametrize(
+    ("status", "has_portfolio_plan"),
+    [
+        ("workspace_ready", False),
+        ("triage_completed", True),
+    ],
+)
+def test_supervisor_calls_portfolio_tool_for_initial_and_post_triage_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    has_portfolio_plan: bool,
+):
+    state = _base_state(
+        [_sca_group()],
+        status=status,
+        portfolio_plan=_portfolio_stub() if has_portfolio_plan else None,
+        portfolio_dirty=False,
+    )
+    portfolio_tool = MagicMock(
+        return_value={
+            "status": "portfolio_ready",
+            "next_routing_step": "teardown",
+            "errors": [],
+        }
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        portfolio_tool,
+    )
+
+    result = run_supervisor_node(state)
+
+    portfolio_tool.assert_called_once_with(state)
+    assert result["next_routing_step"] == "supervisor"
+
+
+def test_supervisor_overlays_replan_patch_on_portfolio_tool_input(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task = _make_task("task-1", "g1")
+    request = PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id="prior-plan",
+    )
+    reconciled_queue = {"task-1": task}
+    supervisor_patch = {
+        "status": "supervisor_routed",
+        "next_routing_step": "portfolio",
+        "decision_code": DecisionCode.PORTFOLIO_PLAN_REQUIRED,
+        "supervisor_instructions": "Rebuild the portfolio before dispatch.",
+        "task_queue": reconciled_queue,
+        "portfolio_replan_request": request,
+        "portfolio_dirty": True,
+        "errors": ["supervisor-error"],
+    }
+    state = _base_state(
+        [_sca_group()],
+        errors=["prior-error"],
+        task_queue={"old-task": _make_task("old-task", "g1")},
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._run_supervisor_decision_node",
+        lambda _state: supervisor_patch,
+    )
+    portfolio_plan = _portfolio_stub()
+    portfolio_tool = MagicMock(
+        return_value={
+            "status": "portfolio_ready",
+            "next_routing_step": "teardown",
+            "portfolio_plan": portfolio_plan,
+            "errors": ["portfolio-error"],
+        }
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        portfolio_tool,
+    )
+
+    result = run_supervisor_node(state)
+
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["task_queue"] is reconciled_queue
+    assert portfolio_input["portfolio_replan_request"] is request
+    assert portfolio_input["errors"] == ["prior-error", "supervisor-error"]
+    assert result["decision_code"] == DecisionCode.PORTFOLIO_PLAN_REQUIRED
+    assert result["supervisor_instructions"] == supervisor_patch["supervisor_instructions"]
+    assert result["portfolio_plan"] is portfolio_plan
+    assert result["errors"] == ["supervisor-error", "portfolio-error"]
+    assert result["next_routing_step"] == "supervisor"
 
 
 # ===========================================================================
@@ -660,6 +920,71 @@ class TestRunSupervisorNodeVersionBump:
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
 
+    def test_terminal_tasks_route_through_optional_final_full_scan(self):
+        group = _sast_group("g-final-scan")
+        task = _make_task(
+            "task-final-scan",
+            group.group_id,
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.QA_PASSED,
+        )
+        base_state = _base_state(
+            [group],
+            task_queue={task.task_id: task},
+            workspace_volume="workspace-volume",
+            baseline_scan_complete=True,
+            package_inventory_baseline_complete=True,
+        )
+
+        enabled = run_supervisor_node({**base_state, "final_full_scan_enabled": True})
+        assert enabled["next_routing_step"] == "final_full_scan"
+        assert enabled["decision_code"].value == "FINAL_FULL_SCAN_REQUIRED"
+        assert supervisor_router({**base_state, **enabled}) == "final_full_scan"
+
+        disabled = run_supervisor_node({**base_state, "final_full_scan_enabled": False})
+        assert disabled["next_routing_step"] == "teardown"
+
+    def test_supervisor_preserves_full_scan_findings_for_triage(self):
+        group = _sast_group("g-full-scan")
+        task = _make_task(
+            "task-full-scan",
+            group.group_id,
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.QA_PASSED,
+        )
+        full_scan = {
+            "completed": True,
+            "authoritative": True,
+            "coverage_scope": "full_workspace",
+            "coverage_complete": True,
+            "found_identifiers": ["CVE-2026-70001"],
+            "remaining_target_identifiers": [],
+            "new_identifiers": ["CVE-2026-70001"],
+            "found_issues": [],
+            "status": "detected",
+            "triage_required": True,
+            "error": None,
+        }
+
+        result = run_supervisor_node(
+            _base_state(
+                [group],
+                task_queue={task.task_id: task},
+                workspace_volume="workspace-volume",
+                final_full_scan_enabled=True,
+                final_full_scan_result=full_scan,
+                status="final_scan_completed",
+                triage_required=True,
+                post_qa_triage_enabled=True,
+            )
+        )
+
+        assert result["next_routing_step"] == "triage"
+        assert result["final_full_scan_result"] == full_scan
+        assert result["new_vulnerability_identifiers"] == ["CVE-2026-70001"]
+        assert result["new_vulnerability_status"] == "detected"
+        assert result["triage_required"] is True
+
     def test_deterministic_retry_routing_dispatches_one_task(self):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
         tasks = {
@@ -680,6 +1005,116 @@ class TestRunSupervisorNodeVersionBump:
 
         assert decision.next_node == "update_subagent"
         assert decision.target_task_ids == ["task-1"]
+
+    def test_active_qa_retry_precedes_unrelated_portfolio_task(self):
+        failed_group = _sca_group("g1")
+        ready_group = _sca_group("g2")
+        failed_task = _make_task(
+            "task-1",
+            failed_group.group_id,
+            status=TaskStatus.NEEDS_RETRY,
+            retry_count=1,
+        )
+        ready_task = _make_task("task-2", ready_group.group_id)
+
+        portfolio_plan = _portfolio_stub()
+        cluster_id = "cluster-task-2"
+        portfolio_plan.task_ids = ["task-2"]
+        portfolio_plan.clusters = [
+            SimpleNamespace(
+                cluster_id=cluster_id,
+                task_ids=["task-2"],
+                dependencies=[],
+                dispatchable=True,
+            )
+        ]
+        portfolio_plan.cluster_order = [cluster_id]
+        portfolio_plan.task_order = ["task-2"]
+        portfolio_plan.task_to_cluster = {"task-2": cluster_id}
+
+        decision = _deterministic_routing(
+            {"task-1": failed_task, "task-2": ready_task},
+            {failed_group.group_id: failed_group, ready_group.group_id: ready_group},
+            {
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="Repair the compatibility regression.",
+                )
+            },
+            {},
+            active_target_task_ids=["task-1"],
+            current_status="qa_completed",
+            portfolio_plan=portfolio_plan,
+        )
+
+        assert decision.decision_code == DecisionCode.RETRY_VERSION_BUMP
+        assert decision.target_task_ids == ["task-1"]
+        assert "tactical/retry planning" in decision.instructions
+
+    def test_active_qa_retry_does_not_split_atomic_portfolio_cluster(self):
+        groups = [_sca_group(f"g{i}") for i in range(1, 4)]
+        tasks = {
+            "task-1": _make_task(
+                "task-1",
+                "g1",
+                status=TaskStatus.NEEDS_RETRY,
+                retry_count=1,
+            ),
+            "task-2": _make_task(
+                "task-2",
+                "g2",
+                status=TaskStatus.NEEDS_RETRY,
+                retry_count=1,
+            ),
+            "task-3": _make_task("task-3", "g3"),
+        }
+        portfolio_plan = _portfolio_stub()
+        unrelated_cluster_id = "unrelated-cluster"
+        cluster_id = "atomic-cluster"
+        portfolio_plan.task_ids = ["task-3", "task-1", "task-2"]
+        portfolio_plan.clusters = [
+            SimpleNamespace(
+                cluster_id=unrelated_cluster_id,
+                task_ids=["task-3"],
+                dependencies=[],
+                dispatchable=True,
+            ),
+            SimpleNamespace(
+                cluster_id=cluster_id,
+                task_ids=["task-1", "task-2"],
+                dependencies=[],
+                dispatchable=True,
+            ),
+        ]
+        portfolio_plan.cluster_order = [unrelated_cluster_id, cluster_id]
+        portfolio_plan.task_order = ["task-3", "task-1", "task-2"]
+        portfolio_plan.task_to_cluster = {
+            "task-1": cluster_id,
+            "task-2": cluster_id,
+            "task-3": unrelated_cluster_id,
+        }
+
+        decision = _deterministic_routing(
+            tasks,
+            {group.group_id: group for group in groups},
+            {
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="Repair the compatibility regression.",
+                )
+            },
+            {},
+            active_target_task_ids=["task-1"],
+            current_status="qa_completed",
+            portfolio_plan=portfolio_plan,
+        )
+
+        assert decision.decision_code == DecisionCode.ATOMIC_CLUSTER_DISPATCH
+        assert decision.target_task_ids == ["task-1", "task-2"]
 
     def test_repeated_routing_advances_to_the_next_task_after_completion(self):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
@@ -722,7 +1157,102 @@ class TestRunSupervisorNodeToQA:
         assert result["next_routing_step"] == "qa_critic"
         assert "task-1" in result["active_target_task_ids"]
 
-    def test_all_optimistically_fixed_tasks_route_to_qa_one_at_a_time(self):
+    def test_active_cluster_action_survives_qa_handoff(self):
+        cluster_id = "cluster-active-qa"
+        batch_id = "batch-active-qa"
+        task_specs = [("task-1", "g1", "pkg-a"), ("task-2", "g2", "pkg-b")]
+        groups = [
+            _sca_group(group_id).model_copy(update={"vulnerable_component": package_name})
+            for _, group_id, package_name in task_specs
+        ]
+        action = MultiPackageAction(
+            cluster_id=cluster_id,
+            dispatch_batch_id=batch_id,
+            selected_strategy="version_bump",
+            package_mutations=[
+                PackageMutation(
+                    task_id=task_id,
+                    package_name=package_name,
+                    target_version="1.2.3",
+                    dependency_type="dependencies",
+                )
+                for task_id, _, package_name in task_specs
+            ],
+            rationale="test atomic QA handoff",
+        )
+        action_digest = instruction_digest(action.model_dump_json())
+        tasks = {}
+        snapshots = {}
+        worker_results = {}
+        for task_id, group_id, package_name in task_specs:
+            attempt_id = f"attempt-{task_id}"
+            instruction = f"Update {package_name} to 1.2.3."
+            task = _make_task(
+                task_id,
+                group_id,
+                status=TaskStatus.OPTIMISTICALLY_FIXED,
+            ).model_copy(
+                update={
+                    "task_revision": 1,
+                    "current_attempt_id": attempt_id,
+                    "qa_policy": QAPolicy.VERSION_BUMP,
+                    "selected_version": "1.2.3",
+                    "allowed_target_versions": ["1.2.3"],
+                    "target_package_name": package_name,
+                    "target_dependency_type": "dependencies",
+                    "instruction": instruction,
+                }
+            )
+            snapshot = TaskAttemptSnapshot(
+                attempt_id=attempt_id,
+                task_id=task_id,
+                task_revision=task.task_revision,
+                cluster_id=cluster_id,
+                dispatch_batch_id=batch_id,
+                action_digest=action_digest,
+                qa_policy=task.qa_policy,
+                selected_version=task.selected_version,
+                target_package_name=package_name,
+                target_dependency_type="dependencies",
+                instruction=instruction,
+                instruction_digest=instruction_digest(instruction),
+                dispatch_node="update_subagent",
+            )
+            tasks[task_id] = task
+            snapshots[attempt_id] = snapshot
+            worker_results[attempt_id] = WorkerAttemptResult(
+                attempt_id=attempt_id,
+                task_id=task_id,
+                task_revision=task.task_revision,
+                cluster_id=cluster_id,
+                dispatch_batch_id=batch_id,
+                action_digest=action_digest,
+                status=AgentActionStatus.SUCCESS,
+                execution_diagnostics=WorkerExecutionDiagnostics(validation_passed=True),
+                instruction_digest=snapshot.instruction_digest,
+            )
+
+        state = _base_state(
+            groups,
+            task_queue=tasks,
+            active_target_task_ids=[task_id for task_id, _, _ in task_specs],
+            active_cluster_id=cluster_id,
+            active_dispatch_batch_id=batch_id,
+            active_multi_package_action=action,
+            attempt_snapshots_by_id=snapshots,
+            worker_results_by_attempt=worker_results,
+            processed_worker_attempt_ids=list(worker_results),
+        )
+
+        result = run_supervisor_node(state)
+
+        assert result["next_routing_step"] == "qa_critic"
+        assert result["active_target_task_ids"] == ["task-1", "task-2"]
+        assert result["active_cluster_id"] == cluster_id
+        assert result["active_dispatch_batch_id"] == batch_id
+        assert result["active_multi_package_action"] == action
+
+    def test_all_optimistically_fixed_tasks_route_to_qa_within_limit(self):
         g1 = _sca_group("g1")
         g2 = _sca_group("g2")
         task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -736,7 +1266,7 @@ class TestRunSupervisorNodeToQA:
 
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "qa_critic"
-        assert result["active_target_task_ids"] == ["task-1"]
+        assert result["active_target_task_ids"] == ["task-1", "task-2"]
 
     def test_current_task_routes_to_qa_before_more_updates(self):
         # 12 groups: first 10 are optimistically fixed, 2 are pending.
@@ -758,7 +1288,7 @@ class TestRunSupervisorNodeToQA:
         result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "qa_critic"
-        assert result["active_target_task_ids"] == ["task-1"]
+        assert result["active_target_task_ids"] == [f"task-{index}" for index in range(1, 11)]
 
     def test_mixed_update_results_route_successful_subset_to_qa(self):
         groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(5)]
@@ -804,7 +1334,7 @@ class TestRunSupervisorNodeToQA:
         result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "qa_critic"
-        assert result["active_target_task_ids"] == ["task-1"]
+        assert result["active_target_task_ids"] == ["task-1", "task-2", "task-3"]
         assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
         assert result["task_queue"]["task-2"].status == TaskStatus.OPTIMISTICALLY_FIXED
         assert result["task_queue"]["task-3"].status == TaskStatus.OPTIMISTICALLY_FIXED
@@ -1135,104 +1665,6 @@ class TestRunSupervisorNodeQAUpdates:
         assert result["processed_qa_attempt_ids"] == []
         assert result["next_routing_step"] == "qa_critic"
 
-    @pytest.mark.parametrize(
-        ("qa_status", "evaluation_kwargs"),
-        [
-            pytest.param(
-                "qa_completed",
-                {
-                    "failure_category": FailureCategory.SECURITY_FLAG,
-                    "retry_feedback": "Dependency evidence was unavailable.",
-                    "evidence_inconclusive": True,
-                },
-                id="inconclusive-evidence",
-            ),
-            pytest.param(
-                "qa_failed",
-                {
-                    "failure_category": FailureCategory.SECURITY_FLAG,
-                    "retry_feedback": "QA could not establish an outcome.",
-                    "contract_error": True,
-                    "contract_error_reason": "Structured evaluator output was missing.",
-                },
-                id="qa-contract-error",
-            ),
-        ],
-    )
-    def test_qa_recheck_limit_terminalizes_same_attempt(self, qa_status, evaluation_kwargs):
-        group = _sca_group("g1")
-        attempt_id = "attempt-qa-bounded"
-        instruction = "Pin test-pkg through the package manager."
-        snapshot = TaskAttemptSnapshot(
-            attempt_id=attempt_id,
-            task_id="task-1",
-            task_revision=1,
-            strategy_stage=SCARemediationStage.NPM_LATEST,
-            selected_version="1.2.3",
-            target_package_name="test-pkg",
-            instruction=instruction,
-            instruction_digest=instruction_digest(instruction),
-            dispatch_node="update_subagent",
-            qa_policy=QAPolicy.VERSION_BUMP,
-        )
-        task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
-            update={
-                "task_revision": 1,
-                "current_attempt_id": attempt_id,
-                "strategy_stage": snapshot.strategy_stage,
-                "selected_version": snapshot.selected_version,
-                "target_package_name": snapshot.target_package_name,
-                "instruction": instruction,
-                "qa_policy": QAPolicy.VERSION_BUMP,
-            }
-        )
-        evaluation = QAEvaluation(
-            task_id="task-1",
-            passed=False,
-            **evaluation_kwargs,
-        )
-
-        def attempt_result():
-            return QAAttemptResult(
-                attempt_id=attempt_id,
-                task_id="task-1",
-                task_revision=1,
-                qa_policy=QAPolicy.VERSION_BUMP,
-                qa_policy_source="attempt_snapshot",
-                evaluation=evaluation,
-            )
-
-        initial = _base_state(
-            [group],
-            status=qa_status,
-            task_queue={"task-1": task},
-            active_target_task_ids=["task-1"],
-            attempt_snapshots_by_id={attempt_id: snapshot},
-            qa_results_by_attempt={attempt_id: attempt_result()},
-        )
-
-        first = run_supervisor_node(initial)
-        assert first["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
-        assert first["qa_rechecks_by_attempt"] == {attempt_id: 1}
-        assert first["processed_qa_attempt_ids"] == []
-
-        second = run_supervisor_node(
-            {
-                **initial,
-                **first,
-                "status": qa_status,
-                "qa_results_by_attempt": {attempt_id: attempt_result()},
-            }
-        )
-
-        terminal = second["task_queue"]["task-1"]
-        assert terminal.status == TaskStatus.INCONCLUSIVE
-        assert terminal.current_attempt_id is None
-        assert terminal.retry_count == 0
-        assert second["processed_qa_attempt_ids"] == [attempt_id]
-        assert second["next_routing_step"] != "qa_critic"
-        assert any("recheck limit reached" in error for error in second["errors"])
-
     def test_qa_completed_passed_adds_constraint(self):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
@@ -1464,34 +1896,7 @@ def test_exhausted_deterministic_guardrail_routes_workaround_child():
         "g1",
         status=TaskStatus.NEEDS_RETRY,
         retry_count=2,
-    ).model_copy(
-        update={
-            "strategy_stage": SCARemediationStage.NPM_LATEST,
-            "qa_policy": QAPolicy.VERSION_BUMP,
-            "task_revision": 1,
-            "current_attempt_id": "update-attempt-1",
-            "target_package_name": "test-pkg",
-            "target_dependency_type": "dependencies",
-            "selected_version": "1.2.3",
-            "instruction": "update package",
-        }
-    )
-    attempt_snapshot = TaskAttemptSnapshot(
-        attempt_id="update-attempt-1",
-        task_id="task-1",
-        state_revision=1,
-        task_revision=1,
-        qa_policy=QAPolicy.VERSION_BUMP,
-        strategy_stage=SCARemediationStage.NPM_LATEST,
-        selected_version="1.2.3",
-        target_package_name="test-pkg",
-        target_dependency_type="dependencies",
-        allowed_target_versions=["1.2.3"],
-        allowed_dependency_types=["dependencies"],
-        instruction=task.instruction,
-        instruction_digest=instruction_digest(task.instruction),
-        dispatch_node="update_subagent",
-    )
+    ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_LATEST})
     state = _base_state(
         [group],
         task_queue={"task-1": task},
@@ -1541,7 +1946,6 @@ def test_exhausted_deterministic_guardrail_routes_workaround_child():
             )
         },
         status="supervisor_entered",
-        attempt_snapshots_by_id={"update-attempt-1": attempt_snapshot},
     )
 
     result = run_supervisor_node(state)
@@ -1616,18 +2020,6 @@ def test_empty_same_major_stage_advances_or_pivots_without_unversioned_dispatch(
         status=TaskStatus.NEEDS_RETRY,
         retry_count=1,
     ).model_copy(update={"strategy_stage": SCARemediationStage.NPM_SAME_MAJOR})
-    attempted_candidate = RegistryCandidate(
-        version="2.17.7",
-        semver_key=(2, 17, 7),
-        security_floor_met=True,
-        is_stable=True,
-        same_major=True,
-        already_attempted=True,
-    )
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
-        lambda *_args, **_kwargs: [attempted_candidate],
-    )
     state = _base_state(
         [group],
         task_queue={"task-1": task},
@@ -1721,6 +2113,86 @@ def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
     assert committed.selected_version == "2.0.0"
     assert committed.status == TaskStatus.OPTIMISTICALLY_FIXED
     assert any(event.error_code == "STALE_WORKER_RESULT" for event in result["consistency_events"])
+
+
+def test_worker_result_under_current_key_must_carry_current_attempt_id():
+    group = _sca_group("g1")
+    instruction = "Update test-pkg to 2.0.0."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-1",
+        state_revision=2,
+        task_revision=2,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.0.0",
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="update_subagent",
+    )
+    task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+        update={
+            "task_revision": 2,
+            "current_attempt_id": snapshot.attempt_id,
+            "strategy_stage": snapshot.strategy_stage,
+            "selected_version": snapshot.selected_version,
+            "instruction": instruction,
+        }
+    )
+    foreign_result = WorkerAttemptResult(
+        attempt_id="attempt-foreign",
+        task_id="task-1",
+        task_revision=2,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=["2.0.0"],
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            attempted_versions=["2.0.0"],
+            executed_versions=["2.0.0"],
+            validation_passed=True,
+        ),
+        instruction_digest=snapshot.instruction_digest,
+    )
+
+    state = _base_state(
+        [group],
+        task_queue={"task-1": task},
+        active_target_task_ids=["task-1"],
+        attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+        # The map key is current, but the serialized envelope identity is not.
+        worker_results_by_attempt={snapshot.attempt_id: foreign_result},
+    )
+    result = run_supervisor_node(state)
+
+    assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+    assert result.get("retry_diagnostics_by_task", {}).get("task-1") is None
+    assert snapshot.attempt_id not in result["processed_worker_attempt_ids"]
+    assert any(
+        event.error_code == "WORKER_ATTEMPT_MISMATCH"
+        and event.expected_attempt_id == snapshot.attempt_id
+        and event.received_attempt_id == "attempt-foreign"
+        for event in result["consistency_events"]
+    )
+
+    valid_result = WorkerAttemptResult(
+        attempt_id=snapshot.attempt_id,
+        task_id="task-1",
+        task_revision=snapshot.task_revision,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=["2.0.0"],
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            attempted_versions=["2.0.0"],
+            executed_versions=["2.0.0"],
+            validation_passed=True,
+        ),
+        instruction_digest=snapshot.instruction_digest,
+    )
+    next_state = {**state, **result}
+    next_state["active_target_task_ids"] = ["task-1"]
+    next_state["worker_results_by_attempt"] = {snapshot.attempt_id: valid_result}
+
+    next_result = run_supervisor_node(next_state)
+
+    assert next_result["retry_diagnostics_by_task"]["task-1"].executed_versions == ["2.0.0"]
+    assert snapshot.attempt_id in next_result["processed_worker_attempt_ids"]
 
 
 def test_worker_result_persists_attempts_by_target_and_override_usage():
@@ -2097,6 +2569,89 @@ def test_stale_qa_result_does_not_increment_retry_count():
     assert result["task_queue"]["task-1"].retry_count == 1
     assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
     assert any(event.error_code == "STALE_QA_RESULT" for event in result["consistency_events"])
+
+
+def test_qa_envelope_attempt_id_must_match_current_attempt_map_key() -> None:
+    group = _sca_group("g1")
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-1",
+        state_revision=2,
+        task_revision=2,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.0.0",
+        instruction="Update test-pkg to 2.0.0.",
+        instruction_digest=instruction_digest("Update test-pkg to 2.0.0."),
+        dispatch_node="update_subagent",
+    )
+    occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="test-pkg",
+        version="2.0.0",
+        lockfile_key="node_modules/test-pkg",
+        found_identifiers=["CVE-2026-10001"],
+    )
+    prior_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="test-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/test-pkg",
+    )
+    prior_key = '["package-lock.json","node_modules/test-pkg","test-pkg","1.0.0",0]'
+    evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1"],
+        covered_occurrences=[occurrence],
+        inventory_updates={
+            '["package-lock.json","node_modules/test-pkg","test-pkg","2.0.0",0]': "fingerprint"
+        },
+        complete=True,
+    )
+    mismatched_result = QAAttemptResult(
+        attempt_id="attempt-stale",
+        task_id="task-1",
+        task_revision=2,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id="task-1",
+            passed=True,
+            scan_evidence=evidence,
+        ),
+    )
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+        retry_count=1,
+    ).model_copy(
+        update={
+            "task_revision": 2,
+            "current_attempt_id": "attempt-current",
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+            "selected_version": "2.0.0",
+            "instruction": "Update test-pkg to 2.0.0.",
+        }
+    )
+    state = _base_state(
+        [group],
+        status="qa_completed",
+        task_queue={"task-1": task},
+        active_target_task_ids=["task-1"],
+        attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+        qa_results_by_attempt={"attempt-current": mismatched_result},
+        accepted_package_inventory_by_lockfile={prior_key: "prior-fingerprint"},
+        current_scan_observations_by_occurrence={prior_key: prior_occurrence},
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+    assert any(event.error_code == "QA_ATTEMPT_MISMATCH" for event in result["consistency_events"])
+    assert result["accepted_package_inventory_by_lockfile"] == {prior_key: "prior-fingerprint"}
+    assert result["current_scan_observations_by_occurrence"] == {prior_key: prior_occurrence}
+    assert result["latest_successful_scan_by_task"] == {}
 
 
 def test_terminal_task_cannot_retain_retry_plan():
@@ -2502,6 +3057,19 @@ class TestRunSupervisorNodeTargetGuardrails:
             {"task-1": task1, "task-2": task2},
         ) == ["task-1"]
 
+    def test_qa_normalization_accepts_nine_ready_tasks_under_limit(self):
+        task_ids = [f"task-{index}" for index in range(1, 10)]
+        task_queue = {
+            task_id: _make_task(
+                task_id,
+                f"group-{index}",
+                status=TaskStatus.OPTIMISTICALLY_FIXED,
+            )
+            for index, task_id in enumerate(task_ids, start=1)
+        }
+
+        assert _normalize_target_task_ids_for_node("qa_critic", task_ids, task_queue) == task_ids
+
 
 class TestRunSupervisorMaxRetries:
     def test_max_retries_marks_task_unfixable_and_removes_from_targets(self):
@@ -2606,6 +3174,198 @@ class TestRunSupervisorMaxRetries:
         assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
         assert result["task_queue"]["task-3"].status == TaskStatus.UNFIXABLE
         mock_chat.assert_not_called()
+
+
+def test_newly_unfixable_sca_transition_replans_before_dispatch(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
+    groups = [_sca_group("g1"), _sca_group("g2"), _sca_group("g3")]
+    task1 = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.NEEDS_RETRY,
+        retry_count=MAX_RETRIES,
+    )
+    task2 = _make_task("task-2", "g2")
+    task3 = _make_task("task-3", "g3")
+    state = _base_state(
+        groups,
+        task_queue={"task-3": task3, "task-1": task1, "task-2": task2},
+        portfolio_plan=_portfolio_stub(),
+    )
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+
+    result = run_supervisor_node(state)
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["task_queue"] == result["task_queue"]
+    assert portfolio_input["portfolio_replan_request"] == result["portfolio_replan_request"]
+
+    request = result["portfolio_replan_request"]
+    assert request.reason == "UNFIXABLE_REPLAN"
+    assert request.source_portfolio_plan_id == "portfolio-current"
+    assert request.peer_conflict_pairs == []
+    assert request.forced_singleton_task_ids == []
+    assert result["portfolio_dirty"] is True
+    assert result["next_routing_step"] == "supervisor"
+    assert result["decision_code"].value == "PORTFOLIO_PLAN_REQUIRED"
+    assert result["active_target_task_ids"] == []
+    assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
+    assert result["task_queue"]["task-2"].current_attempt_id is None
+    assert result["task_queue"]["task-3"].current_attempt_id is None
+    assert result["supervisor_audit"].reasoning == (
+        "Newly unfixable SCA task(s) ['task-1']; remaining nonterminal SCA task(s) "
+        "['task-2', 'task-3'] require replanning."
+    )
+
+
+def test_existing_unfixable_sca_does_not_trigger_another_replan(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
+    groups = [_sca_group("g1"), _sca_group("g2")]
+    state = _base_state(
+        groups,
+        task_queue={
+            "task-1": _make_task("task-1", "g1", status=TaskStatus.UNFIXABLE),
+            "task-2": _make_task("task-2", "g2").model_copy(
+                update={"instruction": "Update the package to an approved version."}
+            ),
+        },
+        portfolio_plan=_portfolio_stub(),
+    )
+
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+    result = run_supervisor_node(state)
+    portfolio_tool.assert_not_called()
+
+    assert result["portfolio_replan_request"] is None
+    assert result["next_routing_step"] == "update_subagent"
+    assert result["active_target_task_ids"] == ["task-2"]
+
+
+def test_pending_unfixable_replan_waits_for_open_attempt_reconciliation(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
+    groups = [_sca_group("g1"), _sca_group("g2")]
+    open_task = _make_task(
+        "task-open",
+        "g2",
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+    ).model_copy(
+        update={
+            "qa_policy": QAPolicy.VERSION_BUMP,
+            "instruction": "Verify the committed package update.",
+        }
+    )
+    snapshots = {}
+    open_task, snapshot = _create_attempt_snapshot(
+        open_task,
+        dispatch_node="update_subagent",
+        snapshots_by_id=snapshots,
+        state_revision=1,
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=["dependencies"],
+    )
+    request = PortfolioReplanRequest(reason="UNFIXABLE_REPLAN")
+    state = _base_state(
+        groups,
+        task_queue={
+            "task-1": _make_task("task-1", "g1", status=TaskStatus.UNFIXABLE),
+            open_task.task_id: open_task,
+        },
+        active_target_task_ids=[open_task.task_id],
+        attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+        portfolio_replan_request=request,
+        portfolio_plan=_portfolio_stub(),
+    )
+
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+    result = run_supervisor_node(state)
+    portfolio_tool.assert_not_called()
+
+    assert result["portfolio_replan_request"] == request
+    assert result["portfolio_dirty"] is True
+    assert result["next_routing_step"] == "qa_critic"
+    assert result["active_target_task_ids"] == [open_task.task_id]
+    assert result["task_queue"][open_task.task_id].current_attempt_id == snapshot.attempt_id
+
+
+def test_pending_unfixable_replan_routes_when_attempt_barrier_is_clear(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
+    groups = [_sca_group("g1"), _sca_group("g2")]
+    request = PortfolioReplanRequest(reason="UNFIXABLE_REPLAN")
+    state = _base_state(
+        groups,
+        task_queue={
+            "task-1": _make_task("task-1", "g1", status=TaskStatus.UNFIXABLE),
+            "task-2": _make_task("task-2", "g2"),
+        },
+        portfolio_replan_request=request,
+        portfolio_plan=_portfolio_stub(),
+    )
+
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+    result = run_supervisor_node(state)
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["task_queue"] == result["task_queue"]
+    assert portfolio_input["portfolio_replan_request"] == request
+
+    assert result["portfolio_replan_request"] == request
+    assert result["next_routing_step"] == "supervisor"
+    assert result["decision_code"].value == "PORTFOLIO_PLAN_REQUIRED"
+    assert result["active_target_task_ids"] == []
+
+
+def test_unfixable_replan_clears_without_remaining_nonterminal_sca(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
+    groups = [_sca_group("g1"), _sast_group("g2")]
+    request = PortfolioReplanRequest(reason="UNFIXABLE_REPLAN")
+    state = _base_state(
+        groups,
+        task_queue={
+            "task-sca": _make_task("task-sca", "g1", status=TaskStatus.UNFIXABLE),
+            "task-sast": _make_task(
+                "task-sast",
+                "g2",
+                strategy=RoutingStrategy.CODE_WORKAROUND,
+            ).model_copy(update={"instruction": "Apply the committed source workaround."}),
+        },
+        portfolio_replan_request=request,
+        portfolio_dirty=True,
+        portfolio_plan=_portfolio_stub(),
+    )
+
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+    result = run_supervisor_node(state)
+    portfolio_tool.assert_not_called()
+
+    assert result["portfolio_replan_request"] is None
+    assert result["portfolio_dirty"] is False
+    assert result["next_routing_step"] != "portfolio"
+
+
+def test_early_stale_plan_route_preserves_typed_pending_request(monkeypatch):
+    request = PortfolioReplanRequest(
+        reason="PEER_CONFLICT_ESCALATION",
+        peer_conflict_pairs=[("task-1", "task-2")],
+        forced_singleton_task_ids=["task-2"],
+    )
+    state = _base_state(
+        [_sca_group("g1")],
+        portfolio_replan_request=request,
+        portfolio_plan=_portfolio_stub(),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+        lambda *args, **kwargs: ["committed plan is stale"],
+    )
+
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+    result = run_supervisor_node(state)
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["portfolio_replan_request"] == request
+
+    assert result["next_routing_step"] == "supervisor"
+    assert result["portfolio_replan_request"] == request
 
 
 # ===========================================================================
@@ -2955,7 +3715,7 @@ class TestRunSupervisorDeterministicRouting:
 
 class TestBugFixes:
     def test_bug1_deterministic_pivot_populates_feedback_by_task(self):
-        group_id = "sca:package.json:express:UPDATE_VERSION"
+        group_id = "sca:package.json:express"
         g = _sca_group(group_id)
         task = RemediationTask(
             task_id="task-1",
@@ -2995,8 +3755,102 @@ class TestBugFixes:
             decision.feedback_by_task.get("task-1") == "Peer dependency conflict with body-parser"
         )
 
+    def test_peer_conflict_escalation_ignores_satisfied_peer_evidence(self):
+        compiler_group_id = "group-compiler"
+        compiler_cli_group_id = "group-compiler-cli"
+        compiler_group = _sca_group(compiler_group_id).model_copy(
+            update={"vulnerable_component": "@angular/compiler", "file_paths": ["package.json"]}
+        )
+        compiler_cli_group = _sca_group(compiler_cli_group_id).model_copy(
+            update={
+                "vulnerable_component": "@angular/compiler-cli",
+                "file_paths": ["package.json"],
+            }
+        )
+        compiler_task = _make_task("task-compiler", compiler_group_id).model_copy(
+            update={"target_package_name": "@angular/compiler"}
+        )
+        compiler_cli_task = _make_task("task-cli", compiler_cli_group_id).model_copy(
+            update={"target_package_name": "@angular/compiler-cli"}
+        )
+        task_queue = {
+            compiler_task.task_id: compiler_task,
+            compiler_cli_task.task_id: compiler_cli_task,
+        }
+        groups = {
+            compiler_group.group_id: compiler_group,
+            compiler_cli_group.group_id: compiler_cli_group,
+        }
+        gates = QADeterministicGates(
+            status="fail",
+            install_passed=False,
+            scanner_execution_status="success",
+            tests_passed=False,
+            peer_conflicts=[
+                PeerConflictEvidence(
+                    requester_package="@angular/compiler-cli",
+                    requester_version="22.2.1",
+                    peer_package="@angular/compiler",
+                    required_range="22.2.1",
+                    observed_version="22.2.1",
+                ),
+                PeerConflictEvidence(
+                    requester_package="@angular/build",
+                    requester_version="21.2.12",
+                    peer_package="@angular/compiler",
+                    required_range="^21.0.0",
+                    observed_version="22.2.1",
+                ),
+            ],
+        )
+        evaluation = QAEvaluation(
+            task_id=compiler_task.task_id,
+            passed=False,
+            failure_category=FailureCategory.PEER_CONFLICT,
+            retry_feedback="npm install ERESOLVE",
+            deterministic_gates=gates,
+        )
+
+        escalation, unresolved = _peer_conflict_escalation(
+            compiler_task.task_id,
+            evaluation,
+            task_queue,
+            groups,
+        )
+
+        assert escalation is None
+        assert unresolved == [
+            "peer escalation for @angular/build -> @angular/compiler has no existing "
+            "eligible active package task"
+        ]
+
+        actual_conflict = PeerConflictEvidence(
+            requester_package="@angular/compiler-cli",
+            requester_version="22.2.1",
+            peer_package="@angular/compiler",
+            required_range="^21.0.0",
+            observed_version="22.2.1",
+        )
+        actual_conflict_evaluation = evaluation.model_copy(
+            update={
+                "deterministic_gates": gates.model_copy(
+                    update={"peer_conflicts": [actual_conflict]}
+                )
+            }
+        )
+        actual_escalation, actual_unresolved = _peer_conflict_escalation(
+            compiler_task.task_id,
+            actual_conflict_evaluation,
+            task_queue,
+            groups,
+        )
+
+        assert actual_escalation is not None
+        assert actual_escalation["peer_conflict_pairs"] == [("task-cli", "task-compiler")]
+        assert actual_unresolved == []
+
     def test_bug2_materialize_spawn_requests_replaces_triage_strategy_bucket(self):
-        group_id = "sca:package.json:express:UPDATE_VERSION"
+        group_id = "sca:package.json:express"
         parent_task = RemediationTask(
             task_id="task-1",
             parent_group_id=group_id,
@@ -3031,7 +3885,7 @@ class TestBugFixes:
 
         assert len(new_tasks) == 1
         child_task = next(iter(new_tasks.values()))
-        assert child_task.parent_group_id == "sca:package.json:express:CODE_WORKAROUND"
+        assert child_task.parent_group_id == "sca:package.json:express"
         assert child_task.strategy == RoutingStrategy.CODE_WORKAROUND
         assert len(errors) == 0
 
@@ -3039,7 +3893,7 @@ class TestBugFixes:
         """A replayed pivot must not create a second workaround sibling."""
         parent_task = RemediationTask(
             task_id="task-1",
-            parent_group_id="sca:package.json:express:UPDATE_VERSION",
+            parent_group_id="sca:package.json:express",
             qa_policy=QAPolicy.VERSION_BUMP,
             strategy=RoutingStrategy.VERSION_BUMP,
             status=TaskStatus.NEEDS_RETRY,
@@ -3047,7 +3901,7 @@ class TestBugFixes:
         )
         existing_child = RemediationTask(
             task_id="task-2",
-            parent_group_id="sca:package.json:express:CODE_WORKAROUND",
+            parent_group_id="sca:package.json:express",
             parent_task_id="task-1",
             strategy=RoutingStrategy.CODE_WORKAROUND,
             status=TaskStatus.PENDING,
@@ -3076,7 +3930,7 @@ class TestBugFixes:
     def test_materialize_spawn_requests_deduplicates_requests_in_one_decision(self):
         parent_task = RemediationTask(
             task_id="task-1",
-            parent_group_id="sca:package.json:express:UPDATE_VERSION",
+            parent_group_id="sca:package.json:express",
             qa_policy=QAPolicy.VERSION_BUMP,
             strategy=RoutingStrategy.VERSION_BUMP,
             status=TaskStatus.NEEDS_RETRY,
@@ -3110,55 +3964,25 @@ class TestBugFixes:
         assert len(child_ids_by_parent["task-1"]) == 1
         assert errors == []
 
-    @patch("langchain_openai.ChatOpenAI")
-    def test_replayed_pivot_with_terminal_child_routes_to_final_scan(self, mock_chat):
-        """A completed workaround child must not produce an empty worker route."""
-        group = _sca_group("g1")
-        parent_task = _make_task(
+    def test_terminal_tasks_route_to_teardown_without_final_scan(self):
+        group = _sast_group("g1")
+        task = _make_task(
             "task-1",
             "g1",
-            strategy=RoutingStrategy.VERSION_BUMP,
-            status=TaskStatus.NEEDS_RETRY,
-        )
-        existing_child = _make_task(
-            "task-2",
-            "g1",
             strategy=RoutingStrategy.CODE_WORKAROUND,
-            status=TaskStatus.UNFIXABLE,
-        ).model_copy(update={"parent_task_id": "task-1"})
+            status=TaskStatus.QA_PASSED,
+        )
         state = _base_state(
             [group],
-            task_queue={"task-1": parent_task, "task-2": existing_child},
-            qa_evaluations={
-                "task-1": QAEvaluation(
-                    task_id="task-1",
-                    passed=False,
-                    failure_category=FailureCategory.BREAKING_CHANGE,
-                    retry_feedback="The update introduced a breaking runtime regression.",
-                )
-            },
-            active_target_task_ids=["task-1"],
-            retry_diagnostics_by_task={
-                "task-1": UpdateRetryDiagnostics(
-                    task_id="task-1",
-                    exhausted_update_path=True,
-                )
-            },
+            task_queue={"task-1": task},
             workspace_volume="workspace-volume",
-            final_full_scan_completed=False,
         )
-        mock_chat.side_effect = ImportError("No module named langchain_openai")
 
         result = run_supervisor_node(state)
 
-        assert result["task_queue"]["task-1"].status == TaskStatus.PIVOTED
-        assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
-        assert result["next_routing_step"] == "final_full_scan"
+        assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+        assert result["next_routing_step"] == "teardown"
         assert result["active_target_task_ids"] == []
-        assert not any(
-            error.startswith("supervisor: routing fell back to teardown")
-            for error in result.get("errors", [])
-        )
 
     @patch("langchain_openai.ChatOpenAI")
     def test_terminal_pivot_child_releases_other_pending_tasks(self, mock_chat):
@@ -3275,7 +4099,7 @@ class TestBugFixes:
         mock_llm.with_structured_output.return_value = mock_structured
         mock_chat_openai.return_value = mock_llm
 
-        group_id = "sca:package.json:express:CODE_WORKAROUND"
+        group_id = "sca:package.json:express"
         g = _sca_group(group_id)
         task = RemediationTask(
             task_id="task-2",
@@ -3317,6 +4141,1927 @@ class TestBugFixes:
         assert result["next_routing_step"] == "workaround_subagent"
         assert result["feedback_by_task"]["task-2"] == "Real feedback from QA"
 
+
+def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
+    """Build one attempt-correlated two-task atomic QA failure."""
+    group_a = _sca_group("g-atomic-a")
+    group_b = _sca_group("g-atomic-b")
+    cluster_id = "cluster-atomic"
+    dispatch_batch_id = "batch-atomic"
+    action_digest = "atomic-action-digest"
+    source_plan_id = "portfolio-source"
+    tasks = {}
+    snapshots = {}
+    workers = {}
+    qa_results = {}
+    for suffix, group, retry_count in (
+        ("a", group_a, 1),
+        ("b", group_b, 0),
+    ):
+        task_id = f"task-{suffix}"
+        attempt_id = f"attempt-{suffix}"
+        instruction = f"Update test-pkg-{suffix} to 1.2.3."
+        task = _make_task(
+            task_id,
+            group.group_id,
+            status=TaskStatus.OPTIMISTICALLY_FIXED,
+            retry_count=retry_count,
+        ).model_copy(
+            update={
+                "task_revision": 4,
+                "current_attempt_id": attempt_id,
+                "portfolio_plan_id": source_plan_id,
+                "qa_policy": QAPolicy.VERSION_BUMP,
+                "selected_version": "1.2.3",
+                "allowed_target_versions": ["1.2.3", "1.3.0"],
+                "target_package_name": f"test-pkg-{suffix}",
+                "target_dependency_type": "dependencies",
+                "instruction": instruction,
+            }
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id=attempt_id,
+            task_id=task_id,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=dispatch_batch_id,
+            action_digest=action_digest,
+            portfolio_plan_id=source_plan_id,
+            qa_policy=task.qa_policy,
+            strategy_stage=task.strategy_stage,
+            selected_version=task.selected_version,
+            allowed_target_versions=list(task.allowed_target_versions),
+            target_package_name=task.target_package_name,
+            target_dependency_type=task.target_dependency_type,
+            instruction=instruction,
+            instruction_digest=instruction_digest(instruction),
+            dispatch_node="update_subagent",
+        )
+        evaluation = QAEvaluation(
+            task_id=task_id,
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback="the atomic candidate failed deterministic tests",
+        )
+        tasks[task_id] = task
+        snapshots[attempt_id] = snapshot
+        workers[attempt_id] = WorkerAttemptResult(
+            attempt_id=attempt_id,
+            task_id=task_id,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=dispatch_batch_id,
+            action_digest=action_digest,
+            status=AgentActionStatus.SUCCESS,
+            executed_versions=[task.selected_version],
+            execution_diagnostics=WorkerExecutionDiagnostics(validation_passed=True),
+            instruction_digest=snapshot.instruction_digest,
+        )
+        qa_results[attempt_id] = QAAttemptResult(
+            attempt_id=attempt_id,
+            task_id=task_id,
+            task_revision=task.task_revision,
+            cluster_id=cluster_id,
+            dispatch_batch_id=dispatch_batch_id,
+            action_digest=action_digest,
+            qa_policy=QAPolicy.VERSION_BUMP,
+            qa_policy_source="attempt_snapshot",
+            evaluation=evaluation,
+        )
+
+    responsible_task_ids = ["task-b"]
+    attempt_ids_by_task = {"task-a": "attempt-a", "task-b": "attempt-b"}
+    record = {
+        "status": "IDENTIFIED",
+        "responsible_task_ids": responsible_task_ids,
+        "tested_subsets": [["task-b"]],
+        "executions": 1,
+        "candidate_restored": True,
+        "cluster_id": cluster_id,
+        "dispatch_batch_id": dispatch_batch_id,
+        "action_digest": action_digest,
+        "source_portfolio_plan_id": source_plan_id,
+        "attempt_ids_by_task": attempt_ids_by_task,
+    }
+    escalation = {
+        "reason": "DELTA_ISOLATION_ATTRIBUTION",
+        "forced_singleton_task_ids": ["task-b"],
+        "triggering_attempt_id": "attempt-b",
+        "source_portfolio_plan_id": source_plan_id,
+    }
+    if delta_case == "stale_attempt":
+        record["attempt_ids_by_task"] = {
+            **attempt_ids_by_task,
+            "task-b": "attempt-old",
+        }
+    elif delta_case == "foreign_forced_task":
+        escalation["forced_singleton_task_ids"] = ["task-foreign"]
+    elif delta_case == "stale_source":
+        record["source_portfolio_plan_id"] = "portfolio-old"
+        escalation["source_portfolio_plan_id"] = "portfolio-old"
+
+    state = _base_state(
+        [group_a, group_b],
+        status="qa_completed",
+        task_queue=tasks,
+        active_target_task_ids=["task-a", "task-b"],
+        active_cluster_id=cluster_id,
+        active_dispatch_batch_id=dispatch_batch_id,
+        attempt_snapshots_by_id=snapshots,
+        worker_results_by_attempt=workers,
+        qa_results_by_attempt=qa_results,
+        delta_isolation_by_cluster=(
+            {cluster_id: record} if delta_case != "ordinary_failure" else {}
+        ),
+        portfolio_escalation=(escalation if delta_case != "ordinary_failure" else None),
+    )
+    return state, tasks, snapshots
+
+
+def test_atomic_cluster_delta_isolation_charges_only_validated_blame(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state, original_tasks, snapshots = _atomic_cluster_delta_failure_state()
+    approved_inputs = {
+        task_id: (
+            task.selected_version,
+            list(task.allowed_target_versions),
+            task.target_package_name,
+            task.target_dependency_type,
+            task.instruction,
+        )
+        for task_id, task in original_tasks.items()
+    }
+
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+    result = run_supervisor_node(state)
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["task_queue"] == result["task_queue"]
+    assert portfolio_input["portfolio_replan_request"] == result["portfolio_replan_request"]
+
+    blamed = result["task_queue"]["task-b"]
+    unblamed = result["task_queue"]["task-a"]
+    assert blamed.status == TaskStatus.NEEDS_RETRY
+    assert blamed.retry_count == original_tasks["task-b"].retry_count + 1
+    assert blamed.current_attempt_id is None
+    assert blamed.task_revision > original_tasks["task-b"].task_revision
+    assert unblamed.status == TaskStatus.PENDING
+    assert unblamed.retry_count == original_tasks["task-a"].retry_count
+    assert unblamed.current_attempt_id is None
+    assert unblamed.task_revision > original_tasks["task-a"].task_revision
+    assert (
+        unblamed.selected_version,
+        unblamed.allowed_target_versions,
+        unblamed.target_package_name,
+        unblamed.target_dependency_type,
+        unblamed.instruction,
+    ) == approved_inputs["task-a"]
+    assert set(snapshots) == {"attempt-a", "attempt-b"}
+    request = result["portfolio_replan_request"]
+    assert isinstance(request, PortfolioReplanRequest)
+    assert request.reason == "DELTA_ISOLATION_ATTRIBUTION"
+    assert request.forced_singleton_task_ids == ["task-b"]
+    assert request.triggering_attempt_id == "attempt-b"
+    assert request.source_portfolio_plan_id == "portfolio-source"
+    assert result["next_routing_step"] == "supervisor"
+
+
+def test_delta_isolation_requeues_unblamed_peer_for_authoritative_singleton_qa(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state, _original_tasks, _snapshots = _atomic_cluster_delta_failure_state()
+    _keep_portfolio_current(monkeypatch)
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node._apply_tactical_supervisor",
+        lambda *args, **kwargs: None,
+    )
+
+    def rebuild_portfolio(portfolio_input):
+        task_queue = {
+            task_id: task.model_copy(update={"portfolio_plan_id": "portfolio-replanned"})
+            for task_id, task in portfolio_input["task_queue"].items()
+        }
+        clusters = [
+            TaskCluster(cluster_id=f"singleton-{task_id}", task_ids=[task_id], reason="replanned")
+            for task_id in ("task-a", "task-b")
+        ]
+        plan = PortfolioPlan(
+            plan_id="plan-replanned",
+            portfolio_plan_id="portfolio-replanned",
+            repository_fingerprint="repo-fingerprint",
+            graph_digest="graph-digest",
+            plan_digest="plan-digest",
+            task_ids=["task-a", "task-b"],
+            clusters=clusters,
+            cluster_order=[cluster.cluster_id for cluster in clusters],
+            task_order=["task-a", "task-b"],
+            task_to_cluster={task_id: f"singleton-{task_id}" for task_id in ("task-a", "task-b")},
+            task_revisions={task_id: task.task_revision for task_id, task in task_queue.items()},
+            planned_task_revisions={
+                task_id: task.task_revision for task_id, task in task_queue.items()
+            },
+            task_strategies={task_id: task.strategy for task_id, task in task_queue.items()},
+        )
+        return {
+            "status": "portfolio_ready",
+            "next_routing_step": "supervisor",
+            "portfolio_plan": plan,
+            "portfolio_solver_plan": None,
+            "portfolio_iteration": 1,
+            "portfolio_replan_request": None,
+            "portfolio_escalation": None,
+            "portfolio_dirty": False,
+            "valid_groups": portfolio_input["valid_groups"],
+            "task_queue": task_queue,
+            "active_target_task_ids": [],
+            "active_cluster_id": None,
+            "active_dispatch_batch_id": None,
+            "active_multi_package_action": None,
+            "errors": [],
+        }
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        rebuild_portfolio,
+    )
+
+    replanned = run_supervisor_node(state)
+    record = replanned["delta_isolation_by_cluster"]["cluster-atomic"]
+    assert record["authoritative_qa_replay_task_ids"] == ["task-a"]
+    assert replanned["task_queue"]["task-a"].status == TaskStatus.PENDING
+    assert replanned["task_queue"]["task-a"].retry_count == 1
+    assert replanned["retry_diagnostics_by_task"]["task-a"].attempted_versions == ["1.2.3"]
+    assert _validated_delta_replay_task_ids(
+        replanned["task_queue"],
+        replanned["delta_isolation_by_cluster"],
+        replanned["attempt_snapshots_by_id"],
+    ) == {"task-a"}
+
+    singleton_dispatch = run_supervisor_node(replanned)
+    assert singleton_dispatch["next_routing_step"] == "update_subagent"
+    assert singleton_dispatch["active_target_task_ids"] == ["task-a"]
+    peer = singleton_dispatch["task_queue"]["task-a"]
+    attempt = peer.current_attempt_id
+    assert attempt is not None
+    snapshot = singleton_dispatch["attempt_snapshots_by_id"][attempt]
+    assert snapshot.dispatch_batch_id is None
+    assert snapshot.cluster_id is None
+    assert snapshot.selected_version == "1.2.3"
+    assert singleton_dispatch["retry_diagnostics_by_task"]["task-a"].attempted_versions == ["1.2.3"]
+    assert (
+        singleton_dispatch["delta_isolation_by_cluster"]["cluster-atomic"][
+            "authoritative_qa_replay_task_ids"
+        ]
+        == []
+    )
+
+    worker_result = WorkerAttemptResult(
+        attempt_id=attempt,
+        task_id="task-a",
+        task_revision=peer.task_revision,
+        status=AgentActionStatus.SUCCESS,
+        executed_versions=["1.2.3"],
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            validation_passed=True,
+            effective_target_version="1.2.3",
+        ),
+        instruction_digest=snapshot.instruction_digest,
+    )
+    worker_completed = run_supervisor_node(
+        {
+            **singleton_dispatch,
+            "status": "worker_completed",
+            "active_target_task_ids": ["task-a"],
+            "worker_results_by_attempt": {
+                **singleton_dispatch["worker_results_by_attempt"],
+                attempt: worker_result,
+            },
+        }
+    )
+    assert worker_completed["next_routing_step"] == "qa_critic"
+    assert worker_completed["active_target_task_ids"] == ["task-a"]
+
+    passing_evaluation = QAEvaluation(task_id="task-a", passed=True)
+    qa_result = QAAttemptResult(
+        attempt_id=attempt,
+        task_id="task-a",
+        task_revision=worker_completed["task_queue"]["task-a"].task_revision,
+        qa_policy=snapshot.qa_policy,
+        qa_policy_source="attempt_snapshot",
+        evaluation=passing_evaluation,
+    )
+    qa_completed = run_supervisor_node(
+        {
+            **worker_completed,
+            "status": "qa_completed",
+            "active_target_task_ids": ["task-a"],
+            "qa_evaluations": {"task-a": passing_evaluation},
+            "qa_results_by_attempt": {
+                **worker_completed["qa_results_by_attempt"],
+                attempt: qa_result,
+            },
+        }
+    )
+    assert qa_completed["task_queue"]["task-a"].status == TaskStatus.QA_PASSED
+
+
+def test_atomic_cluster_without_delta_attribution_keeps_all_member_retry_behavior():
+    state, original_tasks, _snapshots = _atomic_cluster_delta_failure_state(
+        delta_case="ordinary_failure"
+    )
+
+    result = run_supervisor_node(state)
+
+    for task_id, task in original_tasks.items():
+        committed = result["task_queue"][task_id]
+        assert committed.status == TaskStatus.NEEDS_RETRY
+        assert committed.retry_count == task.retry_count + 1
+        assert committed.current_attempt_id != task.current_attempt_id
+        assert committed.task_revision > task.task_revision
+
+
+@pytest.mark.parametrize(
+    "delta_case",
+    ["stale_attempt", "foreign_forced_task", "stale_source"],
+)
+def test_atomic_cluster_stale_delta_provenance_retries_every_member(delta_case):
+    state, original_tasks, _snapshots = _atomic_cluster_delta_failure_state(delta_case=delta_case)
+
+    result = run_supervisor_node(state)
+
+    for task_id, task in original_tasks.items():
+        committed = result["task_queue"][task_id]
+        assert committed.status == TaskStatus.NEEDS_RETRY
+        assert committed.retry_count == task.retry_count + 1
+        assert committed.current_attempt_id is None
+        assert committed.task_revision > task.task_revision
+    assert result["portfolio_escalation"]["forced_singleton_task_ids"] == []
+    request = result["portfolio_replan_request"]
+    assert request.forced_singleton_task_ids == []
+    assert request.triggering_attempt_id is None
+    assert request.source_portfolio_plan_id is None
+
+
+def test_supervisor_commits_complete_passing_scan_into_ledgers():
+    group = _sca_group("g1")
+    attempt_id = "attempt-current"
+    task_revision = 2
+    instruction = "Update test-pkg to 2.0.0."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id="task-1",
+        state_revision=2,
+        task_revision=task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.0.0",
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="update_subagent",
+    )
+    old_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="test-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/test-pkg",
+    )
+    new_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="test-pkg",
+        version="2.0.0",
+        lockfile_key="node_modules/test-pkg",
+    )
+    stale_new_occurrence = new_occurrence.model_copy(
+        update={"found_identifiers": ["CVE-2026-10001"]}
+    )
+    batch_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-10002",
+            "package_name": "unrelated-pkg",
+            "package_version": "1.0.0",
+            "file_path": "package-lock.json",
+        }
+    )
+    batch_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="unrelated-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/unrelated-pkg",
+        found_identifiers=["CVE-2026-10002"],
+        found_issues=[batch_issue],
+    )
+    old_key = '["package-lock.json","node_modules/test-pkg","test-pkg","1.0.0",0]'
+    new_key = '["package-lock.json","node_modules/test-pkg","test-pkg","2.0.0",0]'
+    evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1"],
+        covered_input_paths=["package-lock.json"],
+        covered_occurrences=[new_occurrence],
+        removed_occurrence_keys=[old_key],
+        inventory_updates={new_key: "new-fingerprint"},
+        complete=True,
+    )
+    batch_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-1"],
+        found_identifiers=["CVE-2026-10002"],
+        new_identifiers=["CVE-2026-10002"],
+        found_issues=[batch_issue],
+        covered_input_paths=["package-lock.json"],
+        covered_occurrences=[new_occurrence, batch_occurrence],
+        complete=True,
+        scan_performed=True,
+    )
+    qa_result = QAAttemptResult(
+        attempt_id=attempt_id,
+        task_id="task-1",
+        task_revision=task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id="task-1",
+            passed=True,
+            scan_evidence=evidence,
+        ),
+        batch_scan_evidence=batch_evidence,
+        batch_scan_candidate_retained=True,
+    )
+    task = _make_task(
+        "task-1",
+        "g1",
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+    ).model_copy(
+        update={
+            "task_revision": task_revision,
+            "current_attempt_id": attempt_id,
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+            "selected_version": "2.0.0",
+            "instruction": instruction,
+        }
+    )
+    state = _base_state(
+        [group],
+        status="qa_completed",
+        task_queue={"task-1": task},
+        active_target_task_ids=["task-1"],
+        attempt_snapshots_by_id={attempt_id: snapshot},
+        qa_results_by_attempt={attempt_id: qa_result},
+        accepted_package_inventory_by_lockfile={
+            old_key: "old-fingerprint",
+            new_key: "stale-fingerprint",
+        },
+        current_scan_observations_by_occurrence={
+            old_key: old_occurrence,
+            new_key: stale_new_occurrence,
+        },
+        latest_incremental_scan_by_input={
+            "package-lock.json": IncrementalScanRecord(
+                source_input_path="package-lock.json",
+                task_ids=["task-1"],
+                attempt_ids=["attempt-old"],
+                found_identifiers=["CVE-2026-10001"],
+                new_identifiers=["CVE-2026-10001"],
+                complete=True,
+            )
+        },
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+    assert result["accepted_package_inventory_by_lockfile"] == {new_key: "new-fingerprint"}
+    assert result["current_scan_observations_by_occurrence"] == {new_key: new_occurrence}
+    committed_record = result["latest_successful_scan_by_task"]["task-1"]
+    assert committed_record.attempt_id == attempt_id
+    assert committed_record.task_revision == task_revision
+    assert committed_record.removed_occurrence_keys == [old_key]
+    assert committed_record.found_identifiers == []
+    assert committed_record.found_issues == []
+    incremental_record = result["latest_incremental_scan_by_input"]["package-lock.json"]
+    assert incremental_record.attempt_ids == [attempt_id]
+    assert incremental_record.found_identifiers == ["CVE-2026-10002"]
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-10002"]
+    assert result["post_remediation_scan_identifiers"] == ["CVE-2026-10002"]
+    assert result["post_remediation_scan_issues"] == [batch_issue]
+    scan_summary = result["final_full_scan_result"]
+    assert scan_summary.coverage_scope == "incremental_dependency_inputs"
+    assert scan_summary.authoritative is False
+    assert scan_summary.new_identifiers == ["CVE-2026-10002"]
+    assert state["accepted_package_inventory_by_lockfile"] == {
+        old_key: "old-fingerprint",
+        new_key: "stale-fingerprint",
+    }
+    assert state["current_scan_observations_by_occurrence"] == {
+        old_key: old_occurrence,
+        new_key: stale_new_occurrence,
+    }
+
+
+def _workerless_absence_state(
+    *,
+    include_portfolio_plan: bool = False,
+    other_attempt_open: bool = False,
+    open_attempt_status: TaskStatus = TaskStatus.OPTIMISTICALLY_FIXED,
+) -> tuple[dict, str]:
+    """Build a current passing QA result that removes an untouched SCA target."""
+    source_group = _sca_group("g-source")
+    target_group = _sca_group("g-target").model_copy(
+        update={"vulnerable_component": "base64url", "file_path": "package.json"}
+    )
+    old_key = '["package-lock.json","node_modules/base64url","base64url","0.0.6",0]'
+    source_task_id = "task-source"
+    source_attempt_id = "attempt-source"
+    source_instruction = "Upgrade test-pkg to 2.0.0."
+    source_task = _make_task(
+        source_task_id,
+        source_group.group_id,
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+    ).model_copy(
+        update={
+            "task_revision": 1,
+            "current_attempt_id": source_attempt_id,
+            "qa_policy": QAPolicy.VERSION_BUMP,
+            "target_package_name": "test-pkg",
+            "selected_version": "2.0.0",
+            "instruction": source_instruction,
+        }
+    )
+    target_task_id = "task-absent"
+    target_task = _make_task(target_task_id, target_group.group_id).model_copy(
+        update={"target_package_name": "base64url"}
+    )
+    source_snapshot = TaskAttemptSnapshot(
+        attempt_id=source_attempt_id,
+        task_id=source_task_id,
+        state_revision=1,
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        strategy_stage=source_task.strategy_stage,
+        selected_version="2.0.0",
+        instruction=source_instruction,
+        instruction_digest=instruction_digest(source_instruction),
+        dispatch_node="update_subagent",
+    )
+    source_scan_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=[source_task_id],
+        covered_input_paths=["package-lock.json"],
+        removed_occurrence_keys=[old_key],
+        complete=True,
+        scan_performed=True,
+    )
+    source_qa_result = QAAttemptResult(
+        attempt_id=source_attempt_id,
+        task_id=source_task_id,
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id=source_task_id,
+            passed=True,
+            scan_evidence=source_scan_evidence,
+        ),
+    )
+
+    groups = [source_group, target_group]
+    task_queue = {
+        source_task_id: source_task,
+        target_task_id: target_task,
+    }
+    snapshots = {source_attempt_id: source_snapshot}
+    active_target_task_ids = [source_task_id]
+    if other_attempt_open:
+        open_group = _sca_group("g-open")
+        waiting_group = _sca_group("g-waiting").model_copy(
+            update={"vulnerable_component": "waiting-package"}
+        )
+        open_task = _make_task(
+            "task-open",
+            open_group.group_id,
+            status=open_attempt_status,
+        ).model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": "attempt-open",
+                "qa_policy": QAPolicy.VERSION_BUMP,
+                "instruction": "Upgrade the open package.",
+            }
+        )
+        waiting_task = _make_task("task-waiting", waiting_group.group_id).model_copy(
+            update={"target_package_name": "waiting-package"}
+        )
+        open_snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-open",
+            task_id="task-open",
+            state_revision=1,
+            task_revision=1,
+            qa_policy=QAPolicy.VERSION_BUMP,
+            instruction=open_task.instruction,
+            instruction_digest=instruction_digest(open_task.instruction),
+            dispatch_node="update_subagent",
+        )
+        groups.extend([open_group, waiting_group])
+        task_queue.update(
+            {
+                "task-open": open_task,
+                "task-waiting": waiting_task,
+            }
+        )
+        snapshots["attempt-open"] = open_snapshot
+        active_target_task_ids.append("task-open")
+
+    overrides: dict[str, object] = {
+        "status": "qa_completed",
+        "task_queue": task_queue,
+        "active_target_task_ids": active_target_task_ids,
+        "attempt_snapshots_by_id": snapshots,
+        "qa_results_by_attempt": {source_attempt_id: source_qa_result},
+        "accepted_package_inventory_by_lockfile": {old_key: "old-fingerprint"},
+    }
+    if include_portfolio_plan:
+        plan_task_ids = list(task_queue)
+        overrides["portfolio_plan"] = SimpleNamespace(
+            plan_id="portfolio-current",
+            portfolio_plan_id="portfolio-current",
+            task_ids=plan_task_ids,
+            clusters=[],
+            cluster_order=[],
+            task_order=plan_task_ids,
+            task_to_cluster={},
+            diagnostics=[],
+        )
+    return _base_state(groups, **overrides), old_key
+
+
+def test_verified_absent_package_helper_fails_closed() -> None:
+    group = _sca_group("g-target").model_copy(
+        update={"vulnerable_component": "base64url", "file_path": "package.json"}
+    )
+    task = _make_task("task-target", group.group_id).model_copy(
+        update={"target_package_name": "base64url"}
+    )
+    old_key = '["package-lock.json","node_modules/base64url","base64url","0.0.6",0]'
+    accepted_record = TaskScanRecord(
+        task_id="task-scan",
+        attempt_id="attempt-scan",
+        task_revision=1,
+        covered_input_paths=["package-lock.json"],
+        removed_occurrence_keys=[old_key],
+        complete=True,
+    )
+    task_queue = {task.task_id: task}
+    groups = {group.group_id: group}
+
+    assert _verified_absent_package_tasks(
+        task_queue,
+        groups,
+        {"task-scan": accepted_record},
+        {},
+    ) == {"task-target": "base64url"}
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {"task-scan": accepted_record.model_copy(update={"complete": False})},
+            {},
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {"task-scan": accepted_record.model_copy(update={"covered_input_paths": []})},
+            {},
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            {
+                group.group_id: group.model_copy(
+                    update={"file_path": "yarn.lock", "file_paths": ["yarn.lock"]}
+                )
+            },
+            {"task-scan": accepted_record},
+            {},
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {"task-scan": accepted_record},
+            {"malformed-occurrence-key": "fingerprint"},
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {"task-scan": accepted_record},
+            {
+                '["package-lock.json","node_modules/nested/node_modules/base64url",'
+                '"base64url","0.0.7",0]': "present-fingerprint"
+            },
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {"task-scan": accepted_record},
+            {
+                '["another/package-lock.json","node_modules/base64url","base64url","0.0.7",0]': (
+                    "present-fingerprint"
+                )
+            },
+        )
+        == {}
+    )
+    assert (
+        _verified_absent_package_tasks(
+            task_queue,
+            groups,
+            {
+                "task-scan": accepted_record.model_copy(
+                    update={"removed_occurrence_keys": ["not-a-canonical-tombstone"]}
+                )
+            },
+            {},
+        )
+        == {}
+    )
+
+    worker_decision = _deterministic_routing(
+        task_queue,
+        groups,
+        {},
+        {},
+        portfolio_plan=None,
+    )
+    assert worker_decision.next_node == "update_subagent"
+    assert worker_decision.target_task_ids == ["task-target"]
+
+
+def test_supervisor_completes_absent_package_without_worker_attempt() -> None:
+    state, old_key = _workerless_absence_state()
+
+    with (
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            return_value=[],
+        ),
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            return_value=False,
+        ),
+    ):
+        result = run_supervisor_node(state)
+
+    target = result["task_queue"]["task-absent"]
+    assert target.status == TaskStatus.QA_PASSED
+    assert (
+        target.remediation_action
+        == "Removed due to another package upgrade; target absent from every covered package-lock input."
+    )
+    assert target.current_attempt_id is None
+    assert "task-absent" not in result["active_target_task_ids"]
+    assert result["accepted_package_inventory_by_lockfile"] == {}
+    assert result["latest_successful_scan_by_task"]["task-source"].removed_occurrence_keys == [
+        old_key
+    ]
+    assert all(
+        snapshot.task_id != "task-absent" for snapshot in result["attempt_snapshots_by_id"].values()
+    )
+    assert all(
+        worker_result.task_id != "task-absent"
+        for worker_result in result["worker_results_by_attempt"].values()
+    )
+    assert all(
+        qa_result.task_id != "task-absent" for qa_result in result["qa_results_by_attempt"].values()
+    )
+
+
+def test_verified_absent_portfolio_member_requires_replan_before_workers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state, _old_key = _workerless_absence_state(include_portfolio_plan=True)
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+
+    with (
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            return_value=[],
+        ),
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            return_value=False,
+        ),
+    ):
+        result = run_supervisor_node(state)
+    portfolio_tool.assert_called_once()
+    portfolio_input = portfolio_tool.call_args.args[0]
+    assert portfolio_input["task_queue"] == result["task_queue"]
+    assert portfolio_input["portfolio_replan_request"] == result["portfolio_replan_request"]
+
+    assert result["task_queue"]["task-absent"].status == TaskStatus.QA_PASSED
+    assert result["decision_code"] == DecisionCode.PORTFOLIO_PLAN_REQUIRED
+    assert result["next_routing_step"] == "supervisor"
+    assert result["portfolio_dirty"] is True
+    assert result["portfolio_replan_request"].reason == (
+        "Verified target-package absence changed portfolio membership."
+    )
+    assert result["portfolio_replan_request"].source_portfolio_plan_id == "portfolio-current"
+    assert "task-absent" not in result["active_target_task_ids"]
+
+
+def test_verified_absent_portfolio_member_waits_for_open_attempts_then_replans(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state, _old_key = _workerless_absence_state(
+        include_portfolio_plan=True,
+        other_attempt_open=True,
+    )
+
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+    with (
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            return_value=[],
+        ),
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            return_value=False,
+        ),
+    ):
+        result = run_supervisor_node(state)
+    portfolio_tool.assert_not_called()
+
+    assert result["task_queue"]["task-absent"].status == TaskStatus.QA_PASSED
+    assert result["portfolio_dirty"] is True
+    assert result["portfolio_replan_request"].reason == (
+        "Verified target-package absence changed portfolio membership."
+    )
+    assert result["next_routing_step"] == "qa_critic"
+    assert result["active_target_task_ids"] == ["task-open"]
+    assert result["task_queue"]["task-waiting"].status == TaskStatus.PENDING
+
+
+def test_verified_absence_does_not_dispatch_remaining_members_while_worker_attempt_is_open(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state, _old_key = _workerless_absence_state(
+        include_portfolio_plan=True,
+        other_attempt_open=True,
+        open_attempt_status=TaskStatus.PENDING,
+    )
+
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+    with (
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            return_value=[],
+        ),
+        patch(
+            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            return_value=False,
+        ),
+    ):
+        result = run_supervisor_node(state)
+    portfolio_tool.assert_not_called()
+
+    assert result["task_queue"]["task-absent"].status == TaskStatus.QA_PASSED
+    assert result["portfolio_dirty"] is True
+    assert result["next_routing_step"] == "update_subagent"
+    assert result["active_target_task_ids"] == ["task-open"]
+    assert result["task_queue"]["task-open"].current_attempt_id == "attempt-open"
+    assert result["task_queue"]["task-waiting"].status == TaskStatus.PENDING
+    assert set(result["attempt_snapshots_by_id"]) == {"attempt-source", "attempt-open"}
+
+
+def test_retained_regression_candidate_does_not_commit_batch_scan_findings():
+    group = _sca_group("g-regression")
+    attempt_id = "attempt-regression"
+    task_revision = 1
+    instruction = "Upgrade test-pkg to 2.0.0."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id="task-regression",
+        state_revision=1,
+        task_revision=task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.0.0",
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="update_subagent",
+    )
+    task_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-regression"],
+        covered_input_paths=["package-lock.json"],
+        complete=True,
+        scan_performed=True,
+    )
+    batch_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-10003",
+            "package_name": "report-wide-pkg",
+            "package_version": "1.0.0",
+        }
+    )
+    batch_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="report-wide-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/report-wide-pkg",
+        found_identifiers=["CVE-2026-10003"],
+        found_issues=[batch_issue],
+    )
+    qa_result = QAAttemptResult(
+        attempt_id=attempt_id,
+        task_id="task-regression",
+        task_revision=task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id="task-regression",
+            passed=False,
+            failure_category=FailureCategory.BREAKING_CHANGE,
+            retry_feedback="The candidate failed an API test.",
+            scan_evidence=task_evidence,
+        ),
+        batch_scan_evidence=ODCScanEvidence(
+            requested_scope=ScanScope.TARGETED,
+            effective_scope=ScanScope.TARGETED,
+            covered_task_ids=["task-regression"],
+            found_identifiers=["CVE-2026-10003"],
+            new_identifiers=["CVE-2026-10003"],
+            found_issues=[batch_issue],
+            covered_input_paths=["package-lock.json"],
+            covered_occurrences=[batch_occurrence],
+            complete=True,
+            scan_performed=True,
+        ),
+        batch_scan_candidate_retained=True,
+    )
+    task = _make_task("task-regression", group.group_id).model_copy(
+        update={
+            "task_revision": task_revision,
+            "current_attempt_id": attempt_id,
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+            "selected_version": "2.0.0",
+            "instruction": instruction,
+        }
+    )
+
+    result = run_supervisor_node(
+        _base_state(
+            [group],
+            status="qa_completed",
+            task_queue={task.task_id: task},
+            active_target_task_ids=[task.task_id],
+            attempt_snapshots_by_id={attempt_id: snapshot},
+            qa_results_by_attempt={attempt_id: qa_result},
+        )
+    )
+
+    assert result["task_queue"][task.task_id].status != TaskStatus.QA_PASSED
+    assert result["latest_successful_scan_by_task"] == {}
+    assert result["new_vulnerability_identifiers"] == []
+    assert result["latest_incremental_scan_by_input"] == {}
+    assert result["qa_results_by_attempt"][attempt_id].batch_scan_candidate_retained is True
+
+
+@pytest.mark.parametrize(
+    ("passed", "complete"),
+    [(False, True), (True, False)],
+)
+def test_task_scan_record_rejects_failed_or_incomplete_qa(passed, complete):
+    qa_result = QAAttemptResult(
+        attempt_id="attempt-1",
+        task_id="task-1",
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id="task-1",
+            passed=passed,
+            failure_category=None if passed else FailureCategory.SECURITY_FLAG,
+            retry_feedback=None if passed else "The target remains vulnerable.",
+            scan_evidence=ODCScanEvidence(
+                requested_scope=ScanScope.TARGETED,
+                effective_scope=ScanScope.TARGETED,
+                covered_task_ids=["task-1"],
+                complete=complete,
+            ),
+        ),
+    )
+
+    assert _task_scan_record_from_qa_result(qa_result) is None
+
+
+@pytest.mark.parametrize("failing_task_id", [None, "task-b"])
+def test_atomic_cluster_commits_scan_records_only_when_every_member_passes(failing_task_id):
+    state, _tasks, _snapshots = _atomic_cluster_delta_failure_state(delta_case="ordinary_failure")
+    batch_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-77777",
+            "package_name": "report-wide-pkg",
+            "package_version": "1.0.0",
+        }
+    )
+    batch_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-a", "task-b"],
+        found_identifiers=["CVE-2026-77777"],
+        new_identifiers=["CVE-2026-77777"],
+        found_issues=[batch_issue],
+        covered_input_paths=["package-lock-a.json", "package-lock-b.json"],
+        covered_occurrences=[
+            PackageScanOccurrence(
+                source_input_path="package-lock-a.json",
+                package_name="report-wide-pkg",
+                version="1.0.0",
+                lockfile_key="node_modules/report-wide-pkg",
+                found_identifiers=["CVE-2026-77777"],
+                found_issues=[batch_issue],
+            )
+        ],
+        complete=True,
+        scan_performed=True,
+    )
+    prior_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock-prior.json",
+        package_name="prior-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/prior-pkg",
+    )
+    prior_key = '["package-lock-prior.json","node_modules/prior-pkg","prior-pkg","1.0.0",0]'
+    if failing_task_id is not None:
+        state["accepted_package_inventory_by_lockfile"] = {prior_key: "prior-fingerprint"}
+        state["current_scan_observations_by_occurrence"] = {prior_key: prior_occurrence}
+    occurrence_keys = {}
+    for suffix in ("a", "b"):
+        task_id = f"task-{suffix}"
+        attempt_id = f"attempt-{suffix}"
+        occurrence = PackageScanOccurrence(
+            source_input_path=f"package-lock-{suffix}.json",
+            package_name=f"test-pkg-{suffix}",
+            version="1.2.3",
+            lockfile_key=f"node_modules/test-pkg-{suffix}",
+        )
+        occurrence_key = (
+            f'["package-lock-{suffix}.json","node_modules/test-pkg-{suffix}",'
+            f'"test-pkg-{suffix}","1.2.3",0]'
+        )
+        occurrence_keys[task_id] = occurrence_key
+        previous_result = state["qa_results_by_attempt"][attempt_id]
+        passed = failing_task_id is None or task_id != failing_task_id
+        state["qa_results_by_attempt"][attempt_id] = previous_result.model_copy(
+            update={
+                "evaluation": QAEvaluation(
+                    task_id=task_id,
+                    passed=passed,
+                    failure_category=None if passed else FailureCategory.BREAKING_CHANGE,
+                    retry_feedback=None if passed else "the atomic candidate failed tests",
+                    scan_evidence=ODCScanEvidence(
+                        requested_scope=ScanScope.TARGETED,
+                        effective_scope=ScanScope.TARGETED,
+                        covered_task_ids=[task_id],
+                        covered_input_paths=[f"package-lock-{suffix}.json"],
+                        covered_occurrences=[occurrence],
+                        inventory_updates={occurrence_key: f"fingerprint-{suffix}"},
+                        complete=True,
+                    ),
+                ),
+                "batch_scan_evidence": batch_evidence if suffix == "a" else None,
+                "batch_scan_candidate_retained": (
+                    failing_task_id is None if suffix == "a" else False
+                ),
+            }
+        )
+
+    result = run_supervisor_node(state)
+
+    if failing_task_id is None:
+        assert set(result["latest_successful_scan_by_task"]) == {"task-a", "task-b"}
+        assert set(result["accepted_package_inventory_by_lockfile"]) == set(
+            occurrence_keys.values()
+        )
+        assert all(task.status == TaskStatus.QA_PASSED for task in result["task_queue"].values())
+        assert set(result["latest_incremental_scan_by_input"]) == {
+            "package-lock-a.json",
+            "package-lock-b.json",
+        }
+        assert result["new_vulnerability_identifiers"] == ["CVE-2026-77777"]
+    else:
+        assert result["latest_successful_scan_by_task"] == {}
+        assert result["accepted_package_inventory_by_lockfile"] == {prior_key: "prior-fingerprint"}
+        assert result["current_scan_observations_by_occurrence"] == {prior_key: prior_occurrence}
+        assert state["accepted_package_inventory_by_lockfile"] == {prior_key: "prior-fingerprint"}
+        assert state["current_scan_observations_by_occurrence"] == {prior_key: prior_occurrence}
+
+        assert result["latest_incremental_scan_by_input"] == {}
+
+
+def test_cumulative_scan_metrics_use_latest_qa_passed_records_and_baseline():
+    baseline_issue = "CVE-2024-10001"
+    introduced_a = "CVE-2026-10001"
+    introduced_b = "CVE-2026-10002"
+    shared_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": introduced_a,
+        }
+    )
+    second_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": introduced_b,
+        }
+    )
+    task_queue = {
+        "task-a": _make_task("task-a", "g1", status=TaskStatus.QA_PASSED),
+        "task-b": _make_task("task-b", "g2", status=TaskStatus.QA_PASSED),
+        "task-pending": _make_task("task-pending", "g3", status=TaskStatus.PENDING),
+    }
+    scan_records = {
+        "task-a": TaskScanRecord(
+            task_id="task-a",
+            attempt_id="attempt-a",
+            task_revision=1,
+            found_identifiers=[baseline_issue, introduced_a],
+            new_identifiers=[baseline_issue, introduced_a],
+            remaining_target_identifiers=[baseline_issue],
+            found_issues=[shared_issue],
+            complete=True,
+        ),
+        "task-b": TaskScanRecord(
+            task_id="task-b",
+            attempt_id="attempt-b",
+            task_revision=1,
+            found_identifiers=[introduced_a, introduced_b],
+            new_identifiers=[introduced_a, introduced_b],
+            found_issues=[shared_issue, second_issue],
+            complete=True,
+        ),
+        "task-pending": TaskScanRecord(
+            task_id="task-pending",
+            attempt_id="attempt-pending",
+            task_revision=1,
+            found_identifiers=["CVE-2026-19999"],
+            new_identifiers=["CVE-2026-19999"],
+            complete=True,
+        ),
+    }
+
+    new_ids, found_ids, remaining_ids, found_issues = _calculate_cumulative_scan_metrics(
+        task_queue,
+        scan_records,
+        [baseline_issue.lower()],
+    )
+
+    assert new_ids == [introduced_a, introduced_b]
+    assert found_ids == [baseline_issue, introduced_a, introduced_b]
+    assert remaining_ids == [baseline_issue]
+    assert len(found_issues) == 2
+    assert {issue.cve_id for issue in found_issues} == {introduced_a, introduced_b}
+
+
+def test_report_wide_scan_snapshot_replaces_stale_task_findings():
+    old_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-10001",
+        }
+    )
+    current_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-10002",
+        }
+    )
+    task = _make_task("task-1", "g1", status=TaskStatus.QA_PASSED)
+    stale_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="stale-pkg",
+        version="1.0.0",
+        lockfile_key="node_modules/stale-pkg",
+        found_identifiers=["CVE-2026-10001"],
+        found_issues=[old_issue],
+    )
+    stale_task_record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-old",
+        task_revision=1,
+        found_identifiers=["CVE-2026-10001"],
+        new_identifiers=["CVE-2026-10001"],
+        found_issues=[old_issue],
+        covered_input_paths=["package-lock.json"],
+        covered_occurrences=[stale_occurrence],
+        complete=True,
+    )
+    current_input_record = IncrementalScanRecord(
+        source_input_path="package-lock.json",
+        task_ids=["task-1"],
+        attempt_ids=["attempt-current"],
+        found_identifiers=["CVE-2026-10002"],
+        new_identifiers=["CVE-2026-10002"],
+        found_issues=[current_issue],
+        complete=True,
+    )
+
+    new_ids, found_ids, remaining_ids, found_issues = _calculate_cumulative_scan_metrics(
+        {"task-1": task},
+        {"task-1": stale_task_record},
+        [],
+        incremental_scan_records_by_input={"package-lock.json": current_input_record},
+    )
+
+    assert new_ids == ["CVE-2026-10002"]
+    assert found_ids == ["CVE-2026-10002"]
+    assert remaining_ids == []
+    assert found_issues == [current_issue]
+
+
+@pytest.mark.parametrize(
+    ("triage_enabled", "expected_route"),
+    [(True, "triage"), (False, "teardown")],
+)
+def test_supervisor_projects_incremental_metrics_before_terminal_routing(
+    triage_enabled, expected_route
+):
+    group = _sast_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-55555",
+        }
+    )
+    scan_record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-1",
+        task_revision=1,
+        found_identifiers=["CVE-2026-55555"],
+        new_identifiers=["CVE-2026-55555"],
+        found_issues=[issue],
+        complete=True,
+    )
+    result = run_supervisor_node(
+        _base_state(
+            [group],
+            task_queue={"task-1": task},
+            latest_successful_scan_by_task={"task-1": scan_record},
+            baseline_scan_identifiers=["CVE-2024-10001"],
+            baseline_scan_complete=True,
+            package_inventory_baseline_complete=True,
+            post_qa_triage_enabled=triage_enabled,
+        )
+    )
+
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-55555"]
+    assert result["post_remediation_scan_identifiers"] == ["CVE-2026-55555"]
+    assert result["post_remediation_scan_issues"] == [issue]
+    assert result["new_vulnerability_status"] == "detected"
+    assert result["triage_required"] is triage_enabled
+    assert result["next_routing_step"] == expected_route
+    summary = result["final_full_scan_result"]
+    assert summary.authoritative is False
+    assert summary.coverage_scope == "incremental_dependency_inputs"
+    assert summary.coverage_complete is True
+
+
+def test_supervisor_defers_incremental_triage_while_remediation_remains():
+    completed_group = _sast_group("g-completed")
+    pending_group = _sast_group("g-pending")
+    completed_task = _make_task(
+        "task-completed",
+        completed_group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    pending_task = _make_task(
+        "task-pending",
+        pending_group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.PENDING,
+    ).model_copy(update={"instruction": "Apply the selected workaround."})
+    scan_record = TaskScanRecord(
+        task_id="task-completed",
+        attempt_id="attempt-completed",
+        task_revision=1,
+        found_identifiers=["CVE-2026-55555"],
+        new_identifiers=["CVE-2026-55555"],
+        complete=True,
+    )
+
+    result = run_supervisor_node(
+        _base_state(
+            [completed_group, pending_group],
+            task_queue={
+                completed_task.task_id: completed_task,
+                pending_task.task_id: pending_task,
+            },
+            latest_successful_scan_by_task={
+                completed_task.task_id: scan_record,
+            },
+            baseline_scan_identifiers=["CVE-2024-10001"],
+        )
+    )
+
+    assert result["triage_required"] is True
+    assert result["next_routing_step"] == "workaround_subagent"
+    assert result["active_target_task_ids"] == ["task-pending"]
+
+
+def test_supervisor_retriage_limit_suppresses_triage_and_preserves_metrics():
+    result = run_supervisor_node(
+        _base_state(
+            [_sast_group("g1")],
+            triage_required=True,
+            new_vulnerability_identifiers=["CVE-2026-55555"],
+            new_vulnerability_status="detected",
+            post_qa_retriage_limit_reached=True,
+        )
+    )
+
+    assert result["next_routing_step"] == "teardown"
+    assert result["triage_required"] is False
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-55555"]
+    assert result["new_vulnerability_status"] == "detected"
+
+
+def test_supervisor_preserves_known_new_ids_when_incremental_coverage_is_incomplete():
+    group_incomplete = _sast_group("g-incomplete")
+    group_scanned = _sast_group("g-scanned")
+    incomplete_task = _make_task(
+        "task-incomplete",
+        group_incomplete.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    scanned_task = _make_task(
+        "task-scanned",
+        group_scanned.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    scan_record = TaskScanRecord(
+        task_id=scanned_task.task_id,
+        attempt_id="attempt-scanned",
+        task_revision=1,
+        found_identifiers=["CVE-2026-70001"],
+        new_identifiers=["CVE-2026-70001"],
+        complete=True,
+    )
+    incomplete_result = QAAttemptResult(
+        attempt_id="attempt-incomplete",
+        task_id=incomplete_task.task_id,
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id=incomplete_task.task_id,
+            passed=True,
+            scan_evidence=ODCScanEvidence(
+                requested_scope=ScanScope.TARGETED,
+                effective_scope=ScanScope.TARGETED,
+                covered_task_ids=[incomplete_task.task_id],
+                complete=False,
+            ),
+        ),
+    )
+
+    result = run_supervisor_node(
+        _base_state(
+            [group_incomplete, group_scanned],
+            task_queue={
+                incomplete_task.task_id: incomplete_task,
+                scanned_task.task_id: scanned_task,
+            },
+            qa_results_by_attempt={
+                incomplete_result.attempt_id: incomplete_result,
+            },
+            latest_successful_scan_by_task={
+                scanned_task.task_id: scan_record,
+            },
+            baseline_scan_identifiers=[],
+            baseline_scan_complete=True,
+            package_inventory_baseline_complete=True,
+        )
+    )
+
+    summary = result["final_full_scan_result"]
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-70001"]
+    assert result["new_vulnerability_status"] == "detected"
+    assert summary.coverage_scope == "incremental_dependency_inputs"
+    assert summary.coverage_complete is False
+    assert summary.new_identifiers == ["CVE-2026-70001"]
+
+
+def test_absent_target_skip_preserves_cumulative_ids_from_scanned_tasks():
+    skipped_group = _sast_group("g-skipped")
+    scanned_group = _sast_group("g-scanned")
+    skipped_task = _make_task(
+        "task-skipped",
+        skipped_group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    scanned_task = _make_task(
+        "task-scanned",
+        scanned_group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    skipped_result = QAAttemptResult(
+        attempt_id="attempt-skipped",
+        task_id=skipped_task.task_id,
+        task_revision=1,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id=skipped_task.task_id,
+            passed=True,
+            scan_evidence=ODCScanEvidence(
+                requested_scope=ScanScope.TARGETED,
+                effective_scope=ScanScope.TARGETED,
+                covered_task_ids=[skipped_task.task_id],
+                scan_performed=False,
+                scan_skip_reason="no_matching_target",
+                complete=True,
+            ),
+        ),
+    )
+    skipped_record = _task_scan_record_from_qa_result(skipped_result)
+    assert skipped_record is not None
+    assert _incremental_scan_coverage_complete(
+        {
+            "baseline_scan_complete": True,
+            "package_inventory_baseline_complete": True,
+            "qa_results_by_attempt": {skipped_result.attempt_id: skipped_result},
+            "attempt_snapshots_by_id": {},
+        },
+        None,
+    )
+
+    scanned_record = TaskScanRecord(
+        task_id=scanned_task.task_id,
+        attempt_id="attempt-scanned",
+        task_revision=1,
+        found_identifiers=["CVE-2026-70001"],
+        new_identifiers=["CVE-2026-70001"],
+        complete=True,
+    )
+    new_ids, found_ids, remaining_ids, _ = _calculate_cumulative_scan_metrics(
+        {
+            skipped_task.task_id: skipped_task,
+            scanned_task.task_id: scanned_task,
+        },
+        {
+            skipped_task.task_id: skipped_record,
+            scanned_task.task_id: scanned_record,
+        },
+        [],
+    )
+
+    assert new_ids == ["CVE-2026-70001"]
+    assert found_ids == ["CVE-2026-70001"]
+    assert remaining_ids == []
+
+
+def test_supervisor_commits_setup_scan_findings_and_inventory_once():
+    group = _sast_group("g-setup")
+    task = _make_task(
+        "task-setup",
+        group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-70002",
+            "package_name": "new-package",
+            "package_version": "1.0.0",
+        }
+    )
+    occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="new-package",
+        version="1.0.0",
+        lockfile_key="node_modules/new-package",
+        found_identifiers=["CVE-2026-70002"],
+        found_issues=[issue],
+    )
+    occurrence_key = '["package-lock.json","node_modules/new-package","new-package","1.0.0",0]'
+    setup_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_occurrences=[occurrence],
+        covered_input_paths=["package-lock.json"],
+        closure_package_names=["new-package"],
+        found_identifiers=["CVE-2026-70002"],
+        new_identifiers=["CVE-2026-70002"],
+        found_issues=[issue],
+        inventory_updates={occurrence_key: "setup-fingerprint"},
+        complete=True,
+    )
+    state = _base_state(
+        [group],
+        task_queue={task.task_id: task},
+        accepted_package_inventory_by_lockfile={},
+        current_scan_observations_by_occurrence={},
+        baseline_scan_identifiers=["CVE-2024-70000"],
+        baseline_scan_complete=True,
+        package_inventory_baseline_complete=True,
+        setup_scan_evidence=setup_evidence,
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["setup_scan_committed"] is True
+    assert result["accepted_package_inventory_by_lockfile"] == {occurrence_key: "setup-fingerprint"}
+    assert result["current_scan_observations_by_occurrence"] == {occurrence_key: occurrence}
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-70002"]
+    assert result["post_remediation_scan_issues"] == [issue]
+    assert state["accepted_package_inventory_by_lockfile"] == {}
+    assert state.get("setup_scan_committed", False) is False
+
+
+def test_setup_scan_findings_persist_until_accepted_task_scan_replaces_them():
+    group = _sast_group("g-setup")
+    task = _make_task(
+        "task-setup",
+        group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    setup_issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-70003",
+            "package_name": "new-package",
+            "package_version": "1.0.0",
+        }
+    )
+    setup_occurrence = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="new-package",
+        version="1.0.0",
+        lockfile_key="node_modules/new-package",
+        found_identifiers=["CVE-2026-70003"],
+        found_issues=[setup_issue],
+    )
+    occurrence_key = '["package-lock.json","node_modules/new-package","new-package","1.0.0",0]'
+    setup_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_occurrences=[setup_occurrence],
+        covered_input_paths=["package-lock.json"],
+        closure_package_names=["new-package"],
+        found_identifiers=["CVE-2026-70003"],
+        new_identifiers=["CVE-2026-70003"],
+        found_issues=[setup_issue],
+        inventory_updates={occurrence_key: "setup-fingerprint"},
+        complete=True,
+    )
+    first_state = _base_state(
+        [group],
+        task_queue={task.task_id: task},
+        accepted_package_inventory_by_lockfile={},
+        current_scan_observations_by_occurrence={},
+        baseline_scan_identifiers=["CVE-2024-70000"],
+        baseline_scan_complete=True,
+        package_inventory_baseline_complete=True,
+        post_qa_triage_enabled=False,
+        setup_scan_evidence=setup_evidence,
+    )
+
+    first_result = run_supervisor_node(first_state)
+
+    assert first_result["new_vulnerability_identifiers"] == ["CVE-2026-70003"]
+    assert first_result["setup_scan_evidence"] == setup_evidence
+    assert first_result["setup_scan_committed"] is True
+
+    clean_occurrence = setup_occurrence.model_copy(
+        update={"found_identifiers": [], "found_issues": []}
+    )
+    instruction = "Apply the selected package workaround."
+    attempt_id = "attempt-clean-setup"
+    task_revision = 2
+    next_task = first_result["task_queue"][task.task_id].model_copy(
+        update={
+            "task_revision": task_revision,
+            "current_attempt_id": attempt_id,
+            "status": TaskStatus.OPTIMISTICALLY_FIXED,
+            "instruction": instruction,
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id=task.task_id,
+        task_revision=task_revision,
+        state_revision=first_result["state_revision"] + 1,
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="workaround_subagent",
+    )
+    clean_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=[task.task_id],
+        covered_input_paths=["package-lock.json"],
+        covered_occurrences=[clean_occurrence],
+        inventory_updates={occurrence_key: "clean-fingerprint"},
+        complete=True,
+    )
+    qa_result = QAAttemptResult(
+        attempt_id=attempt_id,
+        task_id=task.task_id,
+        task_revision=task_revision,
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(
+            task_id=task.task_id,
+            passed=True,
+            scan_evidence=clean_evidence,
+        ),
+    )
+    second_state = {
+        **first_state,
+        **first_result,
+        "status": "qa_completed",
+        "task_queue": {task.task_id: next_task},
+        "active_target_task_ids": [task.task_id],
+        "attempt_snapshots_by_id": {
+            **first_result["attempt_snapshots_by_id"],
+            attempt_id: snapshot,
+        },
+        "qa_results_by_attempt": {
+            **first_result["qa_results_by_attempt"],
+            attempt_id: qa_result,
+        },
+    }
+
+    second_result = run_supervisor_node(second_state)
+
+    assert second_result["setup_scan_evidence"] is None
+    assert second_result["new_vulnerability_identifiers"] == []
+    assert second_result["new_vulnerability_status"] == "none"
+    assert second_result["latest_successful_scan_by_task"][task.task_id].found_identifiers == []
+
+
+def test_later_clean_task_scan_clears_prior_incremental_vulnerability():
+    task = _make_task("task-1", "g1", status=TaskStatus.QA_PASSED)
+    issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-70020",
+        }
+    )
+    vulnerable_record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-vulnerable",
+        task_revision=1,
+        found_identifiers=["CVE-2026-70020"],
+        new_identifiers=["CVE-2026-70020"],
+        found_issues=[issue],
+        complete=True,
+    )
+    clean_record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-clean",
+        task_revision=2,
+        complete=True,
+    )
+
+    first_metrics = _calculate_cumulative_scan_metrics(
+        {"task-1": task},
+        {"task-1": vulnerable_record},
+        [],
+    )
+    later_metrics = _calculate_cumulative_scan_metrics(
+        {"task-1": task},
+        {"task-1": clean_record},
+        [],
+    )
+
+    assert first_metrics[0] == ["CVE-2026-70020"]
+    assert first_metrics[3] == [issue]
+    assert later_metrics[0] == []
+    assert later_metrics[1] == []
+    assert later_metrics[3] == []
+
+# Stage-2 behavior retained during the architecture merge.
+class TestSupervisorDecisionSchemaStage2Parity:
+    def test_update_subagent_rejects_more_than_ten_targets(self):
+        with pytest.raises(ValidationError):
+            SupervisorDecision(
+                next_node="update_subagent",
+                target_task_ids=[f"t{i}" for i in range(11)],
+                instructions="test",
+                decision_reason="test",
+            )
+
+class TestRunSupervisorNodeToQAStage2Parity:
+    def test_all_optimistically_fixed_tasks_route_to_qa_one_at_a_time(self):
+        g1 = _sca_group("g1")
+        g2 = _sca_group("g2")
+        task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
+        task2 = _make_task("task-2", "g2", status=TaskStatus.OPTIMISTICALLY_FIXED)
+        state = _base_state(
+            [g1, g2],
+            task_queue={"task-1": task1, "task-2": task2},
+            # No active_target_task_ids â€” all tasks are already optimistically fixed
+            active_target_task_ids=[],
+        )
+
+        result = run_supervisor_node(state)
+        assert result["next_routing_step"] == "qa_critic"
+        assert result["active_target_task_ids"] == ["task-1"]
+
+class TestRunSupervisorNodeQAUpdatesStage2Parity:
+    @pytest.mark.parametrize(
+        ("qa_status", "evaluation_kwargs"),
+        [
+            pytest.param(
+                "qa_completed",
+                {
+                    "failure_category": FailureCategory.SECURITY_FLAG,
+                    "retry_feedback": "Dependency evidence was unavailable.",
+                    "evidence_inconclusive": True,
+                },
+                id="inconclusive-evidence",
+            ),
+            pytest.param(
+                "qa_failed",
+                {
+                    "failure_category": FailureCategory.SECURITY_FLAG,
+                    "retry_feedback": "QA could not establish an outcome.",
+                    "contract_error": True,
+                    "contract_error_reason": "Structured evaluator output was missing.",
+                },
+                id="qa-contract-error",
+            ),
+        ],
+    )
+    def test_qa_recheck_limit_terminalizes_same_attempt(self, qa_status, evaluation_kwargs):
+        group = _sca_group("g1")
+        attempt_id = "attempt-qa-bounded"
+        instruction = "Pin test-pkg through the package manager."
+        snapshot = TaskAttemptSnapshot(
+            attempt_id=attempt_id,
+            task_id="task-1",
+            task_revision=1,
+            strategy_stage=SCARemediationStage.NPM_LATEST,
+            selected_version="1.2.3",
+            target_package_name="test-pkg",
+            instruction=instruction,
+            instruction_digest=instruction_digest(instruction),
+            dispatch_node="update_subagent",
+            qa_policy=QAPolicy.VERSION_BUMP,
+        )
+        task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": attempt_id,
+                "strategy_stage": snapshot.strategy_stage,
+                "selected_version": snapshot.selected_version,
+                "target_package_name": snapshot.target_package_name,
+                "instruction": instruction,
+                "qa_policy": QAPolicy.VERSION_BUMP,
+            }
+        )
+        evaluation = QAEvaluation(
+            task_id="task-1",
+            passed=False,
+            **evaluation_kwargs,
+        )
+
+        def attempt_result():
+            return QAAttemptResult(
+                attempt_id=attempt_id,
+                task_id="task-1",
+                task_revision=1,
+                qa_policy=QAPolicy.VERSION_BUMP,
+                qa_policy_source="attempt_snapshot",
+                evaluation=evaluation,
+            )
+
+        initial = _base_state(
+            [group],
+            status=qa_status,
+            task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
+            attempt_snapshots_by_id={attempt_id: snapshot},
+            qa_results_by_attempt={attempt_id: attempt_result()},
+        )
+
+        first = run_supervisor_node(initial)
+        assert first["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+        assert first["qa_rechecks_by_attempt"] == {attempt_id: 1}
+        assert first["processed_qa_attempt_ids"] == []
+
+        second = run_supervisor_node(
+            {
+                **initial,
+                **first,
+                "status": qa_status,
+                "qa_results_by_attempt": {attempt_id: attempt_result()},
+            }
+        )
+
+        terminal = second["task_queue"]["task-1"]
+        assert terminal.status == TaskStatus.INCONCLUSIVE
+        assert terminal.current_attempt_id is None
+        assert terminal.retry_count == 0
+        assert second["processed_qa_attempt_ids"] == [attempt_id]
+        assert second["next_routing_step"] != "qa_critic"
+        assert any("recheck limit reached" in error for error in second["errors"])
+
+class TestBugFixesStage2Parity:
+    @patch("langchain_openai.ChatOpenAI")
+    def test_replayed_pivot_with_terminal_child_routes_to_final_scan(self, mock_chat):
+        """A completed workaround child must not produce an empty worker route."""
+        group = _sca_group("g1")
+        parent_task = _make_task(
+            "task-1",
+            "g1",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.NEEDS_RETRY,
+        )
+        existing_child = _make_task(
+            "task-2",
+            "g1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.UNFIXABLE,
+        ).model_copy(update={"parent_task_id": "task-1"})
+        state = _base_state(
+            [group],
+            task_queue={"task-1": parent_task, "task-2": existing_child},
+            qa_evaluations={
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="The update introduced a breaking runtime regression.",
+                )
+            },
+            active_target_task_ids=["task-1"],
+            retry_diagnostics_by_task={
+                "task-1": UpdateRetryDiagnostics(
+                    task_id="task-1",
+                    exhausted_update_path=True,
+                )
+            },
+            workspace_volume="workspace-volume",
+            final_full_scan_completed=False,
+        )
+        mock_chat.side_effect = ImportError("No module named langchain_openai")
+
+        result = run_supervisor_node(state)
+
+        assert result["task_queue"]["task-1"].status == TaskStatus.PIVOTED
+        assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
+        assert result["next_routing_step"] == "final_full_scan"
+        assert result["active_target_task_ids"] == []
+        assert not any(
+            error.startswith("supervisor: routing fell back to teardown")
+            for error in result.get("errors", [])
+        )
 
 def test_pypi_dispatch_uses_canonical_attempts_and_immutable_snapshot_pool():
     task = _make_task("task-pypi", "pypi-group").model_copy(

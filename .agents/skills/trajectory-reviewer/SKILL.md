@@ -40,18 +40,29 @@ Use the attempt table as a compact index, then verify it against the full JSON i
 
 ### 3. Reconstruct the graph and node behavior
 
-Explain the observed path in execution order, including skipped and failed nodes. The Phase 5 topology is:
+Explain the observed path in execution order, including skipped and failed nodes. The current Phase 5 topology is:
 
 ```text
-initial_triage -> workspace_builder -> supervisor
-                                      |-> update_subagent ----|
-                                      |-> workaround_subagent |
-                                      |-> qa_critic ----------|-> supervisor
-                                      |-> triage -------------|
-                                      `-> teardown -> END
+START -> initial_triage
+  |          | no work / failure
+  |          `-------------------------------> teardown -> report -> END
+  `-> workspace_builder -> workspace_setup_scan -> supervisor
+                                                  |-> update_subagent ----|
+                                                  |-> workaround_subagent|
+                                                  |-> qa_critic ---------|-> supervisor
+                                                  |-> triage -> supervisor
+                                                  |-> final_full_scan ---|  (optional)
+                                                  `-> teardown -> report -> END
 ```
 
-The initial triage or workspace builder can route directly to teardown on no work or setup failure. The Supervisor is the routing and task-state authority; it may dispatch workers, QA, post-QA triage, or teardown. Workers return to the Supervisor. `triage` after QA is reconciliation/re-triage, not the initial preprocessing pass.
+The initial triage or workspace builder can route directly to teardown on no
+work or setup failure. `workspace_setup_scan` runs before the first Supervisor
+transition. The Supervisor is the task-state and dispatch authority and invokes
+portfolio planning/certification functions as needed; portfolio planning is
+not a graph node. The Supervisor may dispatch workers, QA, post-QA triage, an
+optional final full scan, or teardown. Workers and QA return to the Supervisor.
+`triage` after QA is reconciliation/re-triage, not the initial preprocessing
+pass. Teardown is followed by report rendering.
 
 For each observed node, state what it received, what it returned, whether it routed as expected, and what evidence supports that conclusion:
 
@@ -59,12 +70,15 @@ For each observed node, state what it received, what it returned, whether it rou
 |---|---|---|
 | `initial_triage` | Normalize/enrich/group findings and produce valid groups, or skip for pre-triaged input | status, `initial_triage_status`, valid groups, `triage.pipeline` span, errors |
 | `workspace_builder` | Create a temporary Docker volume and copy the host repository into it | `workspace_volume`, `workspace_ready`/failure, errors, setup spans |
-| `supervisor` | Select strategy/version, commit instructions and attempt snapshots, update task status, and choose the next node | decision output, `next_routing_step`, target task IDs, retry plans, revisions, strategy stage, consistency events |
-| `update_subagent` | Execute the committed dependency-update instruction; it must not select a new version or query registries | attempt identity, worker result, changed files, tool spans such as repository-map, dependency modification, revert, and manifest-sync validation |
+| `workspace_setup_scan` | Capture initial scoped dependency scan evidence before task dispatch | scan scope/status, baseline evidence, covered input paths, errors |
+| `supervisor` | Invoke portfolio planning as needed; select strategy/version, commit instructions and attempt snapshots, update task status, and choose the next node | decision output, `next_routing_step`, target task IDs, retry plans, revisions, strategy stage, consistency events, dispatch batch provenance |
+| `update_subagent` | Execute the committed dependency-update instruction; it may use only explicitly authorized candidate versions and cannot query registries or expand that set | attempt identity, worker result, effective executed version, changed files, tool spans such as repository-map, dependency modification, revert, and manifest-sync validation |
 | `workaround_subagent` | Investigate and execute a committed code workaround or permitted no-fix mitigation | plan/evidence, search/read/edit/validation tools, changed files, validation JSON, attempt identity |
 | `qa_critic` | Run deterministic install, security scan, and tests, then map evidence to typed evaluations | install/scan/test spans or outputs, `qa_results_by_attempt`, `eval_status`, `QAEvaluation`, failure evidence, scan status |
 | `triage` | Reconcile post-remediation scan findings and reopen/retain/close groups as needed | `triage_reconciliation`, post-scan issues/identifiers, task reopening, errors |
+| `final_full_scan` | Run a full-workspace ODC scan only when explicitly enabled | `final_full_scan_enabled`, scan result authority/scope, coverage, identifiers, errors |
 | `teardown` | Extract a host-relative unified diff and remove the temporary volume on every path | `diff`, changed files, final task statuses, `workspace_volume: null`, cleanup errors, final status |
+| `report` | Render and persist the final report after teardown | report path/content, persistence errors, final result |
 
 Do not claim a tool was called merely because its name appears in a prompt or serialized tool list. Count a tool call only when the trace contains a tool span or an explicit tool-call/message record with arguments and a result/error. Distinguish “tool available” from “tool invoked.”
 
@@ -76,7 +90,7 @@ Answer the binary question “Was it a successful remediation?” using this evi
 
 1. **Final task state:** every targeted task is `qa_passed` for a successful fix. `unfixable`, `needs_retry`, `pending`, or `optimistically_fixed` means the remediation is not a fully successful fix, even if teardown completed.
 2. **QA verdict:** targeted `QAEvaluation.passed` values and `eval_status` must support the task state. Inspect install, security-scan, and test evidence; identify skipped or unscanned gates.
-3. **Post-remediation scan:** confirm target vulnerability identifiers disappeared or were explicitly reconciled. Check `post_remediation_scan_identifiers`, `new_vulnerability_status`, and post-QA triage results. A scan failure or `not_scanned` status cannot prove resolution.
+3. **Post-remediation scan:** confirm target vulnerability identifiers disappeared or were explicitly reconciled. Check `post_remediation_scan_identifiers`, `new_vulnerability_status`, incremental scan coverage, and post-QA triage results. By default, the terminal result represents incremental dependency-input coverage and has `authoritative=false`; it does not establish full-repository status. If `REMEDY_FINAL_FULL_SCAN_ENABLED` is true, inspect whether the optional full scan actually ran and completed. A scan failure, incomplete coverage, or `not_scanned` status cannot prove resolution.
 4. **Attempt consistency:** verify QA and worker results carry the current `attempt_id` and `task_revision`; flag stale results or ignored results. Confirm the Supervisor committed the instruction that the worker actually executed.
 5. **Patch evidence:** use `diff` and `changed_files` to show what changed and whether the change plausibly addresses the finding. A diff is supporting evidence, not a security verdict.
 

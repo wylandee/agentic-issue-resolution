@@ -1,30 +1,25 @@
 """Dependency-update worker for Supervisor-committed Phase 5 attempts.
 
-The worker receives one task and its immutable attempt inputs, executes the
-focused manifest transaction toolbelt in the Docker workspace, and returns
-typed attempt diagnostics for QA and Supervisor reconciliation.
+The worker receives one task or one Supervisor-committed package cluster and
+its immutable attempt inputs, executes the focused manifest transaction
+toolbelt in the Docker workspace, and returns typed attempt diagnostics for QA
+and Supervisor reconciliation.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langsmith import traceable
-from packaging.version import InvalidVersion, Version
-
-try:
-    from langchain_openai import ChatOpenAI  # type: ignore[import]
-except ImportError:  # pragma: no cover
-    ChatOpenAI = None  # type: ignore[assignment,misc]
 
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
+    MultiPackageAction,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -35,14 +30,22 @@ from remediation_engine.contracts.schemas import (
     WorkerExecutionDiagnostics,
 )
 from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
-from remediation_engine.orchestration.remedy_tools import build_update_toolbelt
-from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.orchestration.remedy_tools import (
+    build_multi_package_update_toolbelt,
+    build_update_toolbelt,
+)
+from remediation_engine.orchestration.runtime_context import (
+    get_runtime_settings,
+    openai_api_key_kwargs,
+)
 from remediation_engine.orchestration.state import SubagentState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
+from remediation_engine.orchestration.supervisor_planner import instruction_digest
 from remediation_engine.orchestration.task_utils import (
     create_skinny_subagent_group,
     filter_constraints_ledger,
     is_transitive_group,
+    select_package_fix_plan,
 )
 from remediation_engine.orchestration.tools_manifest import rollback_pending_package_updates
 from remediation_engine.runtime.path_policy import (
@@ -55,9 +58,26 @@ from remediation_engine.tools.repository_map import build_repository_map
 
 logger = logging.getLogger(__name__)
 
+_UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_npm_dependency"
+_PYTHON_UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_python_dependency"
+_UPDATE_MANIFEST_TOOL_NAMES = frozenset(
+    {_UPDATE_MANIFEST_TOOL_NAME, _PYTHON_UPDATE_MANIFEST_TOOL_NAME}
+)
+_BATCH_NPM_DEPENDENCIES_TOOL_NAME = "modify_batch_npm_dependencies"
+_MAJOR_MIGRATION_DIRECTIVE = (
+    "Migrate all affected production and test code to the selected package API "
+    "while preserving behavior; do not change the solver-approved package or version."
+)
+
+try:
+    from langchain_openai import ChatOpenAI  # type: ignore[import]
+except ImportError:  # pragma: no cover
+    ChatOpenAI = None  # type: ignore[assignment,misc]
+
 
 def _group_ecosystem(group: VulnerabilityGroup) -> str:
-    for issue in [*group.issues, *(localized.issue for localized in group.localized_issues)]:
+    """Return the single package ecosystem identified by a grouped finding."""
+    for issue in [*group.issues, *(item.issue for item in group.localized_issues)]:
         if str(issue.ecosystem or "").strip().casefold() in {"python", "pypi"}:
             return "pypi"
         if str(issue.purl or "").strip().casefold().startswith("pkg:pypi/"):
@@ -65,68 +85,38 @@ def _group_ecosystem(group: VulnerabilityGroup) -> str:
     return "npm"
 
 
-def _normalize_attempt_version(value: str, ecosystem: str) -> str:
-    raw = str(value).strip()
-    if ecosystem != "pypi":
-        return raw.lstrip("vV")
-    try:
-        return str(Version(raw))
-    except InvalidVersion:
-        return raw
-
-
-def _attempt_version_key(value: str, ecosystem: str) -> str:
-    normalized = _normalize_attempt_version(value, ecosystem)
-    return normalized if ecosystem == "pypi" else normalized.lower()
-
-
-_UPDATE_MANIFEST_TOOL_NAMES = frozenset(
-    {"modify_and_validate_npm_dependency", "modify_and_validate_python_dependency"}
-)
-_PYTHON_MANIFEST_TOOL_NAME = "modify_and_validate_python_dependency"
-_UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_npm_dependency"
-
-
-def _event_ecosystem(event: Any) -> str:
-    return "pypi" if getattr(event, "name", "") == _PYTHON_MANIFEST_TOOL_NAME else "npm"
-
-
-def _event_package_name(event: Any) -> str:
-    package = str((getattr(event, "args", {}) or {}).get("package_name", "")).strip()
-    ecosystem = _event_ecosystem(event)
-    return normalize_python_package_name(package) if ecosystem == "pypi" else package
-
-
-def _candidate_manifest_paths(
-    group: VulnerabilityGroup,
-    package_ecosystem: str | None = None,
-) -> list[str]:
-    """Return candidate manifests, using localization as the only Python source."""
-    ecosystem = package_ecosystem or _group_ecosystem(group)
+def _candidate_manifest_paths(group: VulnerabilityGroup) -> list[str]:
+    """Return all candidate manifest paths for one grouped dependency target."""
     candidates: list[str] = []
     seen: set[str] = set()
 
     def add_candidate(value: str | None) -> None:
+        """Add a normalized manifest path once."""
         if not value:
             return
         candidate = value.replace("\\", "/")
-        if candidate not in seen:
-            candidates.append(candidate)
-            seen.add(candidate)
+        if candidate in seen:
+            return
+        candidates.append(candidate)
+        seen.add(candidate)
 
-    if ecosystem == "pypi":
+    if _group_ecosystem(group) == "pypi":
         for localized_issue in group.localized_issues:
             add_candidate(localized_issue.manifest_file)
         return candidates
 
     for localized_issue in group.localized_issues:
         add_candidate(localized_issue.manifest_file)
+
     for file_path in group.file_paths:
         add_candidate(file_path)
+
     add_candidate(group.file_path)
+
     for issue in group.issues:
         if issue.file_path and Path(issue.file_path).name == "package.json":
             add_candidate(issue.file_path)
+
     return candidates
 
 
@@ -145,18 +135,14 @@ def _filter_constraints_ledger(
 def _resolve_manifest_targets(
     group: VulnerabilityGroup,
     repo_root: Path,
-    package_ecosystem: str | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Resolve only the language- and ecosystem-authorized manifest targets."""
-    ecosystem = package_ecosystem or _group_ecosystem(group)
-    candidates = _candidate_manifest_paths(group, ecosystem)
+    """Resolve existing, safe declaration paths for one vulnerability group."""
+    candidates = _candidate_manifest_paths(group)
     if not candidates:
-        target = "localized Python manifest" if ecosystem == "pypi" else "package.json"
-        return [], [f"Group '{group.group_id}': no {target} target could be resolved."]
+        return [], [f"Group '{group.group_id}': no manifest target could be resolved."]
 
     resolved_paths: list[str] = []
     errors: list[str] = []
-    requirements_name = re.compile(r"requirements(?:[-_.].+)?\.txt$", re.IGNORECASE)
 
     for candidate in candidates:
         try:
@@ -170,22 +156,21 @@ def _resolve_manifest_targets(
             )
             continue
         if abs_target.is_dir():
-            errors.append(
-                f"Group '{group.group_id}': manifest target '{candidate}' must be a file."
-            )
+            errors.append(f"Group '{group.group_id}': manifest target '{candidate}' is a directory.")
             continue
-        basename = abs_target.name
-        if ecosystem == "pypi":
-            supported = (
-                basename in {"pyproject.toml", "setup.cfg", "Pipfile"}
-                or requirements_name.fullmatch(basename) is not None
-            )
-            if not supported:
+        if _group_ecosystem(group) == "pypi":
+            try:
+                from remediation_engine.orchestration.tools_manifest import (
+                    _normalize_python_manifest_targets,
+                )
+
+                _normalize_python_manifest_targets([candidate])
+            except ValueError as exc:
                 errors.append(
-                    f"Group '{group.group_id}': Python manifest target '{candidate}' is not editable."
+                    f"Group '{group.group_id}': unsupported Python manifest '{candidate}': {exc}"
                 )
                 continue
-        elif basename != "package.json":
+        elif abs_target.name != "package.json":
             errors.append(
                 f"Group '{group.group_id}': manifest target '{candidate}' must be a package.json file."
             )
@@ -236,38 +221,24 @@ def _target_package_name(task: RemediationTask, group: VulnerabilityGroup) -> st
     """Return the Supervisor-owned package target for this task stage."""
     ecosystem = _group_ecosystem(group)
     if isinstance(task.target_package_name, str) and task.target_package_name.strip():
-        package_name = task.target_package_name.strip()
-    elif ecosystem == "pypi" and is_transitive_group(group):
-        # Pipfile.lock is not parent proof. Never fall back to the vulnerable
-        # child or a triage-provided parent for a Python update target.
-        package_name = task.parent_package_name or ""
-    elif task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
-        package_name = (
-            group.parent_package_name
-            or next(
-                (
-                    localized.parent_package_name
-                    for localized in group.localized_issues
-                    if localized.parent_package_name
-                ),
-                None,
-            )
-            or (group.vulnerable_component or "")
-        )
-    else:
-        package_name = group.vulnerable_component or ""
-    return (
-        normalize_python_package_name(package_name) if ecosystem == "pypi" else package_name.strip()
-    )
+        value = task.target_package_name.strip()
+        return normalize_python_package_name(value) if ecosystem == "pypi" else value
+    if task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
+        if group.parent_package_name:
+            value = group.parent_package_name.strip()
+            return normalize_python_package_name(value) if ecosystem == "pypi" else value
+        for localized in group.localized_issues:
+            if localized.parent_package_name:
+                value = localized.parent_package_name.strip()
+                return normalize_python_package_name(value) if ecosystem == "pypi" else value
+    value = (group.vulnerable_component or "").strip()
+    return normalize_python_package_name(value) if ecosystem == "pypi" else value
 
 
 def _target_dependency_type(task: RemediationTask, group: VulnerabilityGroup) -> str | None:
     """Return the Supervisor-owned manifest declaration type for this task."""
-    ecosystem = _group_ecosystem(group)
     if isinstance(task.target_dependency_type, str) and task.target_dependency_type:
         return task.target_dependency_type
-    if ecosystem == "pypi" and is_transitive_group(group):
-        return None
     if task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
         if group.parent_declaration_type:
             return group.parent_declaration_type
@@ -279,8 +250,12 @@ def _target_dependency_type(task: RemediationTask, group: VulnerabilityGroup) ->
                 return localized.declaration_type
     if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
         return "overrides"
+    # Direct dependency localization normally supplies declaration_type. Keep
+    # legacy group-based callers executable when that optional enrichment is
+    # absent, while leaving transitive targets fail-closed until their parent
+    # declaration policy is committed.
     if task.strategy == RoutingStrategy.VERSION_BUMP and not is_transitive_group(group):
-        return None if ecosystem == "pypi" else "dependencies"
+        return "dependencies"
     return None
 
 
@@ -307,40 +282,95 @@ def _is_mixed_retry_batch(
     return saw_retry and saw_first_pass
 
 
-def _event_matches_task(
-    task: RemediationTask,
-    group: VulnerabilityGroup,
-    manifest_paths: Sequence[str],
-    event: Any,
-) -> bool:
-    ecosystem = _group_ecosystem(group)
-    expected_names = (
-        {_PYTHON_MANIFEST_TOOL_NAME} if ecosystem == "pypi" else {_UPDATE_MANIFEST_TOOL_NAME}
-    )
-    if getattr(event, "name", "") not in expected_names:
-        return False
-    if _event_package_name(event) != _target_package_name(task, group):
-        return False
-    event_path = str((getattr(event, "args", {}) or {}).get("manifest_path", "")).strip()
-    if event_path:
-        normalized_event_path = event_path.replace("\\", "/").lstrip("/")
-        allowed_paths = {path.replace("\\", "/").lstrip("/") for path in manifest_paths}
-        if normalized_event_path not in allowed_paths:
-            return False
-    return True
+def _validate_committed_multi_package_action(
+    state: SubagentState,
+    action: Any,
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    snapshots: Mapping[str, Any],
+) -> list[str]:
+    """Validate a committed cluster action immediately before mutation."""
+    errors: list[str] = []
+    if not isinstance(action, MultiPackageAction):
+        return ["Update Subagent: active cluster action is not a validated MultiPackageAction."]
+    expected_task_ids = {task.task_id for task, _, _ in resolved_tasks}
+    if len(expected_task_ids) < 2:
+        errors.append("Update Subagent: atomic action requires at least two resolved tasks.")
+    if action.cluster_id != state.get("active_cluster_id"):
+        errors.append("Update Subagent: action cluster_id does not match active cluster metadata.")
+    if action.dispatch_batch_id != state.get("dispatch_batch_id"):
+        errors.append(
+            "Update Subagent: action dispatch_batch_id does not match active batch metadata."
+        )
+    action_digest = instruction_digest(action.model_dump_json())
+    expected_batch_id = state.get("dispatch_batch_id")
+    mutations_by_task: dict[str, list[Any]] = {}
+    for mutation in action.package_mutations:
+        mutations_by_task.setdefault(mutation.task_id, []).append(mutation)
+    if set(mutations_by_task) != expected_task_ids:
+        errors.append("Update Subagent: action mutations do not cover exactly the active tasks.")
+    if any(len(mutations) != 1 for mutations in mutations_by_task.values()):
+        errors.append("Update Subagent: each active task must map to exactly one package mutation.")
+
+    for task, group, manifest_paths in resolved_tasks:
+        snapshot = snapshots.get(task.task_id)
+        if snapshot is None:
+            errors.append(f"Update Subagent: missing committed snapshot for task {task.task_id}.")
+            continue
+        if (
+            snapshot.cluster_id != state.get("active_cluster_id")
+            or snapshot.dispatch_batch_id != expected_batch_id
+            or snapshot.action_digest != action_digest
+        ):
+            errors.append(f"Update Subagent: snapshot provenance mismatch for task {task.task_id}.")
+        mutation = mutations_by_task.get(task.task_id, [None])[0]
+        if mutation is None:
+            continue
+        expected_package = _target_package_name(task, group)
+        expected_type = _target_dependency_type(task, group)
+        allowed_versions = {
+            value.strip().lstrip("vV") for value in snapshot.allowed_target_versions if value
+        }
+        if snapshot.selected_version:
+            allowed_versions.add(snapshot.selected_version.strip().lstrip("vV"))
+        allowed_types = {
+            value.strip().lower() for value in snapshot.allowed_dependency_types if value
+        }
+        if snapshot.target_dependency_type:
+            allowed_types.add(snapshot.target_dependency_type.strip().lower())
+        valid_manifest_paths = {path.replace("\\", "/").lstrip("/") for path in manifest_paths}
+        if mutation.package_name != expected_package:
+            errors.append(f"Update Subagent: package mismatch for task {task.task_id}.")
+        if mutation.ecosystem != _group_ecosystem(group):
+            errors.append(f"Update Subagent: ecosystem mismatch for task {task.task_id}.")
+        if mutation.manifest_path not in valid_manifest_paths:
+            errors.append(f"Update Subagent: manifest mismatch for task {task.task_id}.")
+        if snapshot.manifest_path and mutation.manifest_path != snapshot.manifest_path:
+            errors.append(
+                f"Update Subagent: manifest does not match the committed snapshot for task {task.task_id}."
+            )
+        if mutation.target_version.strip().lstrip("vV") not in allowed_versions:
+            errors.append(
+                f"Update Subagent: target version is not allowlisted for task {task.task_id}."
+            )
+        if expected_type and mutation.dependency_type.lower() not in allowed_types:
+            errors.append(
+                f"Update Subagent: dependency type is not allowlisted for task {task.task_id}."
+            )
+    return errors
 
 
 def _has_successful_manifest_transaction_for_package(
     task: RemediationTask,
     group: VulnerabilityGroup,
-    manifest_paths: Sequence[str],
     tool_events: Sequence[Any] | None,
 ) -> bool:
-    """Return whether this task has a successful edit-and-sync transaction."""
+    """Return whether the package has a successful edit-and-sync transaction."""
     if not tool_events:
         return False
+    package_name = _target_package_name(task, group)
     return any(
-        _event_matches_task(task, group, manifest_paths, event)
+        getattr(event, "name", "") in _UPDATE_MANIFEST_TOOL_NAMES
+        and _event_package_name(event) == package_name
         and str(getattr(event, "content", "")).startswith("SUCCESS:")
         for event in tool_events
     )
@@ -356,6 +386,14 @@ def _is_executed_manifest_transaction(event: Any) -> bool:
     )
 
 
+def _event_package_name(event: Any) -> str:
+    """Normalize the package identity using the tool's language-specific semantics."""
+    package = str((getattr(event, "args", {}) or {}).get("package_name", "")).strip()
+    if getattr(event, "name", "") == _PYTHON_UPDATE_MANIFEST_TOOL_NAME:
+        return normalize_python_package_name(package)
+    return package
+
+
 _UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a dependency-manifest execution worker.
 The Supervisor owns candidate generation, version selection, retry planning, and
 task routing. Execute only the Supervisor's task instruction.
@@ -366,55 +404,141 @@ manifest and immediately synchronizes package manifests before returning.
 Transactions are serialized per package. Keep package_name and manifest_path
 within the committed task allowlists.
 
-If a transaction returns ERROR_CODE or FAILURE, call the same tool again for that
-package with a different Supervisor-approved target_version or dependency_type.
-A package may receive at most three combined transaction attempts. Failed
-transactions roll back automatically. Continue with the next independent package
-after a package succeeds or exhausts its attempts.
+If the exact Supervisor instruction requires a major-version migration, you are
+authorized and required to update affected production and test code to the selected
+package API while preserving behavior. Do not reselect or change the committed
+package or version. Otherwise, do not edit source-code files.
 
-Never edit source-code files in this worker. Supervisor-owned dependency-type
-candidates are the only permitted strategy alternatives.
+If a transaction returns ERROR_CODE or FAILURE, retry only with a target_version
+or dependency_type explicitly allowed by the Supervisor. A major-version migration
+instruction never authorizes another package or version. A package may receive at
+most three combined transaction attempts. Failed transactions roll back
+automatically. Continue with the next independent package after a package succeeds
+or exhausts its attempts.
 
 Return control only after every package has one successful combined transaction or
 has exhausted its three attempts and been surrendered."""
-
 
 _PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a Python dependency-manifest
 execution worker. The Supervisor owns candidate generation, version selection,
-retry planning, and task routing. Execute only the Supervisor's exact task
-instruction and committed target version; never choose or substitute a version.
+retry planning, and task routing. Execute only the Supervisor's committed task
+instruction, target package, candidate rule, and declaration type.
 
-Supported editable dependency declarations are requirements files such as
-requirements.txt, static PEP 621 dependencies in pyproject.toml, static setup.cfg
-declarations, and Pipfile. setup.py is install-only and must not be edited. Use
-only modify_and_validate_python_dependency for dependency-manifest changes. Do
-not search PyPI or another package registry, read registry evidence, or perform
+Supported editable declarations are requirements files, static PEP 621
+dependencies in pyproject.toml, static setup.cfg declarations, and Pipfile.
+setup.py is install-only and must not be edited. Use only
+modify_and_validate_python_dependency for dependency-manifest changes. Do not
+search PyPI or another package registry, read registry evidence, or perform
 version selection. Keep package_name and manifest_path within the committed task
 allowlists.
 
-If a transaction fails, retry only when the Supervisor has supplied a revised
-exact task instruction and committed target. Do not choose an alternative version
-or dependency declaration. A package may receive at most three combined
+If a transaction fails, retry only with a target version or dependency type
+explicitly allowed by the committed attempt. Do not invent alternatives or
+expand the candidate set. A package may receive at most three combined
 transaction attempts; failed transactions roll back automatically. Continue
 with the next independent package after a package succeeds or exhausts its
-attempts.
+attempts. Never edit source-code files in this worker.
 
-Never edit source-code files in this worker. Use only the dependency type named
-by the Supervisor's committed instruction; do not choose strategy alternatives.
-
-Return control only after every package has one successful combined transaction or
-has exhausted its three attempts and been surrendered."""
+Return control only after every package has one successful combined transaction
+or has exhausted its three attempts and been surrendered."""
 
 
 def _build_update_system_prompt(
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> str:
-    """Return the language-specific dependency worker prompt."""
+    """Return the update worker's language-specific capability instructions."""
     if not isinstance(project_language, ProjectLanguage):
         project_language = ProjectLanguage(project_language)
     if project_language == ProjectLanguage.PYTHON:
         return _PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS
     return _UPDATE_WORKER_STATIC_INSTRUCTIONS
+
+
+_MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a dependency-manifest
+cluster execution worker.
+
+The Supervisor has already selected and validated one atomic multi-package action.
+It owns candidate generation, package/version selection, dependency types, retry
+planning, task routing, and cluster membership. Your only job is to execute that
+committed action in the Docker workspace.
+
+You have exactly one tool: modify_batch_npm_dependencies. Call it exactly
+once, with no arguments. The tool applies every package mutation in the committed
+action, synchronizes each affected npm manifest, validates the requested results,
+and rolls back the complete cluster if any step fails.
+
+When a task's exact Supervisor instruction requires a major-version migration,
+source and test migration to the committed package API is authorized and required;
+preserve behavior. Do not reselect or change any package name or version in the
+committed action. Do not call the singleton dependency tool, search the registry,
+or perform retry planning. After the tool returns, report its result and return
+control to the Supervisor. A failed or rolled-back action must be surrendered for
+a new Supervisor-committed attempt."""
+
+_MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a Python
+dependency-manifest cluster execution worker. The Supervisor selected and
+validated one atomic multi-package action and owns package/version selection,
+declaration types, task routing, and cluster membership.
+
+You have exactly one tool: modify_batch_python_dependencies. Call it exactly
+once, with no arguments. It applies the complete committed action, validates
+Python dependency resolution, and rolls back the complete cluster if any step
+fails. Do not call singleton tools, search PyPI, select versions, or perform
+retry planning. After the tool returns, report its result to the Supervisor.
+Never edit source-code files."""
+
+
+def _build_multi_package_update_prompt(
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    action: MultiPackageAction,
+    constraints_ledger: Sequence[str],
+    feedback_by_task: dict[str, str],
+    previous_action_summaries_by_task: dict[str, str],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
+    repository_map: str = "(repository map unavailable)",
+    allowed_target_versions_by_task: Mapping[str, Sequence[str]] | None = None,
+    allowed_dependency_types_by_task: Mapping[str, Sequence[str]] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str:
+    """Build the authoritative prompt for one committed package cluster.
+
+    The action JSON is included as provenance and context only. The worker tool
+    closes over the same immutable action, so model-produced arguments cannot
+    alter the mutations that reach the deterministic executor.
+    """
+    task_context = _build_update_prompt(
+        resolved_tasks,
+        constraints_ledger,
+        feedback_by_task,
+        previous_action_summaries_by_task,
+        retry_diagnostics_by_task,
+        repository_map=repository_map,
+        allowed_target_versions_by_task=allowed_target_versions_by_task,
+        allowed_dependency_types_by_task=allowed_dependency_types_by_task,
+        project_language=project_language,
+    )
+    tool_name = (
+        "modify_batch_python_dependencies"
+        if project_language == ProjectLanguage.PYTHON
+        else _BATCH_NPM_DEPENDENCIES_TOOL_NAME
+    )
+    return "\n".join(
+        [
+            "MULTI-PACKAGE CLUSTER EXECUTION (Supervisor-owned and authoritative):",
+            "",
+            f"Cluster ID: {action.cluster_id or '(missing)'}",
+            f"Dispatch batch ID: {action.dispatch_batch_id or '(missing)'}",
+            f"Committed action digest: {instruction_digest(action.model_dump_json())}",
+            "",
+            "The following immutable action is the only action you may execute:",
+            action.model_dump_json(),
+            "",
+            f"Invoke {tool_name} exactly once with no arguments.",
+            "The tool is the only permitted mutation path and applies all listed package mutations atomically.",
+            "",
+            task_context,
+        ]
+    )
 
 
 def _build_update_prompt(
@@ -444,7 +568,7 @@ def _build_update_prompt(
         "Constraints ledger:",
     ]
     if python_project:
-        sections.append("Canonical project language: python (Python).")
+        sections.append("Canonical project language: python.")
     sections.extend(f"- {item}" for item in constraints_ledger)
     if not constraints_ledger:
         sections.append("- none")
@@ -462,6 +586,9 @@ def _build_update_prompt(
                     if value
                 )
             )
+        migration_required = _MAJOR_MIGRATION_DIRECTIVE in str(task.instruction or "")
+        if migration_required and task.selected_version:
+            allowed_versions = [task.selected_version]
         allowed_types = list(allowed_dependency_types_by_task.get(task.task_id, ()))
         if not allowed_types:
             allowed_types = [
@@ -472,20 +599,6 @@ def _build_update_prompt(
                 ]
                 if value
             ]
-        if python_project:
-            allowed_versions = [task.selected_version] if task.selected_version else []
-            dependency_type = _target_dependency_type(task, group)
-            allowed_types = [dependency_type] if dependency_type else []
-        version_line = (
-            f"- Committed target version: {task.selected_version or 'none supplied'}"
-            if python_project
-            else f"- Allowed target versions: {', '.join(allowed_versions) or 'none supplied'}"
-        )
-        dependency_type_line = (
-            f"- Committed dependency type: {allowed_types[0] if allowed_types else 'none supplied'}"
-            if python_project
-            else f"- Allowed dependency types: {', '.join(dict.fromkeys(allowed_types)) or 'none supplied'}"
-        )
         sections.extend(
             [
                 "",
@@ -496,13 +609,29 @@ def _build_update_prompt(
                 f"- Strategy stage: {task.strategy_stage.value}",
                 f"- Parent package: {task.parent_package_name or group.parent_package_name or 'none'}",
                 f"- Manifest paths: {', '.join(manifest_paths) or 'none'}",
-                version_line,
-                dependency_type_line,
+                (
+                    f"- Committed target version: {task.selected_version or 'none supplied'}"
+                    if python_project
+                    else f"- Allowed target versions: {', '.join(allowed_versions) or 'none supplied'}"
+                ),
+                (
+                    f"- Committed declaration type: {_target_dependency_type(task, group) or 'none supplied'}"
+                    if python_project
+                    else f"- Allowed dependency types: {', '.join(dict.fromkeys(allowed_types)) or 'none supplied'}"
+                ),
                 f"- Exact supervisor instruction: {task.instruction or '(missing)'}",
                 f"- QA feedback: {feedback_by_task.get(task.task_id, 'none')}",
                 f"- Previous outcome: {previous_action_summaries_by_task.get(task.task_id, 'none')}",
             ]
         )
+        if migration_required:
+            sections.extend(
+                [
+                    "- Major-version source/test migration: required.",
+                    "- Keep the selected package and version exactly as committed; "
+                    "do not reselect or retry another version.",
+                ]
+            )
     return "\n".join(sections)
 
 
@@ -515,24 +644,19 @@ def _build_action_summaries(
     tool_events: Sequence[Any] | None = None,
 ) -> list[AgentActionSummary]:
     """Summarize worker execution without requiring registry evidence."""
-    del retry_batch
     normalized_changed_files = {path.replace("\\", "/") for path in changed_files}
     final_note = (final_text or "").strip()
     summaries: list[AgentActionSummary] = []
     for task, group, manifest_paths in resolved_tasks:
         package_modified = _has_successful_manifest_transaction_for_package(
-            task,
-            group,
-            manifest_paths,
-            tool_events,
+            task, group, tool_events
         )
-        task_succeeded = package_modified
+        package_validated = package_modified
+        task_succeeded = package_modified and package_validated
         if tool_events is None:
             task_succeeded = succeeded and bool(normalized_changed_files)
         changed = [
-            path
-            for path in _authorized_changed_paths(group, manifest_paths)
-            if path.replace("\\", "/") in normalized_changed_files
+            path for path in manifest_paths if path.replace("\\", "/") in normalized_changed_files
         ]
         status = AgentActionStatus.SUCCESS if task_succeeded else AgentActionStatus.SURRENDER
         outcome = (
@@ -541,11 +665,7 @@ def _build_action_summaries(
             else "Stopped without a validated manifest update"
         )
         changed_label = changed or (manifest_paths if package_modified else ["no files"])
-        summary = (
-            f"{outcome} for {group.vulnerable_component or 'unknown component'} in "
-            f"{', '.join(manifest_paths) or 'no manifest'}; changed files: "
-            f"{', '.join(changed_label)}."
-        )
+        summary = f"{outcome} for {group.vulnerable_component or 'unknown component'} in {', '.join(manifest_paths) or 'no manifest'}; changed files: {', '.join(changed_label)}."
         if final_note and len(resolved_tasks) == 1:
             summary += f" Final note: {final_note}"
         summaries.append(AgentActionSummary(task_id=task.task_id, status=status, summary=summary))
@@ -599,16 +719,22 @@ def _worker_result_map(
         summary = summary_by_task.get(task.task_id)
         attempted = list(attempted_versions_by_task.get(task.task_id, []))
         executed = list(executed_versions_by_task.get(task.task_id, []))
-        task_succeeded = summary is not None and summary.status == AgentActionStatus.SUCCESS
+        task_succeeded = (
+            succeeded
+            and not errors
+            and summary is not None
+            and summary.status == AgentActionStatus.SUCCESS
+        )
         results[snapshot.attempt_id] = WorkerAttemptResult(
             attempt_id=snapshot.attempt_id,
             task_id=task.task_id,
             task_revision=snapshot.task_revision,
+            cluster_id=snapshot.cluster_id,
+            dispatch_batch_id=snapshot.dispatch_batch_id,
+            action_digest=snapshot.action_digest,
             status=(
                 summary.status
-                if summary is not None
-                else AgentActionStatus.SUCCESS
-                if succeeded
+                if task_succeeded and summary is not None
                 else AgentActionStatus.SURRENDER
             ),
             executed_versions=executed,
@@ -629,28 +755,20 @@ def _worker_result_map(
             instruction_digest=snapshot.instruction_digest,
             errors=list(errors),
         )
-
-
-def _authorized_changed_paths(
-    group: VulnerabilityGroup,
-    manifest_paths: Sequence[str],
-) -> list[str]:
-    """Include generated Pipfile.lock files in each task's file partition."""
-    paths = list(manifest_paths)
-    if _group_ecosystem(group) == "pypi":
-        for manifest_path in manifest_paths:
-            if Path(manifest_path).name == "Pipfile":
-                lock_path = str(Path(manifest_path).with_name("Pipfile.lock")).replace("\\", "/")
-                if lock_path not in paths:
-                    paths.append(lock_path)
-    return paths
+    return results
 
 
 def _changed_files_by_task(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     changed_files: Sequence[str],
 ) -> dict[str, list[str]]:
-    """Partition committed worker files by each task's authorized files."""
+    """Partition committed worker files by task for attempt envelopes.
+
+    A normal Supervisor dispatch contains one task and receives the complete
+    committed file set. When multiple task records are present, manifest
+    ownership provides a conservative deterministic partition so a task cannot
+    claim another task's package files.
+    """
     normalized_files = list(
         dict.fromkeys(
             path.replace("\\", "/").lstrip("/")
@@ -658,13 +776,42 @@ def _changed_files_by_task(
             if isinstance(path, str) and path.strip()
         )
     )
+    if len(resolved_tasks) == 1:
+        return {resolved_tasks[0][0].task_id: normalized_files}
+
     result: dict[str, list[str]] = {}
-    for task, group, manifest_paths in resolved_tasks:
+    for task, _group, manifest_paths in resolved_tasks:
         manifest_set = {
             path.replace("\\", "/").lstrip("/")
-            for path in _authorized_changed_paths(group, manifest_paths)
+            for path in manifest_paths
+            if isinstance(path, str) and path.strip()
         }
-        result[task.task_id] = [path for path in normalized_files if path in manifest_set]
+        manifest_parents = {
+            PurePosixPath(path).parent
+            for path in manifest_set
+            if PurePosixPath(path).name == "package.json"
+        }
+        task_files: list[str] = []
+        for path in normalized_files:
+            if path in manifest_set:
+                task_files.append(path)
+                continue
+
+            # npm synchronization can update the lockfile alongside the
+            # manifest. A shared package cluster has multiple task records,
+            # so exact manifest matching alone would drop the lockfile from
+            # every per-task result. Associate package lockfiles with tasks
+            # whose manifest lives in the lockfile's directory or below it.
+            path_obj = PurePosixPath(path)
+            if path_obj.name not in {"package-lock.json", "npm-shrinkwrap.json"}:
+                continue
+            if any(
+                manifest_parent == path_obj.parent
+                or manifest_parent.is_relative_to(path_obj.parent)
+                for manifest_parent in manifest_parents
+            ):
+                task_files.append(path)
+        result[task.task_id] = task_files
     return result
 
 
@@ -672,21 +819,25 @@ def _attempted_versions_for_current_run(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     tool_events: Sequence[Any],
 ) -> dict[str, list[str]]:
-    """Collect version targets from transactions correlated to each task."""
+    """Collect version targets from combined transactions in this worker run."""
+    package_to_task_ids: dict[str, list[str]] = {}
+    for task, group, _manifest_paths in resolved_tasks:
+        package = _target_package_name(task, group)
+        if package:
+            package_to_task_ids.setdefault(package, []).append(task.task_id)
+
     result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
-    for task, group, manifest_paths in resolved_tasks:
-        ecosystem = _group_ecosystem(group)
-        for event in tool_events:
-            if not _is_executed_manifest_transaction(event) or not _event_matches_task(
-                task, group, manifest_paths, event
-            ):
-                continue
-            target = _normalize_attempt_version(
-                str((getattr(event, "args", {}) or {}).get("target_version", "")),
-                ecosystem,
-            )
-            if target and target not in result[task.task_id]:
-                result[task.task_id].append(target)
+    for event in tool_events:
+        if not _is_executed_manifest_transaction(event):
+            continue
+        args = getattr(event, "args", {}) or {}
+        package = str(args.get("package_name", "")).strip()
+        target = str(args.get("target_version", "")).strip().lstrip("vV")
+        if not package or not target:
+            continue
+        for task_id in package_to_task_ids.get(package, []):
+            if target not in result[task_id]:
+                result[task_id].append(target)
     return result
 
 
@@ -694,23 +845,26 @@ def _executed_versions_for_current_run(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     tool_events: Sequence[Any],
 ) -> dict[str, list[str]]:
-    """Collect successful version targets correlated to each current task."""
+    """Collect only successful version targets from this worker run."""
     result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
-    for task, group, manifest_paths in resolved_tasks:
-        ecosystem = _group_ecosystem(group)
-        for event in tool_events:
-            if (
-                not _is_executed_manifest_transaction(event)
-                or not str(getattr(event, "content", "")).startswith("SUCCESS:")
-                or not _event_matches_task(task, group, manifest_paths, event)
-            ):
-                continue
-            target = _normalize_attempt_version(
-                str((getattr(event, "args", {}) or {}).get("target_version", "")),
-                ecosystem,
-            )
-            if target and target not in result[task.task_id]:
-                result[task.task_id].append(target)
+    package_to_task_ids: dict[str, list[str]] = {}
+    for task, group, _manifest_paths in resolved_tasks:
+        package = _target_package_name(task, group)
+        if package:
+            package_to_task_ids.setdefault(package, []).append(task.task_id)
+    for event in tool_events:
+        if not _is_executed_manifest_transaction(event):
+            continue
+        if not str(getattr(event, "content", "")).startswith("SUCCESS:"):
+            continue
+        args = getattr(event, "args", {}) or {}
+        package = str(args.get("package_name", "")).strip()
+        target = str(args.get("target_version", "")).strip().lstrip("vV")
+        if not package or not target:
+            continue
+        for task_id in package_to_task_ids.get(package, []):
+            if target not in result[task_id]:
+                result[task_id].append(target)
     return result
 
 
@@ -718,19 +872,24 @@ def _attempted_dependency_types_for_current_run(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     tool_events: Sequence[Any],
 ) -> dict[str, list[str]]:
-    """Collect declaration types from transactions correlated to each task."""
+    """Collect dependency declaration types from combined transactions."""
     result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
-    for task, group, manifest_paths in resolved_tasks:
-        for event in tool_events:
-            if not _is_executed_manifest_transaction(event) or not _event_matches_task(
-                task, group, manifest_paths, event
-            ):
-                continue
-            dependency_type = str(
-                (getattr(event, "args", {}) or {}).get("dependency_type", "")
-            ).strip()
-            if dependency_type and dependency_type not in result[task.task_id]:
-                result[task.task_id].append(dependency_type)
+    package_to_task_ids: dict[str, list[str]] = {}
+    for task, group, _manifest_paths in resolved_tasks:
+        package = _target_package_name(task, group)
+        if package:
+            package_to_task_ids.setdefault(package, []).append(task.task_id)
+    for event in tool_events:
+        if not _is_executed_manifest_transaction(event):
+            continue
+        args = getattr(event, "args", {}) or {}
+        package = str(args.get("package_name", "")).strip()
+        dependency_type = str(args.get("dependency_type", "")).strip()
+        if not package or not dependency_type:
+            continue
+        for task_id in package_to_task_ids.get(package, []):
+            if dependency_type not in result[task_id]:
+                result[task_id].append(dependency_type)
     return result
 
 
@@ -738,29 +897,27 @@ def _effective_targets_for_current_run(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     tool_events: Sequence[Any],
 ) -> tuple[dict[str, str | None], dict[str, str | None]]:
-    """Collect effective version/type from successful transactions per task."""
+    """Collect effective version and dependency type from successful transactions."""
+    package_to_task_ids: dict[str, list[str]] = {}
+    for task, group, _manifest_paths in resolved_tasks:
+        package = _target_package_name(task, group)
+        if package:
+            package_to_task_ids.setdefault(package, []).append(task.task_id)
+
     versions: dict[str, str | None] = {task.task_id: None for task, _, _ in resolved_tasks}
     dependency_types: dict[str, str | None] = {task.task_id: None for task, _, _ in resolved_tasks}
-    for task, group, manifest_paths in resolved_tasks:
-        ecosystem = _group_ecosystem(group)
-        for event in tool_events:
-            if (
-                not _is_executed_manifest_transaction(event)
-                or not str(getattr(event, "content", "")).startswith("SUCCESS:")
-                or not _event_matches_task(task, group, manifest_paths, event)
-            ):
-                continue
-            args = getattr(event, "args", {}) or {}
-            versions[task.task_id] = (
-                _normalize_attempt_version(
-                    str(args.get("target_version", "")),
-                    ecosystem,
-                )
-                or versions[task.task_id]
-            )
-            dependency_types[task.task_id] = (
-                str(args.get("dependency_type", "")).strip() or dependency_types[task.task_id]
-            )
+    for event in tool_events:
+        if not _is_executed_manifest_transaction(event):
+            continue
+        if not str(getattr(event, "content", "")).startswith("SUCCESS:"):
+            continue
+        args = getattr(event, "args", {}) or {}
+        package = str(args.get("package_name", "")).strip()
+        version = str(args.get("target_version", "")).strip().lstrip("vV") or None
+        dependency_type = str(args.get("dependency_type", "")).strip() or None
+        for task_id in package_to_task_ids.get(package, []):
+            versions[task_id] = version
+            dependency_types[task_id] = dependency_type
     return versions, dependency_types
 
 
@@ -782,40 +939,15 @@ def _build_retry_diagnostics(
     result: dict[str, UpdateRetryDiagnostics] = {}
     joined_errors = " | ".join(error.strip() for error in errors if error.strip())
     lowered_outcome = f"{final_text or ''} {joined_errors}".lower()
-    for task, group, manifest_paths in resolved_tasks:
-        ecosystem = _group_ecosystem(group)
+    for task, group, _ in resolved_tasks:
         target_package = _target_package_name(task, group)
         target_dependency_type = _target_dependency_type(task, group)
         prior = prior_diagnostics_by_task.get(task.task_id)
-        prior_attempts_by_target = (
-            {
-                (normalize_python_package_name(package) if ecosystem == "pypi" else package): list(
-                    dict.fromkeys(
-                        normalized
-                        for version in versions
-                        if (normalized := _normalize_attempt_version(version, ecosystem))
-                    )
-                )
-                for package, versions in prior.attempted_versions_by_target.items()
-            }
-            if prior
-            else {}
-        )
+        prior_attempts_by_target = dict(prior.attempted_versions_by_target) if prior else {}
         attempted = list(
-            dict.fromkeys(
-                normalized
-                for version in prior_attempts_by_target.get(
-                    target_package,
-                    prior.attempted_versions if prior else [],
-                )
-                if (normalized := _normalize_attempt_version(version, ecosystem))
-            )
+            prior_attempts_by_target.get(target_package, prior.attempted_versions if prior else [])
         )
-        executed = [
-            normalized
-            for version in (prior.executed_versions if prior else [])
-            if (normalized := _normalize_attempt_version(version, ecosystem))
-        ]
+        executed = list(prior.executed_versions) if prior else []
         attempted_dependency_types = list(prior.attempted_dependency_types) if prior else []
         candidate_dependency_types = list(prior.candidate_dependency_types) if prior else []
         candidate_dependency_types.extend(
@@ -826,29 +958,17 @@ def _build_retry_diagnostics(
         if not candidate_dependency_types and target_dependency_type:
             candidate_dependency_types = [target_dependency_type]
         effective_target_version = prior.effective_target_version if prior else None
-        if effective_target_version:
-            effective_target_version = (
-                _normalize_attempt_version(
-                    effective_target_version,
-                    ecosystem,
-                )
-                or None
-            )
         effective_dependency_type = prior.effective_dependency_type if prior else None
         used_overrides = bool(prior.used_overrides) if prior else False
         for event in tool_events:
-            if not _is_executed_manifest_transaction(event) or not _event_matches_task(
-                task, group, manifest_paths, event
-            ):
+            if not _is_executed_manifest_transaction(event):
                 continue
-            event_args = getattr(event, "args", {}) or {}
-            target = _normalize_attempt_version(
-                str(event_args.get("target_version", "")),
-                ecosystem,
-            )
+            if str(event.args.get("package_name", "")).strip() != target_package:
+                continue
+            target = str(event.args.get("target_version", "")).strip().lstrip("vV")
             if target and target not in attempted:
                 attempted.append(target)
-            dependency_type = str(event_args.get("dependency_type", "")).strip()
+            dependency_type = str(event.args.get("dependency_type", "")).strip()
             if dependency_type and dependency_type not in attempted_dependency_types:
                 attempted_dependency_types.append(dependency_type)
             used_overrides = used_overrides or dependency_type in {
@@ -856,7 +976,7 @@ def _build_retry_diagnostics(
                 "resolutions",
                 "pnpm_overrides",
             }
-            if str(getattr(event, "content", "")).startswith("SUCCESS:"):
+            if str(event.content).startswith("SUCCESS:"):
                 if target and target not in executed:
                     executed.append(target)
                 effective_target_version = target or effective_target_version
@@ -887,7 +1007,11 @@ def _build_retry_diagnostics(
             strategy_stage=task_stage,
             security_floor=prior.security_floor
             if prior
-            else (group.fix_plan.fixed_version if group.fix_plan else None),
+            else (
+                select_package_fix_plan(group, task.strategy).plan.fixed_version
+                if select_package_fix_plan(group, task.strategy).plan
+                else None
+            ),
             registry_query_performed=prior.registry_query_performed if prior else False,
             attempted_versions=attempted,
             executed_versions=executed,
@@ -1065,14 +1189,44 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         summaries = _build_surrender_summaries(
             all_task_ids, "Stopped before execution because no manifest targets could be resolved."
         )
-        return {
+        result: dict[str, Any] = {
             "action_summaries": summaries,
             "action_summary": summaries[0] if summaries else None,
             "changed_files": [],
             "errors": resolution_errors,
         }
+        if state.get("multi_package_action") is not None and len(target_tasks) > 1:
+            target_snapshots = {
+                task.task_id: target_attempt_snapshots[task.task_id]
+                for task in target_tasks
+                if task.task_id in target_attempt_snapshots
+            }
+            result["worker_results_by_attempt"] = _worker_result_map(
+                target_tasks,
+                target_snapshots,
+                summaries,
+                succeeded=False,
+                errors=resolution_errors,
+            )
+        return result
 
-    if _is_mixed_retry_batch(resolved_tasks):
+    package_ecosystems = {_group_ecosystem(group) for _, group, _ in resolved_tasks}
+    if len(package_ecosystems) != 1:
+        message = "Update Subagent: one worker invocation cannot mix package ecosystems."
+        summaries = _build_surrender_summaries(all_task_ids, message)
+        return {
+            "action_summaries": summaries,
+            "action_summary": summaries[0] if summaries else None,
+            "changed_files": [],
+            "errors": resolution_errors + [message],
+        }
+    package_ecosystem = next(iter(package_ecosystems))
+    worker_language = (
+        ProjectLanguage.PYTHON if package_ecosystem == "pypi" else ProjectLanguage.NODEJS
+    )
+
+    committed_action = state.get("multi_package_action")
+    if committed_action is None and _is_mixed_retry_batch(resolved_tasks):
         summaries = _build_surrender_summaries(
             all_task_ids,
             "Stopped before execution because the supervisor mixed first-pass and retry update tasks in one batch.",
@@ -1085,6 +1239,302 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             + [
                 "Update Subagent: mixed first-pass and retry update tasks are not supported in the same batch."
             ],
+        }
+
+    if committed_action is not None:
+        action_validation_errors = _validate_committed_multi_package_action(
+            state,
+            committed_action,
+            resolved_tasks,
+            target_attempt_snapshots,
+        )
+        if action_validation_errors:
+            summaries = _build_surrender_summaries(all_task_ids, action_validation_errors[0])
+            target_snapshots = {
+                task.task_id: target_attempt_snapshots[task.task_id]
+                for task in target_tasks
+                if task.task_id in target_attempt_snapshots
+            }
+            action_errors = resolution_errors + action_validation_errors
+            return {
+                "action_summaries": summaries,
+                "action_summary": summaries[0] if summaries else None,
+                "changed_files": [],
+                "worker_results_by_attempt": _worker_result_map(
+                    target_tasks,
+                    target_snapshots,
+                    summaries,
+                    succeeded=False,
+                    errors=action_errors,
+                ),
+                "errors": action_errors,
+            }
+        expected_task_ids = {task.task_id for task, _, _ in resolved_tasks}
+        action_task_ids = {mutation.task_id for mutation in committed_action.package_mutations}
+        if action_task_ids != expected_task_ids:
+            message = (
+                "Update Subagent: committed multi-package action does not cover exactly "
+                "the resolved cluster tasks."
+            )
+            summaries = _build_surrender_summaries(all_task_ids, message)
+            action_errors = resolution_errors + [message]
+            target_snapshots = {
+                task.task_id: target_attempt_snapshots[task.task_id]
+                for task in target_tasks
+                if task.task_id in target_attempt_snapshots
+            }
+            return {
+                "action_summaries": summaries,
+                "action_summary": summaries[0] if summaries else None,
+                "changed_files": [],
+                "worker_results_by_attempt": _worker_result_map(
+                    target_tasks,
+                    target_snapshots,
+                    summaries,
+                    succeeded=False,
+                    errors=action_errors,
+                ),
+                "errors": action_errors,
+            }
+        resolved_task_ids = [task.task_id for task, _, _ in resolved_tasks]
+        target_snapshots = {
+            task.task_id: target_attempt_snapshots[task.task_id]
+            for task, _, _ in resolved_tasks
+            if task.task_id in target_attempt_snapshots
+        }
+        if ChatOpenAI is None:
+            msg = "Update Subagent: 'langchain-openai' is not installed."
+            summaries = _build_surrender_summaries(
+                all_task_ids, "Stopped before execution because the LLM client is unavailable."
+            )
+            action_errors = resolution_errors + [msg]
+            return {
+                "action_summaries": summaries,
+                "action_summary": summaries[0] if summaries else None,
+                "changed_files": [],
+                "worker_results_by_attempt": _worker_result_map(
+                    target_tasks,
+                    {
+                        task.task_id: target_attempt_snapshots[task.task_id]
+                        for task in target_tasks
+                        if task.task_id in target_attempt_snapshots
+                    },
+                    summaries,
+                    succeeded=False,
+                    errors=action_errors,
+                ),
+                "errors": action_errors,
+            }
+
+        settings = get_runtime_settings()
+        model_name = settings.update_llm_model
+        try:
+            llm = ChatOpenAI(
+                model=model_name,
+                temperature=0,
+                **openai_api_key_kwargs(settings),
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = f"Update Subagent: failed to initialize LLM - {exc}."
+            summaries = _build_surrender_summaries(
+                all_task_ids, "Stopped before execution because the LLM failed to initialize."
+            )
+            action_errors = resolution_errors + [msg]
+            return {
+                "action_summaries": summaries,
+                "action_summary": summaries[0] if summaries else None,
+                "changed_files": [],
+                "worker_results_by_attempt": _worker_result_map(
+                    target_tasks,
+                    {
+                        task.task_id: target_attempt_snapshots[task.task_id]
+                        for task in target_tasks
+                        if task.task_id in target_attempt_snapshots
+                    },
+                    summaries,
+                    succeeded=False,
+                    errors=action_errors,
+                ),
+                "errors": action_errors,
+            }
+
+        touched_files: set[str] = set()
+        package_checkpoints: dict[str, Any] = {}
+        execution_state: dict[str, Any] = {
+            "edits_started": False,
+            "validation_calls": 0,
+            "manifest_transaction_attempts": 0,
+            "multi_package_action_executed": False,
+            "multi_package_action_succeeded": False,
+        }
+        skinny_resolved_tasks = [
+            (task, _create_skinny_subagent_group(group), manifest_paths)
+            for task, group, manifest_paths in resolved_tasks
+        ]
+        filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_groups)
+        cluster_prompt = _build_multi_package_update_prompt(
+            skinny_resolved_tasks,
+            committed_action,
+            filtered_ledger,
+            feedback_by_task,
+            previous_action_summaries_by_task,
+            prior_retry_diagnostics_by_task,
+            repository_map=build_repository_map(repo_root),
+            allowed_target_versions_by_task=allowed_target_versions_by_task,
+            allowed_dependency_types_by_task=allowed_dependency_types_by_task,
+            project_language=worker_language,
+        )
+        multi_static_instructions = (
+            _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS
+            if worker_language == ProjectLanguage.PYTHON
+            else _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS
+        )
+        initial_messages = [SystemMessage(content=multi_static_instructions)]
+        if state.get("messages"):
+            initial_messages.extend(state["messages"])
+        initial_messages.append(HumanMessage(content=cluster_prompt))
+
+        runtime = None
+        cleanup_errors: list[str] = []
+        sandbox = None
+        try:
+            with DockerSandbox(
+                repo_root=None,
+                image=LANGUAGE_CONFIGS[worker_language].docker_image,
+                workspace_volume=workspace_volume,
+            ) as sandbox:
+                toolbelt = build_multi_package_update_toolbelt(
+                    sandbox,
+                    touched_files,
+                    committed_action,
+                    execution_state=execution_state,
+                    package_checkpoints=package_checkpoints,
+                    project_language=worker_language,
+                )
+                runtime = run_bounded_subagent_loop(
+                    llm,
+                    toolbelt,
+                    initial_messages,
+                    touched_files,
+                    execution_state=execution_state,
+                )
+                action_tool_events = [
+                    event
+                    for event in runtime.tool_events
+                    if event.name == _BATCH_NPM_DEPENDENCIES_TOOL_NAME
+                ]
+                action_executed = bool(
+                    execution_state.get("multi_package_action_executed") or action_tool_events
+                )
+                action_succeeded = bool(
+                    execution_state.get("multi_package_action_succeeded")
+                    or any(event.content.startswith("SUCCESS:") for event in action_tool_events)
+                )
+                succeeded = (
+                    action_executed
+                    and action_succeeded
+                    and not (resolution_errors or runtime.errors)
+                )
+                if succeeded:
+                    package_checkpoints.clear()
+                else:
+                    if not action_executed:
+                        execution_state["multi_package_action_error"] = (
+                            "LLM did not invoke the committed multi-package action tool."
+                        )
+                    cleanup_errors.extend(
+                        rollback_pending_package_updates(
+                            sandbox,
+                            package_checkpoints,
+                            touched_files,
+                        )
+                    )
+        except Exception as exc:  # noqa: BLE001 - worker boundary returns typed surrender
+            succeeded = False
+            if sandbox is not None and package_checkpoints:
+                cleanup_errors.extend(
+                    rollback_pending_package_updates(
+                        sandbox,
+                        package_checkpoints,
+                        touched_files,
+                    )
+                )
+            cleanup_errors.append(f"Multi-package sandbox or tool loop failed: {exc}")
+
+        runtime_errors = list(resolution_errors)
+        if runtime is not None:
+            runtime_errors.extend(runtime.errors)
+        runtime_errors.extend(cleanup_errors)
+        action_error = str(execution_state.get("multi_package_action_error") or "").strip()
+        if not succeeded and action_error and action_error not in runtime_errors:
+            runtime_errors.append(action_error)
+        if not succeeded and not runtime_errors:
+            runtime_errors.append(
+                "Update Subagent: committed multi-package action did not complete successfully."
+            )
+
+        summary_status = AgentActionStatus.SUCCESS if succeeded else AgentActionStatus.SURRENDER
+        summary_text = (
+            "Supervisor-committed multi-package action completed successfully."
+            if succeeded
+            else runtime_errors[-1]
+        )
+        summaries = [
+            AgentActionSummary(
+                task_id=task.task_id,
+                status=summary_status,
+                summary=summary_text,
+            )
+            for task, _, _ in resolved_tasks
+        ]
+        attempted_by_task = (
+            {
+                task.task_id: [mutation.target_version]
+                for task, _, _ in resolved_tasks
+                for mutation in committed_action.package_mutations
+                if mutation.task_id == task.task_id
+            }
+            if execution_state.get("multi_package_action_executed")
+            else {}
+        )
+        executed_by_task = attempted_by_task if succeeded else {}
+        changed_by_task = _changed_files_by_task(resolved_tasks, sorted(touched_files))
+        tagged_summaries = [
+            summary.model_copy(
+                update={
+                    "attempt_id": target_snapshots[summary.task_id].attempt_id,
+                    "task_revision": target_snapshots[summary.task_id].task_revision,
+                    "instruction_digest": target_snapshots[summary.task_id].instruction_digest,
+                }
+            )
+            if summary.task_id in target_snapshots
+            else summary
+            for summary in summaries
+        ]
+        manifest_count = len(
+            {mutation.manifest_path for mutation in committed_action.package_mutations}
+        )
+        return {
+            "action_summaries": tagged_summaries,
+            "action_summary": tagged_summaries[0] if tagged_summaries else None,
+            "changed_files": sorted(touched_files) if succeeded else [],
+            "worker_results_by_attempt": _worker_result_map(
+                [task for task, _, _ in resolved_tasks],
+                target_snapshots,
+                tagged_summaries,
+                succeeded=succeeded,
+                errors=runtime_errors,
+                attempted_versions_by_task=attempted_by_task,
+                executed_versions_by_task=executed_by_task,
+                changed_files_by_task=changed_by_task if succeeded else {},
+                validation_calls=manifest_count
+                if execution_state.get("multi_package_action_executed")
+                else 0,
+                manifest_transaction_attempts=manifest_count
+                if execution_state.get("multi_package_action_executed")
+                else 0,
+            ),
+            "errors": runtime_errors,
         }
 
     resolved_task_ids = [t.task_id for t, _, _ in resolved_tasks]
@@ -1100,9 +1550,14 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": resolution_errors + [msg],
         }
 
-    model_name = get_runtime_settings().update_llm_model
+    settings = get_runtime_settings()
+    model_name = settings.update_llm_model
     try:
-        llm = ChatOpenAI(model=model_name, temperature=0)
+        llm = ChatOpenAI(
+            model=model_name,
+            temperature=0,
+            **openai_api_key_kwargs(settings),
+        )
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: failed to initialize LLM - {exc}."
         summaries = _build_surrender_summaries(
@@ -1127,20 +1582,6 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
 
     filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_groups)
     retry_batch = _is_retry_batch(resolved_tasks)
-    project_language = state.get("project_language", ProjectLanguage.NODEJS)
-    if not isinstance(project_language, ProjectLanguage):
-        project_language = ProjectLanguage(project_language)
-    package_ecosystems = {_group_ecosystem(group) for _, group, _ in resolved_tasks}
-    if len(package_ecosystems) != 1:
-        msg = "Update Subagent: one worker invocation cannot mix package ecosystems."
-        summaries = _build_surrender_summaries(resolved_task_ids, msg)
-        return {
-            "action_summaries": summaries,
-            "action_summary": summaries[0] if summaries else None,
-            "changed_files": [],
-            "errors": resolution_errors + [msg],
-        }
-    package_ecosystem = next(iter(package_ecosystems))
     skinny_resolved_tasks = [
         (t, _create_skinny_subagent_group(g), paths) for t, g, paths in resolved_tasks
     ]
@@ -1154,9 +1595,9 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         repository_map=build_repository_map(repo_root),
         allowed_target_versions_by_task=allowed_target_versions_by_task,
         allowed_dependency_types_by_task=allowed_dependency_types_by_task,
-        project_language=project_language,
+        project_language=worker_language,
     )
-    initial_messages = [SystemMessage(content=_build_update_system_prompt(project_language))]
+    initial_messages = [SystemMessage(content=_build_update_system_prompt(worker_language))]
     if state.get("messages"):
         initial_messages.extend(state["messages"])
     initial_messages.append(HumanMessage(content=prompt))
@@ -1183,7 +1624,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     try:
         with DockerSandbox(
             repo_root=None,
-            image=LANGUAGE_CONFIGS[project_language].docker_image,
+            image=LANGUAGE_CONFIGS[worker_language].docker_image,
             workspace_volume=workspace_volume,
         ) as sandbox:
             package_manifest_map = _build_package_manifest_map(skinny_resolved_tasks)
@@ -1201,8 +1642,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 allowed_dependency_types_by_package=allowed_dependency_types_by_package,
                 execution_state=execution_state,
                 package_checkpoints=package_checkpoints,
-                language=project_language,
-                package_ecosystem=package_ecosystem,
+                project_language=worker_language,
             )
             try:
                 runtime = run_bounded_subagent_loop(
@@ -1238,43 +1678,32 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         for task, group, _ in resolved_tasks
         if _target_package_name(task, group)
     }
-    successful_task_ids = {
-        task.task_id
-        for task, group, manifest_paths in resolved_tasks
-        if _has_successful_manifest_transaction_for_package(
-            task,
-            group,
-            manifest_paths,
-            runtime.tool_events,
-        )
-    }
-    authorized_changed_paths = {
-        path.replace("\\", "/").lstrip("/")
-        for _, group, manifest_paths in resolved_tasks
-        for path in _authorized_changed_paths(group, manifest_paths)
-    }
-    successful_authorized_paths = {
-        path.replace("\\", "/").lstrip("/")
-        for task, group, manifest_paths in resolved_tasks
-        if task.task_id in successful_task_ids
-        for path in _authorized_changed_paths(group, manifest_paths)
+    successful_packages = {
+        _target_package_name(task, group)
+        for task, group, _ in resolved_tasks
+        if _has_successful_manifest_transaction_for_package(task, group, runtime.tool_events)
     }
     unvalidated_manifest_paths = {
-        path.replace("\\", "/").lstrip("/")
+        path.replace("\\", "/")
         for task, group, manifest_paths in resolved_tasks
-        if task.task_id not in successful_task_ids
-        for path in _authorized_changed_paths(group, manifest_paths)
-    } - successful_authorized_paths
-    committed_changed_files = sorted(
-        {
-            path.replace("\\", "/").lstrip("/")
-            for path in {*touched_files, *runtime.changed_files}
-            if path.replace("\\", "/").lstrip("/") in authorized_changed_paths
-            and path.replace("\\", "/").lstrip("/") not in unvalidated_manifest_paths
-        }
+        if _target_package_name(task, group) not in successful_packages
+        for path in manifest_paths
+    }
+    committed_changed_files = sorted(touched_files)
+    if not committed_changed_files:
+        committed_changed_files = sorted(
+            path
+            for path in runtime.changed_files
+            if path.replace("\\", "/") not in unvalidated_manifest_paths
+        )
+    # A worker succeeds only when every target package has a successful
+    # combined edit-and-sync transaction. Failed transactions may precede a
+    # later success, so neither raw event counts nor changed-file counts are
+    # used as a proxy for completion.
+    succeeded = bool(package_names) and all(
+        _has_successful_manifest_transaction_for_package(task, group, runtime.tool_events)
+        for task, group, _ in resolved_tasks
     )
-    # A worker succeeds only when every task has its own successful transaction.
-    succeeded = bool(package_names) and len(successful_task_ids) == len(resolved_tasks)
     attempted_by_task = _attempted_versions_for_current_run(
         resolved_tasks,
         runtime.tool_events,
@@ -1316,21 +1745,18 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     }
     instruction_mismatch_task_ids: set[str] = set()
     instruction_mismatch_errors: list[str] = []
-    for task, group, _manifest_paths in resolved_tasks:
+    for task, _group, _manifest_paths in resolved_tasks:
         snapshot = target_attempt_snapshots.get(task.task_id)
         if snapshot is None:
             continue
-        ecosystem = _group_ecosystem(group)
         allowed_versions = list(getattr(snapshot, "allowed_target_versions", []) or [])
         if not allowed_versions and snapshot.selected_version:
             allowed_versions = [snapshot.selected_version]
-        allowed = {
-            key for version in allowed_versions if (key := _attempt_version_key(version, ecosystem))
-        }
+        allowed = {version.strip().lstrip("vV").lower() for version in allowed_versions if version}
         observed = {
-            key
+            version.strip().lstrip("vV").lower()
             for version in attempted_by_task.get(task.task_id, [])
-            if (key := _attempt_version_key(version, ecosystem))
+            if version
         }
         unexpected = observed - allowed if allowed else set()
         if unexpected:

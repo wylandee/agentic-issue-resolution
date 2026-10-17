@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from remediation_engine.contracts.schemas import MultiPackageAction
+
 from ._tool_support import (
     _MANIFEST_SYNC_TIMEOUT_SECONDS,
     Any,
@@ -38,7 +40,17 @@ def _package_checkpoint_paths(
     *,
     package_ecosystem: str = "npm",
 ) -> list[str]:
-    """Return manifests and manager-owned lockfiles that may change."""
+    """Return manifests and manager-owned lockfiles that may change.
+
+    Args:
+        manifest_paths: Repository-relative declaration files for a package.
+        package_ecosystem: ``npm`` or ``pypi``; Python Pipfile transactions
+            own their adjacent ``Pipfile.lock`` while requirements and PEP 621
+            installs do not claim to create a lockfile.
+
+    Returns:
+        Sorted, validated paths captured by the transaction checkpoint.
+    """
     paths: set[str] = set()
     ecosystem = str(package_ecosystem or "").strip().casefold()
     for manifest_path in manifest_paths:
@@ -49,13 +61,28 @@ def _package_checkpoint_paths(
             if Path(normalized_manifest).name.casefold() == "pipfile":
                 paths.add(_validate_workspace_path((parent / "Pipfile.lock").as_posix()))
             continue
-        for lockfile_name in ("package-lock.json", "npm-shrinkwrap.json"):
-            paths.add(_validate_workspace_path((parent / lockfile_name).as_posix()))
+        if ecosystem != "npm":
+            raise ValueError(f"Unsupported package ecosystem: {package_ecosystem!r}.")
+        ancestor_dirs = [parent, *parent.parents]
+        for directory in ancestor_dirs:
+            for lockfile_name in ("package-lock.json", "npm-shrinkwrap.json"):
+                paths.add(_validate_workspace_path((directory / lockfile_name).as_posix()))
     return sorted(paths)
 
 
 def _normalize_python_manifest_targets(target_manifest_paths: Iterable[str]) -> list[str]:
-    """Return safe, validated Python declarations that workers may edit."""
+    """Return safe, validated Python declarations that workers may edit.
+
+    Args:
+        target_manifest_paths: Candidate declaration paths committed by the
+            Supervisor.
+
+    Returns:
+        Sorted repository-relative paths limited to supported Python files.
+
+    Raises:
+        ValueError: If a path is unsafe or is not a supported declaration.
+    """
     requirements_pattern = re.compile(r"requirements(?:[-_.][^/\\]+)?\.txt$", re.IGNORECASE)
     manifest_paths = sorted(
         {_validate_workspace_path(path) for path in target_manifest_paths if path}
@@ -65,7 +92,7 @@ def _normalize_python_manifest_targets(target_manifest_paths: Iterable[str]) -> 
         for path in manifest_paths
         if not (
             requirements_pattern.fullmatch(Path(path).name)
-            or Path(path).name in {"pyproject.toml", "setup.cfg", "Pipfile"}
+            or Path(path).name.casefold() in {"pyproject.toml", "setup.cfg", "pipfile"}
         )
     ]
     if invalid:
@@ -101,6 +128,7 @@ def _restore_package_checkpoint(
 ) -> str | None:
     """Restore one package checkpoint and return a rollback error, if any."""
     rollback_errors: list[str] = []
+    restored_paths: set[str] = set()
     for path, content in checkpoint.files.items():
         try:
             if content is None:
@@ -109,13 +137,19 @@ def _restore_package_checkpoint(
                     rollback_errors.append(
                         f"{path}: delete failed with exit {result.exit_code}: {result.stderr}"
                     )
+                else:
+                    restored_paths.add(path)
             else:
                 sandbox.write_file(path, content)
+                restored_paths.add(path)
         except Exception as exc:  # noqa: BLE001
             rollback_errors.append(f"{path}: {exc}")
 
-    touched_files.difference_update(checkpoint.files)
+    touched_files.difference_update(restored_paths)
     touched_files.update(checkpoint.touched_files_before)
+    # Failed paths stay in the final candidate ledger so the outer workspace
+    # anchor can restore them before another worker is dispatched.
+    touched_files.update(set(checkpoint.files) - restored_paths)
     if rollback_errors:
         return "Package checkpoint rollback failed: " + " | ".join(rollback_errors)
     return None
@@ -132,7 +166,8 @@ def rollback_pending_package_updates(
         rollback_error = _restore_package_checkpoint(sandbox, checkpoint, touched_files)
         if rollback_error:
             errors.append(f"Package '{package_name}': {rollback_error}")
-        package_checkpoints.pop(package_name, None)
+        else:
+            package_checkpoints.pop(package_name, None)
     return errors
 
 
@@ -149,31 +184,363 @@ def _bounded_command_output(value: Any, limit: int = 4_000) -> str:
     return f"{text[:limit]}... (truncated)"
 
 
+def _lockfile_target_versions(payload: Mapping[str, Any], package_name: str) -> set[str]:
+    """Return versions recorded for a package in npm lockfile layouts.
+
+    npm v2/v3 lockfiles use a ``packages`` map while npm v1 uses nested
+    ``dependencies`` records.  Workspace lockfiles can contain either a
+    ``name`` field or a ``node_modules/<package>`` path, so both forms are
+    checked before accepting the requested mutation.
+    """
+    versions: set[str] = set()
+    packages = payload.get("packages")
+    if isinstance(packages, Mapping):
+        suffix = f"node_modules/{package_name}"
+        for path, record in packages.items():
+            if not isinstance(record, Mapping):
+                continue
+            normalized_path = str(path).replace("\\", "/").rstrip("/")
+            if record.get("name") == package_name or normalized_path.endswith(suffix):
+                version = record.get("version")
+                if isinstance(version, str) and version.strip():
+                    versions.add(version.strip().lstrip("vV"))
+
+    def visit(dependencies: Any) -> None:
+        """Walk npm v1 nested dependency records without trusting keys alone."""
+        if not isinstance(dependencies, Mapping):
+            return
+        for name, record in dependencies.items():
+            if not isinstance(record, Mapping):
+                continue
+            package = str(name)
+            if package == package_name or record.get("name") == package_name:
+                version = record.get("version")
+                if isinstance(version, str) and version.strip():
+                    versions.add(version.strip().lstrip("vV"))
+            visit(record.get("dependencies"))
+
+    visit(payload.get("dependencies"))
+    return versions
+
+
+def _override_target_was_pruned(
+    checkpoint: _PackageCheckpoint,
+    mutation: Any,
+    original_lockfile: str | None,
+) -> bool:
+    """Return whether a transitive override target disappeared after sync.
+
+    The multi-package action verifies the override declaration in package.json
+    before calling the lockfile verifier. If an upgraded parent removes a
+    previously installed transitive package, the absence of that package from
+    the synchronized lockfile is a valid resolution. Direct dependencies and
+    targets absent from the original graph remain fail-closed.
+    """
+    if mutation.dependency_type not in {"overrides", "resolutions", "pnpm_overrides"}:
+        return False
+    original_manifest = checkpoint.files.get(mutation.manifest_path)
+    if not isinstance(original_manifest, str) or not isinstance(original_lockfile, str):
+        return False
+    try:
+        manifest = json.loads(original_manifest)
+        lockfile = json.loads(original_lockfile)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(manifest, Mapping) or not isinstance(lockfile, Mapping):
+        return False
+    for section in (
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ):
+        declared = manifest.get(section)
+        if isinstance(declared, Mapping) and mutation.package_name in declared:
+            return False
+    return bool(_lockfile_target_versions(lockfile, mutation.package_name))
+
+
+def _verify_lockfile_mutations(
+    sandbox: DockerSandbox,
+    checkpoint: _PackageCheckpoint,
+    mutations: Sequence[Any],
+    *,
+    pruning_baseline: _PackageCheckpoint | None = None,
+) -> None:
+    """Verify mutations against synchronized lockfiles and the candidate base."""
+    baseline = pruning_baseline if pruning_baseline is not None else checkpoint
+    mutation_by_lockfile: dict[str, list[Any]] = {}
+    for path in checkpoint.files:
+        if Path(path).name not in {"package-lock.json", "npm-shrinkwrap.json"}:
+            continue
+        lockfile_parent = Path(path).parent
+        for mutation in mutations:
+            manifest_parent = Path(mutation.manifest_path).parent
+            # Ancestor lockfiles are included in the checkpoint union so an
+            # unexpected npm side effect can still be rolled back, but a
+            # nested manifest is validated against the lockfile in its own
+            # package directory. A repository root lockfile is not evidence
+            # for an independent ``frontend/package.json`` installation.
+            if lockfile_parent == manifest_parent:
+                mutation_by_lockfile.setdefault(path, []).append(mutation)
+
+    for path, path_mutations in sorted(mutation_by_lockfile.items()):
+        before = checkpoint.files.get(path)
+        baseline_before = baseline.files.get(path)
+        content = sandbox.read_file(path)
+        if not isinstance(content, str):
+            # A lockfile that did not exist before the action is optional: npm
+            # may be configured with package-lock=false. Existing lockfiles,
+            # however, must survive and prove every requested target.
+            if before is not None or baseline_before is not None:
+                raise RuntimeError(f"lockfile disappeared after synchronization: {path}")
+            continue
+        try:
+            lockfile = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"lockfile is not valid JSON after synchronization: {path}") from exc
+        if not isinstance(lockfile, Mapping):
+            raise RuntimeError(f"lockfile must contain a JSON object: {path}")
+        for mutation in path_mutations:
+            versions = _lockfile_target_versions(lockfile, mutation.package_name)
+            expected = mutation.target_version.strip().lstrip("vV")
+            if expected not in versions:
+                if not versions and _override_target_was_pruned(
+                    baseline,
+                    mutation,
+                    baseline_before if isinstance(baseline_before, str) else None,
+                ):
+                    continue
+                raise RuntimeError(
+                    f"lockfile verification failed for {mutation.package_name} in {path}: "
+                    f"expected {mutation.target_version}, found {sorted(versions) or 'no package entry'}"
+                )
+
+
 def _sync_package_manifests(
     sandbox: DockerSandbox,
     manifest_paths: Sequence[str],
+    package_specs_by_manifest: Mapping[str, Iterable[str]] | None = None,
 ) -> tuple[bool, str]:
-    """Synchronize all manifests belonging to one package target."""
-    for manifest_path in manifest_paths:
+    """Validate and synchronize package manifests.
+
+    Args:
+        sandbox: Running Docker workspace sandbox.
+        manifest_paths: Repository-relative manifests to synchronize.
+        package_specs_by_manifest: Optional legacy parameter retained for compatibility.
+
+    Returns:
+        ``(True, "")`` when every synchronization succeeds, otherwise a
+        stable tool error and ``False``.
+    """
+    del package_specs_by_manifest
+
+    def build_command(manifest_path: str, *, dry_run: bool) -> str:
+        """Build one deterministic npm manifest validation or sync command."""
+        npm_args = [
+            "npm",
+            "install",
+            "--package-lock-only",
+            "--ignore-scripts",
+            "--legacy-peer-deps",
+            "--no-audit",
+            "--no-fund",
+        ]
+        if dry_run:
+            npm_args.append("--dry-run")
         workspace_dir = _workspace_dir_for_manifest(manifest_path)
-        cmd = f"cd {shlex.quote(workspace_dir)} && npm install --package-lock-only --ignore-scripts"
-        try:
-            result = sandbox.run(cmd, timeout=_MANIFEST_SYNC_TIMEOUT_SECONDS)
-        except Exception as exc:  # noqa: BLE001
-            return False, _tool_error(
-                "MANIFEST_SYNC_FAILED",
-                f"Manifest sync failed for {manifest_path}: {exc}",
-            )
-        if result.exit_code != 0:
-            return False, _tool_error(
-                "MANIFEST_SYNC_FAILED",
-                (
-                    f"Manifest sync failed for {manifest_path} (exit {result.exit_code}). "
-                    f"stdout: {_bounded_command_output(result.stdout)}; "
-                    f"stderr: {_bounded_command_output(result.stderr)}"
-                ),
-            )
+        return f"cd {shlex.quote(workspace_dir)} && {shlex.join(npm_args)}"
+
+    for manifest_path in manifest_paths:
+        for dry_run in (True, False):
+            cmd = build_command(manifest_path, dry_run=dry_run)
+            phase = "preflight validation" if dry_run else "synchronization"
+            try:
+                result = sandbox.run(cmd, timeout=_MANIFEST_SYNC_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                return False, _tool_error(
+                    "MANIFEST_SYNC_FAILED",
+                    f"Manifest {phase} failed for {manifest_path}: {exc}",
+                )
+            if result.exit_code != 0:
+                return False, _tool_error(
+                    "MANIFEST_SYNC_FAILED",
+                    (
+                        f"Manifest {phase} failed for {manifest_path} "
+                        f"(exit {result.exit_code}). "
+                        f"stdout: {_bounded_command_output(result.stdout)}; "
+                        f"stderr: {_bounded_command_output(result.stderr)}"
+                    ),
+                )
     return True, ""
+
+
+def apply_multi_package_action(
+    sandbox: DockerSandbox,
+    action: MultiPackageAction,
+    touched_files: set[str],
+    checkpoint_store: dict[str, _PackageCheckpoint] | None = None,
+) -> tuple[bool, str]:
+    """Apply one Supervisor-committed multi-package npm action atomically.
+
+    All manifest edits are staged before any lockfile synchronization. A
+    failure in an edit, synchronization, or manifest verification restores the
+    union checkpoint for every mutation.
+
+    Args:
+        sandbox: Running Docker workspace sandbox.
+        action: Immutable action authorized by the Supervisor.
+        touched_files: Mutable changed-file projection for the worker result.
+        checkpoint_store: Optional mutable store that retains the union
+            checkpoint until the caller explicitly accepts the successful
+            worker attempt or rolls it back.
+
+    Returns:
+        ``(True, "")`` after every mutation validates, otherwise ``(False,
+        diagnostic)`` after best-effort rollback.
+    """
+    manifest_paths = sorted({mutation.manifest_path for mutation in action.package_mutations})
+    checkpoint = _capture_package_checkpoint(sandbox, manifest_paths, touched_files)
+    checkpoint_key = "__multi_package_action__"
+    if checkpoint_store is not None:
+        checkpoint_store[checkpoint_key] = checkpoint
+    try:
+        for mutation in sorted(
+            action.package_mutations,
+            key=lambda item: (item.manifest_path, item.package_name, item.task_id),
+        ):
+            rel_manifest = _validate_workspace_path(mutation.manifest_path)
+            dependency_path = (
+                "pnpm.overrides"
+                if mutation.dependency_type == "pnpm_overrides"
+                else mutation.dependency_type
+            )
+            package_expr = f"{dependency_path}[{mutation.package_name}]={mutation.target_version}"
+            command = shlex.join(["npm", "pkg", "set", package_expr])
+            workspace_dir = _workspace_dir_for_manifest(rel_manifest)
+            if workspace_dir != "/workspace":
+                command = f"cd {shlex.quote(workspace_dir)} && {command}"
+            result = sandbox.run(command)
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"manifest edit failed for {mutation.package_name} in {rel_manifest} "
+                    f"(exit {result.exit_code}): {_bounded_command_output(result.stderr or result.stdout)}"
+                )
+            touched_files.add(rel_manifest)
+
+        for manifest_path in manifest_paths:
+            synchronized, error = _sync_package_manifests(
+                sandbox,
+                [manifest_path],
+            )
+            if not synchronized:
+                raise RuntimeError(error)
+
+        for mutation in action.package_mutations:
+            content = sandbox.read_file(mutation.manifest_path)
+            if not isinstance(content, str):
+                raise RuntimeError(f"could not read {mutation.manifest_path} after synchronization")
+            payload = json.loads(content)
+            dependency_path = (
+                "pnpm.overrides"
+                if mutation.dependency_type == "pnpm_overrides"
+                else mutation.dependency_type
+            )
+            current: Any = payload
+            for segment in dependency_path.split("."):
+                current = current.get(segment, {}) if isinstance(current, dict) else {}
+            if (
+                not isinstance(current, dict)
+                or current.get(mutation.package_name) != mutation.target_version
+            ):
+                raise RuntimeError(
+                    f"manifest verification failed for {mutation.package_name} in {mutation.manifest_path}"
+                )
+        _verify_lockfile_mutations(sandbox, checkpoint, action.package_mutations)
+        for path, before in checkpoint.files.items():
+            after_value = sandbox.read_file(path)
+            after = after_value if isinstance(after_value, str) else None
+            if after != before:
+                touched_files.add(path)
+        return True, ""
+    except Exception as exc:  # noqa: BLE001 - atomic boundary owns rollback
+        rollback_error = _restore_package_checkpoint(sandbox, checkpoint, touched_files)
+        if checkpoint_store is not None and rollback_error is None:
+            checkpoint_store.pop(checkpoint_key, None)
+        suffix = f" Rollback: {rollback_error}" if rollback_error else " Rollback complete."
+        return False, f"Multi-package action failed: {exc}.{suffix}"
+
+
+def _make_modify_batch_npm_dependencies_tool(
+    sandbox: DockerSandbox,
+    action: MultiPackageAction,
+    touched_files: set[str],
+    execution_state: dict[str, Any] | None = None,
+    package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
+) -> Any:
+    """Build the sole LLM tool for a Supervisor-committed dependency batch.
+
+    The action is captured in the tool closure. The model can request its
+    execution, but cannot provide package names, versions, dependency types,
+    or manifest paths. ``apply_multi_package_action`` remains the deterministic
+    atomic boundary and owns checkpointing and rollback.
+
+    Args:
+        sandbox: Running Docker workspace sandbox.
+        action: Immutable action already validated by the Supervisor boundary.
+        touched_files: Mutable changed-file projection for the worker result.
+        execution_state: Mutable per-worker state used to prevent a second
+            execution of the same committed action.
+        package_checkpoints: Optional store retaining the successful union
+            checkpoint until the worker result is accepted.
+
+    Returns:
+        A LangChain tool that executes the captured action exactly once.
+    """
+    if execution_state is None:
+        execution_state = {}
+
+    @tool
+    def modify_batch_npm_dependencies() -> str:
+        """Modify and synchronize the complete committed npm batch once."""
+        if execution_state.get("multi_package_action_executed"):
+            return _tool_error(
+                "MULTI_PACKAGE_ACTION_ALREADY_EXECUTED",
+                "The committed cluster action has already been executed; return control to the Supervisor.",
+            )
+
+        # Set the barrier before entering the atomic executor. Even a failed
+        # action is returned to the Supervisor for a new committed attempt;
+        # the model must not replay a failed batch in the same worker turn.
+        execution_state["multi_package_action_executed"] = True
+        try:
+            if package_checkpoints is None:
+                succeeded, error = apply_multi_package_action(sandbox, action, touched_files)
+            else:
+                succeeded, error = apply_multi_package_action(
+                    sandbox,
+                    action,
+                    touched_files,
+                    checkpoint_store=package_checkpoints,
+                )
+        except Exception as exc:  # noqa: BLE001 - tool boundary returns typed failure
+            succeeded = False
+            error = f"Multi-package action raised an unexpected error: {exc}"
+
+        execution_state["multi_package_action_succeeded"] = succeeded
+        execution_state["multi_package_action_error"] = error or None
+        if succeeded:
+            cluster_label = action.cluster_id or "unclustered"
+            return (
+                "SUCCESS: Applied the Supervisor-committed multi-package action "
+                f"for cluster {cluster_label}; every mutation and lockfile check passed."
+            )
+        return _tool_error(
+            "MULTI_PACKAGE_ACTION_FAILED",
+            error or "The committed multi-package action failed and was rolled back.",
+        )
+
+    return modify_batch_npm_dependencies
 
 
 def _make_modify_and_validate_npm_dependency_tool(
@@ -389,7 +756,7 @@ def _make_modify_and_validate_npm_dependency_tool(
                     if checkpoint is not None
                     else None
                 )
-                if package_checkpoints is not None:
+                if package_checkpoints is not None and rollback_error is None:
                     package_checkpoints.pop(package_key, None)
                 if execution_state is not None:
                     execution_state["pending_validation_package"] = None
@@ -413,7 +780,7 @@ def _make_modify_and_validate_npm_dependency_tool(
                     if checkpoint is not None
                     else None
                 )
-                if package_checkpoints is not None:
+                if package_checkpoints is not None and rollback_error is None:
                     package_checkpoints.pop(package_key, None)
                 if execution_state is not None:
                     execution_state["pending_validation_package"] = None
@@ -451,7 +818,7 @@ def _make_modify_and_validate_npm_dependency_tool(
                 if checkpoint is not None
                 else None
             )
-            if package_checkpoints is not None:
+            if package_checkpoints is not None and rollback_error is None:
                 package_checkpoints.pop(package_key, None)
             if execution_state is not None:
                 execution_state["pending_validation_package"] = None
@@ -474,12 +841,12 @@ def _is_prohibited_target(rel_path: str) -> bool:
         "pom.xml",
         "build.gradle",
         "requirements.txt",
-        "pyproject.toml",
-        "setup.cfg",
-        "setup.py",
+        "requirements-dev.txt",
         "pipfile",
         "pipfile.lock",
-    ) or re.fullmatch(r"requirements(?:[-_.][^/\\]+)?\.txt", basename):
+        "setup.cfg",
+        "pyproject.toml",
+    ):
         return True
 
     parts = norm.lower().split("/")
@@ -573,6 +940,13 @@ def _make_remove_no_fix_dependency_tool(
         """Remove only the configured vulnerable direct dependency safely."""
         nonlocal checkpoint
 
+        if plan_state.get("restoration_failed"):
+            paths = ", ".join(plan_state.get("restoration_failure_paths", []) or [])
+            return (
+                "ERROR: [RESTORATION_INCOMPLETE] A previous rollback did not restore "
+                f"the workspace files ({paths}); package removal is blocked until the "
+                "outer attempt snapshot restores the workspace."
+            )
         if plan_state.get("no_fix_stage") != NoFixMitigationStage.PACKAGE_REMOVAL.value:
             return "NOT_APPLICABLE: package removal is available only during PACKAGE_REMOVAL."
         if not plan_state.get("recorded") or not plan_state.get("package_removal_planned"):

@@ -31,6 +31,16 @@ def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
 
 DEFAULT_REMEDY_RETRIAGE_LIMIT = 3
 
+# A finite model-variable cap keeps an accidentally unbounded CP-SAT model
+# from exhausting process resources.  Deployments with larger repositories can
+# raise it explicitly through REMEDY_SOLVER_MAX_MODEL_VARIABLES.
+DEFAULT_SOLVER_MAX_MODEL_VARIABLES = 10_000
+# Candidate catalogs above this per-target bound are pruned to the installed
+# version, security floor, and latest release from each eligible minor branch.
+DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET = 1000
+
+DEFAULT_MAX_DELTA_CANARY_PROBES = 2
+
 
 @dataclass(frozen=True)
 class AppSettings:
@@ -51,13 +61,28 @@ class AppSettings:
     langsmith_project: str = "AppSec-Remediation-Engine"
     langsmith_endpoint: str = ""
     triage_cache_dir: Path | None = None
+    solver_timeout_seconds: int = 10
+    solver_certification_timeout_seconds: int = 900
+    solver_top_k: int = 3
+    solver_phase_budget: int = 8
+    solver_accept_feasible: bool = True
+    solver_random_seed: int = 0
+    solver_num_search_workers: int = 1
+    solver_max_candidates_per_target: int = DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET
+    solver_max_model_variables: int = DEFAULT_SOLVER_MAX_MODEL_VARIABLES
+    solver_cache_dir: Path | None = None
+    solver_llm_enabled: bool = False
+    solver_llm_model: str = "gpt-4o-mini"
     remediation_trajectory_dir: Path | None = None
     remediation_report_dir: Path | None = None
     remedy_bypass_workaround_subagent: bool = False
     remedy_disable_post_qa_triage: bool = False
+    # Development-only opt-in; production keeps incremental scanning by default.
+    remedy_final_full_scan_enabled: bool = False
     # Development-only safety valve. Production remains unlimited by default.
     remedy_retriage_limit_enabled: bool = False
     remedy_retriage_limit: int = DEFAULT_REMEDY_RETRIAGE_LIMIT
+    max_delta_canary_probes: int = DEFAULT_MAX_DELTA_CANARY_PROBES
 
     @classmethod
     def from_env(cls) -> AppSettings:
@@ -69,6 +94,7 @@ class AppSettings:
         """
         trajectory = os.environ.get("REMEDIATION_TRAJECTORY_DIR", "").strip()
         report_dir = os.environ.get("REMEDIATION_REPORT_DIR", "").strip()
+        solver_cache_dir = os.environ.get("REMEDIATION_SOLVER_CACHE_DIR", "").strip()
         default_model = os.environ.get("REMEDY_LLM_MODEL", "gpt-4o-mini").strip()
         if not default_model:
             default_model = "gpt-4o-mini"
@@ -99,14 +125,42 @@ class AppSettings:
                 if os.environ.get("TRIAGE_CACHE_DIR", "").strip()
                 else None
             ),
+            solver_timeout_seconds=_env_int("REMEDY_SOLVER_TIMEOUT_SECONDS", 10, minimum=1),
+            solver_certification_timeout_seconds=_env_int(
+                "REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS", 900, minimum=1
+            ),
+            solver_top_k=_env_int("REMEDY_SOLVER_TOP_K", 3, minimum=1),
+            solver_phase_budget=_env_int("REMEDY_SOLVER_PHASE_BUDGET", 8, minimum=1),
+            solver_accept_feasible=_env_bool("REMEDY_SOLVER_ACCEPT_FEASIBLE", True),
+            solver_random_seed=_env_int("REMEDY_SOLVER_RANDOM_SEED", 0, minimum=0),
+            solver_num_search_workers=_env_int("REMEDY_SOLVER_NUM_SEARCH_WORKERS", 1, minimum=1),
+            solver_max_candidates_per_target=_env_int(
+                "REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET",
+                DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET,
+                minimum=1,
+            ),
+            solver_max_model_variables=_env_int(
+                "REMEDY_SOLVER_MAX_MODEL_VARIABLES",
+                DEFAULT_SOLVER_MAX_MODEL_VARIABLES,
+                minimum=1,
+            ),
+            solver_cache_dir=Path(solver_cache_dir) if solver_cache_dir else None,
+            solver_llm_enabled=_env_bool("REMEDY_SOLVER_LLM_ENABLED"),
+            solver_llm_model=os.environ.get("SOLVER_LLM_MODEL", "").strip() or default_model,
             remediation_trajectory_dir=Path(trajectory) if trajectory else None,
             remediation_report_dir=Path(report_dir) if report_dir else None,
             remedy_bypass_workaround_subagent=_env_bool("REMEDY_BYPASS_WORKAROUND_SUBAGENT"),
             remedy_disable_post_qa_triage=_env_bool("REMEDY_DISABLE_POST_QA_TRIAGE"),
+            remedy_final_full_scan_enabled=_env_bool("REMEDY_FINAL_FULL_SCAN_ENABLED"),
             remedy_retriage_limit_enabled=_env_bool("REMEDY_RETRIAGE_LIMIT_ENABLED"),
             remedy_retriage_limit=_env_int(
                 "REMEDY_RETRIAGE_LIMIT",
                 DEFAULT_REMEDY_RETRIAGE_LIMIT,
                 minimum=0,
+            ),
+            max_delta_canary_probes=_env_int(
+                "REMEDY_MAX_DELTA_CANARY_PROBES",
+                DEFAULT_MAX_DELTA_CANARY_PROBES,
+                minimum=1,
             ),
         )

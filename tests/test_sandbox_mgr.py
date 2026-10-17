@@ -15,10 +15,13 @@ import pytest
 from pydantic import ValidationError
 
 from remediation_engine.contracts import CommandResult
+from remediation_engine.runtime.path_policy import WorkspacePathError
 from remediation_engine.runtime.sandbox_mgr import (
     DockerSandbox,
     WorkspaceReadCache,
     _make_tar_archive,
+    _trace_read_files_inputs,
+    _trace_read_files_outputs,
     get_docker_client,
 )
 
@@ -299,6 +302,9 @@ class TestSandboxRun:
         with pytest.raises(RuntimeError, match="Sandbox is not running."):
             sandbox.write_file("package.json", "{}")
 
+        with pytest.raises(RuntimeError, match="Sandbox is not running."):
+            sandbox.write_files({"package.json": "{}"})
+
 
 class TestSandboxWorkspaceSnapshots:
     def _started_sandbox(self, tmp_path, client, container):
@@ -414,6 +420,43 @@ class TestSandboxFileIO:
         args, _kwargs = container.put_archive.call_args
         assert args[0] == "/workspace/config"
 
+    def test_write_files_uploads_nested_files_in_one_archive(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+        files = {
+            "package.json": "{}",
+            ".odc-targeted/000/node_modules/esbuild/package.json": (
+                '{"name":"esbuild","version":"0.28.1"}'
+            ),
+        }
+
+        sandbox.write_files(files)
+
+        container.put_archive.assert_called_once()
+        archive_path, archive_bytes = container.put_archive.call_args.args
+        assert archive_path == "/workspace"
+        container.exec_run.assert_called_once()
+        assert sandbox.read_cache_metrics()["epoch"] == 1
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+            package_json = archive.extractfile("package.json")
+            esbuild_manifest = archive.extractfile(
+                ".odc-targeted/000/node_modules/esbuild/package.json"
+            )
+            assert package_json is not None
+            assert esbuild_manifest is not None
+            assert package_json.read() == b"{}"
+            assert esbuild_manifest.read() == (b'{"name":"esbuild","version":"0.28.1"}')
+
+    def test_write_files_rejects_duplicate_normalized_paths(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(WorkspacePathError, match="duplicate normalized"):
+            sandbox.write_files({"config//overrides.json": "{}", "config/overrides.json": "{}"})
+
+        container.exec_run.assert_not_called()
+        container.put_archive.assert_not_called()
+
     def test_read_file_uses_workspace_path(self, tmp_path):
         docker_mod, docker_errors, client, container = _docker_modules()
         container.get_archive.return_value = (_tar_chunks("package.json", "{}"), {})
@@ -493,3 +536,84 @@ class TestSandboxFileIO:
         sandbox = self._started_sandbox(tmp_path, client, container)
 
         assert sandbox.read_file("missing.json") is None
+
+
+def _directory_tar_chunks(filename: str) -> list[bytes]:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name=filename)
+        info.type = tarfile.DIRTYPE
+        tf.addfile(info)
+    return [buf.getvalue()]
+
+
+class TestSandboxBatchFileIO:
+    def _started_sandbox(self, tmp_path, container):
+        sandbox = DockerSandbox(tmp_path)
+        sandbox._container = container
+        sandbox._alive = True
+        return sandbox
+
+    def test_read_files_returns_complete_documents_and_summary_only_trace(self, tmp_path):
+        _docker_mod, _docker_errors, _client, container = _docker_modules()
+        container.get_archive.side_effect = [
+            (_tar_chunks("package-lock.json", '{"lockfileVersion":3}'), {}),
+            (_tar_chunks("package.json", '{"name":"app"}'), {}),
+        ]
+        sandbox = self._started_sandbox(tmp_path, container)
+
+        documents = sandbox.read_files(["package-lock.json", "package.json"])
+
+        assert documents == {
+            "package-lock.json": '{"lockfileVersion":3}',
+            "package.json": '{"name":"app"}',
+        }
+        trace_summary = _trace_read_files_outputs(documents)
+        assert trace_summary["file_count"] == 2
+        assert trace_summary["total_bytes"] == sum(
+            len(value.encode("utf-8")) for value in documents.values()
+        )
+        assert trace_summary["duration_seconds"] >= 0
+        assert trace_summary["digest"]
+        assert "app" not in repr(trace_summary)
+        assert _trace_read_files_inputs({"paths": ["private/package.json"]}) == {"file_count": 1}
+        assert container.get_archive.call_count == 2
+
+    def test_read_files_byte_limit_fails_without_returning_partial_documents(self, tmp_path):
+        _docker_mod, _docker_errors, _client, container = _docker_modules()
+        container.get_archive.return_value = (_tar_chunks("package.json", '{"large":true}'), {})
+        sandbox = self._started_sandbox(tmp_path, container)
+
+        with pytest.raises(ValueError, match="total-byte limit"):
+            sandbox.read_files(["package.json"], max_total_bytes=1)
+
+    def test_read_files_returns_none_for_missing_or_nonregular_file(self, tmp_path):
+        _docker_mod, _docker_errors, _client, container = _docker_modules()
+        container.get_archive.side_effect = [
+            (_tar_chunks("package.json", "{}"), {}),
+            (_directory_tar_chunks("nested"), {}),
+        ]
+        sandbox = self._started_sandbox(tmp_path, container)
+
+        assert sandbox.read_files(["package.json", "nested"]) is None
+
+        _docker_mod, _docker_errors, _client, missing_container = _docker_modules()
+        missing_container.get_archive.side_effect = [Exception("missing")]
+        missing_sandbox = self._started_sandbox(tmp_path, missing_container)
+        assert missing_sandbox.read_files(["missing.json"]) is None
+
+    def test_read_files_rejects_traversal_and_symlink_escape_before_reading(self, tmp_path):
+        _docker_mod, _docker_errors, _client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, container)
+
+        with pytest.raises(WorkspacePathError):
+            sandbox.read_files(["../outside.json"])
+        container.exec_run.assert_not_called()
+
+        container.exec_run.side_effect = [
+            (0, (b"", b"")),
+            (1, (b"", b"outside workspace")),
+        ]
+        with pytest.raises(WorkspacePathError, match="resolves outside the workspace"):
+            sandbox.read_files(["package.json", "linked/package.json"])
+        container.get_archive.assert_not_called()

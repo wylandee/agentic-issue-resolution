@@ -25,6 +25,43 @@ from .tools_manifest import _is_prohibited_target, _remember_stage_baseline
 from .tools_validation import _make_validate_code_syntax_tool
 
 
+def _restoration_failure_message(plan_state: dict[str, Any] | None) -> str | None:
+    """Block further mutations after an incomplete local rollback."""
+    if not plan_state or not plan_state.get("restoration_failed"):
+        return None
+    paths = ", ".join(plan_state.get("restoration_failure_paths", []) or [])
+    return (
+        "ERROR: [RESTORATION_INCOMPLETE] A previous rollback did not restore "
+        f"the workspace files ({paths}); this worker cannot edit until the "
+        "outer attempt snapshot restores the workspace."
+    )
+
+
+def _restore_source_snapshots(
+    sandbox: DockerSandbox,
+    snapshots: dict[str, str],
+    touched_files: set[str],
+    plan_state: dict[str, Any] | None,
+) -> list[str]:
+    """Restore local source snapshots and retain failed paths as candidates."""
+    errors: list[str] = []
+    for path, content in snapshots.items():
+        try:
+            sandbox.write_file(path, content)
+        except Exception as exc:  # noqa: BLE001 - retain the primary edit failure
+            touched_files.add(path)
+            errors.append(f"{path}: {exc}")
+    if errors and plan_state is not None:
+        plan_state["restoration_failed"] = True
+        plan_state["restoration_failure_paths"] = sorted(
+            set(plan_state.get("restoration_failure_paths", []) or [])
+            | {error.split(":", 1)[0] for error in errors}
+        )
+        plan_state["restoration_failure_diagnostics"] = errors
+        plan_state["validation_passed"] = False
+    return errors
+
+
 def _apply_replacements_to_content(
     content: str,
     replacements: list[WorkaroundPlannedReplacement],
@@ -115,6 +152,9 @@ def _make_deterministic_apply_edit_set_tool(
                 ]
             }
         """
+        restoration_error = _restoration_failure_message(plan_state)
+        if restoration_error:
+            return restoration_error
         if plan_state is not None:
             if not plan_state.get("recorded", False) or "planned_replacements" not in plan_state:
                 return "ERROR: [PLAN_VIOLATION] You MUST call record_plan before making any code edits with deterministic_apply_edit_set."
@@ -237,11 +277,15 @@ def _make_deterministic_apply_edit_set_tool(
                 sandbox.write_file(rel_path, new_content)
                 written_files.append(rel_path)
         except Exception as exc:
-            for rel_path, orig in file_snapshots.items():
-                sandbox.write_file(rel_path, orig)
-            return (
-                f"ERROR: [WRITE_FAILURE] Write failed on '{rel_path}': {exc}. All files restored."
+            restore_errors = _restore_source_snapshots(
+                sandbox, file_snapshots, touched_files, plan_state
             )
+            restoration_note = (
+                " All files restored."
+                if not restore_errors
+                else " RESTORATION_INCOMPLETE: " + " | ".join(restore_errors)
+            )
+            return f"ERROR: [WRITE_FAILURE] Write failed on '{rel_path}': {exc}.{restoration_note}"
 
         for rel_path in new_file_contents:
             language = (
@@ -252,15 +296,24 @@ def _make_deterministic_apply_edit_set_tool(
             syntax_tool = _make_validate_code_syntax_tool(sandbox, language=language)
             syntax_res = syntax_tool.invoke({"file_path": rel_path})
             if "FAILURE" in syntax_res or "ERROR" in syntax_res:
-                for p, orig in file_snapshots.items():
-                    sandbox.write_file(p, orig)
+                restore_errors = _restore_source_snapshots(
+                    sandbox, file_snapshots, touched_files, plan_state
+                )
                 if plan_state is not None:
                     plan_state["phase"] = WorkaroundExecutionPhase.INVESTIGATE.value
                     plan_state["local_investigation_complete"] = False
                     plan_state["edit_failure_requires_replan"] = True
                     plan_state["validation_passed"] = False
 
-                return f"ERROR: [SYNTAX_FAILURE] Replacement produced invalid syntax in '{rel_path}'. All files in edit set restored.\n{syntax_res}"
+                restoration_note = (
+                    " All files in the edit set were restored."
+                    if not restore_errors
+                    else " RESTORATION_INCOMPLETE: " + " | ".join(restore_errors)
+                )
+                return (
+                    f"ERROR: [SYNTAX_FAILURE] Replacement produced invalid syntax in '{rel_path}'."
+                    f"{restoration_note}\n{syntax_res}"
+                )
 
         plan_rev = plan_state.get("plan_revision", 1) if plan_state else 1
         iteration = plan_state.get("iteration", 1) if plan_state else 1
@@ -332,6 +385,9 @@ def _make_deterministic_search_replace_tool(
         """
         Apply an exact one-time search/replace to a workspace file.
         """
+        restoration_error = _restoration_failure_message(plan_state)
+        if restoration_error:
+            return restoration_error
         if plan_state is not None:
             if not plan_state.get("recorded", False):
                 return "ERROR: [PLAN_VIOLATION] You MUST call record_plan before making any code edits with deterministic_search_replace."
@@ -466,6 +522,9 @@ def _make_deterministic_replace_ast_symbol_tool(
         """
         Replace the complete AST body of a declared function, class, or method.
         """
+        restoration_error = _restoration_failure_message(plan_state)
+        if restoration_error:
+            return restoration_error
         if plan_state is not None:
             if not plan_state.get("recorded", False):
                 return "ERROR: [PLAN_VIOLATION] You MUST call record_plan before making any code edits."

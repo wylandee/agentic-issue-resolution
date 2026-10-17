@@ -6,11 +6,11 @@
     "package_name": "notevil",
     "initial_no_fix_stage": "vulnerable_code_removal",
     "initial_attempt_id": "notevil-nofix-stage-two-attempt",
-    "source_group_id": "sca:package.json:notevil:NO_FIX",
+    "source_group_id": "sca:package.json:notevil",
     "source_fixture": "examples/juice_shop/fixtures/suppressed/triaged_groups_suppressed.json"
   },
   "group": {
-    "group_id": "sca:package.json:notevil:NO_FIX",
+    "group_id": "sca:package.json:notevil",
     "issue_type": "sca",
     "vulnerable_component": "notevil",
     "file_path": "package.json",
@@ -110,7 +110,7 @@
     "task_id": "task-nofix-notevil",
     "task_revision": 2,
     "current_attempt_id": null,
-    "parent_group_id": "sca:package.json:notevil:NO_FIX",
+    "parent_group_id": "sca:package.json:notevil",
     "parent_task_id": null,
     "qa_policy": "no_fix_code_removal",
     "strategy": "code_workaround",
@@ -158,7 +158,7 @@
     "install_command": "npm install --package-lock=true --no-audit --no-fund && cd frontend && npm install --package-lock=true --no-audit --no-fund"
   },
   "provenance": {
-    "source_group_id": "sca:package.json:notevil:NO_FIX",
+    "source_group_id": "sca:package.json:notevil",
     "source_fixture": "examples/juice_shop/fixtures/suppressed/triaged_groups_suppressed.json",
     "workflow_entrypoint": "package_removal QA failure -> supervisor retry -> workaround_subagent"
   }

@@ -1,12 +1,12 @@
 # Triage Task-Completion Evaluation Mapping
 
-The triage replay suite in tests/evals/test_triage_eval.py uses only
-DeepEval TaskCompletionMetric. Each golden puts its completion contract in
-completion_task and the replayed final outcome in actual_output. The
-expected_output, provenance, and historical evidence fields are retained for
-review and persistence; they are not treated as a second metric or as
-deterministic field assertions. Tool calls are empty because triage completion
-does not require a worker tool trace.
+The triage live-replay suite in `tests/evals/test_triage_eval.py` uses DeepEval
+`TaskCompletionMetric`. Each golden puts its completion contract in
+`completion_task` and the replayed final outcome in `actual_output`.
+`expected_output`, provenance, and historical evidence provide review context;
+they are not a second live metric. Separate deterministic tests exercise timeout
+fallback, hallucinated issue selection, and guardrail replay. Triage tool calls
+are empty because triage completion does not require a worker tool trace.
 
 ## Provenance labels
 
@@ -41,3 +41,11 @@ does not require a worker tool trace.
 The dataset intentionally keeps all 15 proposed case IDs, while labeling
 unsupported or boundary cases instead of presenting them as historical
 replays.
+
+The tactical Supervisor has a separate ten-case suite in
+`tests/evals/golden/supervisor_cases.json` and
+`tests/evals/test_supervisor_eval.py`. Its offline replays assert the production
+proposal-verification and state-transition contracts; optional live judgments
+measure task completion and applicable tool correctness. This is distinct from
+triage model evaluation and does not transfer orchestration authority to the
+model.

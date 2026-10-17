@@ -1,0 +1,23 @@
+flowchart TD
+    Start([START]) --> Initial[initial_triage]
+    Initial -->|actionable| Builder[workspace_builder]
+    Initial -->|no work or failure| Teardown[teardown]
+    Builder -->|ready| SetupScan[workspace_setup_scan]
+    Builder -->|setup failure| Teardown
+    SetupScan --> Supervisor[Supervisor<br/>plans and certifies inside this node]
+
+    Supervisor -->|committed update| Update[update_subagent]
+    Supervisor -->|committed workaround| Workaround[workaround_subagent]
+    Supervisor -->|validate attempt| QA[qa_critic]
+    Supervisor -->|post-QA reconcile| Triage[triage]
+    Supervisor -->|optional full scan| FullScan[final_full_scan]
+    Supervisor -->|finished| Teardown
+
+    Update --> Supervisor
+    Workaround --> Supervisor
+    QA --> Supervisor
+    Triage -->|reconciled| Supervisor
+    Triage -->|no work or failure| Teardown
+    FullScan --> Supervisor
+    Teardown --> Report[report]
+    Report --> End([END])

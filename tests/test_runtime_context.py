@@ -5,6 +5,7 @@ import pytest
 from remediation_engine.orchestration.runtime_context import (
     get_bound_runtime_settings,
     get_runtime_settings,
+    openai_api_key_kwargs,
     use_runtime_settings,
 )
 from remediation_engine.settings import AppSettings
@@ -55,3 +56,14 @@ def test_use_runtime_settings_restores_binding_when_context_raises() -> None:
         assert get_bound_runtime_settings() is outer_settings
 
     assert get_bound_runtime_settings() is None
+
+
+def test_openai_client_receives_bound_key_without_environment(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    settings = AppSettings(openai_api_key="injected-test-key")
+
+    with use_runtime_settings(settings):
+        assert openai_api_key_kwargs() == {"api_key": "injected-test-key"}
+
+    with use_runtime_settings(AppSettings(openai_api_key="")):
+        assert openai_api_key_kwargs() == {}

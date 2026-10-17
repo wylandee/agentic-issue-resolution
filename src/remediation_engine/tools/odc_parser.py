@@ -47,6 +47,7 @@ except ImportError:  # pragma: no cover
 
 
 log = logging.getLogger(__name__)
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 CSV_HEADERS = [
     "Dependency_Name",
@@ -170,16 +171,21 @@ def _parse_cwes(vulnerability: dict[str, Any]) -> list[CWEEntry]:
 
 def _extract_cve_id(vulnerability: dict[str, Any]) -> str | None:
     """Return CVE ID if the vuln name matches CVE format, else check references."""
-    name = (vulnerability.get("name") or "").strip()
+    name = str(vulnerability.get("name") or "").strip()
     if name.upper().startswith("CVE-"):
         return name.upper()
 
     import re
 
     cve_regex = re.compile(r"\b(CVE-\d{4}-\d{4,7})\b", re.IGNORECASE)
-    for ref in vulnerability.get("references") or []:
+    references = vulnerability.get("references") or []
+    if not isinstance(references, list):
+        return None
+    for ref in references:
+        if not isinstance(ref, dict):
+            continue
         for key in ("url", "name"):
-            val = ref.get(key) or ""
+            val = str(ref.get(key) or "")
             match = cve_regex.search(val)
             if match:
                 return match.group(1).upper()
@@ -190,7 +196,7 @@ def _extract_ghsa_id(vulnerability: dict[str, Any]) -> str | None:
     """Return GHSA ID if the vulnerability name or references contain one."""
     import re
 
-    name = (vulnerability.get("name") or "").strip()
+    name = str(vulnerability.get("name") or "").strip()
     ghsa_regex = re.compile(
         r"\b(GHSA-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})\b",
         re.IGNORECASE,
@@ -200,9 +206,14 @@ def _extract_ghsa_id(vulnerability: dict[str, Any]) -> str | None:
     if match:
         return match.group(1).upper()
 
-    for ref in vulnerability.get("references") or []:
+    references = vulnerability.get("references") or []
+    if not isinstance(references, list):
+        return None
+    for ref in references:
+        if not isinstance(ref, dict):
+            continue
         for key in ("url", "name"):
-            val = ref.get(key) or ""
+            val = str(ref.get(key) or "")
             match = ghsa_regex.search(val)
             if match:
                 return match.group(1).upper()
@@ -239,11 +250,14 @@ def parse_vulnerabilities(
     base_ref:
         Optional git branch or commit SHA that was scanned.
     """
+    if not isinstance(report, dict):
+        raise ValueError("OWASP Dependency-Check report must be a JSON object.")
+
     issues: list[VulnerabilityIssue] = []
     dependencies = report.get("dependencies") or []
 
     if not isinstance(dependencies, list):
-        return issues
+        raise ValueError("OWASP Dependency-Check dependencies must be a JSON array.")
 
     for dep in dependencies:
         if not isinstance(dep, dict):
@@ -370,26 +384,23 @@ def main(argv: list[str] | None = None) -> None:
     """Run the ODC JSON â†’ JSONL + CSV ingestion pipeline."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent.parent
-
     parser = argparse.ArgumentParser(description="Parse an OWASP Dependency-Check JSON report.")
     parser.add_argument(
         "--input",
         type=Path,
-        default=project_root / "data" / "dependency-check-report.json",
+        default=_PROJECT_ROOT / "data" / "dependency-check-report.json",
         help="Dependency-Check JSON report path.",
     )
     parser.add_argument(
         "--output-jsonl",
         type=Path,
-        default=project_root / "data" / "odc_issues.jsonl",
+        default=_PROJECT_ROOT / "data" / "odc_issues.jsonl",
         help="Canonical issue JSONL output path.",
     )
     parser.add_argument(
         "--output-csv",
         type=Path,
-        default=project_root / "data" / "odc_issues.csv",
+        default=_PROJECT_ROOT / "data" / "odc_issues.csv",
         help="Human-readable CSV output path.",
     )
     parser.add_argument(

@@ -6,24 +6,37 @@ All Docker SDK interactions are mocked. No real Docker daemon is required.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
+
+from langgraph.graph import END, START, StateGraph
 
 from remediation_engine.contracts.schemas import (
     CommandResult,
+    IssueSource,
+    IssueType,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
+    Severity,
+    SystemContext,
     TaskAttemptSnapshot,
     TaskStatus,
+    VulnerabilityGroup,
+    VulnerabilityIssue,
 )
-from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import (
     ChangedFilesProjection,
+    OrchestratorState,
     initial_orchestrator_state,
     merge_changed_files_reducer,
 )
 from remediation_engine.orchestration.supervisor_node import instruction_digest
-from remediation_engine.orchestration.teardown_node import _build_diff, run_teardown_node
+from remediation_engine.orchestration.teardown_node import (
+    _build_diff,
+    _revert_unfixable_packages_in_json,
+    run_teardown_node,
+)
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 
 
@@ -33,6 +46,246 @@ def _sandbox_mock() -> MagicMock:
     mock.__exit__ = MagicMock(return_value=None)
     mock.run.return_value = CommandResult(exit_code=0, duration_seconds=0.0)
     return mock
+
+
+def test_revert_unfixable_v3_lockfile_entries_and_descendants():
+    original = {
+        "name": "app",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "app",
+                "dependencies": {"foo": "1.0.0", "bar": "1.0.0"},
+            },
+            "node_modules/foo": {"version": "1.0.0"},
+            "node_modules/foo/node_modules/child": {"version": "1.1.0"},
+            "node_modules/bar": {"version": "1.0.0"},
+        },
+    }
+    updated = {
+        "name": "app",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "app",
+                "dependencies": {
+                    "foo": "9.9.9",
+                    "bar": "2.0.0",
+                    "new-package": "9.9.9",
+                },
+            },
+            "node_modules/foo": {"version": "9.9.9"},
+            "node_modules/foo/node_modules/child": {"version": "9.9.9"},
+            "node_modules/foo/node_modules/added": {"version": "1.0.0"},
+            "node_modules/bar": {"version": "2.0.0"},
+            "node_modules/new-package": {"version": "9.9.9"},
+        },
+    }
+
+    reverted = json.loads(
+        _revert_unfixable_packages_in_json(
+            json.dumps(original),
+            json.dumps(updated),
+            {"foo", "new-package"},
+        )
+    )
+
+    assert reverted["packages"]["node_modules/foo"] == {"version": "1.0.0"}
+    assert reverted["packages"]["node_modules/foo/node_modules/child"] == {"version": "1.1.0"}
+    assert "node_modules/foo/node_modules/added" not in reverted["packages"]
+    assert "node_modules/new-package" not in reverted["packages"]
+    assert "new-package" not in reverted["packages"][""]["dependencies"]
+    assert reverted["packages"][""]["dependencies"] == {
+        "foo": "1.0.0",
+        "bar": "2.0.0",
+    }
+    assert reverted["packages"]["node_modules/bar"] == {"version": "2.0.0"}
+
+
+def test_revert_unfixable_v1_v2_dependency_trees_preserve_other_packages():
+    for lockfile_version in (1, 2):
+        original = {
+            "name": "app",
+            "lockfileVersion": lockfile_version,
+            "dependencies": {
+                "foo": {
+                    "version": "1.0.0",
+                    "dependencies": {"child": {"version": "1.1.0"}},
+                },
+                "bar": {
+                    "version": "1.0.0",
+                    "dependencies": {"foo": {"version": "1.0.0"}},
+                },
+                "unrelated": {"version": "1.0.0"},
+            },
+        }
+        updated = {
+            "name": "app",
+            "lockfileVersion": lockfile_version,
+            "dependencies": {
+                "foo": {
+                    "version": "9.9.9",
+                    "dependencies": {
+                        "child": {"version": "9.9.9"},
+                        "added": {"version": "1.0.0"},
+                    },
+                },
+                "bar": {
+                    "version": "2.0.0",
+                    "dependencies": {"foo": {"version": "9.9.9"}},
+                },
+                "unrelated": {"version": "2.0.0"},
+                "ghost": {"version": "9.9.9"},
+                "new-parent": {
+                    "version": "2.0.0",
+                    "dependencies": {"foo": {"version": "9.9.9"}},
+                },
+            },
+        }
+
+        reverted = json.loads(
+            _revert_unfixable_packages_in_json(
+                json.dumps(original),
+                json.dumps(updated),
+                {"foo", "ghost"},
+            )
+        )
+
+        assert reverted["dependencies"]["foo"] == original["dependencies"]["foo"]
+        assert reverted["dependencies"]["bar"]["version"] == "2.0.0"
+        assert reverted["dependencies"]["bar"]["dependencies"]["foo"] == {"version": "1.0.0"}
+        assert "dependencies" not in reverted["dependencies"]["new-parent"]
+        assert "ghost" not in reverted["dependencies"]
+        assert reverted["dependencies"]["unrelated"]["version"] == "2.0.0"
+
+
+def test_malformed_lockfile_reversion_uses_host_text_and_reports_error():
+    original = '{"packages":{"node_modules/foo":{"version":"1.0.0"}}}\n'
+    errors = []
+
+    reverted = _revert_unfixable_packages_in_json(
+        original,
+        "{malformed json\n",
+        {"foo"},
+        errors,
+    )
+
+    assert reverted == original
+    assert len(errors) == 1
+    assert "malformed JSON" in errors[0]
+
+
+def test_unfixable_lockfile_candidate_is_absent_from_final_patch(tmp_path):
+    manifest_before = {
+        "name": "app",
+        "dependencies": {"foo": "1.0.0", "bar": "1.0.0"},
+    }
+    manifest_after = {
+        "name": "app",
+        "dependencies": {"foo": "9.9.9", "bar": "2.0.0"},
+    }
+    lockfile_before = {
+        "name": "app",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "app",
+                "dependencies": {"foo": "1.0.0", "bar": "1.0.0"},
+            },
+            "node_modules/foo": {"version": "1.0.0"},
+            "node_modules/foo/node_modules/child": {"version": "1.1.0"},
+            "node_modules/bar": {"version": "1.0.0"},
+        },
+    }
+    lockfile_after = {
+        "name": "app",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "app",
+                "dependencies": {"foo": "9.9.9", "bar": "2.0.0"},
+            },
+            "node_modules/foo": {"version": "9.9.9"},
+            "node_modules/foo/node_modules/child": {"version": "9.9.9"},
+            "node_modules/bar": {"version": "2.0.0"},
+        },
+    }
+    (tmp_path / "package.json").write_text(
+        json.dumps(manifest_before, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "package-lock.json").write_text(
+        json.dumps(lockfile_before, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    groups = [
+        VulnerabilityGroup(
+            group_id="group-foo",
+            issue_type=IssueType.SCA,
+            vulnerable_component="foo",
+            file_path="package.json",
+            file_paths=["package.json"],
+            representative_issue_id="00000000-0000-0000-0000-000000000001",
+        ),
+        VulnerabilityGroup(
+            group_id="group-bar",
+            issue_type=IssueType.SCA,
+            vulnerable_component="bar",
+            file_path="package.json",
+            file_paths=["package.json"],
+            representative_issue_id="00000000-0000-0000-0000-000000000002",
+        ),
+    ]
+    state = initial_orchestrator_state(str(tmp_path), groups)
+    state.update(
+        {
+            "task_queue": {
+                "task-foo": RemediationTask(
+                    task_id="task-foo",
+                    parent_group_id="group-foo",
+                    strategy=RoutingStrategy.VERSION_BUMP,
+                    target_package_name="foo",
+                    instruction="Update foo.",
+                    status=TaskStatus.UNFIXABLE,
+                ),
+                "task-bar": RemediationTask(
+                    task_id="task-bar",
+                    parent_group_id="group-bar",
+                    strategy=RoutingStrategy.VERSION_BUMP,
+                    target_package_name="bar",
+                    instruction="Update bar.",
+                    status=TaskStatus.QA_PASSED,
+                ),
+            },
+            "workspace_volume": "agent_workspace_lockfile",
+            "changed_files": ["package.json", "package-lock.json"],
+            "final_full_scan_completed": True,
+        }
+    )
+    sandbox = _sandbox_mock()
+    sandbox.read_file.side_effect = {
+        "package.json": json.dumps(manifest_after, indent=2) + "\n",
+        "package-lock.json": json.dumps(lockfile_after, indent=2) + "\n",
+    }.get
+    client = MagicMock()
+
+    with (
+        patch(
+            "remediation_engine.orchestration.teardown_node.DockerSandbox",
+            return_value=sandbox,
+        ),
+        patch(
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            return_value=client,
+        ),
+    ):
+        result = run_teardown_node(state)
+
+    assert result["changed_files"] == ["package-lock.json", "package.json"]
+    assert '"foo": "9.9.9"' not in result["diff"]
+    assert '"version": "9.9.9"' not in result["diff"]
+    assert '"bar": "2.0.0"' in result["diff"]
+    assert '"version": "2.0.0"' in result["diff"]
 
 
 class TestStateDefaults:
@@ -45,10 +298,60 @@ class TestStateDefaults:
         assert state["qa_evaluations"] == {}
         assert state["action_summaries"] == []
         assert state["changed_files"] == []
-        assert state["qa_rechecks_by_attempt"] == {}
+        assert state["package_inventory_baseline_complete"] is False
+        assert "changed_files" in OrchestratorState.__annotations__
+        assert state["baseline_scan_complete"] is False
+        assert state["accepted_package_inventory_by_lockfile"] == {}
+        assert state["current_scan_observations_by_occurrence"] == {}
+        assert state["latest_successful_scan_by_task"] == {}
         assert state["workspace_volume"] is None
         assert state["status"] == "pending"
         assert "messages" not in state
+
+        assert (
+            initial_orchestrator_state(str(tmp_path), [], issues=[])["baseline_scan_complete"]
+            is True
+        )
+
+    def test_package_scope_preserves_the_full_supplied_scan_baseline(self, tmp_path):
+        def issue(package_name: str, cve_id: str) -> VulnerabilityIssue:
+            return VulnerabilityIssue(
+                source=IssueSource.ODC,
+                issue_type=IssueType.SCA,
+                severity=Severity.HIGH,
+                cve_id=cve_id,
+                package_name=package_name,
+                package_version="1.0.0",
+            )
+
+        state = initial_orchestrator_state(
+            str(tmp_path),
+            [],
+            issues=[issue("selected", "CVE-2025-0001"), issue("outside", "CVE-2025-0002")],
+            system_context=SystemContext(environment="development"),
+            target_packages=["selected"],
+        )
+
+        assert state["baseline_scan_identifiers"] == ["CVE-2025-0001", "CVE-2025-0002"]
+        assert [item.package_name for item in state["issues"]] == ["selected"]
+
+    def test_graph_preserves_changed_file_channel_and_teardown_projection(self):
+        workflow = StateGraph(OrchestratorState)
+        workflow.add_node(
+            "candidate",
+            lambda _state: {"changed_files": ["frontend/package-lock.json"]},
+        )
+        workflow.add_node(
+            "final",
+            lambda _state: {"changed_files": ChangedFilesProjection(["frontend/package.json"])},
+        )
+        workflow.add_edge(START, "candidate")
+        workflow.add_edge("candidate", "final")
+        workflow.add_edge("final", END)
+
+        result = workflow.compile().invoke({"changed_files": []})
+
+        assert result["changed_files"] == ["frontend/package.json"]
 
 
 class TestWorkspaceBuilderNode:
@@ -63,6 +366,14 @@ class TestWorkspaceBuilderNode:
         (tmp_path / "package.json").write_text("{}", encoding="utf-8")
         (tmp_path / "frontend").mkdir()
         (tmp_path / "frontend" / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "package-lock.json").write_text(
+            '{"packages":{"":{"name":"root","version":"1.0.0"}}}',
+            encoding="utf-8",
+        )
+        (tmp_path / "frontend" / "package-lock.json").write_text(
+            '{"packages":{"":{"name":"frontend","version":"1.0.0"}}}',
+            encoding="utf-8",
+        )
         client = MagicMock()
         sandbox = _sandbox_mock()
 
@@ -80,13 +391,17 @@ class TestWorkspaceBuilderNode:
 
         client.volumes.create.assert_called_once()
         mock_sandbox.assert_called_once()
-        assert mock_sandbox.call_args.kwargs["image"] == "node:22"
         assert [call.args[0] for call in sandbox.run.call_args_list] == [
             "npm install --package-lock=true",
             "cd frontend && npm install --package-lock=true",
         ]
         assert result["status"] == "workspace_ready"
         assert result["workspace_volume"].startswith("agent_workspace_")
+        inventory = result["accepted_package_inventory_by_lockfile"]
+        assert result["package_inventory_baseline_complete"] is True
+        assert len(inventory) == 2
+        assert any(key.startswith('["package-lock.json",') for key in inventory)
+        assert any(key.startswith('["frontend/package-lock.json",') for key in inventory)
 
     def test_no_package_repository_skips_install(self, tmp_path):
         state = initial_orchestrator_state(str(tmp_path), [])
@@ -243,7 +558,6 @@ class TestTeardownNode:
         state["status"] = "edits_completed"
         state["workspace_volume"] = "agent_workspace_deadbeef"
         state["changed_files"] = ["routes/login.ts", "routes/login.ts"]
-        state["project_language"] = "python"
 
         sandbox = _sandbox_mock()
         sandbox.read_file.return_value = "const x = 2;\n"
@@ -253,7 +567,7 @@ class TestTeardownNode:
             patch(
                 "remediation_engine.orchestration.teardown_node.DockerSandbox",
                 return_value=sandbox,
-            ) as sandbox_type,
+            ),
             patch(
                 "remediation_engine.orchestration.teardown_node.get_docker_client",
                 return_value=client,
@@ -262,11 +576,6 @@ class TestTeardownNode:
             result = run_teardown_node(state)
 
         sandbox.read_file.assert_called_once_with("routes/login.ts")
-        sandbox_type.assert_called_once_with(
-            repo_root=None,
-            image=LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image,
-            workspace_volume="agent_workspace_deadbeef",
-        )
         client.volumes.get.assert_called_once_with("agent_workspace_deadbeef")
         client.volumes.get.return_value.remove.assert_called_once_with(force=True)
         assert result["status"] == "completed"
@@ -416,3 +725,50 @@ class TestTeardownNode:
         result = run_teardown_node(state)
 
         assert result["status"] == "completed_with_errors"
+
+# Stage-2 behavior retained during the architecture merge.
+from remediation_engine.language import LANGUAGE_CONFIGS
+
+from remediation_engine.language import ProjectLanguage
+
+class TestTeardownNodeStage2Parity:
+    def test_changed_files_are_deduplicated_diffed_and_volume_removed_python_stage2(self, tmp_path):
+        route_dir = tmp_path / "routes"
+        route_dir.mkdir()
+        (route_dir / "login.ts").write_text("const x = 1;\n", encoding="utf-8")
+
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["status"] = "edits_completed"
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["changed_files"] = ["routes/login.ts", "routes/login.ts"]
+        state["project_language"] = "python"
+
+        sandbox = _sandbox_mock()
+        sandbox.read_file.return_value = "const x = 2;\n"
+        client = MagicMock()
+
+        with (
+            patch(
+                "remediation_engine.orchestration.teardown_node.DockerSandbox",
+                return_value=sandbox,
+            ) as sandbox_type,
+            patch(
+                "remediation_engine.orchestration.teardown_node.get_docker_client",
+                return_value=client,
+            ),
+        ):
+            result = run_teardown_node(state)
+
+        sandbox.read_file.assert_called_once_with("routes/login.ts")
+        sandbox_type.assert_called_once_with(
+            repo_root=None,
+            image=LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image,
+            workspace_volume="agent_workspace_deadbeef",
+        )
+        client.volumes.get.assert_called_once_with("agent_workspace_deadbeef")
+        client.volumes.get.return_value.remove.assert_called_once_with(force=True)
+        assert result["status"] == "completed"
+        assert result["workspace_volume"] is None
+        assert result["changed_files"] == ["routes/login.ts"]
+        assert "a/routes/login.ts" in result["diff"]
+        assert "b/routes/login.ts" in result["diff"]

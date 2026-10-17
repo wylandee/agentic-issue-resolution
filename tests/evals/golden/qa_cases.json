@@ -11,7 +11,7 @@
     "completion_task": "Review one version-bump QA group and emit one evidence-backed evaluation. A clean pass requires install, scanner clearance, and tests to pass.",
     "qa_policy": "version_bump",
     "vulnerability_context": {
-      "group_id": "sca:package.json:debug:UPDATE_VERSION",
+      "group_id": "sca:package.json:debug",
       "vulnerable_component": "debug",
       "file_path": "package.json",
       "cve_ids": [],
@@ -100,7 +100,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:debug:UPDATE_VERSION",
+          "group_id": "sca:package.json:debug",
           "vulnerable_component": "debug",
           "file_path": "package.json",
           "cve_ids": [],
@@ -152,7 +152,7 @@
     "completion_task": "Review one version-bump QA group and emit a failure evaluation when dependency installation fails. Use the install log to provide peer-conflict guidance.",
     "qa_policy": "version_bump",
     "vulnerability_context": {
-      "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+      "group_id": "sca:package.json:express-jwt",
       "vulnerable_component": "express-jwt",
       "file_path": "package.json",
       "cve_ids": [
@@ -256,7 +256,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+          "group_id": "sca:package.json:express-jwt",
           "vulnerable_component": "express-jwt",
           "file_path": "package.json",
           "cve_ids": [
@@ -310,7 +310,7 @@
     "completion_task": "Review one version-bump QA group and emit a security failure when the scanner still reports target identifiers, even if install and tests pass.",
     "qa_policy": "version_bump",
     "vulnerability_context": {
-      "group_id": "sca:package.json:fstream:UPDATE_VERSION",
+      "group_id": "sca:package.json:fstream",
       "vulnerable_component": "fstream",
       "file_path": "package.json",
       "cve_ids": [
@@ -419,7 +419,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:fstream:UPDATE_VERSION",
+          "group_id": "sca:package.json:fstream",
           "vulnerable_component": "fstream",
           "file_path": "package.json",
           "cve_ids": [
@@ -478,7 +478,7 @@
     "completion_task": "Review one version-bump QA group and emit a failure evaluation when the updated package causes a test regression. Cite the exact API diagnostic.",
     "qa_policy": "version_bump",
     "vulnerability_context": {
-      "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+      "group_id": "sca:package.json:express-jwt",
       "vulnerable_component": "express-jwt",
       "file_path": "package.json",
       "cve_ids": [
@@ -582,7 +582,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+          "group_id": "sca:package.json:express-jwt",
           "vulnerable_component": "express-jwt",
           "file_path": "package.json",
           "cve_ids": [
@@ -636,7 +636,7 @@
     "completion_task": "Review one initial code-workaround group. Remaining scanner identifiers are nonblocking, but source/diff evidence must prove the vulnerable path is blocked and tests must pass before emitting pass.",
     "qa_policy": "initial_code_workaround",
     "vulnerability_context": {
-      "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+      "group_id": "sca:package.json:express-jwt",
       "vulnerable_component": "express-jwt",
       "file_path": "lib/insecurity.ts",
       "cve_ids": [
@@ -790,7 +790,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "group_id": "sca:package.json:express-jwt",
           "vulnerable_component": "express-jwt",
           "file_path": "lib/insecurity.ts",
           "cve_ids": [
@@ -846,7 +846,7 @@
     "completion_task": "Review one initial code-workaround group and emit a failure evaluation when installation fails. Do not claim semantic validation when the environment cannot be installed.",
     "qa_policy": "initial_code_workaround",
     "vulnerability_context": {
-      "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+      "group_id": "sca:package.json:express-jwt",
       "vulnerable_component": "express-jwt",
       "file_path": "lib/insecurity.ts",
       "cve_ids": [
@@ -959,7 +959,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "group_id": "sca:package.json:express-jwt",
           "vulnerable_component": "express-jwt",
           "file_path": "lib/insecurity.ts",
           "cve_ids": [
@@ -1027,7 +1027,7 @@
     "completion_task": "Review one initial code-workaround group. Remaining scanner identifiers are nonblocking, but source/diff evidence must prove the vulnerable path is blocked; emit a security failure when semantic review fails.",
     "qa_policy": "initial_code_workaround",
     "vulnerability_context": {
-      "group_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+      "group_id": "sca:package.json:sanitize-html",
       "vulnerable_component": "sanitize-html",
       "file_path": "lib/insecurity.ts",
       "cve_ids": [
@@ -1208,7 +1208,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+          "group_id": "sca:package.json:sanitize-html",
           "vulnerable_component": "sanitize-html",
           "file_path": "lib/insecurity.ts",
           "cve_ids": [
@@ -1291,7 +1291,7 @@
     "completion_task": "Review one initial code-workaround group and emit failure when the workaround passes semantic review but regresses required behavior.",
     "qa_policy": "initial_code_workaround",
     "vulnerability_context": {
-      "group_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+      "group_id": "sca:package.json:sanitize-html",
       "vulnerable_component": "sanitize-html",
       "file_path": "lib/insecurity.ts",
       "cve_ids": [
@@ -1407,7 +1407,7 @@
           "test_attribution": {
             "verdict": "responsible",
             "responsible_group_ids": [
-              "sca:package.json:sanitize-html:CODE_WORKAROUND"
+              "sca:package.json:sanitize-html"
             ],
             "failed_tests": [
               "insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]"
@@ -1435,7 +1435,7 @@
         "test_attribution": {
           "verdict": "responsible",
           "responsible_group_ids": [
-            "sca:package.json:sanitize-html:CODE_WORKAROUND"
+            "sca:package.json:sanitize-html"
           ],
           "failed_tests": [
             "insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]"
@@ -1482,7 +1482,7 @@
             "test_attribution": {
               "verdict": "responsible",
               "responsible_group_ids": [
-                "sca:package.json:sanitize-html:CODE_WORKAROUND"
+                "sca:package.json:sanitize-html"
               ],
               "failed_tests": [
                 "insecurity sanitizeSecure cannot be bypassed by exploiting lack of recursive sanitization [server]"
@@ -1497,7 +1497,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:sanitize-html:CODE_WORKAROUND",
+          "group_id": "sca:package.json:sanitize-html",
           "vulnerable_component": "sanitize-html",
           "file_path": "lib/insecurity.ts",
           "cve_ids": [
@@ -1580,7 +1580,7 @@
     "completion_task": "Review one migration code-workaround pivot after an update API break and emit pass only when the migrated API, scanner clearance, and tests are all successful.",
     "qa_policy": "migration_code_workaround",
     "vulnerability_context": {
-      "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+      "group_id": "sca:package.json:express-jwt",
       "vulnerable_component": "express-jwt",
       "file_path": "lib/insecurity.ts",
       "cve_ids": [
@@ -1695,7 +1695,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "group_id": "sca:package.json:express-jwt",
           "vulnerable_component": "express-jwt",
           "file_path": "lib/insecurity.ts",
           "cve_ids": [
@@ -1749,7 +1749,7 @@
     "completion_task": "Review one migration code-workaround pivot and emit a peer-conflict failure when installation fails before the pivot can be validated.",
     "qa_policy": "migration_code_workaround",
     "vulnerability_context": {
-      "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+      "group_id": "sca:package.json:express-jwt",
       "vulnerable_component": "express-jwt",
       "file_path": "lib/insecurity.ts",
       "cve_ids": [
@@ -1852,7 +1852,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "group_id": "sca:package.json:express-jwt",
           "vulnerable_component": "express-jwt",
           "file_path": "lib/insecurity.ts",
           "cve_ids": [
@@ -1906,7 +1906,7 @@
     "completion_task": "Review one migration code-workaround pivot and emit a breaking-change failure when the migrated API still causes required tests to fail.",
     "qa_policy": "migration_code_workaround",
     "vulnerability_context": {
-      "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+      "group_id": "sca:package.json:express-jwt",
       "vulnerable_component": "express-jwt",
       "file_path": "lib/insecurity.ts",
       "cve_ids": [
@@ -2009,7 +2009,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+          "group_id": "sca:package.json:express-jwt",
           "vulnerable_component": "express-jwt",
           "file_path": "lib/insecurity.ts",
           "cve_ids": [
@@ -2063,7 +2063,7 @@
     "completion_task": "Review one no-fix package-removal group. Confirm install, scanner clearance, package absence from manifest and graph, and tests before emitting pass.",
     "qa_policy": "no_fix_package_removal",
     "vulnerability_context": {
-      "group_id": "sca:package.json:notevil:NO_FIX",
+      "group_id": "sca:package.json:notevil",
       "vulnerable_component": "notevil",
       "file_path": "package.json",
       "cve_ids": [
@@ -2183,7 +2183,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:notevil:NO_FIX",
+          "group_id": "sca:package.json:notevil",
           "vulnerable_component": "notevil",
           "file_path": "package.json",
           "cve_ids": [
@@ -2239,7 +2239,7 @@
     "completion_task": "Review one no-fix package-removal group and emit a peer-conflict failure when the install gate fails. Because installation failed, manifest and resolved-graph post-state are unknown; do not claim package-removal validation succeeded.",
     "qa_policy": "no_fix_package_removal",
     "vulnerability_context": {
-      "group_id": "sca:package.json:notevil:NO_FIX",
+      "group_id": "sca:package.json:notevil",
       "vulnerable_component": "notevil",
       "file_path": "package.json",
       "cve_ids": [
@@ -2346,7 +2346,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:notevil:NO_FIX",
+          "group_id": "sca:package.json:notevil",
           "vulnerable_component": "notevil",
           "file_path": "package.json",
           "cve_ids": [
@@ -2402,7 +2402,7 @@
     "completion_task": "Review one no-fix package-removal group. Installation and tests pass, but package removal fails when the vulnerable package remains in the manifest or resolved dependency graph and the scanner still reports target identifiers. Query the scan log, then emit a security_flag failure.",
     "qa_policy": "no_fix_package_removal",
     "vulnerability_context": {
-      "group_id": "sca:package.json:notevil:NO_FIX",
+      "group_id": "sca:package.json:notevil",
       "vulnerable_component": "notevil",
       "file_path": "package.json",
       "cve_ids": [
@@ -2512,7 +2512,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:notevil:NO_FIX",
+          "group_id": "sca:package.json:notevil",
           "vulnerable_component": "notevil",
           "file_path": "package.json",
           "cve_ids": [
@@ -2571,7 +2571,7 @@
     "completion_task": "Review one no-fix package-removal group and emit a failure when required tests fail after package removal. Use the test log and consumer source to provide actionable feedback.",
     "qa_policy": "no_fix_package_removal",
     "vulnerability_context": {
-      "group_id": "sca:package.json:notevil:NO_FIX",
+      "group_id": "sca:package.json:notevil",
       "vulnerable_component": "notevil",
       "file_path": "package.json",
       "cve_ids": [
@@ -2649,7 +2649,7 @@
           "test_attribution": {
             "verdict": "responsible",
             "responsible_group_ids": [
-              "sca:package.json:notevil:NO_FIX"
+              "sca:package.json:notevil"
             ],
             "failed_tests": [
               "Cannot find module notevil from routes/b2bOrder.ts"
@@ -2669,7 +2669,7 @@
         "test_attribution": {
           "verdict": "responsible",
           "responsible_group_ids": [
-            "sca:package.json:notevil:NO_FIX"
+            "sca:package.json:notevil"
           ],
           "failed_tests": [
             "Cannot find module notevil from routes/b2bOrder.ts"
@@ -2703,7 +2703,7 @@
             "test_attribution": {
               "verdict": "responsible",
               "responsible_group_ids": [
-                "sca:package.json:notevil:NO_FIX"
+                "sca:package.json:notevil"
               ],
               "failed_tests": [
                 "Cannot find module notevil from routes/b2bOrder.ts"
@@ -2718,7 +2718,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:notevil:NO_FIX",
+          "group_id": "sca:package.json:notevil",
           "vulnerable_component": "notevil",
           "file_path": "package.json",
           "cve_ids": [
@@ -2774,7 +2774,7 @@
     "completion_task": "Review one no-fix code-removal pivot after package removal was exhausted. Residual target identifiers are expected and nonblocking; emit pass only when source/diff evidence proves the vulnerable path was removed and tests pass.",
     "qa_policy": "no_fix_code_removal",
     "vulnerability_context": {
-      "group_id": "sca:package.json:notevil:NO_FIX",
+      "group_id": "sca:package.json:notevil",
       "vulnerable_component": "notevil",
       "file_path": "routes/b2bOrder.ts",
       "cve_ids": [
@@ -2934,7 +2934,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:notevil:NO_FIX",
+          "group_id": "sca:package.json:notevil",
           "vulnerable_component": "notevil",
           "file_path": "routes/b2bOrder.ts",
           "cve_ids": [
@@ -2993,7 +2993,7 @@
     "completion_task": "Review one no-fix code-removal pivot and emit a peer-conflict failure when installation fails. Package retention is expected for this policy, but the failed install leaves post-install graph validation and source-level semantic validation incomplete.",
     "qa_policy": "no_fix_code_removal",
     "vulnerability_context": {
-      "group_id": "sca:package.json:notevil:NO_FIX",
+      "group_id": "sca:package.json:notevil",
       "vulnerable_component": "notevil",
       "file_path": "routes/b2bOrder.ts",
       "cve_ids": [
@@ -3098,7 +3098,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:notevil:NO_FIX",
+          "group_id": "sca:package.json:notevil",
           "vulnerable_component": "notevil",
           "file_path": "routes/b2bOrder.ts",
           "cve_ids": [
@@ -3154,7 +3154,7 @@
     "completion_task": "Review one no-fix code-removal pivot. Residual target identifiers are nonblocking, but source/diff evidence must prove the vulnerable path is removed; emit a security failure when semantic review fails.",
     "qa_policy": "no_fix_code_removal",
     "vulnerability_context": {
-      "group_id": "sca:package.json:notevil:NO_FIX",
+      "group_id": "sca:package.json:notevil",
       "vulnerable_component": "notevil",
       "file_path": "routes/b2bOrder.ts",
       "cve_ids": [
@@ -3311,7 +3311,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:notevil:NO_FIX",
+          "group_id": "sca:package.json:notevil",
           "vulnerable_component": "notevil",
           "file_path": "routes/b2bOrder.ts",
           "cve_ids": [
@@ -3370,7 +3370,7 @@
     "completion_task": "Review one no-fix code-removal pivot and emit a failure when required unit tests fail. Preserve the historical evidence that semantic review and test attribution were inconclusive.",
     "qa_policy": "no_fix_code_removal",
     "vulnerability_context": {
-      "group_id": "sca:package.json:notevil:NO_FIX",
+      "group_id": "sca:package.json:notevil",
       "vulnerable_component": "notevil",
       "file_path": "routes/b2bOrder.ts",
       "cve_ids": [
@@ -3534,7 +3534,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:notevil:NO_FIX",
+          "group_id": "sca:package.json:notevil",
           "vulnerable_component": "notevil",
           "file_path": "routes/b2bOrder.ts",
           "cve_ids": [
@@ -3590,7 +3590,7 @@
     "completion_task": "Complete the assigned QA evaluation for the vulnerability group. A bounded run that reaches 24 tool-call rounds without emit_qa_evaluation is incomplete and must not claim QA completion.",
     "qa_policy": "version_bump",
     "vulnerability_context": {
-      "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+      "group_id": "sca:package.json:express-jwt",
       "vulnerable_component": "express-jwt",
       "file_path": "package.json",
       "cve_ids": [
@@ -3647,7 +3647,7 @@
     "replay": {
       "input": {
         "vulnerability_context": {
-          "group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+          "group_id": "sca:package.json:express-jwt",
           "vulnerable_component": "express-jwt",
           "file_path": "package.json",
           "cve_ids": [
