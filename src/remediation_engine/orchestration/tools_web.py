@@ -25,11 +25,10 @@ from ._tool_support import (
 
 
 def _make_search_web_tool(
-    mandatory_search_terms: dict[str, str] | None = None,
     plan_state: dict[str, Any] | None = None,
 ):
     """Create a web search tool backed by Serper.dev."""
-    _calls_remaining = [3]
+    _calls_remaining = [_SEARCH_WEB_MAX_CALLS]
 
     @tool
     def search_web(query: str) -> str:

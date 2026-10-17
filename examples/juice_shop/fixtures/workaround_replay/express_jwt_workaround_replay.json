@@ -11,7 +11,7 @@
     "source_workaround_attempt_id": "0415e245-da32-4ae9-96bf-09e3c3f6e0d1"
   },
   "group": {
-    "group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+    "group_id": "sca:package.json:express-jwt",
     "issue_type": "sca",
     "vulnerable_component": "express-jwt",
     "file_path": "package.json",
@@ -61,7 +61,7 @@
     "task_id": "task-2",
     "task_revision": 1,
     "current_attempt_id": null,
-    "parent_group_id": "sca:package.json:express-jwt:CODE_WORKAROUND",
+    "parent_group_id": "sca:package.json:express-jwt",
     "parent_task_id": "task-1",
     "qa_policy": "migration_code_workaround",
     "strategy": "code_workaround",
@@ -132,7 +132,7 @@
   },
   "provenance": {
     "source_trace_file": "data/trajectories/phase5_20260729T063522Z_249c81ed-5f64-42f2-98d8-013fb6ed0723.md",
-    "source_group_id": "sca:package.json:express-jwt:UPDATE_VERSION",
+    "source_group_id": "sca:package.json:express-jwt",
     "source_update_task_id": "task-1",
     "source_update_task_revision": 1,
     "source_workaround_task_id": "task-2",

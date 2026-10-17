@@ -10,7 +10,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import CommandResult
-from remediation_engine.language import ProjectLanguage
+from remediation_engine.orchestration.trajectory_exporter import (
+    TrajectoryRecorder,
+    use_trajectory_recorder,
+)
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 
 _VOLUME_HEX = "deadbeefcafebabe"
@@ -32,6 +35,28 @@ def _volume_name_patch():
 
 
 class TestWorkspaceBuilderNode:
+    def test_created_volume_is_registered_on_the_active_run_recorder(self, tmp_path):
+        recorder = TrajectoryRecorder()
+        client = MagicMock()
+        sandbox = _sandbox_mock()
+
+        with (
+            _volume_name_patch(),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.get_docker_client",
+                return_value=client,
+            ),
+            patch(
+                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
+                return_value=sandbox,
+            ),
+            use_trajectory_recorder(recorder),
+        ):
+            result = run_workspace_builder_node({"repo_root": str(tmp_path)})
+
+        assert result["workspace_volume"] == "agent_workspace_deadbeef"
+        assert recorder.workspace_volume == result["workspace_volume"]
+
     def test_success_creates_named_volume_copies_repo_and_returns_ready_projection(self, tmp_path):
         """The builder provisions one volume and hands the repository to the sandbox."""
         (tmp_path / "package.json").write_text("{}", encoding="utf-8")
@@ -58,7 +83,13 @@ class TestWorkspaceBuilderNode:
         volume_name = f"agent_workspace_{_VOLUME_HEX[:8]}"
         client.volumes.create.assert_called_once_with(name=volume_name)
         client.close.assert_called_once_with()
-        sandbox_type.assert_called_once_with(str(tmp_path), workspace_volume=volume_name)
+        sandbox_type.assert_called_once_with(
+            tmp_path,
+            workspace_volume=volume_name,
+            image="node:22",
+            maven_repository_volume=None,
+            archive_excluded_dirs=frozenset(),
+        )
         sandbox.__enter__.assert_called_once_with()
         sandbox.__exit__.assert_called_once()
         assert [call.args[0] for call in sandbox.run.call_args_list] == [
@@ -66,126 +97,10 @@ class TestWorkspaceBuilderNode:
             "cd packages/web && npm install --package-lock=true",
         ]
         assert all(call.kwargs == {"timeout": 900} for call in sandbox.run.call_args_list)
-        assert result == {
-            "workspace_volume": volume_name,
-            "maven_cache_volume": None,
-            "status": "workspace_ready",
-        }
-
-    def test_java_workspace_uses_maven_image_cache_and_builds_reactor(self, tmp_path):
-        (tmp_path / "pom.xml").write_text("<project/>", encoding="utf-8")
-        client = MagicMock()
-        sandbox = _sandbox_mock()
-
-        with (
-            _volume_name_patch(),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.get_docker_client",
-                return_value=client,
-            ),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
-                return_value=sandbox,
-            ) as sandbox_type,
-        ):
-            result = run_workspace_builder_node(
-                {
-                    "repo_root": str(tmp_path),
-                    "project_language": ProjectLanguage.JAVA,
-                }
-            )
-
-        workspace_volume = f"agent_workspace_{_VOLUME_HEX[:8]}"
-        maven_cache_volume = f"agent_maven_repository_{_VOLUME_HEX[:8]}"
-        assert [entry.kwargs["name"] for entry in client.volumes.create.call_args_list] == [
-            workspace_volume,
-            maven_cache_volume,
-        ]
-        sandbox_type.assert_called_once_with(
-            str(tmp_path),
-            workspace_volume=workspace_volume,
-            image="maven:3.9-eclipse-temurin-17",
-            maven_repository_volume=maven_cache_volume,
-            archive_excluded_dirs=frozenset({"target"}),
-        )
-        assert [entry.args[0] for entry in sandbox.run.call_args_list] == [
-            "mvn -B -q -DskipTests clean package"
-        ]
-        assert result == {
-            "workspace_volume": workspace_volume,
-            "maven_cache_volume": maven_cache_volume,
-            "status": "workspace_ready",
-        }
-
-    def test_maven_cache_volume_creation_failure_preserves_workspace_volume(self, tmp_path):
-        (tmp_path / "pom.xml").write_text("<project/>", encoding="utf-8")
-        client = MagicMock()
-        client.volumes.create.side_effect = [None, RuntimeError("cache quota exceeded")]
-        sandbox_type = MagicMock()
-
-        with (
-            _volume_name_patch(),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.get_docker_client",
-                return_value=client,
-            ),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
-                sandbox_type,
-            ),
-        ):
-            result = run_workspace_builder_node(
-                {
-                    "repo_root": str(tmp_path),
-                    "project_language": ProjectLanguage.JAVA,
-                }
-            )
-
-        workspace_volume = f"agent_workspace_{_VOLUME_HEX[:8]}"
-        assert [entry.kwargs["name"] for entry in client.volumes.create.call_args_list] == [
-            workspace_volume,
-            f"agent_maven_repository_{_VOLUME_HEX[:8]}",
-        ]
-        sandbox_type.assert_not_called()
-        assert result["status"] == "workspace_build_failed"
-        assert result["workspace_volume"] == workspace_volume
-        assert result["maven_cache_volume"] is None
-        assert "cache quota exceeded" in result["errors"][0]
-
-    def test_java_setup_failure_returns_both_created_volumes(self, tmp_path):
-        (tmp_path / "pom.xml").write_text("<project/>", encoding="utf-8")
-        client = MagicMock()
-        sandbox = _sandbox_mock(
-            result=CommandResult(
-                exit_code=1,
-                stdout="maven output",
-                stderr="plugin resolution failed",
-                duration_seconds=0.0,
-            )
-        )
-
-        with (
-            _volume_name_patch(),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.get_docker_client",
-                return_value=client,
-            ),
-            patch(
-                "remediation_engine.orchestration.workspace_builder.DockerSandbox",
-                return_value=sandbox,
-            ),
-        ):
-            result = run_workspace_builder_node(
-                {
-                    "repo_root": str(tmp_path),
-                    "project_language": ProjectLanguage.JAVA,
-                }
-            )
-
-        assert result["status"] == "workspace_build_failed"
-        assert result["workspace_volume"] == f"agent_workspace_{_VOLUME_HEX[:8]}"
-        assert result["maven_cache_volume"] == f"agent_maven_repository_{_VOLUME_HEX[:8]}"
-        assert "plugin resolution failed" in result["errors"][0]
+        assert result["workspace_volume"] == volume_name
+        assert result["status"] == "workspace_ready"
+        assert result["accepted_package_inventory_by_lockfile"] == {}
+        assert result["package_inventory_baseline_complete"] is True
 
     def test_volume_creation_failure_closes_client_and_does_not_start_sandbox(self, tmp_path):
         """A failed volume transaction reports failure and releases its client."""

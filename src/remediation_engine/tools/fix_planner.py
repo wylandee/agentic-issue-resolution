@@ -3,9 +3,8 @@ Fix Planner â€” pure planning tool for SCA vulnerability remediation.
 
 Separation-of-Concerns role
 ----------------------------
-This module sits *between* the SCA Manifest Locator and the Remedy agent.
-It accepts a ``LocalizedIssue`` (which already knows *where* the package lives)
-and answers: **what is the safest version to pin / what workaround exists?**
+This module turns one localized SCA finding into an advisory-backed fix proposal.
+The Supervisor owns registry candidate selection and later version authorization.
 
 It does **not**:
   * Read or write files.
@@ -15,16 +14,15 @@ It does **not**:
 Public API
 ----------
 ``plan_fix(localized_issue) -> dict``
-    Queries OSV for this finding's advisory and returns a plain ``dict`` whose
-    keys mirror the ``FixPlan`` Pydantic model. It never queries NPM or Serper;
-    those later strategy stages belong to the supervisor.
-Current triage planner steps
+    Queries OSV, then optionally uses Serper search and an LLM to extract a
+    fixed-version proposal or workaround. The result mirrors the ``FixPlan``
+    Pydantic model. It does not select registry candidates or edit files.
+Current planner steps
 ----------------------------
 1. **osv_api** â€” resolve this finding's CVE/GHSA advisory through OSV.
-2. **none** â€” OSV supplied neither a fixed version nor mitigation guidance.
-4. **serper** â€” Google Search via Serper.dev for workaround snippets.
+2. **serper_llm** â€” optionally search for fix or workaround evidence.
    Silently skipped if ``SERPER_API_KEY`` is not set.
-5. **none** â€” all strategies exhausted; return a ``no_fix`` plan.
+3. **none** â€” all strategies exhausted; return a ``no_fix`` plan.
 
 All network failures are caught, logged, and trigger continuation to the next
 planner step.
@@ -49,6 +47,7 @@ from remediation_engine.contracts.version_policy import (
     is_stable_maven_version,
 )
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.tools.maven_manifest_locator import _canonical_gav
 from remediation_engine.tools.package_identity import package_name_from_purl
 
 log = logging.getLogger(__name__)
@@ -59,7 +58,6 @@ log = logging.getLogger(__name__)
 
 OSV_QUERYBATCH_URL = "https://api.osv.dev/v1/querybatch"
 OSV_VULN_URL = "https://api.osv.dev/v1/vulns/{vuln_id}"
-NPM_REGISTRY_URL = "https://registry.npmjs.org/{package}/latest"
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
 
 _REQUEST_TIMEOUT = 10  # seconds
@@ -68,12 +66,7 @@ _READ_WEB_PAGE_MAX_CHARS = 16_000
 _JINA_READER_URL_PREFIX = "https://r.jina.ai/"
 _GITHUB_API_URL_PREFIX = "https://api.github.com/"
 
-# Matches "update to version X.Y.Z", "upgrade to 3.0.0 or later", etc.
-_VERSION_RE = re.compile(
-    r"(?:update|upgrade|fix(?:ed)?\s+in|patched\s+in|use|requires?)\s+(?:to\s+)?(?:version\s+)?"
-    r"v?(\d+\.\d+(?:\.\d+)?)(?:[-+][A-Za-z0-9._-]+)?",
-    re.IGNORECASE,
-)
+# Terms that identify mitigation guidance in advisory records.
 _WORKAROUND_KEYWORDS = ("workaround", "mitigate", "mitigation")
 
 # Instruction templates
@@ -116,36 +109,6 @@ class SerperLLMResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _is_npm_issue(issue: Any) -> bool:
-    """Return True if the issue's ecosystem is npm or javascript."""
-    eco = (issue.ecosystem or "").lower()
-    if eco in ("npm", "javascript"):
-        return True
-    purl = issue.purl or ""
-    return purl.startswith("pkg:npm/") or purl.startswith("pkg:javascript/")
-
-
-def _is_maven_issue(issue: Any) -> bool:
-    """Return True for Maven PURLs or ecosystem-labelled findings."""
-    ecosystem = str(getattr(issue, "ecosystem", "") or "").strip().lower()
-    purl = str(getattr(issue, "purl", "") or "").strip().lower()
-    return ecosystem == "maven" or purl.startswith("pkg:maven/")
-
-
-def _canonical_maven_coordinate(issue: Any) -> str:
-    """Return the exact group:artifact identity without Node normalization."""
-    purl = getattr(issue, "purl", None)
-    candidate = package_name_from_purl(purl) if purl else None
-    if not candidate:
-        candidate = str(getattr(issue, "package_name", "") or "").strip()
-    parts = candidate.split(":")
-    if len(parts) != 2 or any(
-        not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", part) for part in parts
-    ):
-        return ""
-    return candidate
-
-
 def _package_name_from_issue(issue: Any) -> str:
     """
     Return the canonical package name for network queries.
@@ -160,20 +123,17 @@ def _package_name_from_issue(issue: Any) -> str:
     return package_name_from_purl(purl) or ""
 
 
-def _extract_local_version(message: str | None) -> str | None:
-    """
-    Scan the ODC/Semgrep ``message`` for an embedded fixed-version hint.
+def _is_maven_issue(issue: Any) -> bool:
+    """Return whether typed issue identity explicitly selects Maven."""
+    return str(getattr(issue, "ecosystem", "") or "").strip().lower() == "maven" or str(
+        getattr(issue, "purl", "") or ""
+    ).strip().lower().startswith("pkg:maven/")
 
-    Examples that match:
-      "Update to version 3.0.0 or later."
-      "Fixed in v2.1.4."
-      "Upgrade to 1.0.1."
-    Returns the first version string found, or ``None``.
-    """
-    if not message:
-        return None
-    m = _VERSION_RE.search(message)
-    return m.group(1) if m else None
+
+def _canonical_maven_coordinate(issue: Any) -> str:
+    """Return an exact canonical Maven ``groupId:artifactId`` or empty string."""
+    coordinate = _canonical_gav(issue)
+    return ":".join(coordinate) if coordinate is not None else ""
 
 
 # ---------------------------------------------------------------------------
@@ -589,31 +549,12 @@ def _query_osv_fixed_version(
 
 
 # ---------------------------------------------------------------------------
-# Waterfall step 3 â€” npm registry
+# Registry candidate selection belongs to the Supervisor, not this advisory planner.
 # ---------------------------------------------------------------------------
 
 
-def _fetch_npm_latest(package_name: str) -> str | None:
-    """
-    Fetch the ``latest`` dist-tag version from the npm registry.
-
-    Handles scoped packages like ``@scope/pkg`` (percent-encode the leading @).
-    """
-    encoded = quote(package_name, safe="")
-    url = NPM_REGISTRY_URL.format(package=encoded)
-    try:
-        resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        version = data.get("version")
-        return str(version) if version else None
-    except Exception as exc:
-        log.warning("npm registry fetch failed for %s: %s", package_name, exc)
-        return None
-
-
 # ---------------------------------------------------------------------------
-# Waterfall step 4 â€” Serper web search + LLM page content extraction
+# Optional Serper search and LLM page-content extraction
 # ---------------------------------------------------------------------------
 
 

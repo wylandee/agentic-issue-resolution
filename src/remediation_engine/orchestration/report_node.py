@@ -44,7 +44,6 @@ from .report_context import (
     _reconciliation_ids,
     _report_group_status,
     _scan_evidence_state,
-    _task_queue_fallback_groups,
     _text,
     _unique_texts,
     _user_friendly_status,
@@ -295,13 +294,36 @@ def _report_groups(context: ReportContext) -> list[_ReportGroup]:
     groups: list[_ReportGroup] = []
     seen: set[str] = set()
     for group in [*context.initial_valid_groups, *context.final_valid_groups]:
+        if bool(_value(group, "is_synthetic")):
+            continue
         group_id = _text(_value(group, "group_id"))
         if not group_id or group_id in seen:
             continue
         seen.add(group_id)
         groups.append(group)
 
-    groups.extend(_task_queue_fallback_groups(context.task_queue, seen))
+    for _task_id, task in sorted(context.task_queue.items(), key=lambda item: str(item[0])):
+        if bool(_value(task, "is_synthetic")):
+            continue
+        group_id = _text(_value(task, "parent_group_id"))
+        if not group_id or group_id in seen:
+            continue
+        if _group_status(context.task_queue, group_id) != "qa_passed":
+            continue
+        package = _text(_value(task, "target_package_name")).strip()
+        if not package:
+            package = _text(_value(task, "parent_package_name")).strip()
+        groups.append(
+            {
+                "group_id": group_id,
+                "vulnerable_component": package or "Unspecified finding",
+                "issue_type": "sca",
+                "sources": ["task_queue"],
+                "file_path": "package.json",
+                "issues": [],
+            }
+        )
+        seen.add(group_id)
     return sorted(groups, key=lambda item: _text(_value(item, "group_id")))
 
 
@@ -344,7 +366,7 @@ def _report_group_identity(
 
 
 def _synthetic_scan_group(context: ReportContext, identifier: str) -> dict[str, Any]:
-    """Create a display-only group for an untriaged authoritative finding."""
+    """Create a display-only group for an untriaged scan finding."""
     issue = _scan_issue_for_identifier(context, identifier)
     issue_data: dict[str, Any] = {}
     if issue is not None:
@@ -379,14 +401,35 @@ def _synthetic_scan_group(context: ReportContext, identifier: str) -> dict[str, 
         "group_id": normalized_identifier,
         "vulnerable_component": package,
         "issue_type": "sca",
-        "sources": [_text(issue_data.get("source"), "final_full_scan")],
-        "file_path": _text(issue_data.get("file_path"), "authoritative final scan"),
+        "sources": [
+            _text(
+                issue_data.get("source"),
+                "incremental ODC scan"
+                if context.scan_coverage_scope == "incremental_dependency_inputs"
+                else "post-remediation ODC scan",
+            )
+        ],
+        "file_path": _text(
+            issue_data.get("file_path"),
+            "incremental dependency closure"
+            if context.scan_coverage_scope == "incremental_dependency_inputs"
+            else "post-remediation scan",
+        ),
         "issues": [issue_data],
     }
 
 
+def _scan_has_reportable_findings(context: ReportContext) -> bool:
+    """Allow known incremental findings through even with incomplete coverage."""
+    if context.scan_evidence_state in {"complete", "incremental_complete"}:
+        return True
+    return context.scan_evidence_state == "incremental_incomplete" and bool(
+        context.new_vulnerability_identifiers
+    )
+
+
 def _follow_up_groups(context: ReportContext) -> list[tuple[str, _ReportGroup]]:
-    """Return every open finding, including untriaged final-scan findings."""
+    """Return every open finding, including untriaged incremental findings."""
     discovered_ids = set(_discovered_group_ids(context))
     initial_ids = {_text(_value(group, "group_id")) for group in context.initial_valid_groups}
     selected: dict[str, tuple[str, _ReportGroup]] = {}
@@ -401,10 +444,7 @@ def _follow_up_groups(context: ReportContext) -> list[tuple[str, _ReportGroup]]:
         if group_id in initial_ids and current_group_id not in initial_ids:
             selected[canonical_id] = (canonical_id, group)
 
-    scan_state = _scan_evidence_state(
-        context.final_full_scan_result, context.new_vulnerability_status
-    )
-    if scan_state == "complete":
+    if _scan_has_reportable_findings(context):
         for group_id in discovered_ids:
             selected.setdefault(group_id, (group_id, {"group_id": group_id}))
 
@@ -442,10 +482,7 @@ def _unique_vulnerability_group_ids(context: ReportContext) -> set[str]:
         canonical_id = _report_group_identity(context, group_id, discovered_ids)
         selected.setdefault(canonical_id, group)
 
-    if (
-        _scan_evidence_state(context.final_full_scan_result, context.new_vulnerability_status)
-        == "complete"
-    ):
+    if _scan_has_reportable_findings(context):
         for group_id in discovered_ids:
             selected.setdefault(group_id, {"group_id": group_id})
 
@@ -477,10 +514,10 @@ def _unique_vulnerability_statuses_by_group(context: ReportContext) -> dict[str,
 
 
 def _discovered_group_ids(context: ReportContext) -> list[str]:
-    """Return groups added or reappeared by the authoritative scan.
+    """Return groups added or reappeared through post-QA incremental triage.
 
-    A final-scan reopening is evidence that an existing group remains
-    unresolved, not evidence that a new vulnerability group was discovered.
+    An incremental scan can discover a package finding, while a remaining
+    identifier belongs to an existing target group rather than a new group.
     """
     return _reconciliation_ids(
         context.triage_reconciliation,
@@ -2204,8 +2241,23 @@ def _attempted_fixes_for_group(context: ReportContext, group_id: str) -> str:
     return "\n\n".join(entries) or "No remediation attempt recorded."
 
 
+def _scan_coverage_label(context: ReportContext) -> str:
+    """Describe scan scope and completeness without implying a full rescan."""
+    if context.scan_coverage_scope == "incremental_dependency_inputs":
+        if context.scan_coverage_complete is True:
+            return "Incremental dependency inputs (complete)"
+        if context.scan_coverage_complete is False:
+            return "Incremental dependency inputs (incomplete)"
+        return "Incremental dependency inputs (unknown)"
+    if context.scan_evidence_state == "complete":
+        return "Full workspace (complete)"
+    if context.scan_evidence_state == "failed":
+        return "Full workspace (failed)"
+    return "Unavailable"
+
+
 def _render_summary(context: ReportContext) -> str:
-    """Render the eight-metric, user-facing run summary."""
+    """Render the run summary, including dependency scan scope and coverage."""
     unique_statuses = _unique_vulnerability_statuses_by_group(context)
     fixed = sum(status == "qa_passed" for status in unique_statuses.values())
     follow_up = sum(
@@ -2214,38 +2266,34 @@ def _render_summary(context: ReportContext) -> str:
     )
     total_vulnerability_groups = len(unique_statuses)
     actionable = max(total_vulnerability_groups, fixed + follow_up)
-    if context.group_reconciliation_incomplete and not total_vulnerability_groups:
-        sentence = (
-            "Remediation coverage could not be determined for "
-            f"**{context.original_scanner_findings} scanner findings** because they were not "
-            "reconciled to vulnerability groups."
-        )
-        total_groups_value = "Unavailable (group reconciliation incomplete)"
-    elif context.group_reconciliation_incomplete:
-        sentence = (
-            f"**{fixed} of {actionable} tracked remediation groups** were successfully remediated. "
-            f"**{follow_up} require follow-up review.** Scanner findings could not be fully "
-            "reconciled to these groups."
-        )
-        total_groups_value = (
-            f"{total_vulnerability_groups} tracked from task queue; coverage incomplete"
-        )
-    else:
-        sentence = (
-            f"**{fixed} of {actionable}** vulnerability groups were successfully remediated. "
-            f"**{follow_up} require follow-up review.**"
-        )
-        total_groups_value = total_vulnerability_groups
+    sentence = (
+        f"**{fixed} of {actionable}** vulnerability groups were successfully remediated. "
+        f"**{follow_up} require follow-up review.**"
+    )
     metrics = [
         ("Run ID", context.run_id),
         ("Total findings (CVEs and GHSAs)", context.original_scanner_findings),
-        ("Total vulnerability groups", total_groups_value),
+        ("Total vulnerability groups", total_vulnerability_groups),
         ("Successfully remediated vulnerability groups", fixed),
         ("Vulnerability groups requiring follow-up", follow_up),
+        ("Dependency scan coverage", _scan_coverage_label(context)),
+        (
+            "Known new vulnerability identifiers",
+            ", ".join(context.new_vulnerability_identifiers) or "None",
+        ),
         ("Run duration", _format_duration(context.duration_seconds)),
         ("Total tokens", _format_token_summary(context)),
         ("Patch status", _format_patch_status(context)),
     ]
+    coverage_note = ""
+    if (
+        context.scan_coverage_scope == "incremental_dependency_inputs"
+        and context.scan_coverage_complete is not True
+    ):
+        coverage_note = (
+            "Incremental scan coverage is incomplete. Listed new identifiers are confirmed, "
+            "but their absence does not establish that the full workspace is clean."
+        )
     return "\n".join(
         [
             "# Remediation Run Report",
@@ -2255,12 +2303,13 @@ def _render_summary(context: ReportContext) -> str:
             sentence,
             "",
             _table(("Metric", "Value"), metrics),
+            *(["", coverage_note] if coverage_note else []),
         ]
     )
 
 
 def _scan_issue_for_identifier(context: ReportContext, identifier: str) -> _ReportIssue | None:
-    """Find the authoritative post-scan issue associated with an identifier."""
+    """Find the accepted post-remediation scan issue for one identifier."""
     normalized = identifier.casefold()
     for issue in context.post_remediation_scan_issues:
         if normalized in {item.casefold() for item in _issue_identifiers(issue)}:
@@ -2394,11 +2443,21 @@ def _successful_remediation_evidence(
     elif diff_blocks:
         changes.append("Code workaround: source changes applied")
     if not changes:
-        changes.append(
-            "No validated change in emitted patch"
-            if context.diff.strip()
-            else "Validated remediation recorded"
-        )
+        for task_id in reversed(_task_ids_for_group(context, group_id)):
+            task = context.task_queue.get(task_id)
+            if task is None or _text(_value(task, "status")).casefold() != "qa_passed":
+                continue
+            remediation_action = _text(_value(task, "remediation_action")).strip()
+            if remediation_action:
+                changes.append(remediation_action)
+                files = []
+                break
+        if not changes:
+            changes.append(
+                "No validated change in emitted patch"
+                if context.diff.strip()
+                else "Validated remediation recorded"
+            )
     return "; ".join(_unique_texts(changes)), files, _unique_texts(code_summaries), diff_blocks
 
 
@@ -2622,6 +2681,11 @@ def generate_report(
         token_summary=token_summary,
         run_ended_at=run_ended_at,
     )
+    return _render_report_context(context)
+
+
+def _render_report_context(context: ReportContext) -> str:
+    """Render a report from one already-built evidence context."""
     sections = [
         _render_follow_up_actions(context),
         _render_successful_remediations(context),
@@ -2710,13 +2774,7 @@ def finalize_report(
         token_summary=token_summary,
         run_ended_at=ended_at,
     )
-    markdown = generate_report(
-        state,
-        trajectory_path=trajectory_path,
-        trace_url=trace_url,
-        token_summary=token_summary,
-        run_ended_at=ended_at,
-    )
+    markdown = _render_report_context(base_context)
     try:
         report_dir = _resolve_report_dir(settings)
         path = report_dir / _report_filename(base_context.run_id)

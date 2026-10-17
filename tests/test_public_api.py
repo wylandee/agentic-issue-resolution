@@ -8,17 +8,30 @@ from unittest.mock import patch
 
 import pytest
 
-from remediation_engine.api import RemediationRequest, RemediationResult, run_remediation
+from remediation_engine.api import (
+    RemediationRequest,
+    RemediationResult,
+    run_remediation,
+    triage_issues,
+)
 from remediation_engine.cli import _load_issues, build_parser, main
 from remediation_engine.contracts.schemas import (
+    FixPlan,
+    FixPlanStatus,
     IssueSource,
     IssueType,
     LocalizedIssue,
     Severity,
+    SystemContext,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.orchestration.runtime_context import (
+    get_bound_runtime_settings,
+    get_runtime_settings,
+)
 from remediation_engine.orchestration.state import normalize_group_paths
+from remediation_engine.settings import AppSettings
 
 
 def _issue() -> VulnerabilityIssue:
@@ -65,6 +78,24 @@ def test_request_rejects_file_as_repository_root(tmp_path: Path) -> None:
         RemediationRequest(repo_root=file_path)
 
 
+def test_target_package_scope_is_development_only(tmp_path: Path) -> None:
+    """Package scoping is normalized and rejected for production requests."""
+    request = RemediationRequest(
+        repo_root=tmp_path,
+        target_packages=[" @angular/core", "@angular/core", "@angular/common "],
+        system_context=SystemContext(environment="development"),
+    )
+
+    assert request.target_packages == ["@angular/common", "@angular/core"]
+
+    with pytest.raises(ValueError, match="development-only"):
+        RemediationRequest(
+            repo_root=tmp_path,
+            target_packages=["@angular/core"],
+            system_context=SystemContext(environment="production"),
+        )
+
+
 def test_run_remediation_projects_orchestrator_state(tmp_path: Path) -> None:
     """The API converts graph state into a typed result without host edits."""
     request = RemediationRequest(repo_root=tmp_path, valid_groups=[])
@@ -99,6 +130,42 @@ def test_run_remediation_leaves_initial_triage_to_graph(tmp_path: Path) -> None:
     mock_triage.assert_not_called()
     assert mock_orchestrator.call_args.kwargs["valid_groups"] == []
     assert mock_orchestrator.call_args.kwargs["issues"] == request.issues
+
+
+def test_triage_issues_binds_injected_settings_for_planner_and_resets(monkeypatch) -> None:
+    """Standalone triage exposes supplied settings to planner runtime lookups."""
+    observed_keys: list[str] = []
+    settings = AppSettings(openai_api_key="injected-test-key")
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-12345",
+        package_name="fixture-package",
+        package_version="1.0.0",
+        file_path="package.json",
+    )
+
+    def plan_fix(_localized_issue):
+        observed_keys.append(get_runtime_settings().openai_api_key)
+        return FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version="1.0.1",
+            instruction="Upgrade fixture-package to 1.0.1.",
+            strategy_used="osv_api",
+        ).model_dump()
+
+    monkeypatch.setattr("remediation_engine.tools.fix_planner.plan_fix", plan_fix)
+    monkeypatch.setattr(
+        "remediation_engine.triage.pipeline._run_enrichment", lambda *_args, **_kw: {}
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    groups = triage_issues([issue], settings=settings)
+
+    assert groups
+    assert observed_keys == ["injected-test-key"]
+    assert get_bound_runtime_settings() is None
 
 
 def test_run_remediation_reports_completed_with_errors(tmp_path: Path) -> None:
@@ -177,7 +244,7 @@ def test_graph_group_paths_are_repo_relative(tmp_path: Path) -> None:
     )
     absolute_manifest = str(tmp_path / "package.json")
     group = VulnerabilityGroup(
-        group_id=f"sca:{absolute_manifest}:lodash:UPDATE_VERSION",
+        group_id=f"sca:{absolute_manifest}:lodash",
         issue_type=IssueType.SCA,
         vulnerable_component="lodash",
         file_path=absolute_manifest,
@@ -255,7 +322,7 @@ def test_preprocessed_groups_expand_compressed_npm_ancestry(tmp_path: Path) -> N
         parent_declaration_type="dependencies",
     )
     group = VulnerabilityGroup(
-        group_id="sca:package.json:@tootallnate/once:UPDATE_VERSION",
+        group_id="sca:package.json:@tootallnate/once",
         issue_type=IssueType.SCA,
         vulnerable_component="@tootallnate/once",
         file_path="package.json",

@@ -26,13 +26,11 @@ from remediation_engine.contracts import (
 )
 from remediation_engine.orchestration.supervisor_node import (
     _build_deterministic_retry_plan,
-    _calculate_eligible_actions,
     _commit_registry_resolution_fallback,
     _commit_task_transition,
     _deterministic_routing,
     _emit_audit,
     _no_fix_failure_transition,
-    _select_deterministic_action,
     _task_sort_key,
     supervisor_router,
 )
@@ -106,14 +104,6 @@ def test_decision_codes_cover_fixed_priority_routes():
     assert (
         _route({"t": _task("t", "g", status=TaskStatus.QA_PASSED)}, [_group("g")]).decision_code
         == DecisionCode.NO_ACTIONABLE_TASKS
-    )
-    assert (
-        _route(
-            {"t": _task("t", "g", status=TaskStatus.QA_PASSED)},
-            [_group("g")],
-            workspace_volume="workspace-volume",
-        ).decision_code
-        == DecisionCode.FINAL_FULL_SCAN_REQUIRED
     )
     assert (
         _route(
@@ -244,6 +234,7 @@ def test_transition_table_accepts_worker_and_qa_edges_and_rejects_terminal_edges
     assert validate_transition(TaskStatus.PENDING, TaskStatus.INCONCLUSIVE)
     assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.INCONCLUSIVE)
     assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.UNFIXABLE)
+    assert validate_transition(TaskStatus.OPTIMISTICALLY_FIXED, TaskStatus.PENDING)
     assert not validate_transition(TaskStatus.QA_PASSED, TaskStatus.PENDING)
     assert not validate_transition(TaskStatus.PENDING, TaskStatus.QA_PASSED)
 
@@ -300,6 +291,53 @@ def test_commit_rejects_unscoped_retry_to_pass_transition():
         queue,
         task.task_id,
         updates={"status": TaskStatus.QA_PASSED},
+        consistency_events=events,
+    )
+
+    assert queue[task.task_id] == task
+    assert events and events[0].error_code == "INVALID_TRANSITION"
+
+
+def test_verified_absent_pass_transition_is_explicitly_scoped() -> None:
+    for status in (TaskStatus.PENDING, TaskStatus.NEEDS_RETRY):
+        task = _task("task-1", "g", status=status)
+        queue = {task.task_id: task}
+        events = []
+
+        _commit_task_transition(
+            queue,
+            task.task_id,
+            updates={"status": TaskStatus.QA_PASSED},
+            consistency_events=events,
+        )
+
+        assert queue[task.task_id] == task
+        assert events and events[0].error_code == "INVALID_TRANSITION"
+
+        _commit_task_transition(
+            queue,
+            task.task_id,
+            updates={"status": TaskStatus.QA_PASSED},
+            allow_verified_absent_target_pass=True,
+        )
+
+        assert queue[task.task_id].status == TaskStatus.QA_PASSED
+        assert queue[task.task_id].current_attempt_id is None
+        assert queue[task.task_id].selected_version is None
+
+
+def test_verified_absent_pass_opt_in_rejects_live_attempts() -> None:
+    task = _task("task-1", "g", status=TaskStatus.NEEDS_RETRY).model_copy(
+        update={"current_attempt_id": "attempt-live", "selected_version": "1.2.3"}
+    )
+    queue = {task.task_id: task}
+    events = []
+
+    _commit_task_transition(
+        queue,
+        task.task_id,
+        updates={"status": TaskStatus.QA_PASSED},
+        allow_verified_absent_target_pass=True,
         consistency_events=events,
     )
 
@@ -445,12 +483,12 @@ def test_deterministic_retry_planner_exhaustion_pivots_to_workaround(monkeypatch
     assert plan.selected_version is None
 
 
-def test_phase_projection_and_audit_are_typed():
+def test_authoritative_route_and_audit_are_typed():
     group = _group("g")
     tasks = {"task-1": _task("task-1", "g")}
-    eligible = _calculate_eligible_actions(tasks, {"g": group}, {}, {})
-    decision = _select_deterministic_action(eligible, tasks, {"g": group}, {}, {})
+    decision = _deterministic_routing(tasks, {"g": group}, {}, {})
     audit = _emit_audit(decision, [], 4)
-    assert eligible.new_version_bumps == ["task-1"]
+    assert decision.next_node == "update_subagent"
+    assert decision.target_task_ids == ["task-1"]
     assert audit.decision_code == DecisionCode.NEW_VERSION_BUMP
     assert audit.state_revision == 4

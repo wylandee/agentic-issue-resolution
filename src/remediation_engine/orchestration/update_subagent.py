@@ -1,15 +1,16 @@
 """Dependency-update worker for Supervisor-committed Phase 5 attempts.
 
-The worker receives one task and its immutable attempt inputs, executes the
-focused manifest transaction toolbelt in the Docker workspace, and returns
-typed attempt diagnostics for QA and Supervisor reconciliation.
+The worker receives one task or one Supervisor-committed package cluster and
+its immutable attempt inputs, executes the focused manifest transaction
+toolbelt in the Docker workspace, and returns typed attempt diagnostics for QA
+and Supervisor reconciliation.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -19,6 +20,7 @@ from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
     MavenTargetOperation,
+    MultiPackageAction,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -30,15 +32,23 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration._tool_support import _resolve_maven_manifest_scope
-from remediation_engine.orchestration.remedy_tools import build_update_toolbelt
-from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.orchestration.remedy_tools import (
+    build_multi_package_update_toolbelt,
+    build_update_toolbelt,
+)
+from remediation_engine.orchestration.runtime_context import (
+    get_runtime_settings,
+    openai_api_key_kwargs,
+)
 from remediation_engine.orchestration.state import SubagentState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
+from remediation_engine.orchestration.supervisor_planner import instruction_digest
 from remediation_engine.orchestration.task_utils import (
     create_skinny_subagent_group,
     filter_constraints_ledger,
     is_maven_group,
     is_transitive_group,
+    select_package_fix_plan,
 )
 from remediation_engine.orchestration.tools_manifest import rollback_pending_package_updates
 from remediation_engine.runtime.path_policy import (
@@ -55,6 +65,21 @@ _MAVEN_UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_maven_dependency"
 _UPDATE_MANIFEST_TOOL_NAMES = frozenset(
     {_UPDATE_MANIFEST_TOOL_NAME, _MAVEN_UPDATE_MANIFEST_TOOL_NAME}
 )
+
+_UPDATE_MANIFEST_TOOL_NAME = "modify_and_validate_npm_dependency"
+_BATCH_NPM_DEPENDENCIES_TOOL_NAME = "modify_batch_npm_dependencies"
+_BATCH_MAVEN_DEPENDENCIES_TOOL_NAME = "modify_batch_maven_dependencies"
+_MAJOR_MIGRATION_DIRECTIVE = (
+    "Migrate all affected production and test code to the selected package API "
+    "while preserving behavior; do not change the solver-approved package or version."
+)
+
+
+def _normalized_worker_version(value: Any, *, maven_mode: bool = False) -> str:
+    """Normalize only npm's optional leading `v`; preserve exact Maven tokens."""
+    normalized = str(value or "").strip()
+    return normalized if maven_mode else normalized.lstrip("vV")
+
 
 try:
     from langchain_openai import ChatOpenAI  # type: ignore[import]
@@ -281,6 +306,116 @@ def _is_mixed_retry_batch(
     return saw_retry and saw_first_pass
 
 
+def _validate_committed_multi_package_action(
+    state: SubagentState,
+    action: Any,
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    snapshots: Mapping[str, Any],
+) -> list[str]:
+    """Validate a committed cluster action immediately before mutation."""
+    errors: list[str] = []
+    if not isinstance(action, MultiPackageAction):
+        return ["Update Subagent: active cluster action is not a validated MultiPackageAction."]
+    expected_task_ids = {task.task_id for task, _, _ in resolved_tasks}
+    if len(expected_task_ids) < 2:
+        errors.append("Update Subagent: atomic action requires at least two resolved tasks.")
+    if action.cluster_id != state.get("active_cluster_id"):
+        errors.append("Update Subagent: action cluster_id does not match active cluster metadata.")
+    if action.dispatch_batch_id != state.get("dispatch_batch_id"):
+        errors.append(
+            "Update Subagent: action dispatch_batch_id does not match active batch metadata."
+        )
+    action_digest = instruction_digest(action.model_dump_json())
+    language_value = state.get("project_language", ProjectLanguage.NODEJS)
+    try:
+        project_language = (
+            language_value
+            if isinstance(language_value, ProjectLanguage)
+            else ProjectLanguage(str(language_value))
+        )
+    except ValueError:
+        project_language = ProjectLanguage.NODEJS
+    expected_ecosystem = "maven" if project_language == ProjectLanguage.JAVA else "npm"
+    expected_batch_id = state.get("dispatch_batch_id")
+    mutations_by_task: dict[str, list[Any]] = {}
+    for mutation in action.package_mutations:
+        mutations_by_task.setdefault(mutation.task_id, []).append(mutation)
+    if set(mutations_by_task) != expected_task_ids:
+        errors.append("Update Subagent: action mutations do not cover exactly the active tasks.")
+    if any(len(mutations) != 1 for mutations in mutations_by_task.values()):
+        errors.append("Update Subagent: each active task must map to exactly one package mutation.")
+
+    for task, group, manifest_paths in resolved_tasks:
+        snapshot = snapshots.get(task.task_id)
+        if snapshot is None:
+            errors.append(f"Update Subagent: missing committed snapshot for task {task.task_id}.")
+            continue
+        if (
+            snapshot.cluster_id != state.get("active_cluster_id")
+            or snapshot.dispatch_batch_id != expected_batch_id
+            or snapshot.action_digest != action_digest
+        ):
+            errors.append(f"Update Subagent: snapshot provenance mismatch for task {task.task_id}.")
+        mutation = mutations_by_task.get(task.task_id, [None])[0]
+        if mutation is None:
+            continue
+        expected_package = _target_package_name(task, group)
+        expected_type = _target_dependency_type(task, group)
+        maven_mode = is_maven_group(group, project_language)
+        allowed_versions = {
+            _normalized_worker_version(value, maven_mode=maven_mode)
+            for value in snapshot.allowed_target_versions
+            if value
+        }
+        if snapshot.selected_version:
+            allowed_versions.add(
+                _normalized_worker_version(snapshot.selected_version, maven_mode=maven_mode)
+            )
+        allowed_types = {
+            value.strip().lower() for value in snapshot.allowed_dependency_types if value
+        }
+        if snapshot.target_dependency_type:
+            allowed_types.add(snapshot.target_dependency_type.strip().lower())
+        valid_manifest_paths = {path.replace("\\", "/").lstrip("/") for path in manifest_paths}
+        if mutation.package_name != expected_package:
+            errors.append(f"Update Subagent: package mismatch for task {task.task_id}.")
+        if mutation.ecosystem != expected_ecosystem:
+            errors.append(f"Update Subagent: ecosystem mismatch for task {task.task_id}.")
+        if mutation.manifest_path not in valid_manifest_paths:
+            errors.append(f"Update Subagent: manifest mismatch for task {task.task_id}.")
+        if snapshot.manifest_path and mutation.manifest_path != snapshot.manifest_path:
+            errors.append(
+                f"Update Subagent: manifest does not match the committed snapshot for task {task.task_id}."
+            )
+        if (
+            _normalized_worker_version(mutation.target_version, maven_mode=maven_mode)
+            not in allowed_versions
+        ):
+            errors.append(
+                f"Update Subagent: target version is not allowlisted for task {task.task_id}."
+            )
+        if expected_type and mutation.dependency_type.lower() not in allowed_types:
+            errors.append(
+                f"Update Subagent: dependency type is not allowlisted for task {task.task_id}."
+            )
+        if project_language == ProjectLanguage.JAVA:
+            expected_operation = (
+                MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT
+                if task.target_dependency_type == "dependencyManagement"
+                else MavenTargetOperation.UPDATE_DECLARATION
+            )
+            if (
+                snapshot.maven_target_operation != expected_operation
+                or mutation.maven_target_operation != expected_operation
+            ):
+                errors.append(f"Update Subagent: Maven operation mismatch for task {task.task_id}.")
+            if set(mutation.target_manifest_paths) != set(snapshot.target_manifest_paths):
+                errors.append(
+                    f"Update Subagent: authorized POM set mismatch for task {task.task_id}."
+                )
+    return errors
+
+
 def _has_successful_manifest_transaction_for_package(
     task: RemediationTask,
     group: VulnerabilityGroup,
@@ -312,38 +447,118 @@ _UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a dependency-manifest execution 
 The Supervisor owns candidate generation, version selection, retry planning, and
 task routing. Execute only the Supervisor's task instruction.
 
-Do not search the NPM registry or perform retry planning. Use only
-modify_and_validate_npm_dependency for manifest changes. Each call edits the
-manifest and immediately synchronizes package manifests before returning.
-Transactions are serialized per package. Keep package_name and manifest_path
-within the committed task allowlists.
+Do not search a package registry or perform retry planning. Use only the
+dependency mutation tools exposed for the selected ecosystem. Each call edits
+the authorized manifest target and immediately validates the dependency change.
+Transactions are serialized per package. Keep package identity and manifest
+paths within the committed task allowlists.
 
-If a transaction returns ERROR_CODE or FAILURE, call the same tool again for that
-package with a different Supervisor-approved target_version or dependency_type.
-A package may receive at most three combined transaction attempts. Failed
-transactions roll back automatically. Continue with the next independent package
-after a package succeeds or exhausts its attempts.
+If the exact Supervisor instruction requires a major-version migration, you are
+authorized and required to update affected production and test code to the selected
+package API while preserving behavior. Do not reselect or change the committed
+package or version. Otherwise, do not edit source-code files.
 
-Never edit source-code files in this worker. Supervisor-owned dependency-type
-candidates are the only permitted strategy alternatives.
+If a transaction returns ERROR_CODE or FAILURE, retry only with a target_version
+or dependency_type explicitly allowed by the Supervisor. A major-version migration
+instruction never authorizes another package or version. A package may receive at
+most three combined transaction attempts. Failed transactions roll back
+automatically. Continue with the next independent package after a package succeeds
+or exhausts its attempts.
 
 Return control only after every package has one successful combined transaction or
 has exhausted its three attempts and been surrendered."""
 
 
-_MAVEN_UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a Maven dependency transaction worker.
-The Supervisor alone selects Maven versions and dependency targets. Do not search a
-registry, choose a version, change the project parent version or an unrelated BOM,
-or use npm tooling. Update only the exact Supervisor-authorized group:artifact
-coordinate through modify_and_validate_maven_dependency, on an authorized
-in-repository pom.xml and only with the committed dependencies or
-dependencyManagement target. For a dependencyManagement target, the committed
-operation may allow the tool to add that exact GAV when no managed declaration
-exists. The combined transaction edits and synchronizes the authorized POM set
-atomically. Keep the coordinate, target_version, dependency_type, and manifest_path
-within the current task's authorized candidates. Failed transactions roll back
-automatically; use a different Supervisor-approved signature on retry, at most
-three times per coordinate. Never edit source code in this worker."""
+def _build_multi_package_static_instructions(project_language: ProjectLanguage) -> str:
+    """Render shared atomic-worker policy with only the selected package tool."""
+    if project_language == ProjectLanguage.JAVA:
+        tool_name = _BATCH_MAVEN_DEPENDENCIES_TOOL_NAME
+        apply_detail = (
+            "applies every authorized Maven POM mutation, resolves the affected reactor, "
+            "and rolls back the complete cluster if any step fails"
+        )
+    else:
+        tool_name = _BATCH_NPM_DEPENDENCIES_TOOL_NAME
+        apply_detail = (
+            "applies every npm manifest mutation, synchronizes the affected lockfiles, "
+            "and rolls back the complete cluster if any step fails"
+        )
+    return f"""You are a dependency-manifest
+cluster execution worker.
+
+The Supervisor has already selected and validated one atomic multi-package action.
+It owns candidate generation, package/version selection, dependency types, retry
+planning, task routing, and cluster membership. Your only job is to execute that
+committed action in the Docker workspace.
+
+You have exactly one tool: {tool_name}. Call it exactly
+once, with no arguments. The tool {apply_detail}.
+
+When a task's exact Supervisor instruction requires a major-version migration,
+source and test migration to the committed package API is authorized and required;
+preserve behavior. Do not reselect or change any package name or version in the
+committed action. Do not call the singleton dependency tool, search the registry,
+or perform retry planning. After the tool returns, report its result and return
+control to the Supervisor. A failed or rolled-back action must be surrendered for
+a new Supervisor-committed attempt."""
+
+
+_MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS = _build_multi_package_static_instructions(
+    ProjectLanguage.NODEJS
+)
+
+
+def _build_multi_package_update_prompt(
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+    action: MultiPackageAction,
+    constraints_ledger: Sequence[str],
+    feedback_by_task: dict[str, str],
+    previous_action_summaries_by_task: dict[str, str],
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
+    repository_map: str = "(repository map unavailable)",
+    allowed_target_versions_by_task: Mapping[str, Sequence[str]] | None = None,
+    allowed_dependency_types_by_task: Mapping[str, Sequence[str]] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str:
+    """Build the authoritative prompt for one committed package cluster.
+
+    The action JSON is included as provenance and context only. The worker tool
+    closes over the same immutable action, so model-produced arguments cannot
+    alter the mutations that reach the deterministic executor.
+    """
+    task_context = _build_update_prompt(
+        resolved_tasks,
+        constraints_ledger,
+        feedback_by_task,
+        previous_action_summaries_by_task,
+        retry_diagnostics_by_task,
+        repository_map=repository_map,
+        allowed_target_versions_by_task=allowed_target_versions_by_task,
+        allowed_dependency_types_by_task=allowed_dependency_types_by_task,
+    )
+    return "\n".join(
+        [
+            "MULTI-PACKAGE CLUSTER EXECUTION (Supervisor-owned and authoritative):",
+            "",
+            f"Cluster ID: {action.cluster_id or '(missing)'}",
+            f"Dispatch batch ID: {action.dispatch_batch_id or '(missing)'}",
+            f"Committed action digest: {instruction_digest(action.model_dump_json())}",
+            "",
+            "The following immutable action is the only action you may execute:",
+            action.model_dump_json(),
+            "",
+            "Invoke "
+            f"{_BATCH_MAVEN_DEPENDENCIES_TOOL_NAME if project_language == ProjectLanguage.JAVA else _BATCH_NPM_DEPENDENCIES_TOOL_NAME} "
+            "exactly once with no arguments.",
+            (
+                "The tool applies every listed Maven POM mutation and resolves the authorized reactor atomically."
+                if project_language == ProjectLanguage.JAVA
+                else "The tool applies all listed npm package mutations and synchronizes lockfiles atomically."
+            ),
+            "",
+            task_context,
+        ]
+    )
 
 
 def _build_update_prompt(
@@ -399,6 +614,9 @@ def _build_update_prompt(
                     if value
                 )
             )
+        migration_required = _MAJOR_MIGRATION_DIRECTIVE in str(task.instruction or "")
+        if migration_required and task.selected_version:
+            allowed_versions = [task.selected_version]
         allowed_types = list(allowed_dependency_types_by_task.get(task.task_id, ()))
         if not allowed_types:
             allowed_types = [
@@ -426,6 +644,14 @@ def _build_update_prompt(
                 f"- Previous outcome: {previous_action_summaries_by_task.get(task.task_id, 'none')}",
             ]
         )
+        if migration_required:
+            sections.extend(
+                [
+                    "- Major-version source/test migration: required.",
+                    "- Keep the selected package and version exactly as committed; "
+                    "do not reselect or retry another version.",
+                ]
+            )
     return "\n".join(sections)
 
 
@@ -496,7 +722,6 @@ def _worker_result_map(
     validation_calls: int = 0,
     manifest_transaction_attempts: int = 0,
     manifest_transaction_attempts_by_task: Mapping[str, int] | None = None,
-    retryable_failure: bool = True,
 ) -> dict[str, WorkerAttemptResult]:
     """Build attempt-correlated worker envelopes without changing task state."""
     summary_by_task = {summary.task_id: summary for summary in summaries}
@@ -514,16 +739,22 @@ def _worker_result_map(
         summary = summary_by_task.get(task.task_id)
         attempted = list(attempted_versions_by_task.get(task.task_id, []))
         executed = list(executed_versions_by_task.get(task.task_id, []))
-        task_succeeded = summary is not None and summary.status == AgentActionStatus.SUCCESS
+        task_succeeded = (
+            succeeded
+            and not errors
+            and summary is not None
+            and summary.status == AgentActionStatus.SUCCESS
+        )
         results[snapshot.attempt_id] = WorkerAttemptResult(
             attempt_id=snapshot.attempt_id,
             task_id=task.task_id,
             task_revision=snapshot.task_revision,
+            cluster_id=snapshot.cluster_id,
+            dispatch_batch_id=snapshot.dispatch_batch_id,
+            action_digest=snapshot.action_digest,
             status=(
                 summary.status
-                if summary is not None
-                else AgentActionStatus.SUCCESS
-                if succeeded
+                if task_succeeded and summary is not None
                 else AgentActionStatus.SURRENDER
             ),
             executed_versions=executed,
@@ -540,7 +771,6 @@ def _worker_result_map(
                 validation_calls=validation_calls,
                 validation_passed=task_succeeded,
                 failure_reason=" | ".join(errors),
-                retryable_failure=retryable_failure,
             ),
             instruction_digest=snapshot.instruction_digest,
             errors=list(errors),
@@ -553,8 +783,6 @@ def _preflight_result(
     snapshots: Mapping[str, Any],
     message: str,
     errors: Sequence[str],
-    *,
-    retryable_failure: bool = True,
 ) -> dict[str, Any]:
     """Build an attempt-correlated surrender for work rejected before execution.
 
@@ -563,8 +791,6 @@ def _preflight_result(
         snapshots: Immutable attempt snapshots keyed by task ID.
         message: User-readable reason execution did not start or complete.
         errors: Detailed diagnostics to return to the Supervisor.
-        retryable_failure: Whether a later Supervisor-planned attempt may retry
-            this failure. Deterministic target validation failures are terminal.
 
     Returns:
         A worker state patch containing summaries and typed results keyed by
@@ -597,7 +823,6 @@ def _preflight_result(
             tagged_summaries,
             succeeded=False,
             errors=diagnostics,
-            retryable_failure=retryable_failure,
         ),
         "errors": diagnostics,
     }
@@ -631,7 +856,32 @@ def _changed_files_by_task(
             for path in manifest_paths
             if isinstance(path, str) and path.strip()
         }
-        result[task.task_id] = [path for path in normalized_files if path in manifest_set]
+        manifest_parents = {
+            PurePosixPath(path).parent
+            for path in manifest_set
+            if PurePosixPath(path).name == "package.json"
+        }
+        task_files: list[str] = []
+        for path in normalized_files:
+            if path in manifest_set:
+                task_files.append(path)
+                continue
+
+            # npm synchronization can update the lockfile alongside the
+            # manifest. A shared package cluster has multiple task records,
+            # so exact manifest matching alone would drop the lockfile from
+            # every per-task result. Associate package lockfiles with tasks
+            # whose manifest lives in the lockfile's directory or below it.
+            path_obj = PurePosixPath(path)
+            if path_obj.name not in {"package-lock.json", "npm-shrinkwrap.json"}:
+                continue
+            if any(
+                manifest_parent == path_obj.parent
+                or manifest_parent.is_relative_to(path_obj.parent)
+                for manifest_parent in manifest_parents
+            ):
+                task_files.append(path)
+        result[task.task_id] = task_files
     return result
 
 
@@ -641,10 +891,12 @@ def _attempted_versions_for_current_run(
 ) -> dict[str, list[str]]:
     """Collect version targets from combined transactions in this worker run."""
     package_to_task_ids: dict[str, list[str]] = {}
+    maven_by_task_id: dict[str, bool] = {}
     for task, group, _manifest_paths in resolved_tasks:
         package = _target_package_name(task, group)
         if package:
             package_to_task_ids.setdefault(package, []).append(task.task_id)
+        maven_by_task_id[task.task_id] = is_maven_group(group, ProjectLanguage.JAVA)
 
     result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
     for event in tool_events:
@@ -652,12 +904,16 @@ def _attempted_versions_for_current_run(
             continue
         args = getattr(event, "args", {}) or {}
         package = str(args.get("package_name", "")).strip()
-        target = str(args.get("target_version", "")).strip().lstrip("vV")
+        target = str(args.get("target_version", "")).strip()
         if not package or not target:
             continue
         for task_id in package_to_task_ids.get(package, []):
-            if target not in result[task_id]:
-                result[task_id].append(target)
+            task_target = _normalized_worker_version(
+                target,
+                maven_mode=maven_by_task_id.get(task_id, False),
+            )
+            if task_target and task_target not in result[task_id]:
+                result[task_id].append(task_target)
     return result
 
 
@@ -668,10 +924,12 @@ def _executed_versions_for_current_run(
     """Collect only successful version targets from this worker run."""
     result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
     package_to_task_ids: dict[str, list[str]] = {}
+    maven_by_task_id: dict[str, bool] = {}
     for task, group, _manifest_paths in resolved_tasks:
         package = _target_package_name(task, group)
         if package:
             package_to_task_ids.setdefault(package, []).append(task.task_id)
+        maven_by_task_id[task.task_id] = is_maven_group(group, ProjectLanguage.JAVA)
     for event in tool_events:
         if not _is_executed_manifest_transaction(event):
             continue
@@ -679,12 +937,16 @@ def _executed_versions_for_current_run(
             continue
         args = getattr(event, "args", {}) or {}
         package = str(args.get("package_name", "")).strip()
-        target = str(args.get("target_version", "")).strip().lstrip("vV")
+        target = str(args.get("target_version", "")).strip()
         if not package or not target:
             continue
         for task_id in package_to_task_ids.get(package, []):
-            if target not in result[task_id]:
-                result[task_id].append(target)
+            task_target = _normalized_worker_version(
+                target,
+                maven_mode=maven_by_task_id.get(task_id, False),
+            )
+            if task_target and task_target not in result[task_id]:
+                result[task_id].append(task_target)
     return result
 
 
@@ -719,10 +981,12 @@ def _effective_targets_for_current_run(
 ) -> tuple[dict[str, str | None], dict[str, str | None]]:
     """Collect effective version and dependency type from successful transactions."""
     package_to_task_ids: dict[str, list[str]] = {}
+    maven_by_task_id: dict[str, bool] = {}
     for task, group, _manifest_paths in resolved_tasks:
         package = _target_package_name(task, group)
         if package:
             package_to_task_ids.setdefault(package, []).append(task.task_id)
+        maven_by_task_id[task.task_id] = is_maven_group(group, ProjectLanguage.JAVA)
 
     versions: dict[str, str | None] = {task.task_id: None for task, _, _ in resolved_tasks}
     dependency_types: dict[str, str | None] = {task.task_id: None for task, _, _ in resolved_tasks}
@@ -733,10 +997,16 @@ def _effective_targets_for_current_run(
             continue
         args = getattr(event, "args", {}) or {}
         package = str(args.get("package_name", "")).strip()
-        version = str(args.get("target_version", "")).strip().lstrip("vV") or None
+        raw_version = str(args.get("target_version", "")).strip()
         dependency_type = str(args.get("dependency_type", "")).strip() or None
         for task_id in package_to_task_ids.get(package, []):
-            versions[task_id] = version
+            versions[task_id] = (
+                _normalized_worker_version(
+                    raw_version,
+                    maven_mode=maven_by_task_id.get(task_id, False),
+                )
+                or None
+            )
             dependency_types[task_id] = dependency_type
     return versions, dependency_types
 
@@ -761,6 +1031,7 @@ def _build_retry_diagnostics(
     lowered_outcome = f"{final_text or ''} {joined_errors}".lower()
     for task, group, _ in resolved_tasks:
         target_package = _target_package_name(task, group)
+        maven_mode = is_maven_group(group, ProjectLanguage.JAVA)
         target_dependency_type = _target_dependency_type(task, group)
         prior = prior_diagnostics_by_task.get(task.task_id)
         prior_attempts_by_target = dict(prior.attempted_versions_by_target) if prior else {}
@@ -785,7 +1056,10 @@ def _build_retry_diagnostics(
                 continue
             if str(event.args.get("package_name", "")).strip() != target_package:
                 continue
-            target = str(event.args.get("target_version", "")).strip().lstrip("vV")
+            target = _normalized_worker_version(
+                event.args.get("target_version", ""),
+                maven_mode=maven_mode,
+            )
             if target and target not in attempted:
                 attempted.append(target)
             dependency_type = str(event.args.get("dependency_type", "")).strip()
@@ -827,7 +1101,11 @@ def _build_retry_diagnostics(
             strategy_stage=task_stage,
             security_floor=prior.security_floor
             if prior
-            else (group.fix_plan.fixed_version if group.fix_plan else None),
+            else (
+                select_package_fix_plan(group, task.strategy).plan.fixed_version
+                if select_package_fix_plan(group, task.strategy).plan
+                else None
+            ),
             registry_query_performed=prior.registry_query_performed if prior else False,
             attempted_versions=attempted,
             executed_versions=executed,
@@ -893,6 +1171,7 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     repo_root_str = state.get("repo_root", "")
     workspace_volume = state.get("workspace_volume", "")
     target_tasks = list(state.get("target_tasks", []))
+    all_task_ids = [task.task_id for task in target_tasks]
     target_attempt_snapshots = dict(state.get("target_attempt_snapshots", {}))
     target_groups = list(state.get("target_groups", []))
     constraints_ledger = list(state.get("constraints_ledger", []))
@@ -988,7 +1267,6 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 task.current_attempt_id != snapshot.attempt_id
                 or task.task_revision != snapshot.task_revision
                 or task.instruction != snapshot.instruction
-                or task.selected_version != snapshot.selected_version
                 or task.target_package_name != snapshot.target_package_name
                 or task.target_dependency_type != snapshot.target_dependency_type
             ):
@@ -1105,23 +1383,353 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         resolved_tasks.append((task, group, manifest_paths))
 
     if not resolved_tasks:
-        return _preflight_result(
-            target_tasks,
-            target_attempt_snapshots,
+        failure_errors = resolution_errors or ["No authorized manifest targets could be resolved."]
+        summaries = _build_surrender_summaries(
+            all_task_ids,
             "Stopped before execution because no manifest targets could be resolved.",
-            resolution_errors or ["No authorized manifest targets could be resolved."],
-            retryable_failure=False,
         )
+        target_snapshots = {
+            task.task_id: target_attempt_snapshots[task.task_id]
+            for task in target_tasks
+            if task.task_id in target_attempt_snapshots
+        }
+        result: dict[str, Any] = {
+            "action_summaries": summaries,
+            "action_summary": summaries[0] if summaries else None,
+            "changed_files": [],
+            "errors": failure_errors,
+        }
+        if len(target_tasks) > 1:
+            result["worker_results_by_attempt"] = _worker_result_map(
+                target_tasks,
+                target_snapshots,
+                summaries,
+                succeeded=False,
+                errors=failure_errors,
+            )
+        return result
 
-    if _is_mixed_retry_batch(resolved_tasks):
-        batch_error = "Update Subagent: mixed first-pass and retry update tasks are not supported in the same batch."
-        return _preflight_result(
-            [task for task, _group, _paths in resolved_tasks],
-            target_attempt_snapshots,
-            "Stopped before execution because the Supervisor mixed first-pass and retry update tasks in one batch.",
-            [*resolution_errors, batch_error],
-            retryable_failure=False,
+    committed_action = state.get("multi_package_action")
+    if committed_action is None and _is_mixed_retry_batch(resolved_tasks):
+        message = "Stopped before execution because the supervisor mixed first-pass and retry update tasks in one batch."
+        summaries = _build_surrender_summaries(
+            all_task_ids,
+            message,
         )
+        failure_errors = [*resolution_errors, message]
+        target_snapshots = {
+            task.task_id: target_attempt_snapshots[task.task_id]
+            for task in target_tasks
+            if task.task_id in target_attempt_snapshots
+        }
+        return {
+            "action_summaries": summaries,
+            "action_summary": summaries[0] if summaries else None,
+            "changed_files": [],
+            "worker_results_by_attempt": _worker_result_map(
+                target_tasks,
+                target_snapshots,
+                summaries,
+                succeeded=False,
+                errors=failure_errors,
+            ),
+            "errors": failure_errors,
+        }
+
+    if committed_action is not None:
+        action_validation_errors = _validate_committed_multi_package_action(
+            state,
+            committed_action,
+            resolved_tasks,
+            target_attempt_snapshots,
+        )
+        if action_validation_errors:
+            summaries = _build_surrender_summaries(all_task_ids, action_validation_errors[0])
+            target_snapshots = {
+                task.task_id: target_attempt_snapshots[task.task_id]
+                for task in target_tasks
+                if task.task_id in target_attempt_snapshots
+            }
+            action_errors = resolution_errors + action_validation_errors
+            return {
+                "action_summaries": summaries,
+                "action_summary": summaries[0] if summaries else None,
+                "changed_files": [],
+                "worker_results_by_attempt": _worker_result_map(
+                    target_tasks,
+                    target_snapshots,
+                    summaries,
+                    succeeded=False,
+                    errors=action_errors,
+                ),
+                "errors": action_errors,
+            }
+        expected_task_ids = {task.task_id for task, _, _ in resolved_tasks}
+        action_task_ids = {mutation.task_id for mutation in committed_action.package_mutations}
+        if action_task_ids != expected_task_ids:
+            message = (
+                "Update Subagent: committed multi-package action does not cover exactly "
+                "the resolved cluster tasks."
+            )
+            summaries = _build_surrender_summaries(all_task_ids, message)
+            action_errors = resolution_errors + [message]
+            target_snapshots = {
+                task.task_id: target_attempt_snapshots[task.task_id]
+                for task in target_tasks
+                if task.task_id in target_attempt_snapshots
+            }
+            return {
+                "action_summaries": summaries,
+                "action_summary": summaries[0] if summaries else None,
+                "changed_files": [],
+                "worker_results_by_attempt": _worker_result_map(
+                    target_tasks,
+                    target_snapshots,
+                    summaries,
+                    succeeded=False,
+                    errors=action_errors,
+                ),
+                "errors": action_errors,
+            }
+        target_snapshots = {
+            task.task_id: target_attempt_snapshots[task.task_id]
+            for task, _, _ in resolved_tasks
+            if task.task_id in target_attempt_snapshots
+        }
+        if ChatOpenAI is None:
+            msg = "Update Subagent: 'langchain-openai' is not installed."
+            summaries = _build_surrender_summaries(
+                all_task_ids, "Stopped before execution because the LLM client is unavailable."
+            )
+            action_errors = resolution_errors + [msg]
+            return {
+                "action_summaries": summaries,
+                "action_summary": summaries[0] if summaries else None,
+                "changed_files": [],
+                "worker_results_by_attempt": _worker_result_map(
+                    target_tasks,
+                    {
+                        task.task_id: target_attempt_snapshots[task.task_id]
+                        for task in target_tasks
+                        if task.task_id in target_attempt_snapshots
+                    },
+                    summaries,
+                    succeeded=False,
+                    errors=action_errors,
+                ),
+                "errors": action_errors,
+            }
+
+        settings = get_runtime_settings()
+        model_name = settings.update_llm_model
+        try:
+            llm = ChatOpenAI(
+                model=model_name,
+                temperature=0,
+                **openai_api_key_kwargs(settings),
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = f"Update Subagent: failed to initialize LLM - {exc}."
+            summaries = _build_surrender_summaries(
+                all_task_ids, "Stopped before execution because the LLM failed to initialize."
+            )
+            action_errors = resolution_errors + [msg]
+            return {
+                "action_summaries": summaries,
+                "action_summary": summaries[0] if summaries else None,
+                "changed_files": [],
+                "worker_results_by_attempt": _worker_result_map(
+                    target_tasks,
+                    {
+                        task.task_id: target_attempt_snapshots[task.task_id]
+                        for task in target_tasks
+                        if task.task_id in target_attempt_snapshots
+                    },
+                    summaries,
+                    succeeded=False,
+                    errors=action_errors,
+                ),
+                "errors": action_errors,
+            }
+
+        touched_files: set[str] = set()
+        package_checkpoints: dict[str, Any] = {}
+        execution_state: dict[str, Any] = {
+            "edits_started": False,
+            "validation_calls": 0,
+            "manifest_transaction_attempts": 0,
+            "multi_package_action_executed": False,
+            "multi_package_action_succeeded": False,
+        }
+        skinny_resolved_tasks = [
+            (task, _create_skinny_subagent_group(group), manifest_paths)
+            for task, group, manifest_paths in resolved_tasks
+        ]
+        filtered_ledger = _filter_constraints_ledger(constraints_ledger, target_groups)
+        cluster_prompt = _build_multi_package_update_prompt(
+            skinny_resolved_tasks,
+            committed_action,
+            filtered_ledger,
+            feedback_by_task,
+            previous_action_summaries_by_task,
+            prior_retry_diagnostics_by_task,
+            repository_map=build_repository_map(repo_root),
+            allowed_target_versions_by_task=allowed_target_versions_by_task,
+            allowed_dependency_types_by_task=allowed_dependency_types_by_task,
+            project_language=project_language,
+        )
+        initial_messages = [
+            SystemMessage(content=_build_multi_package_static_instructions(project_language))
+        ]
+        if state.get("messages"):
+            initial_messages.extend(state["messages"])
+        initial_messages.append(HumanMessage(content=cluster_prompt))
+
+        runtime = None
+        cleanup_errors: list[str] = []
+        sandbox = None
+        sandbox_options: dict[str, Any] = {"workspace_volume": workspace_volume}
+        if project_language == ProjectLanguage.JAVA:
+            sandbox_options["image"] = LANGUAGE_CONFIGS[project_language].docker_image
+            sandbox_options["maven_repository_volume"] = state.get("maven_cache_volume")
+        batch_tool_name = (
+            _BATCH_MAVEN_DEPENDENCIES_TOOL_NAME
+            if project_language == ProjectLanguage.JAVA
+            else _BATCH_NPM_DEPENDENCIES_TOOL_NAME
+        )
+        try:
+            with DockerSandbox(repo_root=None, **sandbox_options) as sandbox:
+                toolbelt = build_multi_package_update_toolbelt(
+                    sandbox,
+                    touched_files,
+                    committed_action,
+                    execution_state=execution_state,
+                    package_checkpoints=package_checkpoints,
+                    project_language=project_language,
+                )
+                runtime = run_bounded_subagent_loop(
+                    llm,
+                    toolbelt,
+                    initial_messages,
+                    touched_files,
+                    execution_state=execution_state,
+                )
+                action_tool_events = [
+                    event for event in runtime.tool_events if event.name == batch_tool_name
+                ]
+                action_executed = bool(
+                    execution_state.get("multi_package_action_executed") or action_tool_events
+                )
+                action_succeeded = bool(
+                    execution_state.get("multi_package_action_succeeded")
+                    or any(event.content.startswith("SUCCESS:") for event in action_tool_events)
+                )
+                succeeded = (
+                    action_executed
+                    and action_succeeded
+                    and not (resolution_errors or runtime.errors)
+                )
+                if succeeded:
+                    package_checkpoints.clear()
+                else:
+                    if not action_executed:
+                        execution_state["multi_package_action_error"] = (
+                            "LLM did not invoke the committed multi-package action tool."
+                        )
+                    cleanup_errors.extend(
+                        rollback_pending_package_updates(
+                            sandbox,
+                            package_checkpoints,
+                            touched_files,
+                        )
+                    )
+        except Exception as exc:  # noqa: BLE001 - worker boundary returns typed surrender
+            succeeded = False
+            if sandbox is not None and package_checkpoints:
+                cleanup_errors.extend(
+                    rollback_pending_package_updates(
+                        sandbox,
+                        package_checkpoints,
+                        touched_files,
+                    )
+                )
+            cleanup_errors.append(f"Multi-package sandbox or tool loop failed: {exc}")
+
+        runtime_errors = list(resolution_errors)
+        if runtime is not None:
+            runtime_errors.extend(runtime.errors)
+        runtime_errors.extend(cleanup_errors)
+        action_error = str(execution_state.get("multi_package_action_error") or "").strip()
+        if not succeeded and action_error and action_error not in runtime_errors:
+            runtime_errors.append(action_error)
+        if not succeeded and not runtime_errors:
+            runtime_errors.append(
+                "Update Subagent: committed multi-package action did not complete successfully."
+            )
+
+        summary_status = AgentActionStatus.SUCCESS if succeeded else AgentActionStatus.SURRENDER
+        summary_text = (
+            "Supervisor-committed multi-package action completed successfully."
+            if succeeded
+            else runtime_errors[-1]
+        )
+        summaries = [
+            AgentActionSummary(
+                task_id=task.task_id,
+                status=summary_status,
+                summary=summary_text,
+            )
+            for task, _, _ in resolved_tasks
+        ]
+        attempted_by_task = (
+            {
+                task.task_id: [mutation.target_version]
+                for task, _, _ in resolved_tasks
+                for mutation in committed_action.package_mutations
+                if mutation.task_id == task.task_id
+            }
+            if execution_state.get("multi_package_action_executed")
+            else {}
+        )
+        executed_by_task = attempted_by_task if succeeded else {}
+        changed_by_task = _changed_files_by_task(resolved_tasks, sorted(touched_files))
+        tagged_summaries = [
+            summary.model_copy(
+                update={
+                    "attempt_id": target_snapshots[summary.task_id].attempt_id,
+                    "task_revision": target_snapshots[summary.task_id].task_revision,
+                    "instruction_digest": target_snapshots[summary.task_id].instruction_digest,
+                }
+            )
+            if summary.task_id in target_snapshots
+            else summary
+            for summary in summaries
+        ]
+        manifest_count = len(
+            {mutation.manifest_path for mutation in committed_action.package_mutations}
+        )
+        return {
+            "action_summaries": tagged_summaries,
+            "action_summary": tagged_summaries[0] if tagged_summaries else None,
+            "changed_files": sorted(touched_files) if succeeded else [],
+            "worker_results_by_attempt": _worker_result_map(
+                [task for task, _, _ in resolved_tasks],
+                target_snapshots,
+                tagged_summaries,
+                succeeded=succeeded,
+                errors=runtime_errors,
+                attempted_versions_by_task=attempted_by_task,
+                executed_versions_by_task=executed_by_task,
+                changed_files_by_task=changed_by_task if succeeded else {},
+                validation_calls=manifest_count
+                if execution_state.get("multi_package_action_executed")
+                else 0,
+                manifest_transaction_attempts=manifest_count
+                if execution_state.get("multi_package_action_executed")
+                else 0,
+            ),
+            "errors": runtime_errors,
+        }
 
     if ChatOpenAI is None:
         msg = "Update Subagent: 'langchain-openai' is not installed."
@@ -1132,9 +1740,14 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             [*resolution_errors, msg],
         )
 
-    model_name = get_runtime_settings().update_llm_model
+    settings = get_runtime_settings()
+    model_name = settings.update_llm_model
     try:
-        llm = ChatOpenAI(model=model_name, temperature=0)
+        llm = ChatOpenAI(
+            model=model_name,
+            temperature=0,
+            **openai_api_key_kwargs(settings),
+        )
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: failed to initialize LLM - {exc}."
         return _preflight_result(
@@ -1174,9 +1787,15 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     initial_messages = [
         SystemMessage(
             content=(
-                _MAVEN_UPDATE_WORKER_STATIC_INSTRUCTIONS
-                if project_language == ProjectLanguage.JAVA
-                else _UPDATE_WORKER_STATIC_INSTRUCTIONS
+                _UPDATE_WORKER_STATIC_INSTRUCTIONS
+                + (
+                    "\n\nUse only modify_and_validate_maven_dependency for manifest changes."
+                    "\n\nThis is a Maven task. Use only the provided Maven transaction tool, "
+                    "the exact committed GAV/POM targets, and the authorized candidate set. "
+                    "Do not query registries or alter a parent POM/BOM."
+                    if project_language == ProjectLanguage.JAVA
+                    else "\n\nUse only modify_and_validate_npm_dependency for manifest changes."
+                )
             )
         )
     ]
@@ -1351,16 +1970,21 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     }
     instruction_mismatch_task_ids: set[str] = set()
     instruction_mismatch_errors: list[str] = []
-    for task, _group, _manifest_paths in resolved_tasks:
+    for task, group, _manifest_paths in resolved_tasks:
         snapshot = target_attempt_snapshots.get(task.task_id)
         if snapshot is None:
             continue
         allowed_versions = list(getattr(snapshot, "allowed_target_versions", []) or [])
         if not allowed_versions and snapshot.selected_version:
             allowed_versions = [snapshot.selected_version]
-        allowed = {version.strip().lstrip("vV").lower() for version in allowed_versions if version}
+        maven_mode = is_maven_group(group, ProjectLanguage.JAVA)
+        allowed = {
+            _normalized_worker_version(version, maven_mode=maven_mode).lower()
+            for version in allowed_versions
+            if version
+        }
         observed = {
-            version.strip().lstrip("vV").lower()
+            _normalized_worker_version(version, maven_mode=maven_mode).lower()
             for version in attempted_by_task.get(task.task_id, [])
             if version
         }

@@ -7,13 +7,27 @@ import os
 import subprocess
 import sys
 import uuid
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from dataclasses import dataclass
 from pathlib import Path
 
 from .db import EvalDatabase
 from .models import EvalRunRecord, EvalTestCaseRecord, MetricRecord
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+@dataclass(frozen=True)
+class EvalProcessOutcome:
+    """Terminal status for one pytest subprocess execution."""
+
+    exit_code: int
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether the subprocess completed successfully."""
+        return self.exit_code == 0
+
 
 SUITE_PATHS: dict[str, list[str]] = {
     "all": ["tests/evals"],
@@ -38,6 +52,7 @@ def run_eval_subprocess(
     is_live: bool = False,
     judge_model: str = "gpt-4o",
     extra_args: list[str] | None = None,
+    on_complete: Callable[[EvalProcessOutcome], None] | None = None,
 ) -> Generator[str, None, int]:
     """Execute pytest evaluation suite as a subprocess, yielding stdout lines in real-time.
 
@@ -46,6 +61,7 @@ def run_eval_subprocess(
         is_live: Whether to pass --run-eval-live for live LLM judge evaluations.
         judge_model: Judge model identifier to export in EVAL_JUDGE_MODEL.
         extra_args: Additional pytest CLI arguments.
+        on_complete: Optional callback for the typed terminal process outcome.
 
     Yields:
         Formatted console output lines.
@@ -65,28 +81,42 @@ def run_eval_subprocess(
 
     env = os.environ.copy()
     env["EVAL_JUDGE_MODEL"] = judge_model
-    if is_live:
-        env["EVAL_RUN_LIVE"] = "true"
+    env["EVAL_RUN_LIVE"] = str(is_live).lower()
 
     yield f"🚀 Launching: {' '.join(cmd)}\n"
 
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(_PROJECT_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
-    )
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(_PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
 
-    if process.stdout:
-        yield from iter(process.stdout.readline, "")
-        process.stdout.close()
+        if process.stdout:
+            yield from iter(process.stdout.readline, "")
 
-    exit_code = process.wait()
-    yield f"\n🏁 Process finished with exit code {exit_code}\n"
-    return exit_code
+        exit_code = process.wait()
+        outcome = EvalProcessOutcome(exit_code=exit_code)
+        if on_complete is not None:
+            on_complete(outcome)
+        yield f"\n🏁 Process finished with exit code {exit_code}\n"
+        return exit_code
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
 
 
 def create_sample_run(

@@ -47,7 +47,10 @@ from remediation_engine.contracts.version_policy import (
     select_maven_version,
 )
 from remediation_engine.language import ProjectLanguage
-from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.orchestration.runtime_context import (
+    get_runtime_settings,
+    openai_api_key_kwargs,
+)
 from remediation_engine.orchestration.supervisor_planner import (
     _registry_report_versions,
     _registry_selected_version,
@@ -1872,7 +1875,11 @@ def _model_action(
         if model_factory is None:
             from langchain_openai import ChatOpenAI  # type: ignore[import]
 
-            llm = ChatOpenAI(model=settings.remedy_llm_model, temperature=0)
+            llm = ChatOpenAI(
+                model=settings.remedy_llm_model,
+                temperature=0,
+                **openai_api_key_kwargs(settings),
+            )
         else:
             llm = model_factory(settings)
         # Do not use ``with_structured_output`` with the discriminated root
@@ -2007,6 +2014,7 @@ def _render_instruction(
     return "\n".join(
         [
             "OBJECTIVE: Apply the Supervisor-approved dependency remediation.",
+            f"STRATEGY STAGE {stage.value}",
             f"AUTHORIZED TARGET: {target_package}",
             f"EXACT VERSION OR HYPOTHESIS: {version}",
             f"DECLARATION TYPE: {target_type or 'committed dependency declaration'}",

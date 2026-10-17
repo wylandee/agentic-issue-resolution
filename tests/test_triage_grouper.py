@@ -250,6 +250,7 @@ class TestSCAGrouping:
         g = groups[0]
         assert IssueSource.SEMGREP in g.sources
         assert IssueSource.ODC in g.sources
+        assert g.sources == sorted(g.sources, key=lambda source: source.value)
         assert len(g.issues) == 2
         assert g.fix_plan is not None
         assert g.fix_plan.strategy_used == "WORKAROUND"
@@ -381,10 +382,13 @@ class TestSCAGrouping:
                 ),
             ],
         )
-        assert len(groups) == 2
-        group_ids = {group.group_id for group in groups}
-        assert "sca:package.json:lodash:UPDATE_VERSION" in group_ids
-        assert "sca:package.json:lodash:WORKAROUND" in group_ids
+        assert len(groups) == 1
+        group = groups[0]
+        assert group.group_id == "sca:package.json:lodash"
+        assert {candidate.plan.status for candidate in group.fix_plan_candidates} == {
+            FixPlanStatus.VERSION_FOUND,
+            FixPlanStatus.WORKAROUND_FOUND,
+        }
 
     def test_highest_fixed_version_handles_partial_and_v_prefix(self):
         issues = [

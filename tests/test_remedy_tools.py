@@ -10,13 +10,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from remediation_engine.contracts.schemas import CommandResult, NoFixMitigationStage
+from remediation_engine.contracts.schemas import (
+    CommandResult,
+    MavenTargetOperation,
+    MultiPackageAction,
+    NoFixMitigationStage,
+    PackageMutation,
+    TacticalStrategy,
+)
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.remedy_tools import (
     _make_deterministic_replace_ast_symbol_tool,
     _make_read_repository_map_tool,
     _make_run_targeted_test_tool,
     _make_validate_code_syntax_tool,
+    build_multi_package_update_toolbelt,
     build_update_toolbelt,
     build_workaround_toolbelt,
 )
@@ -68,6 +76,178 @@ class TestToolbeltFactories:
         tools = _update_tool_map(sandbox)
 
         assert set(tools) == {"modify_and_validate_npm_dependency"}
+
+    def test_multi_package_update_toolbelt_exposes_only_committed_action(self):
+        sandbox = MagicMock()
+        action = MultiPackageAction(
+            cluster_id="cluster-1",
+            dispatch_batch_id="batch-1",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-1",
+                    package_name="lodash",
+                    manifest_path="package.json",
+                    target_version="4.17.21",
+                    dependency_type="dependencies",
+                ),
+                PackageMutation(
+                    task_id="task-2",
+                    package_name="axios",
+                    manifest_path="frontend/package.json",
+                    target_version="1.7.4",
+                    dependency_type="dependencies",
+                ),
+            ],
+            rationale="Keep peer-related updates atomic.",
+        )
+        execution_state = {}
+
+        with patch(
+            "remediation_engine.orchestration.tools_manifest.apply_multi_package_action",
+            return_value=(True, ""),
+        ) as apply_action:
+            tools = build_multi_package_update_toolbelt(
+                sandbox,
+                set(),
+                action,
+                execution_state=execution_state,
+            )
+            tool_map = {tool.name: tool for tool in tools}
+            result = tool_map["modify_batch_npm_dependencies"].invoke({})
+            repeated = tool_map["modify_batch_npm_dependencies"].invoke({})
+
+        assert set(tool_map) == {"modify_batch_npm_dependencies"}
+        assert result.startswith("SUCCESS:")
+        assert execution_state["multi_package_action_executed"] is True
+        assert execution_state["multi_package_action_succeeded"] is True
+        assert repeated.startswith("ERROR_CODE: MULTI_PACKAGE_ACTION_ALREADY_EXECUTED:")
+        apply_action.assert_called_once()
+        assert apply_action.call_args.args[:3] == (sandbox, action, set())
+
+    def test_java_multi_package_toolbelt_exposes_only_committed_maven_batch(self):
+        sandbox = MagicMock()
+        action = MultiPackageAction(
+            cluster_id="cluster-java",
+            dispatch_batch_id="batch-java",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-1",
+                    package_name="org.example:widget",
+                    ecosystem="maven",
+                    manifest_path="module-a/pom.xml",
+                    target_manifest_paths=["pom.xml", "module-a/pom.xml"],
+                    maven_target_operation=MavenTargetOperation.UPDATE_DECLARATION,
+                    target_version="2.0.0",
+                    dependency_type="dependencies",
+                ),
+                PackageMutation(
+                    task_id="task-2",
+                    package_name="org.example:library",
+                    ecosystem="maven",
+                    manifest_path="module-b/pom.xml",
+                    target_manifest_paths=["pom.xml", "module-b/pom.xml"],
+                    maven_target_operation=MavenTargetOperation.UPDATE_DECLARATION,
+                    target_version="3.0.0",
+                    dependency_type="dependencies",
+                ),
+            ],
+            rationale="Keep the Maven reactor changes atomic.",
+        )
+
+        tools = build_multi_package_update_toolbelt(
+            sandbox,
+            set(),
+            action,
+            project_language=ProjectLanguage.JAVA,
+        )
+
+        assert [tool.name for tool in tools] == ["modify_batch_maven_dependencies"]
+
+    def test_multi_package_transaction_syncs_lockfile_cleanly_without_positional_specs(self):
+        from remediation_engine.orchestration.tools_manifest import apply_multi_package_action
+
+        sandbox = MagicMock()
+        baseline_manifest = json.dumps({"dependencies": {"lodash": "4.17.20", "axios": "1.7.3"}})
+        updated_manifest = json.dumps({"dependencies": {"lodash": "4.17.21", "axios": "1.7.4"}})
+        baseline_lockfile = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/lodash": {"version": "4.17.20"},
+                    "node_modules/axios": {"version": "1.7.3"},
+                },
+            }
+        )
+        updated_lockfile = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/lodash": {"version": "4.17.21"},
+                    "node_modules/axios": {"version": "1.7.4"},
+                },
+            }
+        )
+        edited = False
+
+        def run(command: str, timeout: float | None = None) -> CommandResult:
+            nonlocal edited
+            if "npm pkg set" in command:
+                edited = True
+            return CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=0.1)
+
+        def read_file(path: str) -> str | None:
+            if path == "frontend/package.json":
+                return updated_manifest if edited else baseline_manifest
+            if path == "frontend/package-lock.json":
+                return updated_lockfile if edited else baseline_lockfile
+            return None
+
+        sandbox.run.side_effect = run
+        sandbox.read_file.side_effect = read_file
+        action = MultiPackageAction(
+            cluster_id="cluster-1",
+            dispatch_batch_id="batch-1",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-lodash",
+                    package_name="lodash",
+                    manifest_path="frontend/package.json",
+                    target_version="4.17.21",
+                    dependency_type="dependencies",
+                ),
+                PackageMutation(
+                    task_id="task-axios",
+                    package_name="axios",
+                    manifest_path="frontend/package.json",
+                    target_version="1.7.4",
+                    dependency_type="dependencies",
+                ),
+            ],
+            rationale="Update peer-related direct dependencies together.",
+        )
+        touched_files: set[str] = set()
+
+        succeeded, error = apply_multi_package_action(sandbox, action, touched_files)
+
+        assert succeeded is True
+        assert error == ""
+        commands = [call.args[0] for call in sandbox.run.call_args_list]
+        sync_commands = [command for command in commands if "npm install" in command]
+        assert len(sync_commands) == 2
+        assert sum("--dry-run" in command for command in sync_commands) == 1
+        assert all("--legacy-peer-deps" in command for command in sync_commands)
+        assert all("--no-audit" in command for command in sync_commands)
+        assert all("--no-fund" in command for command in sync_commands)
+        assert touched_files == {"frontend/package-lock.json", "frontend/package.json"}
+        assert not any("axios" in command for command in sync_commands)
+        assert not any("lodash" in command for command in sync_commands)
+        assert sync_commands[1] == (
+            "cd /workspace/frontend && npm install --package-lock-only --ignore-scripts "
+            "--legacy-peer-deps --no-audit --no-fund"
+        )
 
     def test_workaround_toolbelt_is_strictly_scoped(self):
         sandbox = MagicMock()
@@ -146,6 +326,73 @@ class TestToolbeltFactories:
         assert plan_state["no_fix_package_manager"] == ""
         assert plan_state["no_fix_manifest_paths"] == []
         assert "remove_no_fix_dependency" not in {tool.name for tool in tools}
+
+    def test_java_workaround_validation_uses_maven_compile_and_scoped_surefire(self):
+        sandbox = MagicMock()
+        files = {
+            "pom.xml": "<project />",
+            "src/main/java/org/example/Auth.java": "package org.example; class Auth {}",
+            "src/test/java/org/example/AuthTest.java": (
+                "package org.example; class AuthTest { void rejectsMissingAuth() {} }"
+            ),
+        }
+        sandbox.read_file.side_effect = lambda path: files.get(path)
+
+        def run(command, **_kwargs):
+            if "-DskipTests compile" in command:
+                return CommandResult(exit_code=0, stdout="", stderr="", duration_seconds=0.1)
+            if "-Dtest='AuthTest#rejectsMissingAuth'" in command:
+                return CommandResult(
+                    exit_code=0,
+                    stdout="Tests run: 1, Failures: 0, Errors: 0, Skipped: 0",
+                    stderr="",
+                    duration_seconds=0.1,
+                )
+            raise AssertionError(f"Unexpected validation command: {command}")
+
+        sandbox.run.side_effect = run
+        tools = {
+            item.name: item
+            for item in build_workaround_toolbelt(
+                sandbox,
+                set(),
+                Path("/dummy/repo/root"),
+                preferred_test_files=["src/test/java/org/example/AuthTest.java"],
+                project_language=ProjectLanguage.JAVA,
+            )
+        }
+
+        result = tools["validate_workaround"].invoke(
+            {
+                "modified_files": ["src/main/java/org/example/Auth.java"],
+                "targeted_test_file": "src/test/java/org/example/AuthTest.java",
+                "targeted_test_name": "rejectsMissingAuth",
+            }
+        )
+
+        assert result.startswith("SUCCESS: Workaround validation gate passed")
+        assert "Maven compilation passed" in result
+        commands = [call.args[0] for call in sandbox.run.call_args_list]
+        assert commands == [
+            "mvn -B -q -DskipTests compile",
+            "mvn -B -Dtest='AuthTest#rejectsMissingAuth' -Dsurefire.useFile=false test",
+        ]
+        assert not any(
+            "npm" in command or "node " in command or "npx" in command for command in commands
+        )
+
+    def test_java_workaround_prompt_describes_only_native_validation(self):
+        from remediation_engine.orchestration.workaround_subagent import (
+            _workaround_static_instructions,
+        )
+
+        prompt = _workaround_static_instructions(ProjectLanguage.JAVA)
+
+        assert "Maven compilation" in prompt
+        assert "Surefire" in prompt
+        assert "Omit runtime_smoke_file" in prompt
+        assert "npm test" not in prompt
+        assert "npx" not in prompt
 
     def test_node_no_fix_still_defaults_to_npm_package_removal(self):
         sandbox = MagicMock()
@@ -671,11 +918,49 @@ class TestModifyAndValidateNpmDependency:
         assert "dependencies" in result
         assert "4.17.21" in result
         assert touched_files == {"frontend/package.json"}
-        assert sandbox.run.call_count == 2
-        edit_command, sync_command = [call.args[0] for call in sandbox.run.call_args_list]
+        assert sandbox.run.call_count == 3
+        edit_command, preflight_command, sync_command = [
+            call.args[0] for call in sandbox.run.call_args_list
+        ]
         assert "npm pkg set" in edit_command
         assert "cd /workspace/frontend" in edit_command
-        assert "npm install --package-lock-only --ignore-scripts" in sync_command
+        assert "npm install --package-lock-only --ignore-scripts" in preflight_command
+        assert "--dry-run" in preflight_command
+        assert "--legacy-peer-deps" in preflight_command
+        assert "--dry-run" not in sync_command
+        assert "--legacy-peer-deps" in sync_command
+
+    def test_nested_manifest_validates_its_own_lockfile_not_root_lockfile(self):
+        from remediation_engine.orchestration.tools_manifest import (
+            _PackageCheckpoint,
+            _verify_lockfile_mutations,
+        )
+
+        sandbox = MagicMock()
+        root_lock = '{"lockfileVersion": 3, "packages": {}}'
+        frontend_lock = (
+            '{"lockfileVersion": 3, "packages": {"node_modules/axios": {"version": "1.7.4"}}}'
+        )
+        sandbox.read_file.side_effect = lambda path: {
+            "package-lock.json": root_lock,
+            "frontend/package-lock.json": frontend_lock,
+        }.get(path)
+        checkpoint = _PackageCheckpoint(
+            files={
+                "package-lock.json": root_lock,
+                "frontend/package-lock.json": frontend_lock,
+            },
+            touched_files_before=set(),
+        )
+        mutation = PackageMutation(
+            task_id="task-1",
+            package_name="axios",
+            manifest_path="frontend/package.json",
+            target_version="1.7.4",
+            dependency_type="dependencies",
+        )
+
+        _verify_lockfile_mutations(sandbox, checkpoint, [mutation])
 
     def test_rejects_manifest_outside_allowed_batch_targets(self):
         sandbox = MagicMock()
@@ -726,7 +1011,7 @@ class TestModifyAndValidateNpmDependency:
         assert result.startswith("SUCCESS:")
         assert "frontend/package.json" in result
         assert touched_files == {"frontend/package.json"}
-        assert sandbox.run.call_count == 2
+        assert sandbox.run.call_count == 3
 
     def test_rejects_unknown_package_name_for_batch(self):
         sandbox = MagicMock()
@@ -804,6 +1089,7 @@ class TestModifyAndValidateNpmDependency:
         sandbox.run.side_effect = [
             success,
             failure,
+            success,
             success,
             success,
             success,
@@ -1062,7 +1348,7 @@ class TestCombinedManifestTransaction:
         assert axios_result.startswith("SUCCESS:")
         assert execution_state["validation_calls"] == 2
         assert execution_state["manifest_transaction_attempts"] == 2
-        assert sandbox.run.call_count == 4
+        assert sandbox.run.call_count == 6
 
     def test_success_runs_sync_for_each_manifest_directory(self):
         sandbox = MagicMock()
@@ -1092,10 +1378,13 @@ class TestCombinedManifestTransaction:
         )
 
         assert result.startswith("SUCCESS:")
-        assert sandbox.run.call_count == 3
+        assert sandbox.run.call_count == 5
         commands = [call.args[0] for call in sandbox.run.call_args_list]
         assert "npm pkg set" in commands[0]
         assert all("--package-lock-only --ignore-scripts" in cmd for cmd in commands[1:])
+        assert sum("--dry-run" in cmd for cmd in commands[1:]) == 2
+        assert sum("--dry-run" not in cmd for cmd in commands[1:]) == 2
+        assert all("--legacy-peer-deps" in cmd for cmd in commands[1:])
         assert any("cd /workspace/frontend" in cmd for cmd in commands[1:])
 
     def test_sync_failure_surfaces_stderr_and_restores_checkpoint(self):
@@ -1126,6 +1415,14 @@ class TestCombinedManifestTransaction:
         assert "partial" in result
         assert "Rollback" in result
         assert touched_files == set()
+        assert sandbox.run.call_count == 4
+        commands = [call.args[0] for call in sandbox.run.call_args_list]
+        assert "npm pkg set" in commands[0]
+        assert "--dry-run" in commands[1]
+        assert "--legacy-peer-deps" in commands[1]
+        assert not any(
+            "npm install" in command and "--dry-run" not in command for command in commands
+        )
         sandbox.write_file.assert_called_once_with("package.json", baseline)
 
 
@@ -1343,3 +1640,175 @@ class TestReadWebPage:
             timeout=15,
         )
         assert "Use expressjwt from the named export" in res
+
+
+def test_lockfile_verification_accepts_pruned_transitive_override_target():
+    from remediation_engine.orchestration.tools_manifest import (
+        _PackageCheckpoint,
+        _verify_lockfile_mutations,
+    )
+
+    original_manifest = json.dumps({"dependencies": {"express-jwt": "0.1.3"}})
+    original_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/express-jwt": {"version": "0.1.3"},
+                "node_modules/base64url": {"version": "0.0.6"},
+            },
+        }
+    )
+    updated_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {"node_modules/express-jwt": {"version": "6.0.0"}},
+        }
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = updated_lockfile
+    checkpoint = _PackageCheckpoint(
+        files={
+            "package.json": original_manifest,
+            "package-lock.json": original_lockfile,
+        },
+        touched_files_before=set(),
+    )
+    mutation = PackageMutation(
+        task_id="task-base64url",
+        package_name="base64url",
+        manifest_path="package.json",
+        target_version="3.0.0",
+        dependency_type="overrides",
+    )
+
+    _verify_lockfile_mutations(sandbox, checkpoint, [mutation])
+
+
+def test_lockfile_verification_does_not_hide_missing_override_target():
+    import pytest
+
+    from remediation_engine.orchestration.tools_manifest import (
+        _PackageCheckpoint,
+        _verify_lockfile_mutations,
+    )
+
+    manifest = json.dumps({"dependencies": {"express-jwt": "0.1.3"}})
+    lockfile = json.dumps(
+        {"lockfileVersion": 3, "packages": {"node_modules/express-jwt": {"version": "0.1.3"}}}
+    )
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = lockfile
+    checkpoint = _PackageCheckpoint(
+        files={"package.json": manifest, "package-lock.json": lockfile},
+        touched_files_before=set(),
+    )
+    mutation = PackageMutation(
+        task_id="task-base64url",
+        package_name="base64url",
+        manifest_path="package.json",
+        target_version="3.0.0",
+        dependency_type="overrides",
+    )
+
+    with pytest.raises(RuntimeError, match="no package entry"):
+        _verify_lockfile_mutations(sandbox, checkpoint, [mutation])
+
+
+def test_multi_package_override_accepts_transitive_target_pruned_by_parent_update():
+    from remediation_engine.orchestration.tools_manifest import apply_multi_package_action
+
+    sandbox = MagicMock()
+    baseline_manifest = json.dumps({"dependencies": {"express-jwt": "0.1.3"}})
+    updated_manifest = json.dumps(
+        {
+            "dependencies": {"express-jwt": "6.0.0"},
+            "overrides": {"base64url": "3.0.0"},
+        }
+    )
+    baseline_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/express-jwt": {"version": "0.1.3"},
+                "node_modules/base64url": {"version": "0.0.6"},
+            },
+        }
+    )
+    updated_lockfile = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {"node_modules/express-jwt": {"version": "6.0.0"}},
+        }
+    )
+    edited = False
+
+    def run(_command: str, timeout: float | None = None) -> CommandResult:
+        nonlocal edited
+        if "npm pkg set" in _command:
+            edited = True
+        return CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=0.1)
+
+    def read_file(path: str) -> str | None:
+        if path == "package.json":
+            return updated_manifest if edited else baseline_manifest
+        if path == "package-lock.json":
+            return updated_lockfile if edited else baseline_lockfile
+        return None
+
+    sandbox.run.side_effect = run
+    sandbox.read_file.side_effect = read_file
+    action = MultiPackageAction(
+        cluster_id="cluster-transitive",
+        dispatch_batch_id="batch-transitive",
+        selected_strategy=TacticalStrategy.VERSION_BUMP,
+        package_mutations=[
+            PackageMutation(
+                task_id="task-base64url",
+                package_name="base64url",
+                manifest_path="package.json",
+                target_version="3.0.0",
+                dependency_type="overrides",
+            ),
+            PackageMutation(
+                task_id="task-express-jwt",
+                package_name="express-jwt",
+                manifest_path="package.json",
+                target_version="6.0.0",
+                dependency_type="dependencies",
+            ),
+        ],
+        rationale="Upgrade the direct parent and retain the child override safely.",
+    )
+
+    succeeded, error = apply_multi_package_action(sandbox, action, set())
+
+    assert succeeded is True
+    assert error == ""
+
+
+def test_failed_package_checkpoint_restore_retains_anchor_and_unresolved_paths():
+    from remediation_engine.orchestration.tools_manifest import (
+        _PackageCheckpoint,
+        rollback_pending_package_updates,
+    )
+
+    sandbox = MagicMock()
+    sandbox.run.return_value = CommandResult(
+        exit_code=1,
+        stdout="",
+        stderr="cannot remove generated lockfile",
+        duration_seconds=0.1,
+    )
+    checkpoint = _PackageCheckpoint(
+        files={"package.json": '{"dependencies":{}}', "package-lock.json": None},
+        touched_files_before={"prior.js"},
+    )
+    checkpoints = {"demo-package": checkpoint}
+    touched_files = {"package.json", "package-lock.json", "other.js", "prior.js"}
+
+    errors = rollback_pending_package_updates(sandbox, checkpoints, touched_files)
+
+    assert errors and "package-lock.json" in errors[0]
+    assert checkpoints == {"demo-package": checkpoint}
+    assert touched_files == {"package-lock.json", "other.js", "prior.js"}
+    sandbox.write_file.assert_called_once_with("package.json", '{"dependencies":{}}')

@@ -384,6 +384,16 @@ def extract_imports(root: Node, source_bytes: bytes) -> list[str]:  # type: igno
     - ES6 ``import`` declarations
     - ``const x = require(...)`` expression statements
     """
+    return _extract_import_statements(root)[:20]
+
+
+def extract_all_imports(root: Node, source_bytes: bytes) -> list[str]:  # type: ignore[name-defined]
+    """Return every top-level import/require statement for deterministic analysis."""
+    return _extract_import_statements(root)
+
+
+def _extract_import_statements(root: Node) -> list[str]:  # type: ignore[name-defined]
+    """Extract top-level JavaScript and TypeScript imports without a size cap."""
     if not _TREE_SITTER_AVAILABLE:
         return []
 
@@ -404,7 +414,7 @@ def extract_imports(root: Node, source_bytes: bytes) -> list[str]:  # type: igno
             if "require(" in raw:
                 results.append(raw.strip())
 
-    return results[:20]  # cap at 20 to stay context-sized
+    return results
 
 
 def extract_sink_expression(

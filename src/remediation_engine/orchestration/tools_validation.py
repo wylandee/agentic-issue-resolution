@@ -409,17 +409,24 @@ def _revert_current_iteration_edit(
     sandbox: DockerSandbox,
     plan_state: dict[str, Any],
     touched_files: set[str],
-) -> None:
-    """Revert the unvalidated edit set made in the current iteration."""
+) -> list[str]:
+    """Revert the unvalidated edit set and retain anchors if any path fails."""
     pending_snapshots = plan_state.get("pending_snapshots", {})
     pending_edit_set = plan_state.get("pending_edit_set")
+    previously_validated_files = set(plan_state.get("validated_files", []) or [])
+    restore_errors: list[str] = []
 
     if pending_snapshots:
         for file_path, orig_content in pending_snapshots.items():
             try:
                 sandbox.write_file(file_path, orig_content)
-                touched_files.discard(file_path)
+                if file_path in previously_validated_files:
+                    touched_files.add(file_path)
+                else:
+                    touched_files.discard(file_path)
             except Exception as exc:  # noqa: BLE001
+                touched_files.add(file_path)
+                restore_errors.append(f"{file_path}: {exc}")
                 logger.warning(
                     "Failed to revert unvalidated snapshot edit on %s: %s", file_path, exc
                 )
@@ -430,8 +437,19 @@ def _revert_current_iteration_edit(
                 if curr and edit.new_text in curr:
                     updated = curr.replace(edit.new_text, edit.old_text, 1)
                     sandbox.write_file(edit.file_path, updated)
-                    touched_files.discard(edit.file_path)
+                    if edit.file_path in previously_validated_files:
+                        touched_files.add(edit.file_path)
+                    else:
+                        touched_files.discard(edit.file_path)
+                elif curr is None:
+                    touched_files.add(edit.file_path)
+                    restore_errors.append(f"{edit.file_path}: current file could not be read")
+                else:
+                    touched_files.add(edit.file_path)
+                    restore_errors.append(f"{edit.file_path}: rollback state could not be verified")
             except Exception as exc:  # noqa: BLE001
+                touched_files.add(edit.file_path)
+                restore_errors.append(f"{edit.file_path}: {exc}")
                 logger.warning("Failed to revert unvalidated edit on %s: %s", edit.file_path, exc)
     else:
         last_edit = plan_state.get("current_iteration_edit")
@@ -441,11 +459,34 @@ def _revert_current_iteration_edit(
                 if curr and last_edit.new_text in curr:
                     updated = curr.replace(last_edit.new_text, last_edit.old_text, 1)
                     sandbox.write_file(last_edit.file_path, updated)
-                    touched_files.discard(last_edit.file_path)
+                    if last_edit.file_path in previously_validated_files:
+                        touched_files.add(last_edit.file_path)
+                    else:
+                        touched_files.discard(last_edit.file_path)
+                elif curr is None:
+                    touched_files.add(last_edit.file_path)
+                    restore_errors.append(f"{last_edit.file_path}: current file could not be read")
+                else:
+                    touched_files.add(last_edit.file_path)
+                    restore_errors.append(
+                        f"{last_edit.file_path}: rollback state could not be verified"
+                    )
             except Exception as exc:  # noqa: BLE001
+                touched_files.add(last_edit.file_path)
+                restore_errors.append(f"{last_edit.file_path}: {exc}")
                 logger.warning(
                     "Failed to revert unvalidated edit on %s: %s", last_edit.file_path, exc
                 )
+
+    if restore_errors:
+        plan_state["restoration_failed"] = True
+        plan_state["restoration_failure_paths"] = sorted(
+            set(plan_state.get("restoration_failure_paths", []) or [])
+            | {error.split(":", 1)[0] for error in restore_errors}
+        )
+        plan_state["restoration_failure_diagnostics"] = restore_errors
+        plan_state["validation_passed"] = False
+        return restore_errors
 
     plan_state["pending_edit_set"] = None
     plan_state["pending_snapshots"] = {}
@@ -458,6 +499,16 @@ def _revert_current_iteration_edit(
     plan_state["validated_files"] = []
     plan_state["validation_passed"] = False
     plan_state["accepted_alternative_test"] = None
+    plan_state.pop("restoration_failure_paths", None)
+    plan_state.pop("restoration_failure_diagnostics", None)
+    return []
+
+
+def _restoration_failure_suffix(errors: Sequence[str]) -> str:
+    """Format local rollback failures for the worker's deterministic gate."""
+    if not errors:
+        return ""
+    return "\nRESTORATION_INCOMPLETE: " + " | ".join(errors)
 
 
 def _make_validate_workaround_tool(
@@ -643,6 +694,14 @@ def _make_validate_workaround_tool(
         test/spec files and compiled ``build/`` or ``dist/`` paths are rejected,
         and the smoke module must be distinct from the targeted test.
         """
+        if plan_state.get("restoration_failed"):
+            paths = ", ".join(plan_state.get("restoration_failure_paths", []) or [])
+            return (
+                "FAILURE: [RESTORATION_INCOMPLETE] A previous rollback did not restore "
+                f"the workspace files ({paths}). The outer attempt snapshot must restore "
+                "the workspace before another validation can run."
+            )
+
         requested: list[str] = []
         for path in modified_files or []:
             if not str(path).strip():
@@ -865,8 +924,12 @@ def _make_validate_workaround_tool(
                         failure_category=FailureCategory.BREAKING_CHANGE,
                     )
                 )
-                _revert_current_iteration_edit(sandbox, plan_state, touched_files)
-                return f"FAILURE: Workaround validation gate 'syntax' failed.\n{syntax_msg}\nJSON: {res.model_dump_json()}"
+                restore_errors = _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+                return (
+                    f"FAILURE: Workaround validation gate 'syntax' failed.\n{syntax_msg}\n"
+                    f"JSON: {res.model_dump_json()}"
+                    f"{_restoration_failure_suffix(restore_errors)}"
+                )
             syntax_result = syntax_tool.invoke({"file_path": file_path})
             if str(syntax_result).startswith("BLOCKED:"):
                 res = _record_result(
@@ -887,8 +950,12 @@ def _make_validate_workaround_tool(
                         failure_category=FailureCategory.BREAKING_CHANGE,
                     )
                 )
-                _revert_current_iteration_edit(sandbox, plan_state, touched_files)
-                return f"FAILURE: Workaround validation gate 'syntax' failed.\n{syntax_msg}\nJSON: {res.model_dump_json()}"
+                restore_errors = _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+                return (
+                    f"FAILURE: Workaround validation gate 'syntax' failed.\n{syntax_msg}\n"
+                    f"JSON: {res.model_dump_json()}"
+                    f"{_restoration_failure_suffix(restore_errors)}"
+                )
             syntax_msg = str(syntax_result)
 
         typecheck_msg = _run_typecheck_gate()
@@ -911,8 +978,12 @@ def _make_validate_workaround_tool(
                     failure_category=FailureCategory.BREAKING_CHANGE,
                 )
             )
-            _revert_current_iteration_edit(sandbox, plan_state, touched_files)
-            return f"FAILURE: Workaround validation gate 'typecheck' failed.\n{typecheck_msg}\nJSON: {res.model_dump_json()}"
+            restore_errors = _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+            return (
+                f"FAILURE: Workaround validation gate 'typecheck' failed.\n{typecheck_msg}\n"
+                f"JSON: {res.model_dump_json()}"
+                f"{_restoration_failure_suffix(restore_errors)}"
+            )
 
         lint_msg = _run_lint_gate(files)
         if lint_msg.startswith("BLOCKED:"):
@@ -935,8 +1006,12 @@ def _make_validate_workaround_tool(
                     failure_category=FailureCategory.BREAKING_CHANGE,
                 )
             )
-            _revert_current_iteration_edit(sandbox, plan_state, touched_files)
-            return f"FAILURE: Workaround validation gate 'lint' failed.\n{lint_msg}\nJSON: {res.model_dump_json()}"
+            restore_errors = _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+            return (
+                f"FAILURE: Workaround validation gate 'lint' failed.\n{lint_msg}\n"
+                f"JSON: {res.model_dump_json()}"
+                f"{_restoration_failure_suffix(restore_errors)}"
+            )
 
         if smoke_target is None and not plan_state.get("runtime_smoke_required", False) and files:
             smoke_target = next(
@@ -984,8 +1059,12 @@ def _make_validate_workaround_tool(
                     failure_category=FailureCategory.BREAKING_CHANGE,
                 )
             )
-            _revert_current_iteration_edit(sandbox, plan_state, touched_files)
-            return f"FAILURE: Workaround validation gate 'runtime_smoke' failed.\n{smoke_msg}\nJSON: {res.model_dump_json()}"
+            restore_errors = _revert_current_iteration_edit(sandbox, plan_state, touched_files)
+            return (
+                f"FAILURE: Workaround validation gate 'runtime_smoke' failed.\n{smoke_msg}\n"
+                f"JSON: {res.model_dump_json()}"
+                f"{_restoration_failure_suffix(restore_errors)}"
+            )
 
         test_msg = ""
         alt_used = bool(accepted_alt)
@@ -1066,8 +1145,14 @@ def _make_validate_workaround_tool(
                             failure_category=FailureCategory.BREAKING_CHANGE,
                         )
                     )
-                    _revert_current_iteration_edit(sandbox, plan_state, touched_files)
-                    return f"FAILURE: Workaround validation gate 'targeted_test' failed.\n{test_msg}\nJSON: {res.model_dump_json()}"
+                    restore_errors = _revert_current_iteration_edit(
+                        sandbox, plan_state, touched_files
+                    )
+                    return (
+                        f"FAILURE: Workaround validation gate 'targeted_test' failed.\n"
+                        f"{test_msg}\nJSON: {res.model_dump_json()}"
+                        f"{_restoration_failure_suffix(restore_errors)}"
+                    )
 
         res = _record_result(
             WorkaroundValidationResult(
@@ -1159,6 +1244,13 @@ def _make_record_plan_tool(plan_state: dict[str, Any]):
         in ``affected_files``, and keep manifest/lockfile mutations out of
         ``planned_replacements``; the dedicated removal tool owns them.
         """
+        if plan_state.get("restoration_failed"):
+            paths = ", ".join(plan_state.get("restoration_failure_paths", []) or [])
+            return (
+                "ERROR: [RESTORATION_INCOMPLETE] A previous rollback did not restore "
+                f"the workspace files ({paths}); this worker cannot create another plan."
+            )
+
         if plan_state.get("inspected_files") or plan_state.get("read_files"):
             plan_state["local_investigation_complete"] = True
 

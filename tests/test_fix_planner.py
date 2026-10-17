@@ -3,40 +3,15 @@ Tests for remediation_engine.tools.fix_planner.
 
 All network calls are mocked â€” no live internet required.
 
-Coverage
---------
-plan_fix waterfall
-  - Step 1: local regex extraction from ODC-style advisory messages
-  - Step 2: OSV querybatch with embedded ranges (full detail in result)
-  - Step 2b: OSV querybatch returns only vuln IDs â†’ GET /v1/vulns/{id} detail
-  - Step 3: npm registry latest dist-tag (plain + scoped packages)
-  - Step 4: Serper workaround snippets (key present / key absent)
-  - Step 5: no_fix when all strategies fail
-
-_build_instruction
-  - Direct dependency (npm/yarn/pnpm)
-  - Transitive dependency â€” npm overrides
-  - Transitive dependency â€” Yarn resolutions
-  - Transitive dependency â€” pnpm overrides
-  - Missing manifest_file falls back to "package.json"
-
-Helper unit tests
-  - _extract_local_version: various message forms, None input
-  - _is_npm_issue: npm / javascript ecosystem, purl matching
-  - _package_name_from_issue: direct name, PURL fallback, scoped packages
-  - _fetch_osv_vuln_detail: success and failure
-  - _fetch_npm_latest: success, scoped packages (@scope/pkg), failure
-
-FixPlan round-trip
-  - Constructed from plan_fix dict validates as FixPlan
+Coverage includes OSV advisory parsing, Serper evidence extraction, package
+identity, instruction generation, and ``FixPlan`` model validation. Network
+boundaries are mocked; registry candidate selection belongs to the Supervisor.
 """
 
 from __future__ import annotations
 
 from typing import Any
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from remediation_engine.contracts import (
     FixPlan,
@@ -51,11 +26,8 @@ from remediation_engine.tools.fix_planner import (
     SerperLLMResult,
     _build_instruction,
     _extract_fixed_from_osv_vuln,
-    _extract_local_version,
-    _fetch_npm_latest,
     _fetch_osv_vuln_detail,
     _fetch_page_content,
-    _is_npm_issue,
     _llm_extract_remediation,
     _minimum_fixed_version,
     _package_name_from_issue,
@@ -101,71 +73,6 @@ def _make_localized(issue: VulnerabilityIssue | None = None, **kwargs) -> Locali
     return LocalizedIssue(**defaults)
 
 
-# ===========================================================================
-# _extract_local_version
-# ===========================================================================
-
-
-class TestExtractLocalVersion:
-    @pytest.mark.parametrize(
-        "msg,expected",
-        [
-            ("Update to version 3.0.0 or later.", "3.0.0"),
-            ("Upgrade to 1.2.3.", "1.2.3"),
-            ("Fixed in v2.1.4.", "2.1.4"),
-            ("Patched in 5.0.0-beta.1.", "5.0.0"),
-            ("Use version 0.0.1.", "0.0.1"),
-            ("Requires 2.0.0 or higher.", "2.0.0"),
-            ("No version mentioned here.", None),
-            ("", None),
-        ],
-    )
-    def test_variants(self, msg, expected):
-        assert _extract_local_version(msg) == expected
-
-    def test_none_input(self):
-        assert _extract_local_version(None) is None
-
-    def test_case_insensitive(self):
-        assert _extract_local_version("UPDATE TO VERSION 1.2.3") == "1.2.3"
-
-    def test_takes_first_version(self):
-        # Should return the first match only
-        result = _extract_local_version("Update to version 4.17.21 or 4.18.0.")
-        assert result == "4.17.21"
-
-
-# ===========================================================================
-# _is_npm_issue
-# ===========================================================================
-
-
-class TestIsNpmIssue:
-    def test_npm_ecosystem(self):
-        issue = _make_vuln_issue(ecosystem="npm")
-        assert _is_npm_issue(issue) is True
-
-    def test_javascript_ecosystem(self):
-        issue = _make_vuln_issue(ecosystem="javascript")
-        assert _is_npm_issue(issue) is True
-
-    def test_purl_npm(self):
-        issue = _make_vuln_issue(ecosystem=None, purl="pkg:npm/lodash@4.17.20")
-        assert _is_npm_issue(issue) is True
-
-    def test_purl_javascript(self):
-        issue = _make_vuln_issue(ecosystem=None, purl="pkg:javascript/underscore.js@1.7.0")
-        assert _is_npm_issue(issue) is True
-
-    def test_maven_is_not_npm(self):
-        issue = _make_vuln_issue(
-            ecosystem="maven",
-            purl="pkg:maven/commons-io/commons-io@2.4",
-        )
-        assert _is_npm_issue(issue) is False
-
-
-# ===========================================================================
 # _package_name_from_issue
 # ===========================================================================
 
@@ -330,54 +237,6 @@ class TestFetchOsvVulnDetail:
         assert result is None
 
 
-# ===========================================================================
-# _fetch_npm_latest
-# ===========================================================================
-
-
-class TestFetchNpmLatest:
-    def test_success(self):
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"version": "4.17.21", "name": "lodash"}
-        mock_resp.raise_for_status = MagicMock()
-        with patch("remediation_engine.tools.fix_planner.requests.get", return_value=mock_resp):
-            result = _fetch_npm_latest("lodash")
-        assert result == "4.17.21"
-
-    def test_scoped_package_encoded_in_url(self):
-        """@scope/pkg must be percent-encoded in the registry URL."""
-        captured = {}
-
-        def fake_get(url, timeout):
-            captured["url"] = url
-            mock = MagicMock()
-            mock.json.return_value = {"version": "1.2.0"}
-            mock.raise_for_status = MagicMock()
-            return mock
-
-        with patch("remediation_engine.tools.fix_planner.requests.get", side_effect=fake_get):
-            result = _fetch_npm_latest("@tootallnate/once")
-        assert result == "1.2.0"
-        # @ and / must be encoded
-        assert "%40" in captured["url"] or "%2F" in captured["url"]
-
-    def test_network_failure_returns_none(self):
-        with patch(
-            "remediation_engine.tools.fix_planner.requests.get", side_effect=Exception("DNS")
-        ):
-            result = _fetch_npm_latest("lodash")
-        assert result is None
-
-    def test_missing_version_key_returns_none(self):
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"name": "lodash"}  # no "version" key
-        mock_resp.raise_for_status = MagicMock()
-        with patch("remediation_engine.tools.fix_planner.requests.get", return_value=mock_resp):
-            result = _fetch_npm_latest("lodash")
-        assert result is None
-
-
-# ===========================================================================
 # _query_osv_fixed_version
 # ===========================================================================
 

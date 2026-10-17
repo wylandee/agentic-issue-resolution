@@ -45,6 +45,9 @@ from remediation_engine.tools.manifest_locator import (
     parse_lockfile_path,
 )
 from remediation_engine.tools.odc_parser import (
+    _PROJECT_ROOT as ODC_PROJECT_ROOT,
+)
+from remediation_engine.tools.odc_parser import (
     _ecosystem_from_purl,
     _extract_cve_id,
     _extract_ghsa_id,
@@ -337,6 +340,23 @@ class TestGHSAIDExtraction:
 
 
 class TestParseVulnerabilities:
+    def test_cli_default_paths_use_repository_data_directory(self):
+        assert Path(__file__).resolve().parents[1] == ODC_PROJECT_ROOT
+
+    def test_rejects_non_object_report(self):
+        with pytest.raises(ValueError, match="report must be a JSON object"):
+            parse_vulnerabilities([])
+
+    def test_skips_malformed_reference_records(self):
+        dep = _minimal_dep()
+        dep["vulnerabilities"][0]["name"] = "GHSA-vpq2-c234-7xj6"
+        dep["vulnerabilities"][0]["references"] = [None, "bad", {"url": "CVE-2020-15084"}]
+
+        issues = parse_vulnerabilities({"dependencies": [dep]})
+
+        assert len(issues) == 1
+        assert issues[0].cve_id == "CVE-2020-15084"
+
     def test_minimal_report(self):
         report = {"dependencies": [_minimal_dep()]}
         issues = parse_vulnerabilities(report)
@@ -689,10 +709,38 @@ class TestFindNearestManifest:
         assert manifest.parent.name == "frontend"
         assert manifest.name == "package.json"
 
+    def test_scan_mount_nested_frontend_prefers_frontend_manifest(self, tmp_repo_nested):
+        """Container-mounted ODC paths must strip the ``/scan`` virtual root."""
+        manifest = _find_nearest_manifest(
+            tmp_repo_nested,
+            "/scan/frontend/package-lock.json?/elliptic:6.6.1",
+        )
+        assert manifest == (tmp_repo_nested / "frontend" / "package.json").resolve()
+
+    def test_relative_scan_mount_nested_frontend_prefers_frontend_manifest(self, tmp_repo_nested):
+        """The same normalization applies when ODC omits the leading slash."""
+        manifest = _find_nearest_manifest(
+            tmp_repo_nested,
+            "scan/frontend/package-lock.json?/elliptic:6.6.1",
+        )
+        assert manifest == (tmp_repo_nested / "frontend" / "package.json").resolve()
+
     def test_empty_path_returns_none(self, tmp_repo):
         result = _find_nearest_manifest(tmp_repo, "")
         # Empty path â€” falls back gracefully
         assert result is None or result.name == "package.json"
+
+    def test_external_symlinked_manifest_is_not_returned_or_read(self, tmp_path):
+        repo = tmp_path / "repo"
+        nested = repo / "src"
+        nested.mkdir(parents=True)
+        outside = tmp_path / "outside-package.json"
+        outside.write_text('{"dependencies":{"sentinel-package":"1.0.0"}}', encoding="utf-8")
+        (nested / "package.json").symlink_to(outside)
+
+        assert _find_nearest_manifest(repo, "/scan/src/package-lock.json") is None
+        result = locate_dependency(repo, "sentinel-package", "/scan/src/package-lock.json")
+        assert result["status"] == "error"
 
 
 # ===========================================================================
@@ -958,6 +1006,20 @@ class TestLocateFromIssue:
         issue = self._make_issue()
         loc = locate_from_issue(issue, tmp_repo)
         assert loc.localization_confidence >= 0.9
+
+    def test_scan_mount_path_is_preserved_in_localized_manifest(self, tmp_repo_nested):
+        issue = self._make_issue(
+            package_name="elliptic",
+            package_version="6.6.1",
+            purl="pkg:npm/elliptic@6.6.1",
+            file_path="/scan/frontend/package-lock.json?/elliptic:6.6.1",
+            raw_payload={"filePath": "/scan/frontend/package-lock.json?/elliptic:6.6.1"},
+        )
+
+        loc = locate_from_issue(issue, tmp_repo_nested)
+
+        assert loc.manifest_file == "frontend/package.json"
+        assert loc.is_direct_dependency is True
 
     def test_low_confidence_for_transitive(self, tmp_repo):
         issue = self._make_issue(

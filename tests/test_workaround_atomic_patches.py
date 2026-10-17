@@ -23,6 +23,7 @@ from remediation_engine.orchestration.subagent_runtime import (
     ToolEvent,
     _infer_changed_files,
 )
+from remediation_engine.orchestration.tools_validation import _revert_current_iteration_edit
 
 
 def _mock_sandbox(initial_files: dict[str, str] | None = None):
@@ -370,6 +371,67 @@ def test_multi_file_atomic_patch_and_syntax_failure_rollback():
     assert files["src/b.js"] == "const b = 1;\n"
 
 
+def test_source_edit_restore_failure_keeps_primary_error_and_blocks_more_edits():
+    sandbox, files = _mock_sandbox({"src/a.js": "const a = 1;\n", "src/b.js": "const b = 1;\n"})
+    plan_state = {
+        "local_investigation_complete": True,
+        "inspected_files": {"src/a.js", "src/b.js"},
+    }
+    touched: set[str] = set()
+    rec_tool = _make_record_plan_tool(plan_state)
+    edit_tool = _make_deterministic_apply_edit_set_tool(sandbox, touched, plan_state)
+    planned_replacements = [
+        {
+            "file_path": "src/a.js",
+            "old_text": "const a = 1;",
+            "new_text": "const a = 2;",
+            "expected_occurrences": 1,
+        },
+        {
+            "file_path": "src/b.js",
+            "old_text": "const b = 1;",
+            "new_text": "const b = invalid syntax {{{",
+            "expected_occurrences": 1,
+        },
+    ]
+    rec_tool.invoke(
+        {
+            "affected_files": ["src/a.js", "src/b.js"],
+            "affected_symbols": ["a", "b"],
+            "security_invariant": "inv",
+            "causal_hypothesis": "hyp",
+            "planned_replacements": planned_replacements,
+            "evidence_source": "docs",
+        }
+    )
+
+    def write_file(path: str, content: str) -> None:
+        if path == "src/a.js" and content == "const a = 1;\n":
+            raise OSError("restore disk failure")
+        files[path] = content
+
+    sandbox.write_file.side_effect = write_file
+    sandbox.run.side_effect = lambda command, **_kwargs: MagicMock(
+        exit_code=1 if "src/b.js" in command else 0,
+        stdout="SyntaxError: Unexpected token" if "src/b.js" in command else "",
+        stderr="",
+    )
+
+    result = edit_tool.invoke({"replacements": planned_replacements})
+
+    assert "ERROR: [SYNTAX_FAILURE]" in result
+    assert "RESTORATION_INCOMPLETE" in result
+    assert "restore disk failure" in result
+    assert plan_state["restoration_failed"] is True
+    assert plan_state["restoration_failure_paths"] == ["src/a.js"]
+    assert files["src/a.js"] == "const a = 2;\n"
+    assert files["src/b.js"] == "const b = 1;\n"
+    assert touched == {"src/a.js"}
+
+    retry = edit_tool.invoke({"replacements": planned_replacements})
+    assert "RESTORATION_INCOMPLETE" in retry
+
+
 def test_code_failure_rollback_requires_fresh_investigation():
     """A code-failing validation restores the edit and clears investigation state."""
     sandbox, files = _mock_sandbox(
@@ -403,6 +465,60 @@ def test_code_failure_rollback_requires_fresh_investigation():
     assert plan_state["phase"] == WorkaroundExecutionPhase.INVESTIGATE.value
     assert plan_state["local_investigation_complete"] is False
     assert touched == set()
+
+
+def test_current_iteration_rollback_preserves_prior_accepted_file_evidence():
+    """Restoring a later edit must retain a path changed by an accepted edit."""
+    sandbox, files = _mock_sandbox({"src/a.ts": "const a = 3;\n"})
+    plan_state = {
+        "phase": WorkaroundExecutionPhase.VALIDATE.value,
+        "iteration": 3,
+        "validated_files": ["src/a.ts"],
+        "pending_snapshots": {"src/a.ts": "const a = 2;\n"},
+    }
+    touched = {"src/a.ts"}
+
+    errors = _revert_current_iteration_edit(sandbox, plan_state, touched)
+
+    assert errors == []
+    assert files["src/a.ts"] == "const a = 2;\n"
+    assert touched == {"src/a.ts"}
+    assert plan_state["iteration"] == 4
+    assert plan_state["pending_snapshots"] == {}
+
+
+def test_failed_current_iteration_rollback_retains_anchor_and_blocks_worker():
+    sandbox, files = _mock_sandbox({"src/a.ts": "const a = 2;\n", "src/b.ts": "const b = 2;\n"})
+
+    def fail_second_restore(path, content):
+        if path == "src/b.ts":
+            raise OSError("disk write failed")
+        files[path] = content
+
+    sandbox.write_file.side_effect = fail_second_restore
+    pending_snapshots = {"src/a.ts": "const a = 1;\n", "src/b.ts": "const b = 1;\n"}
+    plan_state = {
+        "phase": WorkaroundExecutionPhase.VALIDATE.value,
+        "iteration": 3,
+        "pending_snapshots": pending_snapshots,
+    }
+    touched = {"src/a.ts", "src/b.ts"}
+
+    errors = _revert_current_iteration_edit(sandbox, plan_state, touched)
+
+    assert errors == ["src/b.ts: disk write failed"]
+    assert files["src/a.ts"] == "const a = 1;\n"
+    assert files["src/b.ts"] == "const b = 2;\n"
+    assert plan_state["pending_snapshots"] == pending_snapshots
+    assert plan_state["iteration"] == 3
+    assert plan_state["restoration_failed"] is True
+    assert touched == {"src/b.ts"}
+
+    validate = _make_validate_workaround_tool(sandbox, touched, plan_state)
+    blocked = validate.invoke({"modified_files": ["src/a.ts"]})
+
+    assert "RESTORATION_INCOMPLETE" in blocked
+    assert sandbox.run.call_count == 0
 
 
 def test_validation_outcomes_commit_and_rollback():

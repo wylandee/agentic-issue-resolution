@@ -17,12 +17,16 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    MavenTargetOperation,
+    MultiPackageAction,
     NoFixMitigationStage,
+    PackageMutation,
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
-    SCARemediationStage,
     Severity,
+    TacticalStrategy,
+    TaskAttemptSnapshot,
     TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -34,10 +38,10 @@ from remediation_engine.orchestration.state import (
     initial_workaround_subagent_state,
 )
 from remediation_engine.orchestration.update_subagent import (
+    _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _build_update_prompt,
-    _candidate_manifest_paths,
-    _resolve_manifest_targets,
+    _changed_files_by_task,
     run_update_subagent_node,
 )
 from remediation_engine.orchestration.workaround_subagent import (
@@ -58,8 +62,6 @@ def _sca_group(
         package_version="4.17.15",
         file_path=manifest_file,
     )
-    from remediation_engine.contracts.schemas import LocalizedIssue
-
     return VulnerabilityGroup(
         group_id=group_id,
         issue_type=IssueType.SCA,
@@ -87,21 +89,25 @@ def _sca_group(
     )
 
 
-def _maven_group() -> VulnerabilityGroup:
+def _maven_group(
+    coordinate: str = "org.example:library",
+    manifest_path: str = "modules/service/pom.xml",
+) -> VulnerabilityGroup:
+    group_id, artifact_id = coordinate.split(":", 1)
     issue = VulnerabilityIssue(
         source=IssueSource.ODC,
         issue_type=IssueType.SCA,
         severity=Severity.HIGH,
         cve_id="CVE-2026-0002",
-        package_name="org.example:library",
+        package_name=coordinate,
         package_version="1.0.0",
-        purl="pkg:maven/org.example/library@1.0.0",
+        purl=f"pkg:maven/{group_id}/{artifact_id}@1.0.0",
         ecosystem="Maven",
-        file_path="modules/service/pom.xml",
+        file_path=manifest_path,
     )
     localized = LocalizedIssue(
         issue=issue,
-        manifest_file="modules/service/pom.xml",
+        manifest_file=manifest_path,
         package_manager="maven",
         is_direct_dependency=True,
         declaration_type="dependencies",
@@ -110,11 +116,11 @@ def _maven_group() -> VulnerabilityGroup:
         localization_confidence=1.0,
     )
     return VulnerabilityGroup(
-        group_id="sca:modules/service/pom.xml:org.example:library",
+        group_id=f"sca:{manifest_path}:{coordinate}",
         issue_type=IssueType.SCA,
-        vulnerable_component="org.example:library",
-        file_path="modules/service/pom.xml",
-        file_paths=["modules/service/pom.xml"],
+        vulnerable_component=coordinate,
+        file_path=manifest_path,
+        file_paths=[manifest_path],
         cve_ids=["CVE-2026-0002"],
         versions=["1.0.0"],
         sources=[IssueSource.ODC],
@@ -237,67 +243,40 @@ class TestUpdateSubagentWrapper:
         assert "revert_workspace_file" not in prompt
         assert "validate_manifest_sync" not in prompt
 
-    def test_java_resolution_authorizes_exact_poms_and_prompts_for_maven_gav(self, tmp_path):
-        group = _maven_group()
-        (tmp_path / "pom.xml").write_text(
-            "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId>"
-            "<artifactId>parent</artifactId><version>1.0</version><packaging>pom</packaging>"
-            "<properties><library.version>1.0.0</library.version></properties>"
-            "<modules><module>modules/service</module></modules></project>",
-            encoding="utf-8",
+    def test_major_upgrade_prompt_commits_source_migration_and_version(self):
+        group = _sca_group().model_copy(update={"vulnerable_component": "jsonwebtoken"})
+        directive = (
+            "Migrate all affected production and test code to the selected package API "
+            "while preserving behavior; do not change the solver-approved package or version."
         )
-        module_dir = tmp_path / "modules" / "service"
-        module_dir.mkdir(parents=True)
-        (module_dir / "pom.xml").write_text(
-            "<project><modelVersion>4.0.0</modelVersion>"
-            "<parent><groupId>org.example</groupId><artifactId>parent</artifactId>"
-            "<version>1.0</version><relativePath>../../pom.xml</relativePath></parent>"
-            "<artifactId>service</artifactId><dependencies><dependency>"
-            "<groupId>org.example</groupId><artifactId>library</artifactId>"
-            "<version>${library.version}</version></dependency></dependencies></project>",
-            encoding="utf-8",
-        )
-        unrelated = tmp_path / "unrelated"
-        unrelated.mkdir()
-        (unrelated / "pom.xml").write_text(
-            "<project><modelVersion>4.0.0</modelVersion><artifactId>unrelated</artifactId></project>",
-            encoding="utf-8",
+        task = _task_for_group(
+            group,
+            target_package_name="jsonwebtoken",
+            target_dependency_type="dependencies",
+            selected_version="9.0.2",
+            instruction=(
+                "Upgrade package jsonwebtoken from installed version 8.5.1 "
+                f"to selected version 9.0.2.\n{directive}"
+            ),
         )
 
-        candidates = _candidate_manifest_paths(group, ProjectLanguage.JAVA)
-        authorized, errors = _resolve_manifest_targets(
-            group,
-            tmp_path,
-            ProjectLanguage.JAVA,
-        )
-        task = RemediationTask(
-            task_id=group.group_id,
-            parent_group_id=group.group_id,
-            strategy=RoutingStrategy.VERSION_BUMP,
-            strategy_stage=SCARemediationStage.OSV_MINIMUM,
-            qa_policy=QAPolicy.VERSION_BUMP,
-            target_package_name="org.example:library",
-            target_dependency_type="dependencies",
-            selected_version="2.4.1",
-            instruction="Upgrade only org.example:library to 2.4.1.",
-        )
         prompt = _build_update_prompt(
-            [(task, group, authorized)],
+            [(task, group, ["package.json"])],
             [],
             {},
             {},
-            allowed_target_versions_by_task={task.task_id: ["2.4.1"]},
-            allowed_dependency_types_by_task={task.task_id: ["dependencies"]},
-            project_language=ProjectLanguage.JAVA,
         )
 
-        assert "pom.xml" in candidates
-        assert authorized == ["modules/service/pom.xml", "pom.xml"]
-        assert errors == []
-        assert "modify_and_validate_maven_dependency" in prompt
-        assert "org.example:library" in prompt
-        assert "dependencies" in prompt
-        assert "unrelated/pom.xml" not in prompt
+        assert "8.5.1" in prompt
+        assert "9.0.2" in prompt
+        assert directive in prompt
+        assert "Major-version source/test migration: required." in prompt
+        assert "source and test migration to the committed package API is authorized" in (
+            _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS
+        )
+        assert "Do not reselect or change any package name or version" in (
+            _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS
+        )
 
     def test_mixed_first_pass_and_retry_batch_is_rejected_before_execution(self):
         group_a = _sca_group("sca:package.json:lodash", "package.json")
@@ -325,6 +304,23 @@ class TestUpdateSubagentWrapper:
 
         assert "mixed first-pass and retry" in result["errors"][-1]
         assert mock_chat.call_count == 0
+
+    def test_multi_task_changed_file_projection_keeps_shared_lockfile(self):
+        group_a = _sca_group("sca:frontend/package.json:lodash", "frontend/package.json")
+        group_b = _sca_group("sca:frontend/package.json:axios", "frontend/package.json")
+        task_a = _task_for_group(group_a)
+        task_b = _task_for_group(group_b)
+
+        projected = _changed_files_by_task(
+            [
+                (task_a, group_a, ["frontend/package.json"]),
+                (task_b, group_b, ["frontend/package.json"]),
+            ],
+            ["frontend/package-lock.json", "frontend/package.json"],
+        )
+
+        expected = ["frontend/package-lock.json", "frontend/package.json"]
+        assert projected == {task_a.task_id: expected, task_b.task_id: expected}
 
     def test_update_prompt_shows_distinct_exact_instructions_for_multi_target_retry(self):
         group_a = _sca_group("sca:package.json:jsonwebtoken", "package.json")
@@ -475,6 +471,288 @@ class TestUpdateSubagentWrapper:
         assert "package.json" in summary_by_task[group_a.group_id]
         assert "Final note:" not in summary_by_task[group_a.group_id]
         assert "frontend/package.json" in summary_by_task[group_b.group_id]
+
+    def test_multi_package_cluster_uses_llm_committed_action_tool(self):
+        from remediation_engine.orchestration.supervisor_planner import instruction_digest
+
+        group_a = _sca_group("sca:package.json:lodash", "package.json")
+        group_b = _sca_group("sca:frontend/package.json:axios", "frontend/package.json")
+        group_b.vulnerable_component = "axios"
+        task_a = _task_for_group(group_a).model_copy(
+            update={
+                "selected_version": "4.17.21",
+                "target_package_name": "lodash",
+                "target_dependency_type": "dependencies",
+                "current_attempt_id": "attempt-1",
+            }
+        )
+        task_b = _task_for_group(group_b).model_copy(
+            update={
+                "selected_version": "1.7.4",
+                "target_package_name": "axios",
+                "target_dependency_type": "dependencies",
+                "current_attempt_id": "attempt-2",
+            }
+        )
+        action = MultiPackageAction(
+            cluster_id="cluster-1",
+            dispatch_batch_id="batch-1",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id=task_a.task_id,
+                    package_name="lodash",
+                    manifest_path="package.json",
+                    target_version="4.17.21",
+                    dependency_type="dependencies",
+                ),
+                PackageMutation(
+                    task_id=task_b.task_id,
+                    package_name="axios",
+                    manifest_path="frontend/package.json",
+                    target_version="1.7.4",
+                    dependency_type="dependencies",
+                ),
+            ],
+            rationale="Keep the package cluster atomic.",
+        )
+        action_digest = instruction_digest(action.model_dump_json())
+        snapshots = {
+            task_a.task_id: TaskAttemptSnapshot(
+                attempt_id="attempt-1",
+                task_id=task_a.task_id,
+                cluster_id="cluster-1",
+                dispatch_batch_id="batch-1",
+                action_digest=action_digest,
+                manifest_path="package.json",
+                selected_version="4.17.21",
+                allowed_target_versions=["4.17.21"],
+                target_package_name="lodash",
+                target_dependency_type="dependencies",
+                allowed_dependency_types=["dependencies"],
+                instruction=task_a.instruction,
+                instruction_digest=instruction_digest(task_a.instruction),
+                dispatch_node="update_subagent",
+            ),
+            task_b.task_id: TaskAttemptSnapshot(
+                attempt_id="attempt-2",
+                task_id=task_b.task_id,
+                cluster_id="cluster-1",
+                dispatch_batch_id="batch-1",
+                action_digest=action_digest,
+                manifest_path="frontend/package.json",
+                selected_version="1.7.4",
+                allowed_target_versions=["1.7.4"],
+                target_package_name="axios",
+                target_dependency_type="dependencies",
+                allowed_dependency_types=["dependencies"],
+                instruction=task_b.instruction,
+                instruction_digest=instruction_digest(task_b.instruction),
+                dispatch_node="update_subagent",
+            ),
+        }
+        state = initial_update_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            [task_a, task_b],
+            [group_a, group_b],
+            target_attempt_snapshots=snapshots,
+            active_cluster_id="cluster-1",
+            dispatch_batch_id="batch-1",
+            multi_package_action=action,
+        )
+        llm, bound = _mock_llm_with_responses(
+            AIMessage(
+                content="execute the committed action",
+                tool_calls=[
+                    {
+                        "name": "modify_batch_npm_dependencies",
+                        "args": {},
+                        "id": "cluster-call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="cluster action completed"),
+        )
+        sandbox = _sandbox_mock()
+
+        with (
+            patch("remediation_engine.orchestration.update_subagent.ChatOpenAI", return_value=llm),
+            patch(
+                "remediation_engine.orchestration.update_subagent.DockerSandbox",
+                return_value=sandbox,
+            ),
+            patch(
+                "remediation_engine.orchestration.update_subagent._resolve_manifest_targets",
+                side_effect=[(["package.json"], []), (["frontend/package.json"], [])],
+            ),
+            patch(
+                "remediation_engine.orchestration.tools_manifest.apply_multi_package_action",
+                return_value=(True, ""),
+            ) as apply_action,
+        ):
+            result = run_update_subagent_node(state)
+
+        assert bound.invoke.call_count == 2
+        bound_tools = llm.bind_tools.call_args.args[0]
+        assert [tool.name for tool in bound_tools] == ["modify_batch_npm_dependencies"]
+        first_prompt = bound.invoke.call_args_list[0].args[0]
+        assert "MULTI-PACKAGE CLUSTER EXECUTION" in first_prompt[-1].content
+        assert "modify_batch_npm_dependencies" in first_prompt[-1].content
+        assert '"package_name":"lodash"' in first_prompt[-1].content
+        assert result["action_summary"].status == AgentActionStatus.SUCCESS
+        assert len(result["worker_results_by_attempt"]) == 2
+        apply_action.assert_called_once()
+        assert apply_action.call_args.args[1] == action
+
+    def test_maven_multi_package_worker_uses_native_tool_prompt_and_cache(self):
+        from remediation_engine.contracts.schemas import TaskAttemptSnapshot
+        from remediation_engine.language import LANGUAGE_CONFIGS
+        from remediation_engine.orchestration.supervisor_planner import instruction_digest
+
+        group_a = _maven_group()
+        group_b = _maven_group(
+            coordinate="org.example:widget",
+            manifest_path="modules/widget/pom.xml",
+        )
+        task_a = _task_for_group(
+            group_a,
+            task_id="task-library",
+            selected_version="2.4.1",
+            target_package_name="org.example:library",
+            target_dependency_type="dependencies",
+            current_attempt_id="attempt-library",
+        )
+        task_b = _task_for_group(
+            group_b,
+            task_id="task-widget",
+            selected_version="3.1.0",
+            target_package_name="org.example:widget",
+            target_dependency_type="dependencies",
+            current_attempt_id="attempt-widget",
+        )
+        reactor_poms = ["pom.xml", "modules/service/pom.xml", "modules/widget/pom.xml"]
+        action = MultiPackageAction(
+            cluster_id="cluster-java",
+            dispatch_batch_id="batch-java",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id=task_a.task_id,
+                    package_name="org.example:library",
+                    ecosystem="maven",
+                    manifest_path="modules/service/pom.xml",
+                    target_manifest_paths=reactor_poms,
+                    maven_target_operation=MavenTargetOperation.UPDATE_DECLARATION,
+                    target_version="2.4.1",
+                    dependency_type="dependencies",
+                ),
+                PackageMutation(
+                    task_id=task_b.task_id,
+                    package_name="org.example:widget",
+                    ecosystem="maven",
+                    manifest_path="modules/widget/pom.xml",
+                    target_manifest_paths=reactor_poms,
+                    maven_target_operation=MavenTargetOperation.UPDATE_DECLARATION,
+                    target_version="3.1.0",
+                    dependency_type="dependencies",
+                ),
+            ],
+            rationale="Update the committed Maven reactor cluster atomically.",
+        )
+        action_digest = instruction_digest(action.model_dump_json())
+        snapshots = {
+            task.task_id: TaskAttemptSnapshot(
+                attempt_id=task.current_attempt_id,
+                task_id=task.task_id,
+                cluster_id="cluster-java",
+                dispatch_batch_id="batch-java",
+                action_digest=action_digest,
+                selected_version=task.selected_version,
+                allowed_target_versions=[task.selected_version],
+                target_package_name=task.target_package_name,
+                target_dependency_type=task.target_dependency_type,
+                maven_target_operation=MavenTargetOperation.UPDATE_DECLARATION,
+                target_manifest_paths=reactor_poms,
+                allowed_dependency_types=["dependencies"],
+                instruction=task.instruction,
+                instruction_digest=instruction_digest(task.instruction),
+                dispatch_node="update_subagent",
+            )
+            for task in (task_a, task_b)
+        }
+        state = initial_update_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            [task_a.model_copy(update={"selected_version": "2.5.0"}), task_b],
+            [group_a, group_b],
+            target_attempt_snapshots=snapshots,
+            active_cluster_id="cluster-java",
+            dispatch_batch_id="batch-java",
+            multi_package_action=action,
+            project_language=ProjectLanguage.JAVA,
+            maven_cache_volume="agent_maven_repository_deadbeef",
+        )
+        llm, bound = _mock_llm_with_responses(
+            AIMessage(
+                content="execute the committed Maven action",
+                tool_calls=[
+                    {
+                        "name": "modify_batch_maven_dependencies",
+                        "args": {},
+                        "id": "maven-cluster-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Maven cluster action completed"),
+        )
+        sandbox = _sandbox_mock()
+
+        with (
+            patch("remediation_engine.orchestration.update_subagent.ChatOpenAI", return_value=llm),
+            patch(
+                "remediation_engine.orchestration.update_subagent.DockerSandbox",
+                return_value=sandbox,
+            ) as sandbox_factory,
+            patch(
+                "remediation_engine.orchestration.update_subagent._resolve_manifest_targets",
+                side_effect=[(reactor_poms, []), (reactor_poms, [])],
+            ),
+            patch(
+                "remediation_engine.orchestration.update_subagent.build_repository_map",
+                return_value="Maven repository map",
+            ),
+            patch(
+                "remediation_engine.orchestration.tools_manifest_java.apply_multi_maven_package_action",
+                return_value=(True, ""),
+            ) as apply_action,
+        ):
+            result = run_update_subagent_node(state)
+
+        assert result["action_summary"].status == AgentActionStatus.SUCCESS
+        assert [tool.name for tool in llm.bind_tools.call_args.args[0]] == [
+            "modify_batch_maven_dependencies"
+        ]
+        assert (
+            "modify_batch_maven_dependencies" in bound.invoke.call_args_list[0].args[0][0].content
+        )
+        prompt = "\n".join(
+            str(message.content) for message in bound.invoke.call_args_list[0].args[0]
+        )
+        assert "2.4.1" in prompt
+        assert "2.5.0" not in prompt
+        assert "npm" not in bound.invoke.call_args_list[0].args[0][0].content.lower()
+        assert "authorized and required" in bound.invoke.call_args_list[0].args[0][0].content
+        assert sandbox_factory.call_args.kwargs == {
+            "repo_root": None,
+            "workspace_volume": "agent_workspace_deadbeef",
+            "image": LANGUAGE_CONFIGS[ProjectLanguage.JAVA].docker_image,
+            "maven_repository_volume": "agent_maven_repository_deadbeef",
+        }
+        apply_action.assert_called_once()
+        assert apply_action.call_args.args[1] == action
 
     def test_no_validation_success_becomes_surrender(self):
         group = _sca_group()
@@ -677,7 +955,7 @@ class TestUpdateSubagentWrapper:
 
         group1 = _sca_group()
         group2 = _sca_group()
-        group2.group_id = "sca:package.json:ws:UPDATE_VERSION"
+        group2.group_id = "sca:package.json:ws"
         group2.vulnerable_component = "ws"
         tool_events = [
             ToolEvent(
@@ -711,7 +989,7 @@ class TestUpdateSubagentWrapper:
 
         group1 = _sca_group()
         group2 = _sca_group()
-        group2.group_id = "sca:package.json:ws:UPDATE_VERSION"
+        group2.group_id = "sca:package.json:ws"
         group2.vulnerable_component = "ws"
 
         tool_events = [

@@ -38,7 +38,10 @@ from remediation_engine.orchestration._tool_support import (
 )
 from remediation_engine.orchestration.context_manager import ContextManager
 from remediation_engine.orchestration.remedy_tools import build_workaround_toolbelt
-from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.orchestration.runtime_context import (
+    get_runtime_settings,
+    openai_api_key_kwargs,
+)
 from remediation_engine.orchestration.state import SubagentState
 from remediation_engine.orchestration.subagent_runtime import (
     has_successful_validation_gate,
@@ -49,6 +52,7 @@ from remediation_engine.orchestration.task_utils import (
     create_skinny_subagent_group,
     filter_constraints_ledger,
     is_maven_group,
+    select_package_fix_plan,
 )
 from remediation_engine.orchestration.tools_manifest import (
     _is_allowlisted_no_fix_package_file,
@@ -388,6 +392,11 @@ def _preferred_targeted_test_files(qa_evidence: Any) -> list[str]:
             or "/tests/" in f"/{value}/"
             or "/__tests__/" in f"/{value}/"
             or re.search(r"\.(?:test|spec)\.[^.]+$", value, re.IGNORECASE)
+            or re.search(
+                r"(?:^|/)(?:Test[^/]*|[^/]*Tests?|[^/]*TestCase)\.java$",
+                value,
+                re.IGNORECASE,
+            )
         ):
             continue
         if value not in candidates:
@@ -421,6 +430,11 @@ def _primary_non_test_source_files(qa_evidence: Any) -> list[str]:
             or "/tests/" in f"/{value}/"
             or "/__tests__/" in f"/{value}/"
             or re.search(r"\.(?:test|spec)\.[^.]+$", value, re.IGNORECASE)
+            or re.search(
+                r"(?:^|/)(?:Test[^/]*|[^/]*Tests?|[^/]*TestCase)\.java$",
+                value,
+                re.IGNORECASE,
+            )
         ):
             continue
         if value not in candidates:
@@ -442,7 +456,7 @@ def _extract_vulnerability_mechanism(group: VulnerabilityGroup) -> str:
         if mechanism:
             return mechanism
 
-    fix_plan = getattr(group, "fix_plan", None)
+    fix_plan = select_package_fix_plan(group).plan
     instruction = getattr(fix_plan, "instruction", None)
     if isinstance(instruction, str) and instruction.strip():
         return _clean_prompt_snippet(instruction, max_chars=600)
@@ -456,7 +470,7 @@ def _workaround_search_recommendation(
     previous_feedback: str | None,
 ) -> _SearchQueryRecommendation:
     """Build a first web query from the current remediation evidence."""
-    fix_plan = getattr(target_group, "fix_plan", None)
+    fix_plan = select_package_fix_plan(target_group, target_task.strategy).plan
     plan_status = getattr(getattr(fix_plan, "status", None), "value", "")
     evidence_text = _workaround_evidence_text(workaround_context, previous_feedback)
     scanner_failure = any(
@@ -710,6 +724,15 @@ from the targeted test. Supply the complete cumulative modified-file list to
 validate_workaround. Resolve infrastructure-only validation failures through the
 permitted alternative targeted-test path; do not edit for infrastructure noise."""
 
+_MAVEN_VALIDATION_INSTRUCTIONS = """For Java, validate_workaround uses Maven compilation
+and a bounded Surefire test class. Supply the complete
+cumulative modified-file list and a repository-relative Java test file when a
+targeted test is required. Omit runtime_smoke_file: Java has no safe import-only
+smoke operation, and the native compile plus targeted test are the validation
+operations. The Surefire target is the selected class; a simple test method name
+may narrow it further. Resolve infrastructure-only test failures through the
+permitted alternative targeted-test path; do not edit for infrastructure noise."""
+
 _WORKAROUND_PROHIBITIONS = """Never modify tests to make assertions pass. Test
 and spec files are read-only and must not appear in record_plan affected_files
 or planned_replacements. Never manually edit or delete lockfile nodes, bump
@@ -778,7 +801,7 @@ def _workaround_static_instructions(project_language: ProjectLanguage) -> str:
             _MAVEN_NO_FIX_PACKAGE_REMOVAL_INSTRUCTIONS,
             _MAVEN_NO_FIX_VULNERABLE_CODE_INSTRUCTIONS,
             _MAVEN_EDIT_CHECKPOINT_INSTRUCTIONS,
-            _WORKAROUND_VALIDATION_INSTRUCTIONS,
+            _MAVEN_VALIDATION_INSTRUCTIONS,
             _MAVEN_PROHIBITIONS,
         ]
     )
@@ -797,7 +820,7 @@ def _build_workaround_prompt(
 ) -> str:
     """Build the dynamic human context for one workaround attempt."""
     constraints_ledger = list(constraints_ledger or [])
-    fix_plan = getattr(target_group, "fix_plan", None)
+    fix_plan = select_package_fix_plan(target_group, target_task.strategy).plan
     vulnerability_mechanism = (
         _clean_prompt_snippet(vulnerability_mechanism, max_chars=600)
         if vulnerability_mechanism
@@ -1008,6 +1031,8 @@ def _workaround_attempt_succeeded(
     plan_state: dict[str, Any] | None = None,
 ) -> bool:
     """Apply the deterministic success contract for one workaround attempt."""
+    if plan_state and plan_state.get("restoration_failed"):
+        return False
     validation_passed = (
         validation_gate_passed if validation_gate_passed is not None else has_all_validated
     )
@@ -1135,6 +1160,9 @@ def _build_attempt_result(
             attempt_id=snapshot.attempt_id,
             task_id=snapshot.task_id,
             task_revision=snapshot.task_revision,
+            cluster_id=snapshot.cluster_id,
+            dispatch_batch_id=snapshot.dispatch_batch_id,
+            action_digest=snapshot.action_digest,
             status=tagged_summary.status,
             changed_files=changed_files,
             action_summary=tagged_summary,
@@ -1222,9 +1250,14 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": ["Workaround Subagent: 'langchain-openai' is not installed."],
         }
 
-    model_name = get_runtime_settings().workaround_llm_model
+    settings = get_runtime_settings()
+    model_name = settings.workaround_llm_model
     try:
-        llm = ChatOpenAI(model=model_name, temperature=0)
+        llm = ChatOpenAI(
+            model=model_name,
+            temperature=0,
+            **openai_api_key_kwargs(settings),
+        )
     except Exception as exc:  # noqa: BLE001
         summaries = _build_surrender_summaries(
             t_id, "Stopped before execution because the LLM failed to initialize."
@@ -1585,8 +1618,11 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                     for edit_set in replayed_edit_sets
                     for edit in edit_set.replacements
                 }
-                current_attempt_files = set(runtime.changed_files) - replayed_files
+                current_attempt_files = (set(runtime.changed_files) - replayed_files) | set(
+                    plan_state.get("restoration_failure_paths", []) or []
+                )
                 restored_files: set[str] = set()
+                restoration_errors: list[str] = []
                 for f in current_attempt_files:
                     try:
                         _restore_attempt_file(
@@ -1600,9 +1636,18 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                         restored_files.add(f)
                     except Exception as exc:  # noqa: BLE001
                         logger.error("Failed to restore failed-attempt file %s: %s", f, exc)
+                        restoration_errors.append(f"{f}: {exc}")
                 touched_files -= restored_files
+                unresolved_files = current_attempt_files - restored_files
+                touched_files.update(unresolved_files)
+                runtime_errors = list(getattr(runtime, "errors", []) or [])
+                runtime_errors.extend(
+                    f"workaround rollback failed for {detail}" for detail in restoration_errors
+                )
                 runtime = dataclasses.replace(
-                    runtime, changed_files=sorted(replayed_files & set(touched_files))
+                    runtime,
+                    changed_files=sorted((replayed_files & set(touched_files)) | unresolved_files),
+                    errors=runtime_errors,
                 )
 
     except Exception as exc:  # noqa: BLE001

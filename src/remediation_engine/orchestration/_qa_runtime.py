@@ -13,8 +13,9 @@ import json
 import logging
 import re
 import shlex
-from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from remediation_engine.contracts.schemas import (
     DependencyEvidenceStatus,
     NoFixMitigationStage,
     ODCScanEvidence,
+    PackageScanOccurrence,
     QADependencyEvidence,
     QAPolicy,
     RemediationTask,
@@ -32,6 +34,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
 )
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
+from remediation_engine.orchestration.scan_identity import package_scan_occurrence_key
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.runtime.path_policy import (
     WorkspacePathError,
@@ -41,8 +44,9 @@ from remediation_engine.runtime.path_policy import (
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 from remediation_engine.tools.lockfile_closure import (
     DependencyClosure,
-    build_sliced_lockfile_artifacts,
-    resolve_dependency_closure,
+    TargetPackageResolution,
+    resolve_dependency_closure_for_target,
+    resolve_target_packages,
 )
 from remediation_engine.tools.maven_manifest_locator import (
     MavenManifestError,
@@ -65,12 +69,17 @@ from remediation_engine.tools.maven_manifest_locator import (
 )
 
 from ._tool_support import _run_readonly
-from .qa_odc import _ODC_HTML_REPORT_NAME, _ODC_REPORT_NAME
+from .qa_odc import (
+    _ODC_HTML_REPORT_NAME,
+    _ODC_REPORT_NAME,
+    _normalise_odc_report_path,
+)
 from .qa_test_parsing import _NPM_INSTALL_TIMEOUT_SECONDS, _workspace_json_file
 from .qa_types import (
     QAScanTarget,
     QATaskContext,
     _append_qa_log_records,
+    _ODCReportedPackageOccurrence,
     _QAExecutionResults,
     _QALogRecord,
     _QAPackageState,
@@ -99,6 +108,147 @@ _BULLET_LABEL_RE = re.compile(r"^- ([^:]+):\s*(.*)$")
 _REPORT_PREFIX = "# INVESTIGATIVE REPORT"
 _MAVEN_DEPENDENCY_TREE_TIMEOUT_SECONDS = 120
 _MAVEN_DEPENDENCY_TREE_GOAL = "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree"
+
+
+def _maven_dependency_tree_output(sandbox: DockerSandbox, pom_path: str) -> str:
+    """Run Maven's read-only dependency tree for one validated POM."""
+    normalized_path = _validate_qa_path(pom_path)
+    if Path(normalized_path).name.casefold() != "pom.xml":
+        raise ValueError(f"Maven dependency-tree input is not a POM: {pom_path}")
+    cwd_path = Path(normalized_path).parent
+    cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
+    prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
+    command = f"{prefix}mvn -B -Dstyle.color=never -DoutputType=text {_MAVEN_DEPENDENCY_TREE_GOAL}"
+    result = _run_readonly(sandbox, command, timeout=_MAVEN_DEPENDENCY_TREE_TIMEOUT_SECONDS)
+    if getattr(result, "exit_code", None) != 0:
+        raise RuntimeError(
+            f"Maven dependency:tree failed for {normalized_path} "
+            f"(exit {getattr(result, 'exit_code', None)})."
+        )
+    return "\n".join(str(getattr(result, stream, "") or "") for stream in ("stdout", "stderr"))
+
+
+def _parse_maven_dependency_tree_occurrences(
+    output: str,
+    source_input_path: str,
+) -> tuple[PackageScanOccurrence, ...] | None:
+    """Parse exact resolved GAV occurrences from complete Maven text output."""
+    normalized_path = _validate_qa_path(source_input_path)
+    plain_output = _ANSI_ESCAPE_RE.sub("", output)
+    has_goal_marker = _MAVEN_TREE_GOAL_RE.search(plain_output) is not None
+    matches = list(_MAVEN_TREE_COORDINATE_RE.finditer(plain_output))
+    no_dependencies = (
+        re.search(
+            r"^\s*\[INFO\]\s+No dependencies(?: found)?\.?\s*$",
+            plain_output,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        is not None
+    )
+    if not has_goal_marker or (not matches and not no_dependencies):
+        return None
+
+    occurrences: list[PackageScanOccurrence] = []
+    indexes: Counter[tuple[str, str, str, str]] = Counter()
+    for match in matches:
+        line_end = plain_output.find("\n", match.end())
+        suffix = plain_output[match.end() : line_end if line_end >= 0 else len(plain_output)]
+        if "(omitted for" in suffix.casefold():
+            continue
+        group_id = match.group("group").strip()
+        artifact_id = match.group("artifact").strip()
+        version = _normalise_dependency_version(match.group("version"))
+        dependency_type = match.group("type").strip()
+        scope = match.group("scope").strip()
+        if not all((group_id, artifact_id, version, dependency_type, scope)):
+            return None
+        package_name = f"{group_id}:{artifact_id}"
+        lockfile_key = f"{group_id}:{artifact_id}:{dependency_type}:{scope}"
+        identity = (package_name.casefold(), version, dependency_type, scope)
+        occurrence_index = indexes[identity]
+        indexes[identity] += 1
+        occurrences.append(
+            PackageScanOccurrence(
+                source_input_path=normalized_path,
+                package_name=package_name,
+                version=version,
+                ecosystem="maven",
+                lockfile_key=lockfile_key,
+                occurrence_index=occurrence_index,
+            )
+        )
+    return tuple(occurrences)
+
+
+def _maven_dependency_tree_occurrences(
+    sandbox: DockerSandbox,
+    pom_path: str,
+) -> tuple[PackageScanOccurrence, ...]:
+    """Run and strictly parse the resolved Maven occurrence inventory."""
+    output = _maven_dependency_tree_output(sandbox, pom_path)
+    occurrences = _parse_maven_dependency_tree_occurrences(output, pom_path)
+    if occurrences is None:
+        raise RuntimeError(f"Maven dependency tree for {pom_path} is incomplete or unparseable.")
+    return occurrences
+
+
+@dataclass(frozen=True)
+class _TargetedPackageResolutionFailure:
+    """Task-scoped reason and diagnostic for a target that could not be resolved."""
+
+    reason: ScanFallbackReason
+    detail: str
+
+
+@dataclass(frozen=True)
+class _NonNpmInputProject:
+    """One changed non-npm ODC input and its staged companion files."""
+
+    source_input_path: str
+    staged_input_paths: tuple[str, ...]
+    task_ids: tuple[str, ...]
+    occurrences: tuple[PackageScanOccurrence, ...] = ()
+    preserve_relative_paths: bool = False
+
+
+@dataclass(frozen=True)
+class _TargetedPackageBatch:
+    """Successfully resolved packages and isolated failures from a batch lookup."""
+
+    target_packages: tuple[TargetPackageResolution, ...]
+    closures_by_task: Mapping[str, tuple[DependencyClosure, ...]]
+    covered_task_ids: tuple[str, ...]
+    failures_by_task: Mapping[str, _TargetedPackageResolutionFailure]
+    inventory_updates: Mapping[str, str]
+    inventory_removals: tuple[str, ...]
+    covered_input_paths: tuple[str, ...]
+    non_npm_input_projects: tuple[_NonNpmInputProject, ...]
+    fallback_reason: ScanFallbackReason | None = None
+    fallback_detail: str | None = None
+    skipped_task_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _TargetedArtifactManifest:
+    """Artifact identities and original occurrence attribution for one scan."""
+
+    scan_subdir: str
+    expected_package_occurrences: tuple[tuple[str, str], ...]
+    occurrences_by_project: Mapping[str, tuple[PackageScanOccurrence, ...]]
+    task_ids_by_project: Mapping[str, tuple[str, ...]]
+    input_paths_by_project: Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class _PackageLockChangeBatch:
+    """Inventory deltas and exact closures for changed package-lock entries."""
+
+    closures_by_task: Mapping[str, tuple[DependencyClosure, ...]]
+    target_packages: tuple[TargetPackageResolution, ...]
+    inventory_updates: Mapping[str, str]
+    inventory_removals: tuple[str, ...]
+    covered_input_paths: tuple[str, ...]
+    failures_by_task: Mapping[str, _TargetedPackageResolutionFailure]
 
 
 def _label_scan_records(
@@ -258,54 +408,6 @@ def _generate_workspace_diff(
     return full_diff, changed_files
 
 
-def _workspace_remediation_fingerprint(
-    host_repo_root: str | None,
-    sandbox: DockerSandbox,
-    candidate_changed_files: Sequence[str],
-) -> str:
-    """Return a stable digest of the material workspace change.
-
-    Args:
-        host_repo_root: Repository baseline used for the workspace comparison.
-        sandbox: Active remediation workspace volume.
-        candidate_changed_files: Files reported as candidates by workers.
-
-    Returns:
-        A deterministic SHA-256 digest of the actual changed files and their
-        current unified diff. An empty or unchanged workspace therefore keeps
-        the same digest across final scans.
-
-    Side Effects:
-        Reads the candidate files from the sandbox and the host repository.
-        The helper does not modify either workspace.
-    """
-    candidates = [path for path in candidate_changed_files if isinstance(path, str)]
-    changed_files: list[str]
-    diff_text: str
-    if host_repo_root:
-        try:
-            diff_text, changed_files = _generate_workspace_diff(
-                host_repo_root,
-                sandbox,
-                candidates,
-            )
-        except Exception as exc:  # noqa: BLE001 - fingerprinting must not abort the scan
-            logger.warning("qa_critic: workspace fingerprint failed: %s", exc)
-            diff_text = ""
-            changed_files = sorted(set(candidates))
-    else:
-        diff_text = ""
-        changed_files = sorted(set(candidates))
-
-    payload = {
-        "changed_files": sorted(set(changed_files)),
-        "diff": diff_text,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-
-
 def _collect_target_identifiers(groups: list[VulnerabilityGroup]) -> set[str]:
     """Collect all CVE/GHSA identifiers from the valid vulnerability groups."""
     identifiers: set[str] = set()
@@ -386,6 +488,764 @@ def _lockfile_paths_for_group(group: VulnerabilityGroup) -> tuple[str, ...]:
     )
 
 
+def _package_occurrence_key(
+    source_input_path: str,
+    lockfile_key: str | None,
+    package_name: str,
+    version: str,
+    occurrence_index: int = 0,
+) -> str:
+    """Return the canonical identity for one reported package occurrence."""
+    return package_scan_occurrence_key(
+        source_input_path,
+        lockfile_key,
+        package_name,
+        version,
+        occurrence_index,
+    )
+
+
+def _package_lock_inventory(
+    lockfile_path: str,
+    lockfile: Mapping[str, Any],
+) -> dict[str, str]:
+    """Fingerprint ODC-relevant metadata for every physical lockfile entry.
+
+    The root package entry is included because changes to its declared edges
+    can alter the installed graph even though it is not an ODC package
+    occurrence. Callers replace the accepted inventory with this complete
+    snapshot so absent keys represent deletions.
+
+    Args:
+        lockfile_path: Repository-relative path to the package lockfile.
+        lockfile: Decoded npm package-lock document.
+
+    Returns:
+        Canonical occurrence keys mapped to SHA-256 metadata fingerprints.
+
+    Raises:
+        ValueError: If the path or package map cannot be represented safely.
+    """
+    source_input_path = str(lockfile_path).strip().replace("\\", "/")
+    while source_input_path.startswith("./"):
+        source_input_path = source_input_path[2:]
+    path_parts = source_input_path.split("/")
+    if (
+        not source_input_path
+        or source_input_path.startswith("/")
+        or any(part in {"", ".", ".."} for part in path_parts)
+    ):
+        raise ValueError(f"invalid package-lock path: {lockfile_path!r}")
+
+    packages = lockfile.get("packages")
+    if not isinstance(packages, Mapping):
+        raise ValueError(f"package-lock {source_input_path!r} has no packages mapping")
+
+    inventory: dict[str, str] = {}
+    relevant_edge_fields = (
+        "dependencies",
+        "optionalDependencies",
+        "peerDependencies",
+        "peerDependenciesMeta",
+    )
+    for lockfile_key, raw_metadata in sorted(packages.items(), key=lambda item: str(item[0])):
+        if not isinstance(lockfile_key, str) or not isinstance(raw_metadata, Mapping):
+            raise ValueError(f"invalid package-lock entry in {source_input_path!r}")
+        physical_name = lockfile_key.rsplit("node_modules/", 1)[-1] if lockfile_key else ""
+        raw_name = raw_metadata.get("name")
+        package_name = str(raw_name) if isinstance(raw_name, str) and raw_name else physical_name
+        raw_version = raw_metadata.get("version")
+        version = str(raw_version) if raw_version is not None else ""
+        odc_metadata: dict[str, Any] = {
+            "name": package_name,
+            "version": version,
+        }
+        for field_name in relevant_edge_fields:
+            if field_name in raw_metadata:
+                odc_metadata[field_name] = raw_metadata[field_name]
+        try:
+            encoded_metadata = json.dumps(
+                odc_metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid ODC metadata for {lockfile_key!r} in {source_input_path!r}"
+            ) from exc
+        occurrence_key = _package_occurrence_key(
+            source_input_path,
+            lockfile_key,
+            package_name,
+            version,
+        )
+        inventory[occurrence_key] = hashlib.sha256(encoded_metadata).hexdigest()
+    return inventory
+
+
+def _parse_package_occurrence_key(
+    occurrence_key: str,
+) -> tuple[str, str | None, str, str, int] | None:
+    """Parse and validate the canonical package occurrence key."""
+    try:
+        values = json.loads(occurrence_key)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(values, list) or len(values) != 5:
+        return None
+    source_input_path, lockfile_key, package_name, version, occurrence_index = values
+    if (
+        not isinstance(source_input_path, str)
+        or not isinstance(lockfile_key, str)
+        or not isinstance(package_name, str)
+        or package_name != package_name.casefold()
+        or not isinstance(version, str)
+        or isinstance(occurrence_index, bool)
+        or not isinstance(occurrence_index, int)
+        or occurrence_index < 0
+    ):
+        return None
+    try:
+        normalized_path = _validate_qa_path(source_input_path)
+    except ValueError:
+        return None
+    if (
+        normalized_path != source_input_path
+        or _package_occurrence_key(
+            source_input_path,
+            lockfile_key,
+            package_name,
+            version,
+            occurrence_index,
+        )
+        != occurrence_key
+    ):
+        return None
+    return source_input_path, lockfile_key, package_name, version, occurrence_index
+
+
+def _worker_package_lock_paths(
+    state: OrchestratorState | None,
+    active_task_ids: set[str],
+    *,
+    package_lock_only: bool = True,
+) -> tuple[dict[str, set[str]], list[str]]:
+    """Collect changed workspace files from current and retained pivot attempts.
+
+    By default only package-lock paths are returned. Non-npm callers request
+    all changed paths and filter them by their supported ODC input types.
+    """
+    if state is None or not active_task_ids:
+        return {}, []
+
+    task_queue = state.get("task_queue", {}) or {}
+    worker_results = state.get("worker_results_by_attempt", {}) or {}
+    attempt_snapshots = state.get("attempt_snapshots_by_id", {}) or {}
+    if not isinstance(task_queue, Mapping) or not isinstance(worker_results, Mapping):
+        return {}, ["worker attempt state is not a mapping"]
+
+    active_by_retained_parent: dict[str, set[str]] = {}
+    for active_task_id in active_task_ids:
+        current_task = task_queue.get(active_task_id)
+        parent_task_id = _scan_result_value(current_task, "parent_task_id", None)
+        visited: set[str] = set()
+        while isinstance(parent_task_id, str) and parent_task_id not in visited:
+            visited.add(parent_task_id)
+            parent_task = task_queue.get(parent_task_id)
+            if parent_task is None:
+                break
+            status = _scan_result_value(parent_task, "status", None)
+            status_value = str(getattr(status, "value", status)).casefold()
+            if status_value == "pivoted":
+                active_by_retained_parent.setdefault(parent_task_id, set()).add(active_task_id)
+            parent_task_id = _scan_result_value(parent_task, "parent_task_id", None)
+
+    def _latest_retained_result(task_id: str) -> tuple[str, Any] | None:
+        """Return the newest worker result for a retained pivot parent."""
+        candidates: list[tuple[tuple[int, int, int, str], str, Any]] = []
+        for attempt_key, result in worker_results.items():
+            if _scan_result_value(result, "task_id", None) != task_id:
+                continue
+            attempt_id = str(_scan_result_value(result, "attempt_id", None) or attempt_key)
+            snapshot = (
+                attempt_snapshots.get(attempt_id)
+                if isinstance(attempt_snapshots, Mapping)
+                else None
+            )
+
+            def _as_int(value: Any) -> int:
+                try:
+                    return int(value or 0)
+                except (TypeError, ValueError):
+                    return 0
+
+            order = (
+                _as_int(_scan_result_value(result, "task_revision", 0)),
+                _as_int(_scan_result_value(snapshot, "attempt_number", 0)),
+                _as_int(_scan_result_value(snapshot, "state_revision", 0)),
+                attempt_id,
+            )
+            candidates.append((order, attempt_id, result))
+        if not candidates:
+            return None
+        _order, attempt_id, result = max(candidates, key=lambda item: item[0])
+        return attempt_id, result
+
+    task_attempts: dict[str, tuple[str, Any, set[str]]] = {}
+    for task_id in active_task_ids:
+        task = task_queue.get(task_id)
+        attempt_id = _scan_result_value(task, "current_attempt_id", None)
+        if isinstance(attempt_id, str) and attempt_id:
+            result = worker_results.get(attempt_id)
+            if result is not None and _scan_result_value(result, "task_id", None) == task_id:
+                task_attempts[task_id] = (attempt_id, result, {task_id})
+    for parent_task_id, descendants in active_by_retained_parent.items():
+        parent_task = task_queue.get(parent_task_id)
+        attempt_id = _scan_result_value(parent_task, "current_attempt_id", None)
+        result = worker_results.get(attempt_id) if isinstance(attempt_id, str) else None
+        if result is None:
+            latest = _latest_retained_result(parent_task_id)
+            if latest is not None:
+                attempt_id, result = latest
+        if result is not None:
+            task_attempts[parent_task_id] = (str(attempt_id), result, descendants)
+
+    paths_by_task: dict[str, set[str]] = {}
+    errors: list[str] = []
+    for owner_task_id, (_attempt_id, result, affected_tasks) in task_attempts.items():
+        changed_files = _scan_result_value(result, "changed_files", []) or []
+        if isinstance(changed_files, (str, bytes)) or not isinstance(changed_files, Sequence):
+            errors.append(f"worker result for {owner_task_id} has invalid changed_files")
+            continue
+        for raw_path in changed_files:
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            try:
+                path = _validate_qa_path(raw_path)
+            except ValueError as exc:
+                errors.append(f"worker result for {owner_task_id} has an invalid path: {exc}")
+                continue
+            if package_lock_only and Path(path).name.casefold() != "package-lock.json":
+                continue
+            paths_by_task.setdefault(path, set()).update(affected_tasks)
+    return paths_by_task, errors
+
+
+def _non_npm_input_companions(
+    source_input_path: str,
+) -> tuple[tuple[tuple[str, ...], ...], tuple[str, ...]] | None:
+    """Return required companion alternatives and optional companions."""
+    basename = Path(source_input_path).name.casefold()
+    required = {
+        "cargo.lock": (("Cargo.toml",),),
+        "go.sum": (("go.mod",),),
+        "pipfile.lock": (("Pipfile",),),
+        "poetry.lock": (("pyproject.toml",),),
+        "uv.lock": (("pyproject.toml",),),
+        "pdm.lock": (("pyproject.toml",),),
+        "composer.lock": (("composer.json",),),
+        "gemfile.lock": (("Gemfile",),),
+        "gradle.lockfile": (("build.gradle", "build.gradle.kts"),),
+    }
+    optional = {
+        "cargo.toml": ("Cargo.lock",),
+        "go.mod": ("go.sum",),
+        "pipfile": ("Pipfile.lock",),
+        "pyproject.toml": ("poetry.lock", "uv.lock", "pdm.lock"),
+        "composer.json": ("composer.lock",),
+        "gemfile": ("Gemfile.lock",),
+        "build.gradle": ("gradle.lockfile",),
+        "build.gradle.kts": ("gradle.lockfile",),
+    }
+    if basename in required:
+        return required[basename], ()
+    if basename in optional:
+        return (), optional[basename]
+    if basename == "pom.xml" or (basename.startswith("requirements") and basename.endswith(".txt")):
+        return (), ()
+    if Path(basename).suffix in {".jar", ".war", ".ear", ".aar", ".nupkg", ".whl"}:
+        return (), ()
+    return None
+
+
+def _workspace_file_exists(sandbox: DockerSandbox, path: str) -> bool:
+    """Check one normalized workspace file without reading potentially binary data."""
+    try:
+        result = sandbox.run(f"test -f {shlex.quote(path)}", timeout=30)
+    except Exception:  # noqa: BLE001 - inability to map an input is inconclusive
+        return False
+    return result.exit_code == 0
+
+
+def _collect_non_npm_input_projects(
+    sandbox: DockerSandbox,
+    state: OrchestratorState | None,
+    targets: Sequence[QAScanTarget],
+) -> tuple[
+    tuple[_NonNpmInputProject, ...],
+    dict[str, _TargetedPackageResolutionFailure],
+    tuple[str, ...],
+]:
+    """Map changed non-npm ODC inputs and their local companion files."""
+    if state is None:
+        return (), {}, ()
+
+    active_task_ids = {target.task_id for target in targets}
+    if not active_task_ids:
+        active_task_ids = set(state.get("active_target_task_ids", []) or [])
+    if not active_task_ids:
+        return (), {}, ()
+    changed_paths_by_task, path_errors = _worker_package_lock_paths(
+        state,
+        active_task_ids,
+        package_lock_only=False,
+    )
+    failures: dict[str, _TargetedPackageResolutionFailure] = {}
+
+    def mark_failure(task_ids: Sequence[str] | set[str], detail: str) -> None:
+        for task_id in set(task_ids) or active_task_ids:
+            previous = failures.get(task_id)
+            if previous is None:
+                failures[task_id] = _TargetedPackageResolutionFailure(
+                    ScanFallbackReason.TARGETED_SCAN_FAILED,
+                    detail,
+                )
+            elif detail not in previous.detail:
+                failures[task_id] = _TargetedPackageResolutionFailure(
+                    previous.reason,
+                    f"{previous.detail}; {detail}",
+                )
+
+    for detail in path_errors:
+        mark_failure(active_task_ids, detail)
+
+    known_package_lock_paths: set[str] = set()
+    accepted_inventory = state.get("accepted_package_inventory_by_lockfile", {}) or {}
+    if isinstance(accepted_inventory, Mapping):
+        for occurrence_key in accepted_inventory:
+            parsed_key = (
+                _parse_package_occurrence_key(occurrence_key)
+                if isinstance(occurrence_key, str)
+                else None
+            )
+            if parsed_key is not None:
+                known_package_lock_paths.add(parsed_key[0])
+    for target in targets:
+        for raw_path in target.manifest_paths:
+            try:
+                path = _validate_qa_path(raw_path)
+            except ValueError:
+                continue
+            if Path(path).name.casefold() == "package-lock.json":
+                known_package_lock_paths.add(path)
+
+    projects_by_source: dict[str, tuple[tuple[str, ...], set[str]]] = {}
+    maven_task_ids = {target.task_id for target in targets if target.package_manager == "maven"}
+    maven_source_paths: dict[str, set[str]] = {}
+    staged_input_paths: set[str] = set()
+    for source_input_path, task_ids in sorted(changed_paths_by_task.items()):
+        basename = Path(source_input_path).name.casefold()
+        if basename == "package-lock.json":
+            continue
+        if basename in {"yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json"}:
+            mark_failure(
+                task_ids,
+                f"Changed package-manager input {source_input_path} is not supported by targeted closure scanning.",
+            )
+            continue
+        if basename == "package.json":
+            companion_lockfile = (Path(source_input_path).parent / "package-lock.json").as_posix()
+            if companion_lockfile in known_package_lock_paths:
+                continue
+            mark_failure(
+                task_ids,
+                f"Changed npm manifest {source_input_path} has no inventoried package-lock.json.",
+            )
+            continue
+
+        companion_spec = _non_npm_input_companions(source_input_path)
+        if companion_spec is None:
+            if Path(basename).suffix == ".lock":
+                mark_failure(
+                    task_ids,
+                    f"Changed lockfile {source_input_path} cannot be mapped to a supported ODC input.",
+                )
+            continue
+        required_companions, optional_companions = companion_spec
+        if not _workspace_file_exists(sandbox, source_input_path):
+            mark_failure(
+                task_ids,
+                f"Changed ODC input {source_input_path} is not readable in the workspace.",
+            )
+            continue
+
+        staged_paths = {source_input_path}
+        missing_required = False
+        parent = Path(source_input_path).parent
+        for alternatives in required_companions:
+            candidates = [(parent / name).as_posix() for name in alternatives]
+            companion = next(
+                (path for path in candidates if _workspace_file_exists(sandbox, path)),
+                None,
+            )
+            if companion is None:
+                mark_failure(
+                    task_ids,
+                    (
+                        f"Changed ODC input {source_input_path} is missing companion "
+                        f"manifest/lockfile: {' or '.join(candidates)}."
+                    ),
+                )
+                missing_required = True
+                break
+            staged_paths.add(companion)
+        if missing_required:
+            continue
+
+        for name in optional_companions:
+            companion = (parent / name).as_posix()
+            if _workspace_file_exists(sandbox, companion):
+                staged_paths.add(companion)
+
+        existing = projects_by_source.get(source_input_path)
+        if existing is not None:
+            staged_paths.update(existing[0])
+            merged_tasks = set(existing[1]) | set(task_ids)
+            projects_by_source[source_input_path] = (tuple(sorted(staged_paths)), merged_tasks)
+        else:
+            projects_by_source[source_input_path] = (tuple(sorted(staged_paths)), set(task_ids))
+        staged_input_paths.update(staged_paths)
+        if basename == "pom.xml" and maven_task_ids & set(task_ids):
+            maven_source_paths.setdefault(source_input_path, set()).update(
+                maven_task_ids & set(task_ids)
+            )
+
+    for target in targets:
+        if target.package_manager != "maven":
+            continue
+        for source_input_path in target.manifest_paths:
+            try:
+                pom_path = _validate_qa_path(source_input_path)
+            except ValueError as exc:
+                mark_failure(
+                    {target.task_id},
+                    f"Task {target.task_id} has an invalid Maven POM path: {exc}",
+                )
+                continue
+            if Path(pom_path).name.casefold() != "pom.xml":
+                mark_failure(
+                    {target.task_id},
+                    f"Task {target.task_id} has a non-POM Maven input: {pom_path}.",
+                )
+                continue
+            if not _workspace_file_exists(sandbox, pom_path):
+                mark_failure(
+                    {target.task_id},
+                    f"Task {target.task_id} Maven POM {pom_path} is not readable in the workspace.",
+                )
+                continue
+            current_paths, current_task_ids = projects_by_source.get(pom_path, ((pom_path,), set()))
+            projects_by_source[pom_path] = (
+                tuple(sorted(set(current_paths) | {pom_path})),
+                set(current_task_ids) | {target.task_id},
+            )
+            staged_input_paths.add(pom_path)
+            maven_source_paths.setdefault(pom_path, set()).add(target.task_id)
+
+    projects: list[_NonNpmInputProject] = []
+    for source_input_path, (paths, task_ids) in sorted(projects_by_source.items()):
+        occurrences: tuple[PackageScanOccurrence, ...] = ()
+        if source_input_path in maven_source_paths:
+            try:
+                occurrences = _maven_dependency_tree_occurrences(sandbox, source_input_path)
+            except (OSError, RuntimeError, ValueError) as exc:
+                mark_failure(
+                    maven_source_paths[source_input_path],
+                    f"Maven dependency tree for {source_input_path} was incomplete: {exc}",
+                )
+                continue
+        projects.append(
+            _NonNpmInputProject(
+                source_input_path=source_input_path,
+                staged_input_paths=paths,
+                task_ids=tuple(sorted(task_ids)),
+                occurrences=occurrences,
+            )
+        )
+    return tuple(projects), failures, tuple(sorted(staged_input_paths))
+
+
+def _load_npm_overrides(sandbox: DockerSandbox, lockfile_path: str) -> dict[str, Any]:
+    """Read root npm overrides for the package-lock input, if present."""
+    manifest_path = _validate_qa_path(str(Path(lockfile_path).with_name("package.json")))
+    try:
+        raw_manifest = sandbox.read_file(manifest_path)
+    except (OSError, RuntimeError, ValueError):
+        return {}
+    if not isinstance(raw_manifest, str) or not raw_manifest.strip():
+        return {}
+    try:
+        manifest = json.loads(raw_manifest)
+    except (TypeError, ValueError):
+        return {}
+    overrides = manifest.get("overrides") if isinstance(manifest, Mapping) else None
+    return dict(overrides) if isinstance(overrides, Mapping) else {}
+
+
+def _changed_package_lock_inputs(
+    state: OrchestratorState | None,
+    targets: Sequence[QAScanTarget],
+    lockfile_loader: Callable[
+        [str],
+        tuple[Mapping[str, Any] | None, int | None, ScanFallbackReason | None, str | None],
+    ],
+    overrides_loader: Callable[[str], Mapping[str, Any] | None] | None = None,
+) -> _PackageLockChangeBatch:
+    """Compare every relevant live package-lock inventory with accepted state."""
+    if state is None:
+        return _PackageLockChangeBatch({}, (), {}, (), (), {})
+
+    active_task_ids = {target.task_id for target in targets}
+    if not active_task_ids:
+        active_task_ids = set(state.get("active_target_task_ids", []) or [])
+    target_task_ids_by_path: dict[str, set[str]] = {}
+    target_paths: set[str] = set()
+    failures_by_task: dict[str, _TargetedPackageResolutionFailure] = {}
+
+    def mark_failure(
+        task_ids: Sequence[str] | set[str],
+        reason: ScanFallbackReason,
+        detail: str,
+    ) -> None:
+        """Retain one failure per affected active task without losing diagnostics."""
+        affected = set(task_ids) or active_task_ids
+        for task_id in affected:
+            previous = failures_by_task.get(task_id)
+            if previous is None:
+                failures_by_task[task_id] = _TargetedPackageResolutionFailure(reason, detail)
+            elif detail not in previous.detail:
+                failures_by_task[task_id] = _TargetedPackageResolutionFailure(
+                    previous.reason,
+                    f"{previous.detail}; {detail}",
+                )
+
+    for target in targets:
+        for raw_path in target.manifest_paths:
+            try:
+                path = _validate_qa_path(raw_path)
+            except ValueError:
+                continue
+            target_paths.add(path)
+            target_task_ids_by_path.setdefault(path, set()).add(target.task_id)
+
+    worker_paths_by_task, worker_path_errors = _worker_package_lock_paths(
+        state,
+        active_task_ids,
+    )
+    for detail in worker_path_errors:
+        mark_failure(active_task_ids, ScanFallbackReason.TARGETED_SCAN_FAILED, detail)
+
+    accepted_inventory = state.get("accepted_package_inventory_by_lockfile", {}) or {}
+    accepted_by_path: dict[str, dict[str, str]] = {}
+    if not isinstance(accepted_inventory, Mapping):
+        mark_failure(
+            active_task_ids,
+            ScanFallbackReason.INVALID_LOCKFILE,
+            "Accepted package inventory is not a mapping.",
+        )
+    else:
+        for raw_key, fingerprint in accepted_inventory.items():
+            parsed_key = (
+                _parse_package_occurrence_key(raw_key) if isinstance(raw_key, str) else None
+            )
+            if parsed_key is None or not isinstance(fingerprint, str):
+                mark_failure(
+                    active_task_ids,
+                    ScanFallbackReason.INVALID_LOCKFILE,
+                    f"Accepted package inventory key cannot be mapped: {raw_key!r}.",
+                )
+                continue
+            source_input_path = parsed_key[0]
+            accepted_by_path.setdefault(source_input_path, {})[raw_key] = fingerprint
+
+    paths_to_read = set(accepted_by_path) | target_paths | set(worker_paths_by_task)
+
+    def owners_for_path(source_input_path: str) -> set[str]:
+        return (
+            worker_paths_by_task.get(source_input_path)
+            or target_task_ids_by_path.get(source_input_path)
+            or active_task_ids
+        )
+
+    current_lockfiles: dict[str, tuple[Mapping[str, Any], int]] = {}
+    inventory_updates: dict[str, str] = {}
+    inventory_removals: set[str] = set()
+    changed_keys_by_path: dict[str, list[str]] = {}
+    covered_input_paths: set[str] = set()
+    for source_input_path in sorted(paths_to_read):
+        packages, lockfile_version, reason, detail = lockfile_loader(source_input_path)
+        previous_inventory = accepted_by_path.get(source_input_path, {})
+        if reason is not None or packages is None or lockfile_version is None:
+            if (
+                reason == ScanFallbackReason.MISSING_LOCKFILE
+                and source_input_path in worker_paths_by_task
+                and source_input_path not in target_paths
+            ):
+                inventory_removals.update(previous_inventory)
+                covered_input_paths.add(source_input_path)
+                continue
+            mark_failure(
+                owners_for_path(source_input_path),
+                reason or ScanFallbackReason.INVALID_LOCKFILE,
+                detail or f"Package-lock input {source_input_path} could not be read.",
+            )
+            continue
+
+        try:
+            current_inventory = _package_lock_inventory(
+                source_input_path,
+                {"packages": packages},
+            )
+        except ValueError as exc:
+            mark_failure(
+                owners_for_path(source_input_path),
+                ScanFallbackReason.INVALID_LOCKFILE,
+                f"Package-lock input {source_input_path} cannot be inventoried: {exc}",
+            )
+            continue
+
+        current_lockfiles[source_input_path] = (packages, lockfile_version)
+        changed_keys = sorted(
+            key
+            for key, fingerprint in current_inventory.items()
+            if previous_inventory.get(key) != fingerprint
+        )
+        inventory_updates.update({key: current_inventory[key] for key in changed_keys})
+        inventory_removals.update(set(previous_inventory) - set(current_inventory))
+        if changed_keys:
+            changed_keys_by_path[source_input_path] = changed_keys
+        elif set(previous_inventory) - set(current_inventory):
+            covered_input_paths.add(source_input_path)
+
+    closures_by_task: dict[str, list[DependencyClosure]] = {}
+    changed_resolutions: dict[tuple[str, str], TargetPackageResolution] = {}
+    for source_input_path, changed_keys in sorted(changed_keys_by_path.items()):
+        npm_overrides = (
+            dict(overrides_loader(source_input_path) or {}) if overrides_loader is not None else {}
+        )
+        packages, lockfile_version = current_lockfiles[source_input_path]
+        if lockfile_version not in {2, 3}:
+            mark_failure(
+                owners_for_path(source_input_path),
+                ScanFallbackReason.INVALID_LOCKFILE,
+                f"Changed package-lock input {source_input_path} uses unsupported version "
+                f"{lockfile_version}.",
+            )
+            continue
+
+        path_complete = True
+        for occurrence_key in changed_keys:
+            parsed_key = _parse_package_occurrence_key(occurrence_key)
+            if parsed_key is None:
+                path_complete = False
+                mark_failure(
+                    owners_for_path(source_input_path),
+                    ScanFallbackReason.INVALID_LOCKFILE,
+                    f"Changed package occurrence cannot be mapped: {occurrence_key!r}.",
+                )
+                continue
+            _source_path, lockfile_key, _key_name, version, _occurrence_index = parsed_key
+            metadata = packages.get(lockfile_key)
+            if not isinstance(metadata, Mapping):
+                path_complete = False
+                mark_failure(
+                    owners_for_path(source_input_path),
+                    ScanFallbackReason.INVALID_LOCKFILE,
+                    f"Changed package occurrence {occurrence_key!r} is absent from its lockfile.",
+                )
+                continue
+
+            raw_name = metadata.get("name")
+            package_name = (
+                str(raw_name)
+                if lockfile_key == "" and isinstance(raw_name, str) and raw_name
+                else lockfile_key.rsplit("node_modules/", 1)[-1]
+            )
+            if not package_name or not version:
+                path_complete = False
+                mark_failure(
+                    owners_for_path(source_input_path),
+                    ScanFallbackReason.INVALID_LOCKFILE,
+                    f"Changed package occurrence {occurrence_key!r} has no package identity.",
+                )
+                continue
+
+            resolutions, resolution_error = resolve_target_packages(
+                packages,
+                source_lockfile=source_input_path,
+                target_package=package_name,
+                target_version=version,
+                lockfile_version=lockfile_version,
+            )
+            resolution = next(
+                (
+                    item
+                    for item in resolutions
+                    if item.target_node is not None
+                    and item.target_node.lockfile_key == lockfile_key
+                ),
+                None,
+            )
+            if resolution_error or resolution is None:
+                path_complete = False
+                mark_failure(
+                    owners_for_path(source_input_path),
+                    _target_resolution_fallback_reason(resolution_error),
+                    (
+                        f"Changed package occurrence {occurrence_key!r} could not be "
+                        f"resolved exactly: {resolution_error or 'missing physical key'}."
+                    ),
+                )
+                continue
+
+            closure = resolve_dependency_closure_for_target(
+                packages,
+                resolution,
+                npm_overrides=npm_overrides,
+            )
+            if not closure.complete:
+                path_complete = False
+                mark_failure(
+                    owners_for_path(source_input_path),
+                    _target_resolution_fallback_reason(closure.fallback_reason),
+                    (
+                        f"Changed package occurrence {occurrence_key!r} has an incomplete "
+                        f"dependency closure: {closure.fallback_reason or 'unknown reason'}"
+                        f"{'; ' + closure.failure_detail if closure.failure_detail else ''}."
+                    ),
+                )
+                continue
+
+            changed_resolutions[(source_input_path, lockfile_key)] = resolution
+            for task_id in owners_for_path(source_input_path):
+                closures_by_task.setdefault(task_id, []).append(closure)
+
+        if path_complete:
+            covered_input_paths.add(source_input_path)
+
+    return _PackageLockChangeBatch(
+        closures_by_task={
+            task_id: tuple(closures) for task_id, closures in closures_by_task.items()
+        },
+        target_packages=tuple(changed_resolutions[key] for key in sorted(changed_resolutions)),
+        inventory_updates=inventory_updates,
+        inventory_removals=tuple(sorted(inventory_removals)),
+        covered_input_paths=tuple(sorted(covered_input_paths)),
+        failures_by_task=failures_by_task,
+    )
+
+
 def _build_qa_scan_targets(
     state: OrchestratorState,
     groups: list[VulnerabilityGroup],
@@ -411,7 +1271,11 @@ def _build_qa_scan_targets(
         ).strip()
         attempt_version, has_attempt_version_evidence = _attempt_version_evidence(state, task)
         expected_version = (
-            task.selected_version if task is not None and task.selected_version else attempt_version
+            attempt_version
+            if has_attempt_version_evidence
+            else task.selected_version
+            if task is not None
+            else None
         )
         # A workaround task deliberately has no supervisor-selected package
         # version.  Its worker may leave the installed dependency at whatever
@@ -463,9 +1327,7 @@ def _build_qa_scan_targets(
         if uses_maven and package_manager is None:
             package_manager = "maven"
         manifest_paths = (
-            _maven_target_manifest_paths(group)
-            if uses_maven
-            else _lockfile_paths_for_group(group)
+            _maven_target_manifest_paths(group) if uses_maven else _lockfile_paths_for_group(group)
         )
         targets.append(
             QAScanTarget(
@@ -773,6 +1635,8 @@ def _collect_dependency_package_state(
     *,
     lockfiles: Sequence[str] | None = None,
     version_evidence_inconclusive: bool = False,
+    inspect_resolved_graph: bool = True,
+    npm_ls_disabled: bool = False,
 ) -> _QAPackageState:
     """Collect compact deterministic dependency evidence for a version task."""
     package = str(
@@ -800,6 +1664,10 @@ def _collect_dependency_package_state(
         diagnostics.append("Authorized package.json manifest paths are unavailable.")
     if expected is None:
         diagnostics.append("Supervisor-selected target version is unavailable.")
+    if not inspect_resolved_graph and npm_ls_disabled:
+        diagnostics.append("npm ls is temporarily disabled; installed graph was not inspected.")
+    elif not inspect_resolved_graph:
+        graph_errors.append("npm ls skipped because npm install failed; resolved graph is unknown.")
 
     for manifest in manifests:
         payload = _workspace_json_file(sandbox, manifest)
@@ -813,10 +1681,12 @@ def _collect_dependency_package_state(
         for pointer, value in entries.items():
             declarations[f"{manifest}{pointer}"] = value
 
+        if not inspect_resolved_graph:
+            continue
         cwd_path = Path(manifest).parent
         cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
-        command = f"{prefix}npm ls {shlex.quote(package)} --all --json"
+        command = f"{prefix}npm ls {shlex.quote(package)} --all --json --package-lock-only"
         try:
             command_result = _run_readonly(
                 sandbox,
@@ -857,7 +1727,7 @@ def _collect_dependency_package_state(
     all_lockfiles_parsed = len(parsed_lockfile_paths) == len(lockfiles)
     graph_state = (
         "unknown"
-        if not all_manifests_parsed or graph_errors
+        if not all_manifests_parsed or graph_errors or not inspect_resolved_graph
         else "present"
         if resolved_versions
         else "absent"
@@ -885,6 +1755,7 @@ def _collect_dependency_package_state(
     elif (
         expected is not None
         and all_manifests_parsed
+        and inspect_resolved_graph
         and not graph_errors
         and resolved_versions != {expected}
     ):
@@ -1389,6 +2260,8 @@ def _collect_group_package_state(
     task: RemediationTask | None = None,
     expected_version: str | None = None,
     version_evidence_inconclusive: bool = False,
+    inspect_resolved_graph: bool = True,
+    npm_ls_disabled: bool = False,
 ) -> _QAPackageState:
     """Collect deterministic dependency state for package-backed QA policies."""
     if policy not in {
@@ -1445,6 +2318,8 @@ def _collect_group_package_state(
             expected_version,
             lockfiles=lockfiles,
             version_evidence_inconclusive=version_evidence_inconclusive,
+            inspect_resolved_graph=inspect_resolved_graph,
+            npm_ls_disabled=npm_ls_disabled,
         )
 
     if managers == {"maven"}:
@@ -1480,11 +2355,19 @@ def _collect_group_package_state(
 
     graph_states: list[str] = []
     graph_diagnostics: list[str] = []
-    for manifest, _payload in parsed_manifests:
+    if not inspect_resolved_graph and npm_ls_disabled:
+        graph_diagnostics.append(
+            "npm ls is temporarily disabled; installed graph was not inspected."
+        )
+    elif not inspect_resolved_graph:
+        graph_diagnostics.append(
+            "npm ls skipped because npm install failed; resolved graph is unknown."
+        )
+    for manifest, _payload in parsed_manifests if inspect_resolved_graph else ():
         cwd_path = Path(manifest).parent
         cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
-        command = f"{prefix}npm ls {shlex.quote(package)} --all --json"
+        command = f"{prefix}npm ls {shlex.quote(package)} --all --json --package-lock-only"
         try:
             command_result = _run_readonly(
                 sandbox,
@@ -1968,42 +2851,223 @@ def _targeted_extra_args_conflict() -> bool:
     )
 
 
-def _closure_fallback_reason(reason: str | None) -> ScanFallbackReason:
-    """Map pure resolver diagnostics to the typed QA fallback vocabulary."""
+def _target_resolution_fallback_reason(reason: str | None) -> ScanFallbackReason:
+    """Map target-selection diagnostics to the typed QA fallback vocabulary."""
     return {
         "no_matching_target": ScanFallbackReason.NO_MATCHING_TARGET,
         "multiple_targets": ScanFallbackReason.MULTIPLE_TARGETS,
-        "incomplete_closure": ScanFallbackReason.INCOMPLETE_CLOSURE,
         "invalid_lockfile": ScanFallbackReason.INVALID_LOCKFILE,
-    }.get(reason or "", ScanFallbackReason.INCOMPLETE_CLOSURE)
+    }.get(reason or "", ScanFallbackReason.TARGETED_SCAN_FAILED)
 
 
-def _merge_dependency_closures(
-    source_lockfile: str,
-    closures: Sequence[DependencyClosure],
-) -> DependencyClosure:
-    """Union complete closures from one lockfile without losing physical keys."""
-    node_map = {node.lockfile_key: node for closure in closures for node in closure.nodes}
-    return DependencyClosure(
-        source_lockfile=source_lockfile,
-        root_keys=tuple(sorted({key for closure in closures for key in closure.root_keys})),
-        nodes=tuple(node_map[key] for key in sorted(node_map)),
-        includes_optional=any(closure.includes_optional for closure in closures),
-        includes_peer=any(closure.includes_peer for closure in closures),
-        complete=all(closure.complete for closure in closures),
-        lockfile_version=closures[0].lockfile_version,
-    )
-
-
-def _resolve_targeted_closures(
+def _resolve_targeted_packages(
     sandbox: DockerSandbox,
     targets: Sequence[QAScanTarget],
-) -> tuple[list[DependencyClosure], ScanFallbackReason | None, str | None]:
-    """Read supported live lockfiles and resolve active task dependency closures."""
-    if not targets:
-        return [], ScanFallbackReason.MISSING_LOCKFILE, "No active task scan targets were supplied."
+    state: OrchestratorState | None = None,
+) -> _TargetedPackageBatch:
+    """Resolve active targets and every changed package-lock occurrence.
 
-    by_source: dict[str, list[QAScanTarget]] = {}
+    Lockfiles are read and parsed once per path. Target closures and inventory
+    delta closures are retained by task; unreadable or unrepresentable changed
+    inputs remain task-scoped failures.
+    """
+    active_task_ids = {target.task_id for target in targets} or set(
+        (state or {}).get("active_target_task_ids", []) or []
+    )
+    if not active_task_ids:
+        return _TargetedPackageBatch(
+            target_packages=(),
+            closures_by_task={},
+            covered_task_ids=(),
+            failures_by_task={},
+            inventory_updates={},
+            inventory_removals=(),
+            covered_input_paths=(),
+            fallback_reason=ScanFallbackReason.MISSING_LOCKFILE,
+            fallback_detail="No active task scan targets were supplied.",
+            non_npm_input_projects=(),
+        )
+
+    package_managers = {target.package_manager for target in targets if target.package_manager}
+    if "maven" in package_managers:
+        if package_managers != {"maven"} or any(
+            target.package_manager != "maven" for target in targets
+        ):
+            failure = _TargetedPackageResolutionFailure(
+                ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
+                "A targeted scan batch cannot mix Maven and other package managers.",
+            )
+            failures = {task_id: failure for task_id in active_task_ids}
+            return _TargetedPackageBatch(
+                target_packages=(),
+                closures_by_task={},
+                covered_task_ids=(),
+                failures_by_task=failures,
+                inventory_updates={},
+                inventory_removals=(),
+                covered_input_paths=(),
+                non_npm_input_projects=(),
+                fallback_reason=failure.reason,
+                fallback_detail=failure.detail,
+            )
+        projects, failures, covered_input_paths = _collect_non_npm_input_projects(
+            sandbox,
+            state,
+            targets,
+        )
+        projects_by_source = {project.source_input_path: project for project in projects}
+        for target in targets:
+            target_projects = [
+                projects_by_source[path]
+                for path in target.manifest_paths
+                if path in projects_by_source
+            ]
+            if not target_projects:
+                failures.setdefault(
+                    target.task_id,
+                    _TargetedPackageResolutionFailure(
+                        ScanFallbackReason.MISSING_LOCKFILE,
+                        f"Task {target.task_id} has no complete Maven POM input for targeted scanning.",
+                    ),
+                )
+                continue
+            if target.expected_version:
+                matches = {
+                    (occurrence.package_name, occurrence.version)
+                    for project in target_projects
+                    for occurrence in project.occurrences
+                }
+                expected = (target.target_package, target.expected_version)
+                if expected not in matches:
+                    failures.setdefault(
+                        target.task_id,
+                        _TargetedPackageResolutionFailure(
+                            ScanFallbackReason.TARGET_PACKAGE_NOT_REPORTED,
+                            f"Task {target.task_id} exact Maven target/version was not present "
+                            "in the resolved dependency tree.",
+                        ),
+                    )
+        first_failure = next(iter(failures.values()), None)
+        covered_task_ids = {task_id for project in projects for task_id in project.task_ids} - set(
+            failures
+        )
+        return _TargetedPackageBatch(
+            target_packages=(),
+            closures_by_task={},
+            covered_task_ids=tuple(sorted(covered_task_ids)),
+            failures_by_task=failures,
+            inventory_updates={},
+            inventory_removals=(),
+            covered_input_paths=covered_input_paths,
+            non_npm_input_projects=projects,
+            fallback_reason=first_failure.reason if first_failure else None,
+            fallback_detail=first_failure.detail if first_failure else None,
+        )
+
+    lockfile_cache: dict[
+        str,
+        tuple[Mapping[str, Any] | None, int | None, ScanFallbackReason | None, str | None],
+    ] = {}
+    overrides_cache: dict[str, dict[str, Any]] = {}
+
+    def load_lockfile(
+        source_lockfile: str,
+    ) -> tuple[Mapping[str, Any] | None, int | None, ScanFallbackReason | None, str | None]:
+        """Read and validate one npm package-lock file, caching both success and failure."""
+        if source_lockfile in lockfile_cache:
+            return lockfile_cache[source_lockfile]
+        try:
+            raw_lockfile = sandbox.read_file(source_lockfile)
+            if raw_lockfile is None:
+                result = (
+                    None,
+                    None,
+                    ScanFallbackReason.MISSING_LOCKFILE,
+                    f"Live workspace lockfile {source_lockfile} could not be read.",
+                )
+            else:
+                lockfile = json.loads(raw_lockfile)
+                packages = lockfile.get("packages") if isinstance(lockfile, Mapping) else None
+                lockfile_version = (
+                    lockfile.get("lockfileVersion") if isinstance(lockfile, Mapping) else None
+                )
+                if not isinstance(packages, Mapping) or not isinstance(lockfile_version, int):
+                    result = (
+                        None,
+                        None,
+                        ScanFallbackReason.INVALID_LOCKFILE,
+                        f"Live workspace lockfile {source_lockfile} lacks a supported packages map.",
+                    )
+                else:
+                    result = (packages, lockfile_version, None, None)
+        except (OSError, RuntimeError) as exc:
+            result = (
+                None,
+                None,
+                ScanFallbackReason.MISSING_LOCKFILE,
+                f"Live workspace lockfile {source_lockfile} could not be read: {exc}",
+            )
+        except (TypeError, ValueError) as exc:
+            result = (
+                None,
+                None,
+                ScanFallbackReason.INVALID_LOCKFILE,
+                f"Live workspace lockfile {source_lockfile} is not valid JSON: {exc}",
+            )
+        lockfile_cache[source_lockfile] = result
+        return result
+
+    def load_overrides(source_lockfile: str) -> dict[str, Any]:
+        """Read root npm overrides once per source lockfile."""
+        if source_lockfile not in overrides_cache:
+            overrides_cache[source_lockfile] = _load_npm_overrides(
+                sandbox,
+                source_lockfile,
+            )
+        return overrides_cache[source_lockfile]
+
+    change_batch = _changed_package_lock_inputs(
+        state,
+        targets,
+        load_lockfile,
+        load_overrides,
+    )
+
+    resolved_packages: list[TargetPackageResolution] = list(change_batch.target_packages)
+    resolved_identities = {
+        (
+            resolution.source_lockfile,
+            resolution.target_node.lockfile_key,
+            resolution.target_node.version,
+        )
+        for resolution in resolved_packages
+        if resolution.target_node is not None
+    }
+    closures_by_task: dict[str, list[DependencyClosure]] = {
+        task_id: list(closures) for task_id, closures in change_batch.closures_by_task.items()
+    }
+    covered_task_ids = set(closures_by_task)
+    skipped_task_ids: set[str] = set()
+    target_absent_input_paths: set[str] = set()
+    failures_by_task = dict(change_batch.failures_by_task)
+
+    def retain_failure(task_id: str, failure: _TargetedPackageResolutionFailure) -> None:
+        previous = failures_by_task.get(task_id)
+        if previous is None:
+            failures_by_task[task_id] = failure
+        elif failure.detail not in previous.detail:
+            failures_by_task[task_id] = _TargetedPackageResolutionFailure(
+                previous.reason,
+                f"{previous.detail}; {failure.detail}",
+            )
+
+    non_npm_input_projects, non_npm_failures, non_npm_covered_paths = (
+        _collect_non_npm_input_projects(sandbox, state, targets)
+    )
+    for task_id, failure in non_npm_failures.items():
+        retain_failure(task_id, failure)
+    for project in non_npm_input_projects:
+        covered_task_ids.update(project.task_ids)
     for target in targets:
         if target.package_manager and target.package_manager != "npm":
             return (
@@ -2015,91 +3079,655 @@ def _resolve_targeted_closures(
                 ),
             )
         if not target.manifest_paths:
-            return (
-                [],
-                ScanFallbackReason.MISSING_LOCKFILE,
-                (f"Task {target.task_id} has no supported lockfile path."),
+            retain_failure(
+                target.task_id,
+                _TargetedPackageResolutionFailure(
+                    ScanFallbackReason.MISSING_LOCKFILE,
+                    f"Task {target.task_id} has no supported lockfile path.",
+                ),
             )
-        for source_lockfile in target.manifest_paths:
-            source_lockfile = _validate_qa_path(source_lockfile)
-            if Path(source_lockfile).name.lower() != "package-lock.json":
-                return (
-                    [],
-                    ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
-                    (f"Task {target.task_id} uses unsupported lockfile {source_lockfile}."),
+            continue
+
+        task_resolutions: list[TargetPackageResolution] = []
+        task_closures: list[DependencyClosure] = []
+        missing_target_paths: set[str] = set()
+        task_failure: _TargetedPackageResolutionFailure | None = None
+        for raw_source_lockfile in target.manifest_paths:
+            try:
+                source_lockfile = _validate_qa_path(raw_source_lockfile)
+            except ValueError as exc:
+                task_failure = _TargetedPackageResolutionFailure(
+                    ScanFallbackReason.MISSING_LOCKFILE,
+                    f"Task {target.task_id} has an invalid lockfile path: {exc}",
                 )
-            by_source.setdefault(source_lockfile, []).append(target)
+                break
+            if Path(source_lockfile).name.lower() != "package-lock.json":
+                task_failure = _TargetedPackageResolutionFailure(
+                    ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
+                    f"Task {target.task_id} uses unsupported lockfile {source_lockfile}.",
+                )
+                break
 
-    merged: list[DependencyClosure] = []
-    for source_lockfile, source_targets in sorted(by_source.items()):
-        raw_lockfile = sandbox.read_file(source_lockfile)
-        if raw_lockfile is None:
-            return (
-                [],
-                ScanFallbackReason.MISSING_LOCKFILE,
-                (f"Live workspace lockfile {source_lockfile} could not be read."),
+            packages, lockfile_version, lockfile_reason, lockfile_detail = load_lockfile(
+                source_lockfile
             )
-        try:
-            lockfile = json.loads(raw_lockfile)
-        except (TypeError, json.JSONDecodeError) as exc:
-            return (
-                [],
-                ScanFallbackReason.INVALID_LOCKFILE,
-                (f"Live workspace lockfile {source_lockfile} is not valid JSON: {exc}"),
-            )
-        packages = lockfile.get("packages") if isinstance(lockfile, Mapping) else None
-        lockfile_version = (
-            lockfile.get("lockfileVersion") if isinstance(lockfile, Mapping) else None
-        )
-        if not isinstance(packages, Mapping) or not isinstance(lockfile_version, int):
-            return (
-                [],
-                ScanFallbackReason.INVALID_LOCKFILE,
-                (f"Live workspace lockfile {source_lockfile} lacks a supported packages map."),
-            )
+            if lockfile_reason is not None or packages is None or lockfile_version is None:
+                task_failure = _TargetedPackageResolutionFailure(
+                    lockfile_reason or ScanFallbackReason.INVALID_LOCKFILE,
+                    lockfile_detail or f"Task {target.task_id} lockfile could not be resolved.",
+                )
+                break
 
-        closures: list[DependencyClosure] = []
-        for target in source_targets:
-            closure = resolve_dependency_closure(
+            resolutions, resolution_error = resolve_target_packages(
                 packages,
                 source_lockfile=source_lockfile,
                 target_package=target.target_package,
                 target_version=target.expected_version,
                 dependency_ancestry=target.dependency_ancestry,
-                include_optional=True,
-                include_peer=True,
                 lockfile_version=lockfile_version,
             )
-            if not closure.complete:
-                return (
-                    [],
-                    _closure_fallback_reason(closure.fallback_reason),
-                    (
-                        f"Task {target.task_id} closure failed for {source_lockfile}: "
-                        f"{closure.fallback_reason or 'unknown reason'}"
+            if resolution_error or not resolutions:
+                reason = _target_resolution_fallback_reason(resolution_error)
+                if (
+                    reason == ScanFallbackReason.NO_MATCHING_TARGET
+                    and target.target_package.strip()
+                ):
+                    versionless_resolutions, versionless_error = resolve_target_packages(
+                        packages,
+                        source_lockfile=source_lockfile,
+                        target_package=target.target_package,
+                        target_version=None,
+                        dependency_ancestry=target.dependency_ancestry,
+                        lockfile_version=lockfile_version,
+                    )
+                    if versionless_error == "no_matching_target" and not versionless_resolutions:
+                        missing_target_paths.add(source_lockfile)
+                        target_absent_input_paths.add(source_lockfile)
+                        continue
+                    if versionless_resolutions:
+                        versions = sorted(
+                            {
+                                resolution.target_node.version
+                                for resolution in versionless_resolutions
+                                if resolution.target_node is not None
+                            }
+                        )
+                        reason = ScanFallbackReason.TARGETED_SCAN_FAILED
+                        detail = (
+                            f"Task {target.task_id} target package {target.target_package!r} "
+                            f"was found at version(s) {', '.join(versions)}, but not at "
+                            f"selected version {target.expected_version!r}."
+                        )
+                    else:
+                        detail = (
+                            f"Task {target.task_id} target selection failed for "
+                            f"{source_lockfile}: {resolution_error or 'unknown reason'}"
+                        )
+                else:
+                    detail = (
+                        f"Task {target.task_id} target selection failed for "
+                        f"{source_lockfile}: {resolution_error or 'unknown reason'}"
+                    )
+                task_failure = _TargetedPackageResolutionFailure(reason, detail)
+                break
+
+            lockfile_closures: list[DependencyClosure] = []
+            for resolution in resolutions:
+                closure = resolve_dependency_closure_for_target(
+                    packages,
+                    resolution,
+                    npm_overrides=load_overrides(source_lockfile),
+                )
+                if not closure.complete:
+                    task_failure = _TargetedPackageResolutionFailure(
+                        _target_resolution_fallback_reason(closure.fallback_reason),
+                        (
+                            f"Task {target.task_id} dependency closure failed for "
+                            f"{source_lockfile}:{resolution.target_node.lockfile_key if resolution.target_node else ''}: "
+                            f"{closure.fallback_reason or 'incomplete_closure'}"
+                            f"{'; ' + closure.failure_detail if closure.failure_detail else ''}"
+                        ),
+                    )
+                    break
+                lockfile_closures.append(closure)
+            if task_failure is not None:
+                break
+            task_resolutions.extend(resolutions)
+            task_closures.extend(lockfile_closures)
+
+        if task_failure is not None:
+            retain_failure(target.task_id, task_failure)
+            logger.info(
+                "qa_critic: skipping target package for %s: %s",
+                target.task_id,
+                task_failure.detail,
+            )
+            continue
+        if not task_resolutions:
+            if target.task_id in change_batch.failures_by_task or not missing_target_paths:
+                retain_failure(
+                    target.task_id,
+                    _TargetedPackageResolutionFailure(
+                        ScanFallbackReason.NO_MATCHING_TARGET,
+                        f"Task {target.task_id} did not resolve to any package-lock entry.",
                     ),
                 )
-            closures.append(closure)
-        merged.append(_merge_dependency_closures(source_lockfile, closures))
-    return merged, None, None
+                continue
+            covered_task_ids.add(target.task_id)
+            skipped_task_ids.add(target.task_id)
+            logger.info(
+                "qa_critic: target package %s was absent from its live lockfiles; "
+                "skipping that package's targeted scan.",
+                target.target_package,
+            )
+            continue
+
+        covered_task_ids.add(target.task_id)
+        for resolution in task_resolutions:
+            node = resolution.target_node
+            identity = (
+                resolution.source_lockfile,
+                node.lockfile_key if node is not None else "",
+                node.version if node is not None else "",
+            )
+            if identity not in resolved_identities:
+                resolved_identities.add(identity)
+                resolved_packages.append(resolution)
+        closures_by_task.setdefault(target.task_id, []).extend(task_closures)
+
+    for task_id, closures in closures_by_task.items():
+        if closures:
+            covered_task_ids.add(task_id)
+    covered_input_paths = set(change_batch.covered_input_paths)
+    covered_input_paths.update(non_npm_covered_paths)
+    for closures in closures_by_task.values():
+        covered_input_paths.update(closure.source_lockfile for closure in closures)
+    covered_input_paths.update(target_absent_input_paths)
+    first_failure = next(iter(failures_by_task.values()), None)
+    return _TargetedPackageBatch(
+        non_npm_input_projects=non_npm_input_projects,
+        target_packages=tuple(resolved_packages),
+        closures_by_task={
+            task_id: tuple(closures) for task_id, closures in closures_by_task.items()
+        },
+        covered_task_ids=tuple(sorted(covered_task_ids)),
+        failures_by_task=failures_by_task,
+        inventory_updates=change_batch.inventory_updates,
+        inventory_removals=change_batch.inventory_removals,
+        covered_input_paths=tuple(sorted(covered_input_paths)),
+        fallback_reason=first_failure.reason if first_failure else None,
+        fallback_detail=(
+            "; ".join(failure.detail for failure in failures_by_task.values())
+            if failures_by_task
+            else None
+        ),
+        skipped_task_ids=tuple(sorted(skipped_task_ids)),
+    )
 
 
 def _write_targeted_artifacts(
     sandbox: DockerSandbox,
-    closures: Sequence[DependencyClosure],
-) -> tuple[str, list[str], list[str]]:
-    """Write synthetic package roots and return scan path plus closure metadata."""
+    closures_by_task: Mapping[str, Sequence[DependencyClosure]],
+    non_npm_input_projects: Sequence[_NonNpmInputProject] = (),
+) -> _TargetedArtifactManifest:
+    """Stage each changed npm lockfile once to bound Node Audit requests."""
     targeted_subdir = ".odc-targeted"
-    package_names: set[str] = set()
-    lockfile_keys: set[str] = set()
-    for index, closure in enumerate(closures):
-        artifacts = build_sliced_lockfile_artifacts(closure)
-        subdir = f"{targeted_subdir}/{index:03d}"
-        for filename, content in artifacts.items():
-            sandbox.write_file(_validate_qa_path(f"{subdir}/{filename}"), content)
-        package_names.update(node.package_name for node in closure.nodes)
-        lockfile_keys.update(node.lockfile_key for node in closure.nodes)
-    return targeted_subdir, sorted(package_names), sorted(lockfile_keys)
+    task_ids_by_lockfile: dict[str, set[str]] = {}
+    for task_id, closures in sorted(closures_by_task.items()):
+        for closure in closures:
+            if not closure.complete or len(closure.root_keys) != 1:
+                raise ValueError(closure.fallback_reason or "incomplete_closure")
+            source_lockfile = _validate_qa_path(closure.source_lockfile)
+            task_ids_by_lockfile.setdefault(source_lockfile, set()).add(task_id)
+
+    if not task_ids_by_lockfile and not non_npm_input_projects:
+        raise ValueError("no_target_packages")
+
+    expected_package_occurrences: list[tuple[str, str]] = []
+    occurrences_by_project: dict[str, tuple[PackageScanOccurrence, ...]] = {}
+    task_ids_by_project: dict[str, tuple[str, ...]] = {}
+    input_paths_by_project: dict[str, tuple[str, ...]] = {}
+    artifact_index = 0
+    staged_npm_files: dict[str, str] = {}
+
+    for source_lockfile, task_ids in sorted(task_ids_by_lockfile.items()):
+        raw_lockfile = sandbox.read_file(source_lockfile)
+        if not isinstance(raw_lockfile, str) or not raw_lockfile.strip():
+            raise ValueError(f"could not read changed package-lock input {source_lockfile}")
+        try:
+            lockfile = json.loads(raw_lockfile)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid package-lock input {source_lockfile}") from exc
+        if not isinstance(lockfile, Mapping):
+            raise ValueError(f"invalid package-lock input {source_lockfile}")
+        lockfile_version = lockfile.get("lockfileVersion")
+        packages = lockfile.get("packages")
+        if lockfile_version not in {2, 3} or not isinstance(packages, Mapping):
+            raise ValueError(f"unsupported package-lock input {source_lockfile}")
+
+        root_metadata = packages.get("", {})
+        if not isinstance(root_metadata, Mapping):
+            raise ValueError(f"invalid package-lock root in {source_lockfile}")
+        package_json_path = _validate_qa_path(str(Path(source_lockfile).with_name("package.json")))
+        package_json_text: str | None = None
+        try:
+            raw_package_json = sandbox.read_file(package_json_path)
+        except (OSError, RuntimeError, ValueError):
+            raw_package_json = None
+        if isinstance(raw_package_json, str) and raw_package_json.strip():
+            try:
+                parsed_manifest = json.loads(raw_package_json)
+            except (TypeError, ValueError):
+                parsed_manifest = None
+            if isinstance(parsed_manifest, Mapping) and "packages" not in parsed_manifest:
+                package_json_text = raw_package_json
+        if package_json_text is None:
+            root_name = root_metadata.get("name") or lockfile.get("name")
+            root_version = root_metadata.get("version") or lockfile.get("version")
+            package_manifest: dict[str, Any] = {
+                "name": root_name if isinstance(root_name, str) and root_name else "remedy-scan",
+                "version": (
+                    str(root_version) if root_version is not None and str(root_version) else "0.0.0"
+                ),
+                "private": True,
+            }
+            for field_name in (
+                "dependencies",
+                "devDependencies",
+                "optionalDependencies",
+                "peerDependencies",
+            ):
+                edges = root_metadata.get(field_name)
+                if isinstance(edges, Mapping):
+                    package_manifest[field_name] = dict(edges)
+            package_json_text = json.dumps(package_manifest, indent=2, sort_keys=True) + "\n"
+
+        project_path = f"{targeted_subdir}/{artifact_index:03d}"
+        artifact_index += 1
+        project_manifest_path = _validate_qa_path(f"{project_path}/package.json")
+        project_lockfile_path = _validate_qa_path(f"{project_path}/package-lock.json")
+        staged_npm_files[project_manifest_path] = package_json_text
+        staged_npm_files[project_lockfile_path] = raw_lockfile
+
+        occurrences: list[PackageScanOccurrence] = []
+        for lockfile_key, metadata in sorted(packages.items(), key=lambda item: str(item[0])):
+            if not isinstance(lockfile_key, str) or not isinstance(metadata, Mapping):
+                raise ValueError(f"invalid package occurrence in {source_lockfile}")
+            if not lockfile_key:
+                continue
+            raw_name = metadata.get("name")
+            package_name = (
+                str(raw_name)
+                if isinstance(raw_name, str) and raw_name
+                else lockfile_key.rsplit("node_modules/", 1)[-1]
+            )
+            version = str(metadata.get("version") or "").strip()
+            if not package_name or not version:
+                continue
+            occurrences.append(
+                PackageScanOccurrence(
+                    source_input_path=source_lockfile,
+                    package_name=package_name,
+                    version=version,
+                    lockfile_key=lockfile_key,
+                )
+            )
+            # One lockfile preserves a single Node Audit request per input;
+            # companion manifests let ODC identify each physical package.
+            package_manifest_path = _validate_qa_path(f"{project_path}/{lockfile_key}/package.json")
+            staged_npm_files[package_manifest_path] = (
+                json.dumps(
+                    {"name": package_name, "version": version},
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        occurrences_by_project[project_path] = tuple(occurrences)
+        task_ids_by_project[project_path] = tuple(sorted(task_ids))
+        input_paths_by_project[project_path] = (source_lockfile,)
+        expected_package_occurrences.extend(
+            (occurrence.package_name, occurrence.version) for occurrence in occurrences
+        )
+
+    if staged_npm_files:
+        sandbox.write_files(staged_npm_files)
+
+    for project in sorted(non_npm_input_projects, key=lambda item: item.source_input_path):
+        project_path = f"{targeted_subdir}/{artifact_index:03d}"
+        artifact_index += 1
+        copied_names: set[str] = set()
+        for source_path in project.staged_input_paths:
+            validated_source = _validate_qa_path(source_path)
+            destination_name = (
+                validated_source if project.preserve_relative_paths else Path(validated_source).name
+            )
+            if not destination_name or destination_name in copied_names:
+                raise ValueError(f"changed input files collide in {project.source_input_path}")
+            copied_names.add(destination_name)
+            destination_path = _validate_qa_path(f"{project_path}/{destination_name}")
+            destination_parent = Path(destination_path).parent.as_posix()
+            command = (
+                f"mkdir -p -- {shlex.quote(destination_parent)} && "
+                f"cp -- {shlex.quote(validated_source)} {shlex.quote(destination_path)}"
+            )
+            result = sandbox.run(command, timeout=30)
+            if result.exit_code != 0:
+                raise ValueError(f"could not stage changed ODC input {source_path}")
+
+        occurrences_by_project[project_path] = project.occurrences
+        expected_package_occurrences.extend(
+            (occurrence.package_name, occurrence.version) for occurrence in project.occurrences
+        )
+        task_ids_by_project[project_path] = project.task_ids
+        input_paths_by_project[project_path] = (
+            project.source_input_path,
+            *(path for path in project.staged_input_paths if path != project.source_input_path),
+        )
+
+    return _TargetedArtifactManifest(
+        scan_subdir=targeted_subdir,
+        expected_package_occurrences=tuple(
+            sorted(
+                expected_package_occurrences,
+                key=lambda item: (item[0].casefold(), item[1], item[0]),
+            )
+        ),
+        occurrences_by_project=occurrences_by_project,
+        task_ids_by_project=task_ids_by_project,
+        input_paths_by_project=input_paths_by_project,
+    )
+
+
+def _targeted_project_for_report_path(file_path: str | None) -> str | None:
+    """Return a targeted project directory from one ODC dependency path."""
+    if not isinstance(file_path, str) or not file_path.strip():
+        return None
+    normalized = _normalise_odc_report_path(file_path)
+    if normalized is None:
+        return None
+    parts = normalized.split("/")
+    if len(parts) < 3 or parts[0] != ".odc-targeted":
+        return None
+    return "/".join(parts[:2])
+
+
+def _issue_identifiers(issues: Sequence[Any]) -> list[str]:
+    """Return both CVE and GHSA identifiers from occurrence-attributed issues."""
+    identifiers: set[str] = set()
+    for issue in issues:
+        for field_name in ("cve_id", "ghsa_id"):
+            value = _scan_result_value(issue, field_name, None)
+            if isinstance(value, str) and value.strip():
+                identifiers.add(value.strip().upper())
+    return sorted(identifiers)
+
+
+def _attribute_reported_occurrences(
+    artifact_manifest: _TargetedArtifactManifest,
+    scan_result: Any,
+) -> tuple[_TargetedArtifactManifest, bool]:
+    """Map report package occurrences and findings onto original occurrences."""
+    raw_reported = _scan_result_value(scan_result, "reported_package_occurrences", None)
+    if (
+        raw_reported is None
+        or isinstance(raw_reported, (str, bytes))
+        or not isinstance(raw_reported, Sequence)
+    ):
+        return artifact_manifest, False
+
+    mapping_complete = True
+    reports_by_project: dict[str, list[_ODCReportedPackageOccurrence]] = {}
+    for reported in raw_reported:
+        project_path = _targeted_project_for_report_path(
+            _scan_result_value(reported, "file_path", None)
+        )
+        if project_path is None or project_path not in artifact_manifest.input_paths_by_project:
+            mapping_complete = False
+            continue
+        reports_by_project.setdefault(project_path, []).append(reported)
+
+    issues = _scan_result_value(scan_result, "found_issues", []) or []
+    issues_by_identity: dict[tuple[str, str, str], list[Any]] = {}
+    issues_by_report_path: dict[tuple[str, str, str, str], list[Any]] = {}
+    issues_by_project: dict[str, list[Any]] = {}
+    unmapped_issues: list[Any] = []
+    for issue in issues:
+        package_name = _scan_result_value(issue, "package_name", None)
+        package_version = _scan_result_value(issue, "package_version", None)
+        file_path = _scan_result_value(issue, "file_path", None)
+        project_path = _targeted_project_for_report_path(file_path)
+        if not isinstance(package_name, str) or not package_name.strip() or project_path is None:
+            mapping_complete = False
+            unmapped_issues.append(issue)
+            continue
+        identity = (
+            project_path,
+            package_name.casefold(),
+            str(package_version or ""),
+        )
+        normalized_path = _normalise_odc_report_path(file_path)
+        issues_by_identity.setdefault(identity, []).append(issue)
+        issues_by_project.setdefault(project_path, []).append(issue)
+        if normalized_path is not None:
+            issues_by_report_path.setdefault(
+                (*identity, normalized_path),
+                [],
+            ).append(issue)
+
+    consumed_issue_ids: set[int] = set()
+
+    def matching_issues(
+        project_path: str,
+        package_name: str,
+        version: str,
+        report_path: str | None,
+        *,
+        identity_count: int,
+    ) -> list[Any]:
+        """Attach merged ODC findings to every matching physical occurrence."""
+        nonlocal mapping_complete
+        identity = (project_path, package_name.casefold(), version)
+        identity_candidates = list(issues_by_identity.get(identity, []))
+        if not identity_candidates:
+            return []
+        if identity_count > 1:
+            if not report_path:
+                mapping_complete = False
+            consumed_issue_ids.update(id(issue) for issue in identity_candidates)
+            return identity_candidates
+
+        candidates = issues_by_report_path.get((*identity, report_path), []) if report_path else []
+        available = [issue for issue in candidates if id(issue) not in consumed_issue_ids]
+        if available:
+            consumed_issue_ids.update(id(issue) for issue in available)
+            return available
+        available = [issue for issue in identity_candidates if id(issue) not in consumed_issue_ids]
+        consumed_issue_ids.update(id(issue) for issue in available)
+        return available
+
+    occurrences_by_project: dict[str, tuple[PackageScanOccurrence, ...]] = {}
+    for project_path, input_paths in artifact_manifest.input_paths_by_project.items():
+        templates = artifact_manifest.occurrences_by_project.get(project_path, ())
+        project_reports = reports_by_project.get(project_path, [])
+        attributed: list[PackageScanOccurrence] = []
+        if templates:
+            expected_by_identity: dict[tuple[str, str, str], list[PackageScanOccurrence]] = {}
+            for occurrence in templates:
+                expected_by_identity.setdefault(
+                    (
+                        occurrence.ecosystem.casefold(),
+                        occurrence.package_name.casefold(),
+                        occurrence.version,
+                    ),
+                    [],
+                ).append(occurrence)
+            reported_by_identity: dict[
+                tuple[str, str, str],
+                list[_ODCReportedPackageOccurrence],
+            ] = {}
+            for reported in project_reports:
+                ecosystem = str(_scan_result_value(reported, "ecosystem", "")).casefold()
+                identity = (
+                    ecosystem,
+                    str(_scan_result_value(reported, "package_name", "")).casefold(),
+                    str(_scan_result_value(reported, "version", "")),
+                )
+                reported_by_identity.setdefault(identity, []).append(reported)
+            expected_identities = set(expected_by_identity)
+            reported_identities = set(reported_by_identity)
+            if expected_identities != reported_identities:
+                mapping_complete = False
+            for identity in sorted(expected_by_identity):
+                originals = sorted(
+                    expected_by_identity[identity],
+                    key=lambda occurrence: occurrence.lockfile_key or "",
+                )
+                reports_for_identity = sorted(
+                    reported_by_identity.get(identity, []),
+                    key=lambda reported: str(_scan_result_value(reported, "file_path", "") or ""),
+                )
+                representative_report = reports_for_identity[0] if reports_for_identity else None
+                identity_count = len(originals)
+                for occurrence in originals:
+                    if representative_report is None:
+                        mapping_complete = False
+                        occurrence_issues = matching_issues(
+                            project_path,
+                            occurrence.package_name,
+                            occurrence.version,
+                            None,
+                            identity_count=identity_count,
+                        )
+                    else:
+                        occurrence_issues = matching_issues(
+                            project_path,
+                            occurrence.package_name,
+                            occurrence.version,
+                            _scan_result_value(representative_report, "file_path", None),
+                            identity_count=identity_count,
+                        )
+                    attributed.append(
+                        occurrence.model_copy(
+                            update={
+                                "found_identifiers": _issue_identifiers(occurrence_issues),
+                                "found_issues": occurrence_issues,
+                            }
+                        )
+                    )
+        else:
+            if not input_paths:
+                if project_reports:
+                    mapping_complete = False
+                occurrences_by_project[project_path] = ()
+                continue
+            source_input_path = input_paths[0]
+            sorted_reports = sorted(
+                project_reports,
+                key=lambda reported: (
+                    str(_scan_result_value(reported, "file_path", "") or ""),
+                    str(_scan_result_value(reported, "package_name", "")).casefold(),
+                    str(_scan_result_value(reported, "version", "")),
+                ),
+            )
+            occurrence_indexes: dict[tuple[str, str], int] = {}
+            report_counts = Counter(
+                (
+                    str(_scan_result_value(reported, "ecosystem", "npm")).casefold(),
+                    str(_scan_result_value(reported, "package_name", "")).casefold(),
+                    str(_scan_result_value(reported, "version", "")),
+                )
+                for reported in sorted_reports
+            )
+            for reported in sorted_reports:
+                package_name = str(_scan_result_value(reported, "package_name", "") or "")
+                version = str(_scan_result_value(reported, "version", "") or "")
+                ecosystem = str(_scan_result_value(reported, "ecosystem", "npm") or "npm")
+                if not package_name or not version:
+                    mapping_complete = False
+                    continue
+                identity = (ecosystem.casefold(), package_name.casefold(), version)
+                occurrence_index = occurrence_indexes.get(identity, 0)
+                occurrence_indexes[identity] = occurrence_index + 1
+                occurrence_issues = matching_issues(
+                    project_path,
+                    package_name,
+                    version,
+                    _scan_result_value(reported, "file_path", None),
+                    identity_count=report_counts[identity],
+                )
+                attributed.append(
+                    PackageScanOccurrence(
+                        source_input_path=source_input_path,
+                        package_name=package_name,
+                        version=version,
+                        ecosystem=ecosystem,
+                        lockfile_key=None,
+                        occurrence_index=occurrence_index,
+                        found_identifiers=_issue_identifiers(occurrence_issues),
+                        found_issues=occurrence_issues,
+                    )
+                )
+
+        occurrences_by_project[project_path] = tuple(attributed)
+
+    for project_path, input_paths in artifact_manifest.input_paths_by_project.items():
+        if artifact_manifest.occurrences_by_project.get(project_path) or not input_paths:
+            continue
+        fallback_issues: dict[tuple[str, str], list[Any]] = {}
+        for issue in issues_by_project.get(project_path, []):
+            if id(issue) in consumed_issue_ids:
+                continue
+            package_name = _scan_result_value(issue, "package_name", None)
+            if not isinstance(package_name, str) or not package_name.strip():
+                mapping_complete = False
+                continue
+            version = str(_scan_result_value(issue, "package_version", None) or "")
+            fallback_issues.setdefault((package_name, version), []).append(issue)
+        source_input_path = input_paths[0]
+        existing_occurrences = list(occurrences_by_project.get(project_path, ()))
+        for package_name, version in sorted(fallback_issues):
+            matching_existing = [
+                occurrence
+                for occurrence in existing_occurrences
+                if occurrence.package_name.casefold() == package_name.casefold()
+                and occurrence.version == version
+            ]
+            occurrence_index = len(matching_existing)
+            attached_issues = fallback_issues[(package_name, version)]
+            consumed_issue_ids.update(id(issue) for issue in attached_issues)
+            existing_occurrences.append(
+                PackageScanOccurrence(
+                    source_input_path=source_input_path,
+                    package_name=package_name,
+                    version=version,
+                    lockfile_key=None,
+                    occurrence_index=occurrence_index,
+                    found_identifiers=_issue_identifiers(attached_issues),
+                    found_issues=attached_issues,
+                )
+            )
+        occurrences_by_project[project_path] = tuple(existing_occurrences)
+
+    for issue in unmapped_issues:
+        if id(issue) not in consumed_issue_ids:
+            mapping_complete = False
+    for issue in issues:
+        if id(issue) in consumed_issue_ids:
+            continue
+        project_path = _targeted_project_for_report_path(
+            _scan_result_value(issue, "file_path", None)
+        )
+        if (
+            project_path is None
+            or artifact_manifest.occurrences_by_project.get(project_path)
+            or project_path not in artifact_manifest.input_paths_by_project
+        ):
+            mapping_complete = False
+    return (
+        replace(artifact_manifest, occurrences_by_project=occurrences_by_project),
+        mapping_complete,
+    )
 
 
 def _cleanup_targeted_artifacts(sandbox: DockerSandbox) -> None:
@@ -2117,26 +3745,254 @@ def _scan_evidence(
     effective_scope: ScanScope,
     complete: bool,
     fallback_reason: ScanFallbackReason | None = None,
-    closures: Sequence[DependencyClosure] = (),
+    target_packages: Sequence[TargetPackageResolution] = (),
+    covered_task_ids: Sequence[str] | None = None,
+    batch: _TargetedPackageBatch | None = None,
+    artifact_manifest: _TargetedArtifactManifest | None = None,
+    scan_performed: bool = True,
+    scan_skip_reason: str | None = None,
 ) -> ODCScanEvidence:
-    """Build typed, attempt-local ODC evidence from a scan result."""
+    """Build typed, attempt-local ODC evidence from a targeted scan batch."""
+    covered_occurrences = (
+        [
+            occurrence
+            for occurrences in artifact_manifest.occurrences_by_project.values()
+            for occurrence in occurrences
+        ]
+        if artifact_manifest is not None
+        else []
+    )
+    closure_package_names = {occurrence.package_name for occurrence in covered_occurrences}
+    closure_lockfile_keys = {
+        occurrence.lockfile_key
+        for occurrence in covered_occurrences
+        if occurrence.lockfile_key is not None
+    }
+    covered_input_paths = set(batch.covered_input_paths) if batch is not None else set()
+    covered_input_paths.update(occurrence.source_input_path for occurrence in covered_occurrences)
+    if artifact_manifest is not None:
+        for project_input_paths in artifact_manifest.input_paths_by_project.values():
+            covered_input_paths.update(project_input_paths)
+    if artifact_manifest is None:
+        closure_package_names.update(
+            resolution.target_node.package_name
+            for resolution in target_packages
+            if resolution.target_node is not None
+        )
+        closure_lockfile_keys.update(
+            resolution.target_node.lockfile_key
+            for resolution in target_packages
+            if resolution.target_node is not None
+        )
+    inventory_updates = dict(batch.inventory_updates) if batch is not None else {}
+    inventory_removals = list(batch.inventory_removals) if batch is not None else []
+
     return ODCScanEvidence(
         requested_scope=ScanScope.TARGETED,
         effective_scope=effective_scope,
         authoritative=False,
-        covered_task_ids=sorted({target.task_id for target in targets}),
-        closure_package_names=sorted(
-            {node.package_name for closure in closures for node in closure.nodes}
+        covered_task_ids=sorted(
+            set(covered_task_ids)
+            if covered_task_ids is not None
+            else {target.task_id for target in targets}
         ),
-        closure_lockfile_keys=sorted(
-            {node.lockfile_key for closure in closures for node in closure.nodes}
-        ),
+        closure_package_names=sorted(closure_package_names),
+        closure_lockfile_keys=sorted(closure_lockfile_keys),
+        covered_occurrences=covered_occurrences,
         found_identifiers=sorted(
             _scan_result_value(scan_result, "found_identifiers", set()) or set()
         ),
+        new_identifiers=sorted(_scan_result_value(scan_result, "new_identifiers", set()) or set()),
+        found_issues=list(_scan_result_value(scan_result, "found_issues", []) or []),
         remaining_target_identifiers=sorted(
             _scan_result_value(scan_result, "remaining_identifiers", set()) or set()
         ),
+        covered_input_paths=sorted(covered_input_paths),
+        removed_occurrence_keys=inventory_removals,
+        inventory_updates=inventory_updates,
+        inventory_removals=inventory_removals,
+        scan_performed=scan_performed,
+        scan_skip_reason=scan_skip_reason,
         complete=complete,
         fallback_reason=fallback_reason,
     )
+
+
+def _scan_evidence_by_task(
+    evidence: ODCScanEvidence | None,
+    *,
+    targets: Sequence[QAScanTarget],
+    baseline_identifiers: set[str],
+    batch: _TargetedPackageBatch | None,
+    artifact_manifest: _TargetedArtifactManifest | None,
+) -> dict[str, ODCScanEvidence]:
+    """Project shared scanner results into task-owned occurrence evidence."""
+    if evidence is None:
+        return {}
+
+    targets_by_task = {target.task_id: target for target in targets}
+    task_ids = set(targets_by_task)
+    if batch is not None:
+        task_ids.update(batch.covered_task_ids)
+        task_ids.update(batch.failures_by_task)
+    projects_by_task: dict[str, list[str]] = {task_id: [] for task_id in task_ids}
+    if artifact_manifest is not None:
+        for project_path, project_task_ids in artifact_manifest.task_ids_by_project.items():
+            for task_id in project_task_ids:
+                projects_by_task.setdefault(task_id, []).append(project_path)
+
+    normalized_baseline = {
+        identifier.strip().upper()
+        for identifier in baseline_identifiers
+        if isinstance(identifier, str) and identifier.strip()
+    }
+    result: dict[str, ODCScanEvidence] = {}
+    for task_id in sorted(task_ids):
+        task_closures = batch.closures_by_task.get(task_id, ()) if batch is not None else ()
+        task_occurrence_keys = {
+            _package_occurrence_key(
+                closure.source_lockfile,
+                node.lockfile_key,
+                node.package_name,
+                node.version,
+            )
+            for closure in task_closures
+            for node in closure.nodes
+        }
+        restrict_to_task_closure = bool(task_closures)
+        project_paths = sorted(set(projects_by_task.get(task_id, [])))
+        target_skipped = batch is not None and task_id in getattr(batch, "skipped_task_ids", ())
+        occurrences_by_key: dict[str, PackageScanOccurrence] = {}
+        covered_input_paths: set[str] = set()
+        for project_path in project_paths:
+            if artifact_manifest is None:
+                continue
+            covered_input_paths.update(
+                artifact_manifest.input_paths_by_project.get(project_path, ())
+            )
+            for occurrence in artifact_manifest.occurrences_by_project.get(project_path, ()):
+                occurrence_key = _package_occurrence_key(
+                    occurrence.source_input_path,
+                    occurrence.lockfile_key,
+                    occurrence.package_name,
+                    occurrence.version,
+                    occurrence.occurrence_index,
+                )
+                if restrict_to_task_closure and occurrence_key not in task_occurrence_keys:
+                    continue
+                previous = occurrences_by_key.get(occurrence_key)
+                if previous is None:
+                    occurrences_by_key[occurrence_key] = occurrence
+                    continue
+                merged_issues: dict[tuple[str, str, str, str, str, str], Any] = {}
+                for issue in (*previous.found_issues, *occurrence.found_issues):
+                    issue_identity = (
+                        str(_scan_result_value(issue, "cve_id", None) or ""),
+                        str(_scan_result_value(issue, "ghsa_id", None) or ""),
+                        str(_scan_result_value(issue, "package_name", None) or ""),
+                        str(_scan_result_value(issue, "package_version", None) or ""),
+                        str(_scan_result_value(issue, "file_path", None) or ""),
+                        str(_scan_result_value(issue, "purl", None) or ""),
+                    )
+                    merged_issues[issue_identity] = issue
+                merged_identifiers = set(previous.found_identifiers) | set(
+                    occurrence.found_identifiers
+                )
+                occurrences_by_key[occurrence_key] = previous.model_copy(
+                    update={
+                        "found_identifiers": sorted(merged_identifiers),
+                        "found_issues": list(merged_issues.values()),
+                    }
+                )
+        if (
+            not evidence.scan_performed
+            and batch is not None
+            and task_id in evidence.covered_task_ids
+        ):
+            covered_input_paths.update(batch.covered_input_paths)
+        if target_skipped and task_id in targets_by_task:
+            covered_input_paths.update(targets_by_task[task_id].manifest_paths)
+
+        occurrences = list(occurrences_by_key.values())
+        found_identifiers = {
+            identifier.strip().upper()
+            for occurrence in occurrences
+            for identifier in occurrence.found_identifiers
+            if identifier and identifier.strip()
+        }
+        target_ids = {
+            identifier.strip().upper()
+            for identifier in (
+                targets_by_task[task_id].target_identifiers if task_id in targets_by_task else ()
+            )
+            if identifier and identifier.strip()
+        }
+        found_issues_by_identity: dict[tuple[str, str, str, str, str, str], Any] = {}
+        for occurrence in occurrences:
+            for issue in occurrence.found_issues:
+                issue_identity = (
+                    str(_scan_result_value(issue, "cve_id", None) or ""),
+                    str(_scan_result_value(issue, "ghsa_id", None) or ""),
+                    str(_scan_result_value(issue, "package_name", None) or ""),
+                    str(_scan_result_value(issue, "package_version", None) or ""),
+                    str(_scan_result_value(issue, "file_path", None) or ""),
+                    str(_scan_result_value(issue, "purl", None) or ""),
+                )
+                found_issues_by_identity[issue_identity] = issue
+
+        task_failure = batch.failures_by_task.get(task_id) if batch is not None else None
+        task_complete = (
+            evidence.complete
+            and task_failure is None
+            and task_id in evidence.covered_task_ids
+            and (bool(project_paths) or target_skipped or not evidence.scan_performed)
+        )
+        task_inventory_updates: dict[str, str] = {}
+        task_inventory_removals: list[str] = []
+        if batch is not None:
+            for occurrence_key, fingerprint in batch.inventory_updates.items():
+                parts = _parse_package_occurrence_key(occurrence_key)
+                if parts is not None and parts[0] in covered_input_paths:
+                    task_inventory_updates[occurrence_key] = fingerprint
+            for occurrence_key in batch.inventory_removals:
+                parts = _parse_package_occurrence_key(occurrence_key)
+                if parts is not None and parts[0] in covered_input_paths:
+                    task_inventory_removals.append(occurrence_key)
+
+        result[task_id] = evidence.model_copy(
+            update={
+                "covered_task_ids": [task_id],
+                "closure_package_names": sorted(
+                    {occurrence.package_name for occurrence in occurrences}
+                ),
+                "closure_lockfile_keys": sorted(
+                    {
+                        occurrence.lockfile_key
+                        for occurrence in occurrences
+                        if occurrence.lockfile_key is not None
+                    }
+                ),
+                "found_identifiers": sorted(found_identifiers),
+                "new_identifiers": sorted(found_identifiers - normalized_baseline),
+                "found_issues": list(found_issues_by_identity.values()),
+                "remaining_target_identifiers": sorted(found_identifiers & target_ids),
+                "covered_input_paths": sorted(covered_input_paths),
+                "covered_occurrences": occurrences,
+                "removed_occurrence_keys": task_inventory_removals,
+                "inventory_updates": task_inventory_updates,
+                "inventory_removals": task_inventory_removals,
+                "scan_performed": evidence.scan_performed
+                and (not target_skipped or bool(project_paths)),
+                "scan_skip_reason": (
+                    "no_matching_target" if target_skipped and task_complete else None
+                ),
+                "fallback_reason": (
+                    task_failure.reason
+                    if task_failure is not None
+                    else evidence.fallback_reason
+                    if not task_complete
+                    else None
+                ),
+            }
+        )
+    return result

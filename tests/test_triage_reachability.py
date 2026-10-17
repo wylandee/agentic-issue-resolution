@@ -8,7 +8,6 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from remediation_engine.language import ProjectLanguage
 from remediation_engine.triage.reachability import analyze_reachability
 
 
@@ -56,7 +55,7 @@ def test_analyze_reachability_distinguishes_direct_and_transitive(monkeypatch, t
         lambda source_bytes, language: SimpleNamespace(root_node=source_bytes.decode("utf-8")),
     )
     monkeypatch.setattr(
-        "remediation_engine.triage.reachability.extract_imports",
+        "remediation_engine.triage.reachability.extract_all_imports",
         lambda root_node, source_bytes: (
             ['import lodash from "lodash";']
             if "use_lodash" in root_node
@@ -104,7 +103,7 @@ def test_analyze_reachability_continues_after_parse_failure(monkeypatch, tmp_pat
 
     monkeypatch.setattr("remediation_engine.triage.reachability.parse_source", _parse)
     monkeypatch.setattr(
-        "remediation_engine.triage.reachability.extract_imports",
+        "remediation_engine.triage.reachability.extract_all_imports",
         lambda root_node, source_bytes: (
             ['import lodash from "lodash";'] if root_node == "ok" else []
         ),
@@ -133,19 +132,87 @@ def test_analyze_reachability_skips_symlinked_source_outside_repository(tmp_path
     assert groups[0].is_reachable is False
 
 
-def test_java_maven_reachability_stays_unknown_without_javascript_analysis(monkeypatch, tmp_path):
-    group = _sca_group("org.example:widget")
-    group.issues[0].ecosystem = "maven"
-    group.issues[0].purl = "pkg:maven/org.example/widget@1.0"
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Maven reachability must not inspect Java/Node source mappings")
-
-    monkeypatch.setattr(
-        "remediation_engine.triage.reachability._load_direct_dependencies", forbidden
+def test_reachability_matches_package_identity_not_substrings(monkeypatch, tmp_path):
+    (tmp_path / "package.json").write_text(
+        '{"dependencies":{"got":"1.0.0","@scope/pkg":"1.0.0","right":"1.0.0"}}',
+        encoding="utf-8",
     )
-    monkeypatch.setattr("remediation_engine.triage.reachability._collect_global_imports", forbidden)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.js").write_text("imports", encoding="utf-8")
+    monkeypatch.setattr(
+        "remediation_engine.triage.reachability.language_for_path", lambda _: object()
+    )
+    monkeypatch.setattr(
+        "remediation_engine.triage.reachability.load_source_bytes",
+        lambda path: path.read_bytes(),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.triage.reachability.parse_source",
+        lambda source_bytes, language: SimpleNamespace(root_node=source_bytes.decode()),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.triage.reachability.extract_all_imports",
+        lambda *_: [
+            'import forgot from "forgot";',
+            'import nested from "@scope/pkg/subpath";',
+            'const left = require("left"), right = require("right");',
+        ],
+    )
 
-    analyze_reachability([group], tmp_path, project_language=ProjectLanguage.JAVA)
+    got, scoped, second_require = (
+        _sca_group("got"),
+        _sca_group("@scope/pkg"),
+        _sca_group("right"),
+    )
+    analyze_reachability([got, scoped, second_require], tmp_path)
+
+    assert got.is_reachable is False
+    assert scoped.is_reachable is True
+    assert second_require.is_reachable is True
+
+
+def test_reachability_scans_mjs_cjs_and_imports_after_twentieth(monkeypatch, tmp_path):
+    (tmp_path / "package.json").write_text(
+        '{"dependencies":{"module-24":"1.0.0","module-cjs":"1.0.0"}}',
+        encoding="utf-8",
+    )
+    (tmp_path / "app.mjs").write_text("module", encoding="utf-8")
+    (tmp_path / "worker.cjs").write_text("commonjs", encoding="utf-8")
+    monkeypatch.setattr(
+        "remediation_engine.triage.reachability.language_for_path", lambda _: object()
+    )
+    monkeypatch.setattr(
+        "remediation_engine.triage.reachability.load_source_bytes",
+        lambda path: path.read_bytes(),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.triage.reachability.parse_source",
+        lambda source_bytes, language: SimpleNamespace(root_node=source_bytes.decode()),
+    )
+
+    def imports(root_node, _source_bytes):
+        if root_node == "module":
+            return [f'import mod{i} from "mod{i}";' for i in range(24)] + [
+                'import target from "module-24";'
+            ]
+        return ['const target = require("module-cjs");']
+
+    monkeypatch.setattr("remediation_engine.triage.reachability.extract_all_imports", imports)
+    groups = [_sca_group("module-24"), _sca_group("module-cjs")]
+
+    analyze_reachability(groups, tmp_path)
+
+    assert [group.is_reachable for group in groups] == [True, True]
+
+
+def test_reachability_rejects_external_root_manifest_symlink(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "external-package.json"
+    outside.write_text('{"dependencies":{"lodash":"1.0.0"}}', encoding="utf-8")
+    (repo / "package.json").symlink_to(outside)
+    group = _sca_group("lodash")
+
+    analyze_reachability([group], repo)
 
     assert group.is_reachable is None

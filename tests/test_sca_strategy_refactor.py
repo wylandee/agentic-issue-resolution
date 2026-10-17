@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from semantic_version import Version
+
 from remediation_engine.contracts import (
     FailureCategory,
     FixPlan,
@@ -47,6 +49,7 @@ from remediation_engine.tools.fix_planner import (
     plan_fix,
 )
 from remediation_engine.tools.registry_tools import (
+    _requirement_matches,
     fetch_registry_candidates,
     plan_npm_parent_version,
     select_npm_parent_version,
@@ -76,6 +79,21 @@ def _localized(issue: VulnerabilityIssue) -> LocalizedIssue:
         is_direct_dependency=True,
         localization_confidence=1.0,
     )
+
+
+def test_registry_parent_requirement_accepts_operator_whitespace_without_policy_change():
+    """Operator-space normalization agrees with manifest range handling."""
+    candidate = Version("1.2.4")
+    assert _requirement_matches("^ 1.2.3", candidate)
+    assert _requirement_matches(">= 1.2.3 < 2.0.0", candidate)
+    assert _requirement_matches("~ 1.2.3", candidate)
+
+    assert _requirement_matches("*", candidate)
+    assert not _requirement_matches(None, candidate)
+    assert not _requirement_matches("", candidate)
+    assert not _requirement_matches("latest", candidate)
+    assert not _requirement_matches("not a range", candidate)
+    assert not _requirement_matches("^1.2.3", Version("1.3.0-beta.1"))
 
 
 def _plan(
@@ -184,7 +202,7 @@ def test_osv_query_uses_the_finding_advisory_when_batch_has_multiple_cves():
     assert snippets is None
 
 
-def test_same_package_findings_are_separated_by_strategy_and_update_floor_is_aggregated():
+def test_same_package_findings_share_one_package_group_and_retain_candidates():
     update_a = _issue("CVE-2026-0001")
     update_b = _issue("CVE-2026-0002")
     workaround = _issue("CVE-2026-0003")
@@ -205,12 +223,17 @@ def test_same_package_findings_are_separated_by_strategy_and_update_floor_is_agg
         ],
     )
 
-    by_strategy = {group.fix_plan.strategy_used: group for group in groups}
-    assert set(by_strategy) == {"UPDATE_VERSION", "WORKAROUND", "NO_FIX"}
-    assert by_strategy["UPDATE_VERSION"].fix_plan.fixed_version == "4.18.0"
-    assert len(by_strategy["UPDATE_VERSION"].localized_issues) == 2
-    assert len(by_strategy["WORKAROUND"].localized_issues) == 1
-    assert len(by_strategy["NO_FIX"].localized_issues) == 1
+    assert len(groups) == 1
+    group = groups[0]
+    assert group.group_id == "sca:package.json:lodash"
+    assert group.fix_plan is not None
+    assert group.fix_plan.fixed_version == "4.18.0"
+    assert len(group.localized_issues) == 4
+    assert {candidate.plan.status for candidate in group.fix_plan_candidates} == {
+        FixPlanStatus.VERSION_FOUND,
+        FixPlanStatus.WORKAROUND_FOUND,
+        FixPlanStatus.NO_FIX,
+    }
 
 
 def test_supervisor_typed_registry_candidates_select_same_major_then_latest(monkeypatch):

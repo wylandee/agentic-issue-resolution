@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import json
+from pathlib import Path
 
 from remediation_engine.contracts import IssueSource, IssueType, Severity, VulnerabilityIssue
 from remediation_engine.tools import semgrep_parser
@@ -20,6 +21,12 @@ from remediation_engine.tools.semgrep_parser import (
     main,
     normalize_finding,
 )
+
+
+def test_default_semgrep_input_uses_repository_data_directory():
+    repository_root = Path(__file__).resolve().parents[1]
+    assert repository_root == semgrep_parser._PROJECT_ROOT
+    assert semgrep_parser._default_input_json_path() == repository_root / "data" / "semgrep.json"
 
 
 def _cli_sast_raw(**overrides):
@@ -107,6 +114,12 @@ class TestExtractFindingsPage:
     def test_unknown_shape_returns_empty(self):
         assert _extract_findings_page({"other": []}) == []
 
+    def test_rejects_non_object_finding_records(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="only JSON object records"):
+            _extract_findings_page({"results": [{"check_id": "valid"}, 7]})
+
 
 class TestLoadFindingsFromJson:
     def test_loads_results_from_top_level_object(self, tmp_path):
@@ -118,6 +131,15 @@ class TestLoadFindingsFromJson:
 
         assert len(findings) == 2
         assert findings[0]["check_id"] == "javascript.crypto.weak-hash"
+
+    def test_rejects_scalar_report_root(self, tmp_path):
+        json_path = tmp_path / "semgrep.json"
+        json_path.write_text("7", encoding="utf-8")
+
+        import pytest
+
+        with pytest.raises(ValueError, match="JSON object or array"):
+            load_findings_from_json(json_path)
 
 
 class TestNormalizeFinding:

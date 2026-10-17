@@ -19,6 +19,11 @@ from dotenv import load_dotenv
 from remediation_engine import RemediationRequest, run_remediation
 from remediation_engine.contracts.schemas import SystemContext, VulnerabilityIssue
 
+try:
+    from .fixture_acceptance import write_fixture_evidence
+except ImportError:
+    from fixture_acceptance import write_fixture_evidence
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_REPO = _PROJECT_ROOT / "data" / "clones" / "juice-shop"
 _DEFAULT_BASELINE = Path(__file__).resolve().parent / "fixtures" / "baseline_issues.jsonl"
@@ -301,6 +306,7 @@ def run_batch_iteration(
     suppressed_issues_path: Path,
     suppressions_xml_path: Path,
     output_dir: Path,
+    evidence_path: Path | None = None,
     dry_run: bool = False,
 ) -> IterationSummary:
     """Execute a single batch remediation iteration.
@@ -365,11 +371,16 @@ def run_batch_iteration(
         request = RemediationRequest(
             repo_root=repo_root,
             issues=filtered_issues,
+            # The batch fixture is intentionally a development-scoped run.
+            # The public engine rejects package scoping for production
+            # contexts, while the normal Juice Shop runner continues to use
+            # the full-repository default.
+            target_packages=selected_packages,
             system_context=SystemContext(
                 public_facing=True,
                 deployment_os="linux",
                 deployment_architecture="containerized",
-                environment="production",
+                environment="development",
                 primary_language="javascript/nodejs",
             ),
         )
@@ -382,6 +393,15 @@ def run_batch_iteration(
             encoding="utf-8",
         )
         patch_path.write_text(result.diff, encoding="utf-8")
+        if evidence_path is not None:
+            write_fixture_evidence(
+                result.raw_state,
+                evidence_path,
+                status=result.status,
+                changed_files=result.changed_files,
+                diff=result.diff,
+                trajectory_path=result.trajectory_path,
+            )
 
         logger.info(
             "Iteration %02d finished: status=%s changed_files=%s errors=%d",
@@ -421,11 +441,13 @@ def run_batch(
     *,
     iterations: int = 10,
     batch_size: int = 3,
+    target_packages: list[str] | None = None,
     repo_root: Path = _DEFAULT_REPO,
     baseline_path: Path = _DEFAULT_BASELINE,
     suppressed_issues_path: Path = _DEFAULT_SUPPRESSED_ISSUES,
     suppressions_xml_path: Path = _DEFAULT_SUPPRESSIONS_XML,
     output_dir: Path = _DEFAULT_OUTPUT_DIR,
+    evidence_dir: Path | None = None,
     seed: int | None = None,
     dry_run: bool = False,
 ) -> list[IterationSummary]:
@@ -434,6 +456,8 @@ def run_batch(
     Args:
         iterations: Total number of iterations to run.
         batch_size: Number of packages per iteration.
+        target_packages: Optional explicit package batch. When supplied, sampling is
+            skipped and exactly one development-scoped iteration is run.
         repo_root: Path to repository clone.
         baseline_path: Path to baseline issues fixture (read-only).
         suppressed_issues_path: Path to suppressed issues output JSONL.
@@ -461,13 +485,29 @@ def run_batch(
         len(packages),
     )
 
-    # Generate distinct package batches
-    batches = sample_package_batches(
-        packages,
-        batch_size=batch_size,
-        num_batches=iterations,
-        seed=seed,
-    )
+    if target_packages is not None:
+        selected_packages = sorted(
+            {package.strip() for package in target_packages if package.strip()}
+        )
+        if not selected_packages:
+            raise ValueError("packages must contain at least one non-empty package name")
+        unknown_packages = sorted(set(selected_packages) - set(packages))
+        if unknown_packages:
+            raise ValueError(
+                "Requested package(s) are not present in the baseline: "
+                + ", ".join(unknown_packages)
+            )
+        # ``packages`` is intentionally a one-shot development batch. The
+        # production/full-repository runner remains examples/juice_shop/run.py.
+        batches = [selected_packages]
+    else:
+        # Generate distinct package batches
+        batches = sample_package_batches(
+            packages,
+            batch_size=batch_size,
+            num_batches=iterations,
+            seed=seed,
+        )
     logger.info("Planned %d distinct package batches", len(batches))
 
     summaries: list[IterationSummary] = []
@@ -482,6 +522,11 @@ def run_batch(
             suppressed_issues_path=suppressed_issues_path,
             suppressions_xml_path=suppressions_xml_path,
             output_dir=output_dir,
+            evidence_path=(
+                evidence_dir / f"juice-shop-run-{idx:02d}-evidence.json"
+                if evidence_dir is not None
+                else None
+            ),
             dry_run=dry_run,
         )
         summaries.append(summary)
@@ -528,6 +573,15 @@ def main() -> int:
         help="Number of packages per batch (default: 3)",
     )
     parser.add_argument(
+        "--packages",
+        nargs="+",
+        default=None,
+        help=(
+            "Run one development-scoped batch for these exact package names "
+            "instead of sampling packages"
+        ),
+    )
+    parser.add_argument(
         "--repo",
         type=Path,
         default=Path(os.environ.get("TEST_REPO_ROOT", str(_DEFAULT_REPO))),
@@ -558,6 +612,12 @@ def main() -> int:
         help="Directory to save per-iteration results and patches",
     )
     parser.add_argument(
+        "--evidence-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for bounded fixture acceptance evidence.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -584,16 +644,19 @@ def main() -> int:
     suppressed_issues_path = args.suppressed_issues.expanduser().resolve()
     suppressions_xml_path = args.suppressions.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
+    evidence_dir = args.evidence_dir.expanduser().resolve() if args.evidence_dir else None
 
     try:
         summaries = run_batch(
             iterations=args.iterations,
             batch_size=args.batch_size,
+            target_packages=args.packages,
             repo_root=repo_root,
             baseline_path=baseline_path,
             suppressed_issues_path=suppressed_issues_path,
             suppressions_xml_path=suppressions_xml_path,
             output_dir=output_dir,
+            evidence_dir=evidence_dir,
             seed=args.seed,
             dry_run=args.dry_run,
         )

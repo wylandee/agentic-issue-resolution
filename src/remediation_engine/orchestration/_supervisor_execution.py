@@ -65,6 +65,9 @@ from remediation_engine.orchestration.task_utils import (
 from remediation_engine.orchestration.task_utils import (
     build_no_fix_retry_instruction as _default_build_no_fix_retry_instruction,
 )
+from remediation_engine.orchestration.task_utils import (
+    select_package_fix_plan as _default_select_package_fix_plan,
+)
 
 _logger = logging.getLogger(__name__)
 _dependencies: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
@@ -182,19 +185,20 @@ def _impl__commit_task_transition(
     close_attempt: bool = False,
     clear_selected_version: bool = False,
     allow_breaking_change_pivot: bool = False,
+    allow_verified_absent_target_pass: bool = False,
     consistency_events: list[StateConsistencyEvent] | None = None,
 ) -> RemediationTask | None:
     """Commit one coherent supervisor transition for a task.
 
-    ``task_queue`` is the authoritative projection.  This helper makes the
+    ``task_queue`` is the authoritative projection. This helper makes the
     transition explicit and ensures that any change to worker-input fields is
     either paired with a new task revision or closes the old attempt first.
     Worker successes that are waiting for QA intentionally do not use this
     helper for a status-only update: their current snapshot remains valid QA
-    input.  Every replan, surrender, terminalization, and pivot does use it.
+    input. Every replan, surrender, terminalization, and pivot does use it.
     ``allow_breaking_change_pivot`` is retained for the Supervisor-owned
-    breaking-change pivot path; the normal ``NEEDS_RETRY -> PIVOTED`` transition
-    is now explicit in the shared transition table.
+    breaking-change pivot path. ``allow_verified_absent_target_pass`` is
+    reserved for workerless SCA completion after accepted absence proof.
     """
     task = task_queue.get(task_id)
     if task is None:
@@ -210,6 +214,12 @@ def _impl__commit_task_transition(
             )
         except (TypeError, ValueError):
             new_status = None
+        verified_absent_transition_allowed = (
+            allow_verified_absent_target_pass
+            and task.current_attempt_id is None
+            and current_status in {TaskStatus.PENDING, TaskStatus.NEEDS_RETRY}
+            and new_status == TaskStatus.QA_PASSED
+        )
         pivot_transition_allowed = (
             allow_breaking_change_pivot
             and current_status == TaskStatus.NEEDS_RETRY
@@ -219,6 +229,7 @@ def _impl__commit_task_transition(
             new_status != current_status
             and not _validate_transition(current_status, new_status)
             and not pivot_transition_allowed
+            and not verified_absent_transition_allowed
         ):
             event = _build_consistency_event(
                 error_code="INVALID_TRANSITION",
@@ -288,12 +299,11 @@ def _impl__validate_committed_state(
     events: list[StateConsistencyEvent] = []
     errors: list[str] = []
 
-    # Reconcile every task before validating routing.  Worker and QA bridges
-    # are not allowed to repair planner-owned fields, so if a stale reducer
-    # or compatibility projection paired a task with a different current
-    # snapshot, the immutable snapshot wins for an active task.  A terminal
-    # task has no authorized future worker input, so its dangling attempt is
-    # detached instead of being allowed to leak into the next prompt.
+    # Reconcile every task before validating routing. Worker and QA bridges
+    # cannot repair planner-owned fields. A matching task/attempt/revision
+    # snapshot may repair corrupted input fields; foreign identity or revision
+    # evidence is rejected without mutating the task. A terminal task has no
+    # authorized future worker input, so its dangling attempt is detached.
     for task_id, task in list(task_queue.items()):
         if task.status in _dependency("_TERMINAL_STATUSES", _DEFAULT_TERMINAL_STATUSES) and (
             task.current_attempt_id is not None or task.selected_version is not None
@@ -327,16 +337,51 @@ def _impl__validate_committed_state(
             errors.append(f"supervisor: task {task_id} references a missing attempt snapshot.")
             continue
 
+        if (
+            snapshot.attempt_id != task.current_attempt_id
+            or snapshot.task_id != task_id
+            or snapshot.task_id != task.task_id
+        ):
+            detail = "Active task references a snapshot with foreign task or attempt identity."
+            errors.append(f"supervisor: {detail}")
+            events.append(
+                _build_consistency_event(
+                    error_code="TASK_SNAPSHOT_IDENTITY_REJECTED",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=snapshot.attempt_id,
+                    action="rejected",
+                    details=detail,
+                )
+            )
+            continue
+        if snapshot.task_revision != task.task_revision:
+            detail = (
+                "Active task revision differs from its committed attempt snapshot; "
+                "snapshot repair was refused."
+            )
+            errors.append(f"supervisor: {detail}")
+            events.append(
+                _build_consistency_event(
+                    error_code="TASK_SNAPSHOT_REVISION_REJECTED",
+                    task_id=task_id,
+                    expected_attempt_id=task.current_attempt_id,
+                    received_attempt_id=snapshot.attempt_id,
+                    action="rejected",
+                    details=detail,
+                )
+            )
+            continue
+
         snapshot_matches = (
-            snapshot.task_id == task.task_id
-            and snapshot.task_revision == task.task_revision
-            and snapshot.strategy_stage == task.strategy_stage
+            snapshot.strategy_stage == task.strategy_stage
             and snapshot.no_fix_stage == task.no_fix_stage
             and snapshot.qa_policy == task.qa_policy
             and snapshot.selected_version == task.selected_version
             and snapshot.target_package_name == task.target_package_name
             and snapshot.target_dependency_type == task.target_dependency_type
             and snapshot.parent_minimum_version == task.parent_minimum_version
+            and snapshot.selected_plan_issue_ids == task.selected_plan_issue_ids
             and snapshot.instruction == task.instruction
             and snapshot.instruction_digest == _instruction_digest(task.instruction)
             and (
@@ -356,7 +401,6 @@ def _impl__validate_committed_state(
 
         task_queue[task_id] = task.model_copy(
             update={
-                "task_revision": snapshot.task_revision,
                 "current_attempt_id": snapshot.attempt_id,
                 "strategy_stage": snapshot.strategy_stage,
                 "no_fix_stage": snapshot.no_fix_stage,
@@ -365,6 +409,7 @@ def _impl__validate_committed_state(
                 "target_package_name": snapshot.target_package_name,
                 "target_dependency_type": snapshot.target_dependency_type,
                 "parent_minimum_version": snapshot.parent_minimum_version,
+                "selected_plan_issue_ids": list(snapshot.selected_plan_issue_ids),
                 "instruction": snapshot.instruction,
             }
         )
@@ -518,6 +563,7 @@ def _impl__validate_committed_state(
             or snapshot.no_fix_stage != task.no_fix_stage
             or snapshot.qa_policy != task.qa_policy
             or snapshot.selected_version != task.selected_version
+            or snapshot.selected_plan_issue_ids != task.selected_plan_issue_ids
             or snapshot.instruction != task.instruction
             or snapshot.instruction_digest != _instruction_digest(task.instruction)
         ):
@@ -670,6 +716,7 @@ def _impl__update_worker_task_ids(
     dispatchable = [
         task_id
         for task_id in task_ids
+        if task_queue[task_id].current_attempt_id is None
         if not _is_exhausted_update_pivot_candidate(
             task_queue[task_id],
             retry_diagnostics_by_task.get(task_id),
@@ -686,6 +733,7 @@ def _impl__normalize_target_task_ids_for_node(
     task_queue: dict[str, RemediationTask],
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
     group_by_id: dict[str, VulnerabilityGroup] | None = None,
+    allow_cluster: bool = False,
 ) -> list[str]:
     """Clamp returned active targets to the lifecycle state accepted by next_node."""
     retry_diagnostics_by_task = retry_diagnostics_by_task or {}
@@ -694,25 +742,36 @@ def _impl__normalize_target_task_ids_for_node(
             task_queue,
             preferred_ids=target_task_ids,
             group_by_id=group_by_id,
-            limit=_dependency("QA_DISPATCH_LIMIT", _DEFAULT_QA_DISPATCH_LIMIT),
+            limit=(
+                None
+                if allow_cluster
+                else _dependency("QA_DISPATCH_LIMIT", _DEFAULT_QA_DISPATCH_LIMIT)
+            ),
         )
     if next_node == "update_subagent":
         return _proxy_update_worker_task_ids(
             task_queue,
             retry_diagnostics_by_task,
             preferred_ids=target_task_ids,
-            limit=_dependency("UPDATE_DISPATCH_LIMIT", _DEFAULT_UPDATE_DISPATCH_LIMIT),
+            limit=(
+                None
+                if allow_cluster
+                else _dependency("UPDATE_DISPATCH_LIMIT", _DEFAULT_UPDATE_DISPATCH_LIMIT)
+            ),
             group_by_id=group_by_id,
         )
     if next_node == "workaround_subagent":
-        return _dispatchable_task_ids_for_status(
-            task_queue,
-            set(_dependency("_WORKABLE_STATUSES", _DEFAULT_WORKABLE_STATUSES)),
-            preferred_ids=target_task_ids,
-            strategy=RoutingStrategy.CODE_WORKAROUND,
-            limit=1,
-            group_by_id=group_by_id,
-        )
+        return [
+            task_id
+            for task_id in _dispatchable_task_ids_for_status(
+                task_queue,
+                set(_dependency("_WORKABLE_STATUSES", _DEFAULT_WORKABLE_STATUSES)),
+                preferred_ids=target_task_ids,
+                strategy=RoutingStrategy.CODE_WORKAROUND,
+                group_by_id=group_by_id,
+            )
+            if task_queue[task_id].current_attempt_id is None
+        ][:1]
     return []
 
 
@@ -756,7 +815,7 @@ def _impl__constraint_entry_for_task(
 ) -> str:
     """Build a deterministic constraints-ledger entry for a QA-passed task."""
     component = (group.vulnerable_component or task.parent_group_id).strip()
-    fix_plan = group.fix_plan
+    fix_plan = _default_select_package_fix_plan(group, task.strategy).plan
 
     if task.strategy == RoutingStrategy.VERSION_BUMP:
         fixed_version = (fix_plan.fixed_version if fix_plan else None) or "unknown"
@@ -786,7 +845,9 @@ def _impl__missing_retry_revised_instructions(
             continue
         # Retry workers are execution-only: a retry instruction is invalid
         # unless it carries both the strategy stage and a concrete semver.
-        if "strategy stage" not in instruction.lower() or not re.search(
+        stage = getattr(task.strategy_stage, "value", task.strategy_stage)
+        stage_marker = f"strategy stage {stage}".lower()
+        if stage_marker not in instruction.lower() or not re.search(
             r"(?<!\d)v?\d+\.\d+\.\d+(?!\d)", instruction
         ):
             missing.append(task_id)

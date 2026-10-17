@@ -31,6 +31,7 @@ from remediation_engine.tools.code_locator import (
 )
 from remediation_engine.tools.code_map import (
     _TREE_SITTER_AVAILABLE,
+    extract_all_imports,
     extract_imports,
     extract_sink_expression,
     extract_snippet,
@@ -297,6 +298,14 @@ class TestASTHelpers:
         root = tree.root_node
         imports = extract_imports(root, lines.encode())
         assert len(imports) <= 20
+
+    def test_extract_all_imports_is_uncapped_for_analysis(self):
+        lines = "\n".join(f"import x{i} from 'mod{i}';" for i in range(30))
+        lang = language_for_path("app.js")
+        tree = parse_source(lines.encode(), lang)
+
+        assert len(extract_all_imports(tree.root_node, lines.encode())) == 30
+        assert len(extract_imports(tree.root_node, lines.encode())) == 20
 
     # --- extract_sink_expression ---
 

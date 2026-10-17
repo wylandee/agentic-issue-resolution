@@ -1,4 +1,4 @@
-"""Deterministic retry planning and Supervisor-owned registry selection."""
+"""Deterministic retry planning from an outer committed portfolio plan."""
 
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ from remediation_engine.contracts.version_policy import (
     compare_maven_versions,
     is_stable_maven_version,
     select_maven_version,
-    select_version,
 )
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.supervisor_policy import (
@@ -38,7 +37,6 @@ from remediation_engine.orchestration.supervisor_policy import (
 from remediation_engine.orchestration.task_utils import (
     group_parent_context,
     is_maven_group,
-    is_transitive_group,
 )
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.tools.maven_registry_tools import fetch_maven_registry_candidates
@@ -50,7 +48,7 @@ from remediation_engine.tools.registry_tools import (
 logger = logging.getLogger(__name__)
 
 UPDATE_DISPATCH_LIMIT: int = 1
-QA_DISPATCH_LIMIT: int = 1
+QA_DISPATCH_LIMIT: int = 30
 _SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.OSV_MINIMUM: 0,
     SCARemediationStage.NPM_SAME_MAJOR: 1,
@@ -232,7 +230,7 @@ def _supervisor_dependency_type_candidates(
     strategy_stage: SCARemediationStage,
     target_dependency_type: str | None,
 ) -> list[str]:
-    """Return dependency-type candidates permitted by the committed strategy."""
+    """Return dependency types permitted by the committed strategy."""
     if strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
         candidates = (
             [target_dependency_type] if target_dependency_type in _OVERRIDE_DEPENDENCY_TYPES else []
@@ -251,155 +249,38 @@ def _build_high_level_retry_instruction(
     *,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> str:
-    """Synthesize a high-level retry instruction for the update worker."""
+    """Synthesize a retry instruction without consulting package metadata."""
     component = group.vulnerable_component if group else task.parent_group_id
     parent_name, _, parent_type = (
         group_parent_context(group) if group is not None else (None, None, None)
     )
-    target = task.target_package_name
-    if not target and task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE:
-        target = parent_name
-    target = target or component
+    target = task.target_package_name or (
+        parent_name if task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE else component
+    )
     dependency_type = task.target_dependency_type or parent_type
-    if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-        dependency_type = dependency_type or "overrides"
-    maven_target = is_maven_group(group, project_language)
-    if maven_target:
-        exact_gav = task.target_package_name or component
-        pom_path = next(
-            (
-                localized.manifest_file
-                for localized in group.localized_issues
-                if localized.manifest_file
-                and (
-                    (localized.package_manager or "").strip().lower() == "maven"
-                    or str(getattr(localized.issue, "purl", "") or "")
-                    .strip()
-                    .lower()
-                    .startswith("pkg:maven/")
-                )
-            ),
-            None,
-        )
-        target_type = task.target_dependency_type or "dependencyManagement"
-        if diagnostics and diagnostics.selected_version:
-            if not pom_path:
-                return (
-                    f"No authorized POM is available for exact Maven coordinate {exact_gav}; "
-                    "do not select or edit a release."
-                )
-            return (
-                f'For exact Maven GAV "{exact_gav}", use only Supervisor-selected Maven Central '
-                f'version "{diagnostics.selected_version}". The committed edit target is '
-                f'"{target_type}" in authorized POM "{pom_path}". Invoke '
-                "modify_and_validate_maven_dependency with "
-                f'package_name="{exact_gav}", target_version="{diagnostics.selected_version}", '
-                f'dependency_type="{target_type}", manifest_path="{pom_path}". '
-                "The OSV fixed value is only a security floor. Do not guess a parent version, "
-                "choose a release from web/LLM text, or change the project parent version "
-                "or an unrelated BOM. The committed dependencyManagement operation may "
-                "add this exact GAV to the authorized reactor root if it has no managed entry."
-            )
-        if task.strategy_stage == SCARemediationStage.CODE_WORKAROUND:
-            return (
-                f"Implement a code workaround for exact Maven GAV {exact_gav}; do not change "
-                "a parent POM, BOM, or dependency version."
-            )
-        floor = group.fix_plan.fixed_version if group and group.fix_plan else "the OSV floor"
-        return (
-            f"For exact Maven GAV {exact_gav}, the OSV fixed value {floor} is a security floor "
-            "only. Wait for a Supervisor-approved Maven Central candidate and edit only the "
-            "authorized POM target; do not guess a release, parent version, or mutate a BOM."
-        )
-    category = evaluation.failure_category if evaluation else None
     if diagnostics and diagnostics.selected_version:
         manifest = group.file_paths[0] if group and group.file_paths else "package.json"
-        is_override = (
-            task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
-            or diagnostics.used_overrides
-            or dependency_type in {"overrides", "resolutions", "pnpm_overrides"}
-        )
-        dependency_action = (
-            f"package-manager override for {component}"
-            if is_override
-            else f"{target} dependency version"
-        )
-        target_clause = (
-            f"edit only the {target} declaration" if target != component else f"update {target}"
-        )
-        if dependency_type:
-            target_clause += f" in {dependency_type}"
         return (
-            f"Apply the supervisor-selected {dependency_action} for {component}; "
-            f"during strategy stage {task.strategy_stage.value}: "
-            f"{target_clause} in {manifest} to exact version {diagnostics.selected_version}; "
-            "do not edit any other dependency target; "
+            f"Apply the outer-solver-approved dependency decision for {component}: "
+            f"update only {target or component} in {manifest}"
+            f"{f' ({dependency_type})' if dependency_type else ''} "
+            f"to exact version {diagnostics.selected_version}; "
+            "do not query a registry or choose another version; "
             "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
         )
-    if task.strategy_stage == SCARemediationStage.OSV_MINIMUM and group and group.fix_plan:
-        floor = group.fix_plan.fixed_version
-        if floor:
-            manifest = group.file_paths[0] if group.file_paths else "package.json"
-            if parent_name and target == parent_name:
-                return (
-                    f"Apply strategy stage {task.strategy_stage.value} for transitive package {component}: "
-                    f"update only directly declared parent {parent_name} in {manifest} to the "
-                    "supervisor-selected compatible parent version; do not use a child override; "
-                    "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
-                )
-            return (
-                f"Apply strategy stage {task.strategy_stage.value} for {component}: "
-                f"update {manifest} to exact OSV minimum fixed version {floor}; "
-                "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
-            )
-    if diagnostics and task.strategy in {RoutingStrategy.VERSION_BUMP}:
-        attempted = set(diagnostics.attempted_versions)
-        candidates = [
-            version
-            for version in diagnostics.candidate_versions_considered
-            if version not in attempted
-        ]
-        candidate = next(
-            (
-                version
-                for version in [diagnostics.latest_version_seen, *candidates]
-                if version and version not in attempted
-            ),
-            None,
-        )
-        if candidate:
-            manifest = group.file_paths[0] if group and group.file_paths else "package.json"
-            return (
-                f"Apply strategy stage {task.strategy_stage.value} for {component}: "
-                f"update only {target} in {manifest} to exact version {candidate}; "
-                "use modify_and_validate_npm_dependency so synchronization runs immediately after the edit."
-            )
     if diagnostics and diagnostics.package_abandoned:
         return (
-            f"The Supervisor found no remaining supported manifest-based update candidate for {component}. "
-            "Do not select another version; report the bounded update failure so the Supervisor can "
-            "pivot this task safely."
+            f"The outer portfolio plan has no remaining approved update candidate for {component}. "
+            "Do not select another version; report the bounded update failure so the Supervisor can pivot safely."
         )
-    if category == FailureCategory.PEER_CONFLICT:
+    if evaluation and evaluation.failure_category == FailureCategory.PEER_CONFLICT:
         return (
-            f"Use only the Supervisor-approved peer-compatible candidate or override path for {component}. "
-            "Preserve the committed package and manifest targets while retrying the combined transaction."
-        )
-    if category == FailureCategory.SECURITY_FLAG:
-        return (
-            f"Use only the Supervisor-approved patched manifest candidate for {component}. "
-            "Do not query a registry or invent a newer release; retry the combined transaction with "
-            "a different committed candidate when instructed."
-        )
-    if category == FailureCategory.BREAKING_CHANGE:
-        return (
-            f"Use only the Supervisor-approved compatible candidate for {component} and preserve the "
-            "committed manifest target. Do not search for another version or change source code."
+            f"Use only the outer-solver-approved peer-compatible candidate for {component}; "
+            "preserve the committed package and manifest targets."
         )
     return (
-        f"Execute the next Supervisor-approved manifest candidate for {component}. "
-        "Use prior validation failures only to follow the committed retry instruction; do not query "
-        "a registry or choose a candidate."
+        f"Execute the next outer-solver-approved manifest candidate for {component}. "
+        "Do not query a registry or invent a candidate."
     )
 
 
@@ -407,18 +288,6 @@ def _registry_selected_version(report: str) -> str | None:
     """Extract a planner-selected stable version from a registry report."""
     match = re.search(
         r"^-\s*Selected Version:\s*(\S+)",
-        report or "",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    if not match or match.group(1).upper() == "NONE":
-        return None
-    return match.group(1).strip().lstrip("vV")
-
-
-def _registry_report_value(report: str, label: str) -> str | None:
-    """Extract one normalized value from a deterministic registry-tool report."""
-    match = re.search(
-        rf"^-\s*{re.escape(label)}:\s*(\S+)",
         report or "",
         re.IGNORECASE | re.MULTILINE,
     )
@@ -485,20 +354,18 @@ def _planner_plan_violations(
                 f"does not match current revision {task.task_revision}"
             )
 
-        attempted = {
-            version.strip().lstrip("vV").lower() for version in plan.attempted_versions if version
-        }
+        def version_key(value: str, *, maven_mode: bool = plan.version_scheme == "maven") -> str:
+            normalized = value.strip()
+            if not maven_mode:
+                normalized = normalized.lstrip("vV")
+            return normalized.lower()
+
+        attempted = {version_key(version) for version in plan.attempted_versions if version}
         diagnostics = diagnostics_by_task.get(task_id)
         if diagnostics is not None:
-            attempted.update(
-                version.strip().lstrip("vV").lower()
-                for version in diagnostics.attempted_versions
-                if version
-            )
+            attempted.update(version_key(version) for version in diagnostics.attempted_versions)
 
-        selected = (
-            plan.selected_version.strip().lstrip("vV").lower() if plan.selected_version else None
-        )
+        selected = version_key(plan.selected_version) if plan.selected_version else None
         if selected and selected in attempted:
             violations.append(
                 f"task {task_id}: selected version {plan.selected_version} was already attempted"
@@ -533,11 +400,16 @@ def _planner_plan_violations(
                 f"task {task_id}: retry plan stage {plan.strategy_stage.value} regresses "
                 f"from committed stage {task.strategy_stage.value}"
             )
-        if (
-            plan.action == "pivot_workaround"
-            and plan.strategy_stage != SCARemediationStage.NPM_LATEST
-        ):
-            violations.append(f"task {task_id}: workaround pivot must be committed at npm_latest")
+        required_pivot_stage = (
+            SCARemediationStage.MAVEN_LATEST
+            if plan.version_scheme == "maven"
+            else SCARemediationStage.NPM_LATEST
+        )
+        if plan.action == "pivot_workaround" and plan.strategy_stage != required_pivot_stage:
+            violations.append(
+                f"task {task_id}: workaround pivot must be committed at "
+                f"{required_pivot_stage.value}"
+            )
         if plan.action == "pivot_workaround" and selected is not None:
             violations.append(
                 f"task {task_id}: workaround pivot cannot retain selected version {plan.selected_version}"
@@ -739,7 +611,7 @@ def _repair_invalid_planner_plans(
                     "candidate_versions_considered": list(
                         dict.fromkeys([*diagnostics.candidate_versions_considered, candidate])
                     ),
-                    "registry_query_performed": True,
+                    "registry_query_performed": False,
                     "exhausted_update_path": False,
                     "target_package_name": target_package,
                     "target_dependency_type": target_type,
@@ -765,73 +637,6 @@ def _repair_invalid_planner_plans(
                 }
             )
             continue
-
-        group = group_by_id.get(task_queue[task_id].parent_group_id)
-        if group is not None and is_transitive_group(group):
-            # Parent registry exhaustion is the deterministic handoff to the
-            # native child override stage, but the child version must be
-            # verified independently. Never reuse the child's fix-plan floor
-            # as if it were a registry candidate.
-            child_floor, _floor_error = _canonical_security_floor(group)
-            target_type = _override_dependency_type(group)
-            child_candidate: str | None = None
-            if child_floor and group.vulnerable_component:
-                try:
-                    child_candidates = _supervisor_fetch_registry_candidates(
-                        group.vulnerable_component,
-                        child_floor,
-                        set(attempted),
-                    )
-                    child_candidate = select_version(
-                        child_candidates,
-                        SCARemediationStage.OSV_MINIMUM,
-                        set(attempted),
-                    )
-                except Exception:  # noqa: BLE001 - fall through to safe pivot
-                    child_candidate = None
-            if child_candidate is not None:
-                if diagnostics is None:
-                    diagnostics = UpdateRetryDiagnostics(task_id=task_id)
-                diagnostics = diagnostics.model_copy(
-                    update={
-                        "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
-                        "security_floor": child_floor,
-                        "selected_version": child_candidate,
-                        "candidate_versions_considered": [child_candidate],
-                        "registry_query_performed": True,
-                        "target_package_name": group.vulnerable_component,
-                        "target_dependency_type": target_type,
-                        "exhausted_update_path": False,
-                    }
-                )
-                repaired_diagnostics[task_id] = diagnostics
-                override_task = task_queue[task_id].model_copy(
-                    update={
-                        "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
-                        "selected_version": child_candidate,
-                        "target_package_name": group.vulnerable_component,
-                        "target_dependency_type": target_type,
-                    }
-                )
-                instruction = _build_high_level_retry_instruction(
-                    override_task,
-                    group,
-                    None,
-                    diagnostics,
-                )
-                repaired_plans[task_id] = plan.model_copy(
-                    update={
-                        "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
-                        "selected_version": child_candidate,
-                        "candidate_versions_considered": [child_candidate],
-                        "exhausted_update_path": False,
-                        "action": "retry_update",
-                        "exact_instruction": instruction,
-                        "target_package_name": group.vulnerable_component,
-                        "target_dependency_type": target_type,
-                    }
-                )
-                continue
 
         # No direct unattempted candidate can be proven. Clear stale selection
         # and pivot at the terminal update stage so no guessed/old version is
@@ -1007,6 +812,7 @@ def _build_maven_retry_plan(
         task_id=task.task_id,
         source_task_revision=task.task_revision,
         strategy_stage=effective_stage,
+        version_scheme="maven",
         selected_version=selected_version,
         attempted_versions=list(diagnostics.attempted_versions),
         candidate_versions_considered=provenance_versions,
@@ -1030,14 +836,12 @@ def _build_deterministic_retry_plan(
     requested_stage: SCARemediationStage | None = None,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> SupervisorRetryPlan:
-    """Build an exact retry plan from committed state and registry facts.
-
-    The task's committed stage is authoritative for this pass. A later
-    Supervisor pass may advance the stage after QA evidence; this function
-    never skips an empty stage, regresses, reuses an attempted version, or
-    turns an exhausted update path back into an update retry.
-    """
-    if is_maven_group(group, project_language) and group is not None:
+    """Build a retry plan solely from the outer solver's committed allowlist."""
+    if (
+        project_language == ProjectLanguage.JAVA
+        and group is not None
+        and is_maven_group(group, project_language)
+    ):
         return _build_maven_retry_plan(
             task,
             diagnostics,
@@ -1045,210 +849,55 @@ def _build_deterministic_retry_plan(
             requested_stage=requested_stage,
         )
     requested = requested_stage or task.strategy_stage
-    requested_order = _SCA_STAGE_ORDER.get(requested, 99)
-    current_order = _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
-    effective_stage = requested if requested_order >= current_order else task.strategy_stage
-    attempted = set(diagnostics.attempted_versions)
-    security_floor, floor_error = _canonical_security_floor(
-        group,
-        project_language=project_language,
+    effective_stage = (
+        requested
+        if _SCA_STAGE_ORDER.get(requested, 99) >= _SCA_STAGE_ORDER.get(task.strategy_stage, 0)
+        else task.strategy_stage
     )
-    transitive = bool(group and is_transitive_group(group))
-    candidate_versions: list[str] = []
-    latest_version_seen: str | None = None
-    selected_version: str | None = None
-    failure_reason = floor_error or ""
-    parent_minimum_version = task.parent_minimum_version
+    attempted = {
+        str(version).strip().lstrip("vV").lower()
+        for version in (*diagnostics.attempted_versions, *diagnostics.executed_versions)
+        if str(version).strip()
+    }
+    approved_versions = list(
+        dict.fromkeys(
+            str(version).strip().lstrip("vV")
+            for version in task.allowed_target_versions
+            if str(version).strip()
+        )
+    )
+    approved_version_keys = {version.lower() for version in approved_versions}
+    selected_version = next(
+        (
+            version
+            for version in [task.selected_version, *approved_versions]
+            if version
+            and version.strip().lstrip("vV").lower() in approved_version_keys
+            and version.strip().lstrip("vV").lower() not in attempted
+        ),
+        None,
+    )
+    exhausted = task.strategy == RoutingStrategy.VERSION_BUMP and selected_version is None
+    if task.strategy == RoutingStrategy.CODE_WORKAROUND:
+        exhausted = False
     target_package_name = task.target_package_name
     target_dependency_type = task.target_dependency_type
-
-    if effective_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-        if group is not None:
-            target_package_name = group.vulnerable_component
-            target_dependency_type = _override_dependency_type(group)
-            if security_floor and target_package_name:
-                try:
-                    child_candidates = _fetch_registry_candidates_for_task(
-                        target_package_name,
-                        security_floor,
-                        attempted,
-                        diagnostics,
-                    )
-                    candidate_versions = [
-                        candidate.version
-                        for candidate in child_candidates[:_MAX_REGISTRY_CANDIDATES]
-                    ]
-                    selected_version = select_version(
-                        child_candidates,
-                        SCARemediationStage.OSV_MINIMUM,
-                        attempted,
-                    )
-                    if selected_version is None:
-                        failure_reason = "No verified vulnerable-child override candidate meets the security floor."
-                except Exception as exc:  # noqa: BLE001
-                    failure_reason = f"Deterministic child override verification failed: {exc}"
-    elif effective_stage != SCARemediationStage.CODE_WORKAROUND and security_floor:
-        # The QA transition already advances the committed stage one step.
-        # Plan only that stage here; an empty candidate set must not silently
-        # skip ahead to a later stage in the same Supervisor pass.
-        stages = [effective_stage]
-        if transitive:
-            parent_name, parent_version, parent_type = group_parent_context(group)
-            target_package_name = target_package_name or parent_name
-            target_dependency_type = target_dependency_type or parent_type
-            if not parent_name or not parent_version or not group.vulnerable_component:
-                failure_reason = "Missing parent context for deterministic transitive planning."
-            else:
-                parent_approved_pool = _approved_candidate_pool(diagnostics, parent_name)
-                for stage in stages:
-                    selection = {
-                        SCARemediationStage.OSV_MINIMUM: "minimum",
-                        SCARemediationStage.NPM_SAME_MAJOR: "same_major",
-                        SCARemediationStage.NPM_LATEST: "latest",
-                    }[stage]
-                    try:
-                        report = _supervisor_plan_npm_parent_version(
-                            {
-                                "parent_package_name": parent_name,
-                                "child_package_name": group.vulnerable_component,
-                                "child_fixed_version": security_floor,
-                                "installed_parent_version": parent_version,
-                                "selection": selection,
-                                "attempted_versions": (
-                                    "" if parent_approved_pool else ",".join(sorted(attempted))
-                                ),
-                                "dependency_ancestry": ",".join(group.dependency_ancestry),
-                            }
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        failure_reason = f"Deterministic parent registry planning failed: {exc}"
-                        continue
-                    report_candidates = _registry_report_versions(
-                        report, "Eligible Candidates"
-                    ) or _registry_report_versions(report, "Compatible Parent Versions")
-                    if parent_approved_pool:
-                        approved = set(parent_approved_pool)
-                        report_candidates = [
-                            _normalise_candidate_version(version)
-                            for version in report_candidates
-                            if _normalise_candidate_version(version) in approved
-                            and _normalise_candidate_version(version) not in attempted
-                        ]
-                    candidate_versions = list(
-                        dict.fromkeys([*candidate_versions, *report_candidates])
-                    )
-                    latest_version_seen = (
-                        _registry_report_value(report, "Npm Latest")
-                        or _registry_report_value(report, "Latest Compatible")
-                        or _registry_report_value(report, "Latest Stable")
-                        or latest_version_seen
-                    )
-                    selected = _registry_selected_version(report)
-                    if parent_approved_pool and selected not in set(report_candidates):
-                        selected = _select_report_candidate(
-                            report_candidates,
-                            stage,
-                            attempted,
-                        )
-                    if selected:
-                        selected_version = selected
-                        effective_stage = stage
-                        if stage == SCARemediationStage.OSV_MINIMUM:
-                            parent_minimum_version = selected
-                        break
-        else:
-            try:
-                candidates = _fetch_registry_candidates_for_task(
-                    group.vulnerable_component or "",
-                    security_floor,
-                    attempted,
-                    diagnostics,
-                )
-                candidate_versions = [
-                    candidate.version for candidate in candidates[:_MAX_REGISTRY_CANDIDATES]
-                ]
-                latest_version_seen = next(
-                    (
-                        candidate.version
-                        for candidate in candidates
-                        if "npm_latest" in candidate.selection_roles
-                    ),
-                    candidates[-1].version if candidates else None,
-                )
-                for stage in stages:
-                    selected = select_version(candidates, stage, attempted)
-                    if selected:
-                        selected_version = selected
-                        effective_stage = stage
-                        break
-            except Exception as exc:  # noqa: BLE001
-                failure_reason = f"Deterministic registry planning failed: {exc}"
-    elif effective_stage != SCARemediationStage.CODE_WORKAROUND and not failure_reason:
-        failure_reason = "No security floor is available for deterministic version selection."
-
-    if selected_version is None and effective_stage != SCARemediationStage.PACKAGE_OVERRIDE:
-        if transitive and security_floor and effective_stage == SCARemediationStage.NPM_LATEST:
-            effective_stage = SCARemediationStage.PACKAGE_OVERRIDE
-            target_package_name = group.vulnerable_component if group else task.parent_group_id
-            target_dependency_type = _override_dependency_type(group)
-            try:
-                child_candidates = _fetch_registry_candidates_for_task(
-                    target_package_name,
-                    security_floor,
-                    attempted,
-                    diagnostics,
-                )
-                candidate_versions = [
-                    candidate.version for candidate in child_candidates[:_MAX_REGISTRY_CANDIDATES]
-                ]
-                selected_version = select_version(
-                    child_candidates,
-                    SCARemediationStage.OSV_MINIMUM,
-                    attempted,
-                )
-                if selected_version is None:
-                    failure_reason = (
-                        "Parent update stages are exhausted and no verified "
-                        "vulnerable-child override candidate remains."
-                    )
-            except Exception as exc:  # noqa: BLE001
-                failure_reason = f"Child override verification failed: {exc}"
-            if selected_version is None:
-                # Keep the terminal marker used by the deterministic router;
-                # never turn the child security floor itself into an
-                # unverified worker target.
-                effective_stage = SCARemediationStage.NPM_LATEST
-        elif effective_stage == SCARemediationStage.NPM_LATEST:
-            effective_stage = SCARemediationStage.NPM_LATEST
-            target_package_name = target_package_name or task.target_package_name
-
-    exhausted = selected_version is None and effective_stage == SCARemediationStage.NPM_LATEST
-    effective_task = task.model_copy(
-        update={
-            "strategy_stage": effective_stage,
-            "selected_version": selected_version,
-            "target_package_name": target_package_name,
-            "target_dependency_type": target_dependency_type,
-            "parent_minimum_version": parent_minimum_version,
-        }
+    candidate_dependency_types = list(
+        dict.fromkeys(
+            str(value).strip() for value in task.allowed_dependency_types if str(value).strip()
+        )
     )
-    safe_candidate_versions = (
-        candidate_versions[:_MAX_REGISTRY_CANDIDATES] if selected_version or exhausted else []
+    failure_reason = (
+        "The outer portfolio plan has no remaining approved version." if exhausted else ""
     )
-    approved_pool = _approved_candidate_pool(diagnostics, target_package_name)
-    provenance_candidate_versions = list(approved_pool or safe_candidate_versions)
-    safe_latest_version = latest_version_seen if selected_version or exhausted else None
-    candidate_dependency_types = _supervisor_dependency_type_candidates(
-        effective_stage,
-        target_dependency_type,
-    )
+    effective_task = task.model_copy(update={"selected_version": selected_version})
     effective_diagnostics = diagnostics.model_copy(
         update={
             "strategy_stage": effective_stage,
-            "candidate_versions_considered": provenance_candidate_versions,
             "selected_version": selected_version,
-            "latest_version_seen": safe_latest_version,
-            "registry_query_performed": bool(security_floor),
+            "candidate_versions_considered": approved_versions,
+            "latest_version_seen": approved_versions[-1] if approved_versions else None,
+            "registry_query_performed": False,
             "exhausted_update_path": exhausted,
             "target_package_name": target_package_name,
             "target_dependency_type": target_dependency_type,
@@ -1256,15 +905,15 @@ def _build_deterministic_retry_plan(
             "parent_package_name": (
                 group.parent_package_name if group is not None else diagnostics.parent_package_name
             ),
-            "parent_minimum_version": parent_minimum_version,
+            "parent_minimum_version": task.parent_minimum_version,
             "failure_reason": failure_reason,
         }
     )
     if exhausted:
         component = group.vulnerable_component if group else task.parent_group_id
         instruction = (
-            f"Implement a code workaround or isolation strategy for {component} "
-            "because the deterministic registry policy found no remaining eligible update version."
+            f"Implement the committed workaround path for {component}; "
+            "the outer portfolio plan has no remaining approved update candidate."
         )
     else:
         instruction = _build_high_level_retry_instruction(
@@ -1279,14 +928,14 @@ def _build_deterministic_retry_plan(
         strategy_stage=effective_stage,
         selected_version=selected_version,
         attempted_versions=list(diagnostics.attempted_versions),
-        candidate_versions_considered=provenance_candidate_versions,
+        candidate_versions_considered=approved_versions,
         candidate_dependency_types=candidate_dependency_types,
-        latest_version_seen=safe_latest_version,
+        latest_version_seen=approved_versions[-1] if approved_versions else None,
         exhausted_update_path=exhausted,
         package_abandoned=diagnostics.package_abandoned,
         target_package_name=target_package_name,
         target_dependency_type=target_dependency_type,
-        parent_minimum_version=parent_minimum_version,
+        parent_minimum_version=task.parent_minimum_version,
         action="pivot_workaround" if exhausted else "retry_update",
         exact_instruction=instruction,
     )
@@ -1342,22 +991,14 @@ def _run_deterministic_retry_planner(
     group_by_id: dict[str, VulnerabilityGroup],
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
     *,
-    advance_failed_stage: bool = False,
     target_task_ids: Iterable[str] | None = None,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
     include_initial_maven: bool = False,
 ) -> tuple[dict[str, UpdateRetryDiagnostics], dict[str, SupervisorRetryPlan]]:
-    """Plan retries from state and registry facts.
+    """Plan retries from the outer portfolio's committed candidate allowlists.
 
-    ``advance_failed_stage`` is used only by the deterministic fallback after
-    tactical reasoning is unavailable or rejected.  Tactical callers inspect
-    the failed stage before this advancement occurs.
-    ``target_task_ids`` optionally narrows planning to the task selected by
-    deterministic routing, preventing registry work for tasks that are not
-    active yet.
-    ``include_initial_maven`` allows the Supervisor to plan a pending Maven
-    version bump before tactical reasoning or dispatch authorization. Initial
-    Maven updates need the same registry-backed candidate whitelist as retries.
+    The portfolio plan owns version and retry-stage transitions. ``target_task_ids``
+    narrows planning to tasks selected for the current Supervisor turn.
     """
     updated_diagnostics = dict(retry_diagnostics_by_task)
     plans: dict[str, SupervisorRetryPlan] = {}
@@ -1401,78 +1042,31 @@ def _run_deterministic_retry_planner(
         if _is_exhausted_update_pivot_candidate(task, diagnostics):
             continue
         group = group_by_id.get(task.parent_group_id)
-        maven_mode = is_maven_group(group, project_language)
-        requested_stage = None
-        if advance_failed_stage:
-            requested_stage = _next_sca_stage(
-                task.strategy_stage,
-                transitive=bool(group and is_transitive_group(group)),
-                project_language=project_language,
-                maven_mode=is_maven_group(group, project_language),
-            )
+        maven_mode = bool(
+            project_language == ProjectLanguage.JAVA
+            and group is not None
+            and is_maven_group(group, project_language)
+        )
         plan = _build_deterministic_retry_plan(
             task,
             diagnostics,
             group,
-            requested_stage=requested_stage,
             project_language=project_language,
         )
-        # An empty stage is deterministic evidence to advance to the next
-        # bounded stage, not a request for the worker to inspect the registry.
-        # Keep the worker execution-only: every update dispatch must end with
-        # an exact unattempted version, or with the terminal update pivot.
-        while plan.selected_version is None and not plan.exhausted_update_path:
-            transitive = bool(group and is_transitive_group(group))
-            maven_mode = is_maven_group(group, project_language)
+        while maven_mode and plan.selected_version is None and not plan.exhausted_update_path:
             next_stage = _next_sca_stage(
                 plan.strategy_stage,
-                transitive=transitive,
-                project_language=project_language,
-                maven_mode=maven_mode,
+                project_language=ProjectLanguage.JAVA,
+                maven_mode=True,
             )
             if next_stage == SCARemediationStage.CODE_WORKAROUND:
                 break
-            if _SCA_STAGE_ORDER.get(next_stage, 99) <= _SCA_STAGE_ORDER.get(
-                plan.strategy_stage, 99
-            ):
-                break
-            if maven_mode:
-                diagnostics = diagnostics.model_copy(
-                    update={
-                        "candidate_versions_considered": plan.candidate_versions_considered,
-                        "target_package_name": plan.target_package_name,
-                        "target_dependency_type": plan.target_dependency_type,
-                    }
-                )
             plan = _build_deterministic_retry_plan(
                 task,
                 diagnostics,
                 group,
                 requested_stage=next_stage,
                 project_language=project_language,
-            )
-
-        if plan.selected_version is None and not plan.exhausted_update_path:
-            # This is a malformed or incomplete registry state (for example a
-            # package-override stage without a security floor). Never preserve
-            # it as retry_update: commit the same fail-closed latest-stage
-            # pivot used by the deterministic guardrail.
-            component = group.vulnerable_component if group else task.parent_group_id
-            plan = plan.model_copy(
-                update={
-                    "strategy_stage": (
-                        SCARemediationStage.MAVEN_LATEST
-                        if maven_mode
-                        else SCARemediationStage.NPM_LATEST
-                    ),
-                    "selected_version": None,
-                    "exhausted_update_path": True,
-                    "action": "pivot_workaround",
-                    "exact_instruction": (
-                        f"Implement a code workaround or isolation strategy for {component} "
-                        "because the manifest-based update path is exhausted."
-                    ),
-                }
             )
         plans[task.task_id] = plan
         security_floor = diagnostics.security_floor or (
@@ -1491,15 +1085,11 @@ def _run_deterministic_retry_planner(
         updated_diagnostics[task.task_id] = diagnostics.model_copy(
             update={
                 "strategy_stage": plan.strategy_stage,
-                "security_floor": security_floor,
+                "security_floor": diagnostics.security_floor,
                 "selected_version": plan.selected_version,
                 "candidate_versions_considered": plan.candidate_versions_considered,
                 "latest_version_seen": plan.latest_version_seen,
-                "registry_query_performed": (
-                    diagnostics.registry_query_performed or maven_registry_query_attempted
-                    if maven_mode
-                    else bool(security_floor)
-                ),
+                "registry_query_performed": maven_registry_query_attempted,
                 "exhausted_update_path": plan.exhausted_update_path,
                 "target_package_name": plan.target_package_name,
                 "target_dependency_type": plan.target_dependency_type,

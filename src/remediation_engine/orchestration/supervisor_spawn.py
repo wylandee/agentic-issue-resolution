@@ -23,9 +23,6 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.supervisor_planner import (
     _build_high_level_retry_instruction,
-    _override_dependency_type,
-    _registry_report_versions,
-    _registry_selected_version,
     instruction_digest,
 )
 from remediation_engine.orchestration.supervisor_policy import (
@@ -33,8 +30,7 @@ from remediation_engine.orchestration.supervisor_policy import (
     _parent_status_for_strategy_pivot,
 )
 from remediation_engine.orchestration.supervisor_routing import _build_consistency_event
-from remediation_engine.orchestration.task_utils import group_parent_context
-from remediation_engine.tools.registry_tools import plan_npm_parent_version
+from remediation_engine.orchestration.task_utils import select_package_fix_plan
 
 logger = logging.getLogger(__name__)
 
@@ -51,132 +47,41 @@ def _plan_initial_transitive_task(
     *,
     candidate_versions: list[str] | None = None,
 ) -> RemediationTask:
-    """Select the first parent-first candidate before worker dispatch.
+    """Project an already committed outer-plan decision for a transitive task.
 
-    The worker receives only the committed result of this function. Registry
-    failures or an empty candidate set advance deterministically to the next
-    parent stage, and only a fully exhausted parent path commits a child
-    package-manager override.
-
-    Args:
-        task: Pending transitive dependency task to plan.
-        group: Vulnerability group containing the transitive dependency chain.
-        candidate_versions: Optional mutable output list populated with the
-            unfiltered registry candidates used for the selected parent stage.
+    Registry and parent-version selection belong to the outer Portfolio
+    Orchestrator.  This compatibility helper only exposes the task's
+    solver-approved values to callers that still use the historical helper.
     """
-    if (
-        task.strategy != RoutingStrategy.VERSION_BUMP
-        or task.status != TaskStatus.PENDING
-        or task.parent_package_name is None
-        or task.strategy_stage != SCARemediationStage.OSV_MINIMUM
-    ):
+    if task.strategy != RoutingStrategy.VERSION_BUMP or task.status != TaskStatus.PENDING:
         return task
-    child_fixed_version = group.fix_plan.fixed_version if group.fix_plan else None
-    parent_name, parent_version, parent_type = group_parent_context(group)
-    installed_parent_version = task.parent_package_version or parent_version
-    if installed_parent_version and task.parent_package_version != installed_parent_version:
-        task = task.model_copy(update={"parent_package_version": installed_parent_version})
-    if not child_fixed_version or not installed_parent_version or not parent_name:
-        stage = SCARemediationStage.PACKAGE_OVERRIDE
-        target_type = _override_dependency_type(group)
-        override_task = task.model_copy(
-            update={
-                "strategy_stage": stage,
-                "target_package_name": group.vulnerable_component,
-                "target_dependency_type": target_type,
-                "selected_version": child_fixed_version,
-                "instruction": (
-                    f"Apply package-manager override stage for {group.vulnerable_component}: "
-                    f"pin the vulnerable child to exact version {child_fixed_version or 'the OSV-fixed version'} "
-                    f"using {target_type}; do not edit the parent declaration."
-                ),
-            }
+    approved = list(
+        dict.fromkeys(
+            str(version).strip().lstrip("vV")
+            for version in (candidate_versions or task.allowed_target_versions)
+            if str(version).strip()
         )
-        return override_task
-
-    attempted: set[str] = set()
-    for selection, stage in (
-        ("minimum", SCARemediationStage.OSV_MINIMUM),
-        ("same_major", SCARemediationStage.NPM_SAME_MAJOR),
-        ("latest", SCARemediationStage.NPM_LATEST),
-    ):
-        try:
-            report = plan_npm_parent_version.invoke(
-                {
-                    "parent_package_name": parent_name,
-                    "child_package_name": group.vulnerable_component,
-                    "child_fixed_version": child_fixed_version,
-                    "installed_parent_version": installed_parent_version,
-                    "selection": selection,
-                    "attempted_versions": ",".join(sorted(attempted)),
-                    "dependency_ancestry": ",".join(group.dependency_ancestry),
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "supervisor: initial parent registry planning failed for %s (%s)",
-                parent_name,
-                exc,
-            )
-            report = ""
-        report_candidates = _registry_report_versions(report, "Eligible Candidates")
-        if not report_candidates:
-            report_candidates = _registry_report_versions(report, "Compatible Parent Versions")
-        selected = _registry_selected_version(report)
-        if selected and candidate_versions is not None:
-            for candidate in [*report_candidates, selected]:
-                if candidate not in candidate_versions:
-                    candidate_versions.append(candidate)
-        if not selected:
-            continue
-        attempted.add(selected)
-        target_task = task.model_copy(
-            update={
-                "strategy_stage": stage,
-                "target_package_name": parent_name,
-                "target_dependency_type": task.target_dependency_type or parent_type,
-                "selected_version": selected,
-                "parent_minimum_version": (
-                    selected
-                    if stage == SCARemediationStage.OSV_MINIMUM
-                    else task.parent_minimum_version
-                ),
-            }
-        )
-        diagnostics = UpdateRetryDiagnostics(
-            task_id=task.task_id,
-            strategy_stage=stage,
-            security_floor=child_fixed_version,
-            selected_version=selected,
-            target_package_name=parent_name,
-            target_dependency_type=target_task.target_dependency_type,
-            parent_package_name=parent_name,
-            parent_minimum_version=target_task.parent_minimum_version,
-            registry_query_performed=True,
-            candidate_versions_considered=[selected],
-        )
-        return target_task.model_copy(
-            update={
-                "instruction": _build_high_level_retry_instruction(
-                    target_task,
-                    group,
-                    None,
-                    diagnostics,
-                )
-            }
-        )
-
-    target_type = _override_dependency_type(group)
+    )
+    if candidate_versions is not None:
+        candidate_versions[:] = approved
+    selected = task.selected_version or (approved[0] if approved else None)
+    if selected is None:
+        return task
     return task.model_copy(
         update={
-            "strategy_stage": SCARemediationStage.PACKAGE_OVERRIDE,
-            "target_package_name": group.vulnerable_component,
-            "target_dependency_type": target_type,
-            "selected_version": child_fixed_version,
-            "instruction": (
-                f"Apply package-manager override stage for {group.vulnerable_component}: "
-                f"pin the vulnerable child to exact version {child_fixed_version} using {target_type}; "
-                "do not edit the parent declaration."
+            "selected_version": selected,
+            "instruction": task.instruction
+            or _build_high_level_retry_instruction(
+                task,
+                group,
+                None,
+                UpdateRetryDiagnostics(
+                    task_id=task.task_id,
+                    strategy_stage=task.strategy_stage,
+                    selected_version=selected,
+                    candidate_versions_considered=approved,
+                    registry_query_performed=False,
+                ),
             ),
         }
     )
@@ -459,44 +364,28 @@ def _materialize_spawn_requests(
         else:
             child_policy = QAPolicy.INITIAL_CODE_WORKAROUND
 
-        _TRIAGE_BUCKET_TO_STRATEGY: dict[str, str] = {
-            "UPDATE_VERSION": RoutingStrategy.VERSION_BUMP.name,
-            "WORKAROUND": RoutingStrategy.CODE_WORKAROUND.name,
-            "NO_FIX": RoutingStrategy.CODE_WORKAROUND.name,
-        }
         new_group_id = parent_task.parent_group_id
-        if parent_task.strategy.name in new_group_id and req.strategy.name not in new_group_id:
-            new_group_id = new_group_id.replace(parent_task.strategy.name, req.strategy.name)
-        elif parent_task.strategy.value in new_group_id and req.strategy.value not in new_group_id:
-            new_group_id = new_group_id.replace(parent_task.strategy.value, req.strategy.value)
-        else:
-            # Fallback: try triage-level strategy bucket tokens
-            for bucket_token, mapped_strategy_name in _TRIAGE_BUCKET_TO_STRATEGY.items():
-                if (
-                    bucket_token in new_group_id
-                    and mapped_strategy_name == parent_task.strategy.name
-                    and req.strategy.name != parent_task.strategy.name
-                ):
-                    new_group_id = new_group_id.replace(
-                        bucket_token,
-                        req.strategy.name,
-                    )
-                    break
+        # Strategy pivots remain child-task audit records, but the package-only
+        # triage group is the stable logical portfolio item. Never manufacture
+        # a second strategy-specific VulnerabilityGroup.
 
-        if new_group_id != parent_task.parent_group_id and new_group_id not in group_by_id:
-            parent_group = group_by_id.get(parent_task.parent_group_id)
-            if parent_group:
-                new_group = parent_group.model_copy(update={"group_id": new_group_id})
-                group_by_id[new_group_id] = new_group
-                if valid_groups is not None:
-                    valid_groups.append(new_group)
-
+        package_selection = (
+            select_package_fix_plan(
+                group_by_id[parent_task.parent_group_id],
+                req.strategy,
+            )
+            if group_by_id and parent_task.parent_group_id in group_by_id
+            else None
+        )
         new_task = RemediationTask(
             task_id=child_task_id,
             parent_group_id=new_group_id,
             parent_task_id=req.parent_task_id,
             qa_policy=child_policy,
             strategy=req.strategy,
+            selected_plan_issue_ids=(
+                list(package_selection.issue_ids) if package_selection is not None else []
+            ),
             strategy_stage=(
                 SCARemediationStage.CODE_WORKAROUND
                 if req.strategy == RoutingStrategy.CODE_WORKAROUND
