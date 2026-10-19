@@ -28,6 +28,7 @@ from remediation_engine.contracts.schemas import (
     IncrementalScanRecord,
     IssueSource,
     IssueType,
+    MavenTargetOperation,
     MultiPackageAction,
     ODCScanEvidence,
     PackageMutation,
@@ -70,6 +71,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _deterministic_routing,
     _incremental_scan_coverage_complete,
     _materialize_spawn_requests,
+    _maven_attempt_target_operation,
     _maven_attempt_target_paths,
     _normalize_target_task_ids_for_node,
     _ordered_update_candidates,
@@ -470,12 +472,14 @@ def test_create_attempt_snapshot_commits_update_authorizations_and_target_poms()
         allowed_target_versions=["1.2.3", "1.4.0", "1.2.3"],
         allowed_dependency_types=["dependencies", "devDependencies", "dependencies"],
         target_manifest_paths=["modules\\widget\\pom.xml", "pom.xml", "modules/widget/pom.xml"],
+        maven_target_operation=MavenTargetOperation.UPDATE_DECLARATION,
     )
 
     assert committed.current_attempt_id == snapshot.attempt_id
     assert snapshot.allowed_target_versions == ["1.2.3", "1.4.0"]
     assert snapshot.allowed_dependency_types == ["dependencies", "devDependencies"]
     assert snapshot.target_manifest_paths == ["modules/widget/pom.xml", "pom.xml"]
+    assert snapshot.maven_target_operation == MavenTargetOperation.UPDATE_DECLARATION
 
 
 def test_attempt_target_poms_include_only_localized_maven_manifests():
@@ -499,6 +503,36 @@ def test_attempt_target_poms_include_only_localized_maven_manifests():
         "pom.xml",
     ]
     assert _maven_attempt_target_paths(group, ProjectLanguage.NODEJS) == []
+
+
+def test_maven_attempt_operation_is_committed_from_exact_declaration_type():
+    group = SimpleNamespace(
+        localized_issues=[
+            SimpleNamespace(
+                package_manager="maven",
+                manifest_file="pom.xml",
+                version_property_file=None,
+            )
+        ]
+    )
+    task = _make_task("task-1", "g1")
+
+    assert (
+        _maven_attempt_target_operation(
+            task.model_copy(update={"target_dependency_type": "dependencies"}),
+            group,
+            ProjectLanguage.JAVA,
+        )
+        == MavenTargetOperation.UPDATE_DECLARATION
+    )
+    assert (
+        _maven_attempt_target_operation(
+            task.model_copy(update={"target_dependency_type": "dependencyManagement"}),
+            group,
+            ProjectLanguage.JAVA,
+        )
+        == MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT
+    )
 
 
 def test_update_dispatch_authorization_requires_committed_selected_candidate():

@@ -38,6 +38,8 @@ from remediation_engine.orchestration.qa_odc import (
     _ODC_INTERNAL_FULL_SCAN_EXCLUDES,
     _ODC_REPORT_NAME,
     _ODC_TIMEOUT_SECONDS,
+    _maven_embedded_pom_owner_path,
+    _maven_repository_layout_coordinate,
     _parse_report_dependency_paths,
     _parse_report_identifiers,
     _parse_report_package_occurrences,
@@ -117,6 +119,45 @@ def test_report_package_occurrences_preserve_ecosystem_and_project_path() -> Non
     ] == [
         ("a", "1.0.0", "npm", ".odc-targeted/000/node_modules/a/package.json"),
         ("org.example:library", "2.1.0", "maven", ".odc-targeted/001/pom.xml"),
+    ]
+
+
+def test_maven_repository_layout_and_embedded_pom_paths_are_physical_evidence() -> None:
+    artifact_path = (
+        ".odc-targeted/000/dependencies/000/net/bytebuddy/byte-buddy/1.9.7/byte-buddy-1.9.7.jar"
+    )
+    embedded_path = f"{artifact_path}/META-INF/maven/net.bytebuddy/byte-buddy-dep/pom.xml"
+    assert _maven_repository_layout_coordinate(artifact_path) == (
+        "net.bytebuddy:byte-buddy",
+        "1.9.7",
+    )
+    assert _maven_embedded_pom_owner_path(embedded_path) == artifact_path
+    assert (
+        _maven_embedded_pom_owner_path(artifact_path + "/META-INF/maven/x/y/pom.xml/extra") is None
+    )
+
+    report = json.dumps(
+        {
+            "dependencies": [
+                {
+                    "filePath": artifact_path,
+                    "packages": [{"id": "pkg:maven/net.bytebuddy/byte-buddy@1.9.7"}],
+                },
+                {
+                    "filePath": embedded_path,
+                    "packages": [{"id": "pkg:maven/net.bytebuddy/byte-buddy-dep@1.9.7"}],
+                },
+            ]
+        }
+    )
+    occurrences = _parse_report_package_occurrences(report)
+
+    assert occurrences is not None
+    assert [
+        (item.package_name, item.evidence_source, item.owner_file_path) for item in occurrences
+    ] == [
+        ("net.bytebuddy:byte-buddy", "maven_repository_layout", None),
+        ("net.bytebuddy:byte-buddy-dep", "embedded_maven_pom", artifact_path),
     ]
 
 

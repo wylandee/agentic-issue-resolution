@@ -13,11 +13,18 @@ from remediation_engine.contracts import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.contracts.schemas import (
+    MavenTargetOperation,
+    MultiPackageAction,
+    PackageMutation,
+    TacticalStrategy,
+)
 from remediation_engine.orchestration.state import normalize_group_paths
 from remediation_engine.orchestration.tools_manifest_java import (
     _make_modify_and_validate_maven_dependency_tool,
     _MavenPackageCheckpoint,
     _remove_maven_no_fix_dependency_transaction,
+    apply_multi_maven_package_action,
 )
 from remediation_engine.tools.maven_manifest_locator import (
     add_dependency_management_entry,
@@ -104,6 +111,7 @@ def _updater(
     version: str = "2.0.0",
     dependency_type: str = "dependencies",
     state: dict | None = None,
+    operation: MavenTargetOperation = MavenTargetOperation.UPDATE_DECLARATION,
 ):
     return _make_modify_and_validate_maven_dependency_tool(
         sandbox,
@@ -112,7 +120,128 @@ def _updater(
         {GAV: {version}},
         {GAV: {dependency_type}},
         execution_state=state,
+        maven_target_operations_by_package={GAV: {operation.value}},
     )
+
+
+def _multi_maven_action() -> MultiPackageAction:
+    return MultiPackageAction(
+        cluster_id="cluster-maven",
+        dispatch_batch_id="batch-maven",
+        selected_strategy=TacticalStrategy.VERSION_BUMP,
+        package_mutations=[
+            PackageMutation(
+                task_id="task-widget",
+                package_name="org.example:widget",
+                ecosystem="maven",
+                manifest_path="module-a/pom.xml",
+                target_manifest_paths=["module-a/pom.xml"],
+                maven_target_operation=MavenTargetOperation.UPDATE_DECLARATION,
+                target_version="2.0.0",
+                dependency_type="dependencies",
+            ),
+            PackageMutation(
+                task_id="task-library",
+                package_name="org.example:library",
+                ecosystem="maven",
+                manifest_path="module-b/pom.xml",
+                target_manifest_paths=["module-b/pom.xml"],
+                maven_target_operation=MavenTargetOperation.UPDATE_DECLARATION,
+                target_version="2.0.0",
+                dependency_type="dependencies",
+            ),
+        ],
+        rationale="Update the committed Maven package cluster atomically.",
+    )
+
+
+def _two_module_poms() -> dict[str, str]:
+    widget = (
+        "<dependencies><dependency><groupId>org.example</groupId>"
+        "<artifactId>widget</artifactId><version>1.0.0</version>"
+        "</dependency></dependencies>"
+    )
+    library = (
+        "<dependencies><dependency><groupId>org.example</groupId>"
+        "<artifactId>library</artifactId><version>1.0.0</version>"
+        "</dependency></dependencies>"
+    )
+    return {
+        "module-a/pom.xml": _pom(widget, artifact="module-a"),
+        "module-b/pom.xml": _pom(library, artifact="module-b"),
+    }
+
+
+class _FailSecondModuleSync(_Sandbox):
+    def __init__(self, files: dict[str, str], *, fail_first_restore: bool = False):
+        super().__init__(files)
+        self.original_files = dict(files)
+        self.fail_first_restore = fail_first_restore
+        self.second_sync_saw_first_edit = False
+
+    def run(self, command: str, timeout: int = 0):
+        self.commands.append(command)
+        if "-f module-b/pom.xml" in command:
+            self.second_sync_saw_first_edit = (
+                "<version>2.0.0</version>" in self.files["module-a/pom.xml"]
+            )
+            return SimpleNamespace(
+                exit_code=1,
+                stdout="second reactor failed",
+                stderr="dependency resolution rejected",
+            )
+        return SimpleNamespace(exit_code=0, stdout="ok", stderr="")
+
+    def write_file(self, path: str, content: str) -> None:
+        if (
+            self.fail_first_restore
+            and path == "module-a/pom.xml"
+            and content == self.original_files[path]
+        ):
+            self.fail_first_restore = False
+            raise OSError("simulated first-module restore failure")
+        super().write_file(path, content)
+
+
+def test_multi_maven_action_rolls_back_all_poms_after_later_package_failure() -> None:
+    baseline = _two_module_poms()
+    sandbox = _FailSecondModuleSync(baseline)
+    touched_files = {"preexisting.java"}
+    checkpoints: dict[str, object] = {}
+
+    succeeded, error = apply_multi_maven_package_action(
+        sandbox,
+        _multi_maven_action(),
+        touched_files,
+        checkpoint_store=checkpoints,
+    )
+
+    assert succeeded is False
+    assert "Rollback complete" in error
+    assert sandbox.second_sync_saw_first_edit is True
+    assert sandbox.files == baseline
+    assert touched_files == {"preexisting.java"}
+    assert checkpoints == {}
+
+
+def test_multi_maven_action_preserves_partial_restore_evidence() -> None:
+    baseline = _two_module_poms()
+    sandbox = _FailSecondModuleSync(baseline, fail_first_restore=True)
+    touched_files: set[str] = set()
+    checkpoints: dict[str, object] = {}
+
+    succeeded, error = apply_multi_maven_package_action(
+        sandbox,
+        _multi_maven_action(),
+        touched_files,
+        checkpoint_store=checkpoints,
+    )
+
+    assert succeeded is False
+    assert "Rollback incomplete" in error
+    assert "module-a/pom.xml" in touched_files
+    assert "__multi_package_action__" in checkpoints
+    assert "<version>2.0.0</version>" in sandbox.files["module-a/pom.xml"]
 
 
 def _invoke(updater, *, version="2.0.0", kind="dependencies", path="pom.xml", package=GAV):
@@ -179,7 +308,12 @@ def test_direct_managed_and_transitive_override_use_dependency_management():
     )
     sandbox = _Sandbox({"pom.xml": transitive})
     result = _invoke(
-        _updater(sandbox, set(), dependency_type="dependencyManagement"),
+        _updater(
+            sandbox,
+            set(),
+            dependency_type="dependencyManagement",
+            operation=MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT,
+        ),
         kind="dependencyManagement",
     )
 
@@ -205,7 +339,12 @@ def test_external_bom_is_overridden_by_new_local_managed_entry_only():
     )
     sandbox = _Sandbox({"pom.xml": root})
     result = _invoke(
-        _updater(sandbox, set(), dependency_type="dependencyManagement"),
+        _updater(
+            sandbox,
+            set(),
+            dependency_type="dependencyManagement",
+            operation=MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT,
+        ),
         kind="dependencyManagement",
     )
 
@@ -222,7 +361,12 @@ def test_unsafe_transitive_insertion_fails_without_rewriting_inline_pom():
     )
     sandbox = _Sandbox({"pom.xml": source})
     result = _invoke(
-        _updater(sandbox, set(), dependency_type="dependencyManagement"),
+        _updater(
+            sandbox,
+            set(),
+            dependency_type="dependencyManagement",
+            operation=MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT,
+        ),
         kind="dependencyManagement",
     )
 

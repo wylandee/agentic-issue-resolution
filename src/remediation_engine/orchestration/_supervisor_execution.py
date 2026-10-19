@@ -514,13 +514,19 @@ def _impl__validate_committed_state(
             errors.append(f"supervisor: active task {task_id} references missing attempt.")
             continue
         if next_node == "update_subagent" and snapshot.dispatch_node == "update_subagent":
+            maven_mode = snapshot.maven_target_operation is not None
+            normalize_version = (
+                (lambda value: str(value).strip())
+                if maven_mode
+                else (lambda value: str(value).strip().lstrip("vV"))
+            )
             allowed_versions = {
-                str(value).strip().lstrip("vV")
+                normalize_version(value)
                 for value in snapshot.allowed_target_versions
                 if str(value).strip()
             }
             selected_version = (
-                task.selected_version.strip().lstrip("vV") if task.selected_version else None
+                normalize_version(task.selected_version) if task.selected_version else None
             )
             if not allowed_versions or (
                 selected_version is None or selected_version not in allowed_versions
@@ -585,6 +591,15 @@ def _impl__validate_committed_state(
         task = task_queue.get(task_id)
         if task is None:
             continue
+        current_snapshot = snapshots_by_id.get(task.current_attempt_id or "")
+        maven_mode = current_snapshot is not None and (
+            current_snapshot.maven_target_operation is not None
+        )
+        normalize_version = (
+            (lambda value: str(value).strip().lower())
+            if maven_mode
+            else (lambda value: str(value).strip().lstrip("vV").lower())
+        )
         if diagnostics.selected_version != task.selected_version:
             diagnostics = diagnostics.model_copy(update={"selected_version": task.selected_version})
             retry_diagnostics_by_task[task_id] = diagnostics
@@ -601,12 +616,8 @@ def _impl__validate_committed_state(
         if (
             next_node == "update_subagent"
             and task.selected_version
-            and task.selected_version.strip().lstrip("vV").lower()
-            in {
-                version.strip().lstrip("vV").lower()
-                for version in diagnostics.attempted_versions
-                if version
-            }
+            and normalize_version(task.selected_version)
+            in {normalize_version(version) for version in diagnostics.attempted_versions if version}
         ):
             errors.append(f"supervisor: selected version for {task_id} was already attempted.")
     return events, errors

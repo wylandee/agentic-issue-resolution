@@ -6,6 +6,7 @@ import re
 import time
 from functools import cmp_to_key
 from typing import Any
+from xml.etree import ElementTree as ET
 
 import requests
 
@@ -16,6 +17,7 @@ from remediation_engine.contracts.version_policy import (
 )
 
 _MAVEN_SEARCH_URL = "https://search.maven.org/solrsearch/select"
+_MAVEN_REPOSITORY_BASE_URL = "https://repo.maven.apache.org/maven2"
 _REQUEST_TIMEOUT_SECONDS = 15
 _REQUEST_MAX_ATTEMPTS = 3
 _REQUEST_RETRY_BACKOFF_SECONDS = 0.5
@@ -25,7 +27,7 @@ _COORDINATE_PART_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 
 
 def _canonical_coordinate(package_name: str) -> tuple[str, str]:
-    """Validate a canonical group:artifact coordinate before querying Solr."""
+    """Validate a canonical group:artifact coordinate before querying Maven Central."""
     value = str(package_name or "").strip()
     parts = value.split(":")
     if (
@@ -37,34 +39,101 @@ def _canonical_coordinate(package_name: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
-def fetch_maven_registry_candidates(
+def _request_with_retries(
+    url: str,
+    *,
     package_name: str,
-    security_floor: str,
-    attempted_versions: set[str] | None = None,
-) -> list[MavenRegistryCandidate]:
-    """Fetch only the lowest and highest stable Maven releases meeting a floor.
+    source: str,
+    params: dict[str, Any] | None = None,
+) -> requests.Response:
+    """Issue one bounded Maven Central request using the shared retry policy."""
+    for attempt in range(_REQUEST_MAX_ATTEMPTS):
+        try:
+            if params is None:
+                response = requests.get(url, timeout=_REQUEST_TIMEOUT_SECONDS)
+            else:
+                response = requests.get(
+                    url,
+                    params=params,
+                    timeout=_REQUEST_TIMEOUT_SECONDS,
+                )
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            retryable = isinstance(exc, (requests.Timeout, requests.ConnectionError)) or (
+                status_code in _RETRYABLE_HTTP_STATUS_CODES
+            )
+            if not retryable or attempt + 1 == _REQUEST_MAX_ATTEMPTS:
+                raise ValueError(
+                    f"Could not query Maven Central {source} for {package_name} "
+                    f"after {attempt + 1} attempt(s): {exc}"
+                ) from exc
+            time.sleep(_REQUEST_RETRY_BACKOFF_SECONDS * (2**attempt))
+    raise ValueError(f"Could not query Maven Central {source} for {package_name}")
 
-    Coordinates are passed only through Solr's parameter interface. Registry
-    timestamps and response ordering never participate in version selection.
-    HTTP and malformed-response errors fail closed as ``ValueError``.
-    """
-    group_id, artifact_id = _canonical_coordinate(package_name)
-    floor = str(security_floor or "").strip()
-    if not is_stable_maven_version(floor):
-        raise ValueError(f"Invalid Maven security floor: {security_floor!r}")
 
-    attempted = tuple(str(value).strip() for value in (attempted_versions or set()))
+def _parse_metadata_versions(response: requests.Response, package_name: str) -> list[str]:
+    """Parse and validate the canonical repository's version list."""
+    content = getattr(response, "content", None)
+    if content is None:
+        content = getattr(response, "text", None)
+    if not content:
+        raise ValueError(f"Maven Central returned empty repository metadata for {package_name}")
+    try:
+        root = ET.fromstring(content)
+    except (ET.ParseError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Maven Central returned invalid repository metadata for {package_name}: {exc}"
+        ) from exc
 
-    def already_attempted(version: str) -> bool:
-        for attempted_version in attempted:
-            try:
-                if compare_maven_versions(version, attempted_version) == 0:
-                    return True
-            except ValueError:
-                if version == attempted_version:
-                    return True
-        return False
+    versioning_nodes = [element for element in root if element.tag == "versioning"]
+    if root.tag != "metadata" or len(versioning_nodes) != 1:
+        raise ValueError(f"Maven Central returned malformed repository metadata for {package_name}")
+    versions_nodes = [element for element in versioning_nodes[0] if element.tag == "versions"]
+    if len(versions_nodes) != 1:
+        raise ValueError(f"Maven Central returned malformed repository metadata for {package_name}")
 
+    versions_node = versions_nodes[0]
+    version_nodes = list(versions_node)
+    if not version_nodes:
+        raise ValueError(f"Maven Central returned empty repository metadata for {package_name}")
+    if versions_node.attrib or (versions_node.text and versions_node.text.strip()):
+        raise ValueError(f"Maven Central returned malformed repository metadata for {package_name}")
+
+    versions: list[str] = []
+    seen_versions: set[str] = set()
+    for version_node in version_nodes:
+        if (
+            version_node.tag != "version"
+            or version_node.attrib
+            or len(version_node)
+            or (version_node.tail and version_node.tail.strip())
+        ):
+            raise ValueError(
+                f"Maven Central returned malformed repository metadata for {package_name}"
+            )
+        version = (version_node.text or "").strip()
+        if not version:
+            raise ValueError(f"Maven Central returned empty repository metadata for {package_name}")
+        try:
+            compare_maven_versions(version, version)
+        except ValueError as exc:
+            raise ValueError(
+                f"Maven Central returned an invalid Maven version for {package_name}: {version!r}"
+            ) from exc
+        if version not in seen_versions:
+            seen_versions.add(version)
+            versions.append(version)
+    return versions
+
+
+def _fetch_solr_versions(
+    group_id: str,
+    artifact_id: str,
+    package_name: str,
+) -> list[str]:
+    """Fetch and deduplicate all Solr versions, preserving its pagination rules."""
     versions: list[str] = []
     seen_versions: set[str] = set()
     start = 0
@@ -77,31 +146,13 @@ def fetch_maven_registry_candidates(
             "start": start,
             "wt": "json",
         }
-        response = None
-        for attempt in range(_REQUEST_MAX_ATTEMPTS):
-            try:
-                response = requests.get(
-                    _MAVEN_SEARCH_URL,
-                    params=params,
-                    timeout=_REQUEST_TIMEOUT_SECONDS,
-                )
-                response.raise_for_status()
-                break
-            except requests.RequestException as exc:
-                status_code = getattr(getattr(exc, "response", None), "status_code", None)
-                retryable = isinstance(exc, (requests.Timeout, requests.ConnectionError)) or (
-                    status_code in _RETRYABLE_HTTP_STATUS_CODES
-                )
-                if not retryable or attempt + 1 == _REQUEST_MAX_ATTEMPTS:
-                    raise ValueError(
-                        f"Could not query Maven Central for {package_name} "
-                        f"after {attempt + 1} attempt(s): {exc}"
-                    ) from exc
-                time.sleep(_REQUEST_RETRY_BACKOFF_SECONDS * (2**attempt))
-
+        response = _request_with_retries(
+            _MAVEN_SEARCH_URL,
+            package_name=package_name,
+            source="Solr",
+            params=params,
+        )
         try:
-            if response is None:
-                raise ValueError("Maven Central request did not produce a response")
             payload: Any = response.json()
         except (TypeError, ValueError) as exc:
             raise ValueError(
@@ -133,7 +184,59 @@ def fetch_maven_registry_candidates(
         start += len(docs)
         if not docs:
             break
+    return versions
 
+
+def _metadata_url(group_id: str, artifact_id: str) -> str:
+    group_path = group_id.replace(".", "/")
+    return f"{_MAVEN_REPOSITORY_BASE_URL}/{group_path}/{artifact_id}/maven-metadata.xml"
+
+
+def fetch_maven_registry_candidates(
+    package_name: str,
+    security_floor: str,
+    attempted_versions: set[str] | None = None,
+) -> list[MavenRegistryCandidate]:
+    """Fetch only the lowest and highest stable Maven releases meeting a floor.
+
+    Canonical repository metadata is preferred, with the Solr API as a bounded
+    fallback. Registry timestamps, response ordering, and declared latest/release
+    values never participate in version selection.
+    """
+    group_id, artifact_id = _canonical_coordinate(package_name)
+    floor = str(security_floor or "").strip()
+    if not is_stable_maven_version(floor):
+        raise ValueError(f"Invalid Maven security floor: {security_floor!r}")
+
+    attempted = tuple(str(value).strip() for value in (attempted_versions or set()))
+
+    def already_attempted(version: str) -> bool:
+        for attempted_version in attempted:
+            try:
+                if compare_maven_versions(version, attempted_version) == 0:
+                    return True
+            except ValueError:
+                if version == attempted_version:
+                    return True
+        return False
+
+    metadata_url = _metadata_url(group_id, artifact_id)
+    try:
+        metadata_response = _request_with_retries(
+            metadata_url,
+            package_name=package_name,
+            source="repository metadata",
+        )
+        versions = _parse_metadata_versions(metadata_response, package_name)
+    except ValueError as metadata_error:
+        try:
+            versions = _fetch_solr_versions(group_id, artifact_id, package_name)
+        except ValueError as solr_error:
+            raise ValueError(
+                f"Could not fetch Maven Central versions for {package_name}; "
+                f"repository metadata failed: {metadata_error}; "
+                f"Solr fallback failed: {solr_error}"
+            ) from solr_error
     eligible: list[str] = []
     for version in versions:
         if not is_stable_maven_version(version):

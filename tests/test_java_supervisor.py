@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import uuid4
 
 from remediation_engine.contracts.schemas import (
@@ -8,10 +9,12 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    MavenTargetOperation,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
     Severity,
+    SupervisorRetryPlan,
     TacticalStrategy,
     TaskStatus,
     UpdateRetryDiagnostics,
@@ -20,7 +23,11 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.contracts.version_policy import MavenRegistryCandidate
 from remediation_engine.language import ProjectLanguage
-from remediation_engine.orchestration.supervisor_node import _ordered_update_candidates
+from remediation_engine.orchestration.supervisor_node import (
+    _build_multi_package_action,
+    _ordered_update_candidates,
+    _planner_plan_violations,
+)
 from remediation_engine.orchestration.supervisor_planner import _run_deterministic_retry_planner
 from remediation_engine.orchestration.supervisor_policy import _next_sca_stage
 from remediation_engine.orchestration.tactical_supervisor import (
@@ -32,20 +39,27 @@ from remediation_engine.orchestration.task_utils import build_initial_remediatio
 from remediation_engine.tools.fix_planner import _extract_fixed_from_osv_vuln
 
 
-def _maven_group(*, direct: bool, declaration_type: str) -> VulnerabilityGroup:
+def _maven_group(
+    *,
+    direct: bool,
+    declaration_type: str,
+    coordinate: str = "org.example:widget",
+    manifest_path: str = "module/pom.xml",
+) -> VulnerabilityGroup:
+    group_id, artifact_id = coordinate.split(":", 1)
     issue = VulnerabilityIssue(
         source=IssueSource.ODC,
         issue_type=IssueType.SCA,
         severity=Severity.HIGH,
-        package_name="org.example:widget",
+        package_name=coordinate,
         package_version="1.0",
-        purl="pkg:maven/org.example/widget@1.0",
+        purl=f"pkg:maven/{group_id}/{artifact_id}@1.0",
         ecosystem="Maven",
         cve_id="CVE-2025-12345",
     )
     localized = LocalizedIssue(
         issue=issue,
-        manifest_file="module/pom.xml",
+        manifest_file=manifest_path,
         is_direct_dependency=direct,
         package_manager="maven",
         declaration_type=declaration_type,
@@ -54,9 +68,9 @@ def _maven_group(*, direct: bool, declaration_type: str) -> VulnerabilityGroup:
     return VulnerabilityGroup(
         group_id=f"maven-{uuid4()}",
         issue_type=IssueType.SCA,
-        vulnerable_component="org.example:widget",
-        file_path="module/pom.xml",
-        file_paths=["module/pom.xml"],
+        vulnerable_component=coordinate,
+        file_path=manifest_path,
+        file_paths=[manifest_path],
         cve_ids=["CVE-2025-12345"],
         versions=["1.0"],
         sources=[IssueSource.ODC],
@@ -72,6 +86,67 @@ def _maven_group(*, direct: bool, declaration_type: str) -> VulnerabilityGroup:
             instruction="Use a Supervisor-approved Maven Central candidate.",
             strategy_used="osv_api",
         ),
+    )
+
+
+def test_java_atomic_action_commits_full_native_maven_target_scope(tmp_path: Path) -> None:
+    widget_group = _maven_group(
+        direct=True,
+        declaration_type="dependencies",
+        manifest_path="module-a/pom.xml",
+    )
+    library_group = _maven_group(
+        direct=True,
+        declaration_type="dependencies",
+        coordinate="org.example:library",
+        manifest_path="module-b/pom.xml",
+    )
+    groups = {group.group_id: group for group in (widget_group, library_group)}
+    for group in groups.values():
+        localized = group.localized_issues[0]
+        pom_path = tmp_path / localized.manifest_file
+        pom_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact = group.vulnerable_component.split(":", 1)[1]
+        pom_path.write_text(
+            '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+            "<modelVersion>4.0.0</modelVersion><groupId>com.acme</groupId>"
+            f"<artifactId>{artifact}-module</artifactId><version>1.0.0</version>"
+            "<dependencies><dependency><groupId>org.example</groupId>"
+            f"<artifactId>{artifact}</artifactId><version>1.0.0</version>"
+            "</dependency></dependencies></project>",
+            encoding="utf-8",
+        )
+    tasks = {
+        "task-widget": build_initial_remediation_task(
+            widget_group,
+            "task-widget",
+            project_language=ProjectLanguage.JAVA,
+        ).model_copy(update={"selected_version": "1.2.0"}),
+        "task-library": build_initial_remediation_task(
+            library_group,
+            "task-library",
+            project_language=ProjectLanguage.JAVA,
+        ).model_copy(update={"selected_version": "1.2.0"}),
+    }
+
+    action = _build_multi_package_action(
+        "cluster-java",
+        tasks,
+        tasks,
+        groups,
+        project_language=ProjectLanguage.JAVA,
+        repo_root=str(tmp_path),
+    )
+
+    assert action is not None
+    assert [mutation.ecosystem for mutation in action.package_mutations] == ["maven", "maven"]
+    assert [mutation.target_manifest_paths for mutation in action.package_mutations] == [
+        ["module-a/pom.xml"],
+        ["module-b/pom.xml"],
+    ]
+    assert all(
+        mutation.maven_target_operation == MavenTargetOperation.UPDATE_DECLARATION
+        for mutation in action.package_mutations
     )
 
 
@@ -145,6 +220,36 @@ def test_java_retry_stage_and_candidate_whitelist_use_maven_stability() -> None:
     )
     assert versions == ["1.2"]
     assert types == ["dependencies"]
+
+
+def test_maven_retry_plan_validation_preserves_native_version_identity_and_pivot_stage() -> None:
+    task = build_initial_remediation_task(
+        _maven_group(direct=True, declaration_type="dependencies"),
+        "task-plan-validation",
+        project_language=ProjectLanguage.JAVA,
+    )
+    retry = SupervisorRetryPlan(
+        task_id=task.task_id,
+        source_task_revision=task.task_revision,
+        strategy_stage=SCARemediationStage.MAVEN_LATEST,
+        version_scheme="maven",
+        selected_version="v1.0",
+        attempted_versions=["1.0"],
+        candidate_versions_considered=["v1.0"],
+        exact_instruction="Apply the authorized Maven version update.",
+    )
+    assert _planner_plan_violations({task.task_id: retry}, {task.task_id: task}, {}) == []
+
+    pivot = SupervisorRetryPlan(
+        task_id=task.task_id,
+        source_task_revision=task.task_revision,
+        strategy_stage=SCARemediationStage.MAVEN_LATEST,
+        version_scheme="maven",
+        exhausted_update_path=True,
+        action="pivot_workaround",
+        exact_instruction="Use the committed workaround path.",
+    )
+    assert _planner_plan_violations({task.task_id: pivot}, {task.task_id: task}, {}) == []
 
 
 def _maven_candidate(version: str, role: str) -> MavenRegistryCandidate:

@@ -28,12 +28,12 @@ from remediation_engine.contracts.schemas import (
     TaskStatus,
 )
 from remediation_engine.contracts.solver_models import QAPassedWorkspacePrefix
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration import qa_test_parsing as _qa_test_parsing
 from remediation_engine.orchestration.portfolio_orchestrator import (
     isolate_delta_failure,
     rank_suspect_tasks_by_suspicion,
 )
-from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.state import (
     OrchestratorState,
     initial_update_subagent_state,
@@ -60,53 +60,57 @@ def _qa_workspace_graph_digest(
     workspace_volume: str | None,
     *,
     sandbox: Any | None = None,
+    package_manager: str | None = None,
 ) -> str | None:
-    """Return the exact npm graph fingerprint for a QA-passed workspace.
+    """Fingerprint QA-passed npm metadata or Maven POM documents.
 
     Args:
         workspace_volume: Shared Docker volume mounted at ``/workspace``.
-        sandbox: Optional open sandbox. Supplying it binds the fingerprint
-            read to the same workspace session used to create the checkpoint.
+        sandbox: Optional open sandbox that owns the workspace read.
+        package_manager: Package manager whose graph the passed task changed.
 
     Returns:
-        The fingerprint of all package manifests and npm lockfiles, or ``None``
-        if the workspace cannot be read or contains unsupported npm metadata.
+        The corresponding repository fingerprint, or ``None`` when its
+        manifests cannot be read and validated.
     """
     if not workspace_volume:
         return None
 
+    is_maven = str(package_manager or "").strip().lower() == "maven"
     try:
-        from remediation_engine.orchestration.portfolio_certifier import _read_npm_documents
+        from remediation_engine.orchestration.portfolio_certifier import (
+            _maven_documents_fingerprint,
+            _read_maven_documents,
+            _read_npm_documents,
+        )
         from remediation_engine.tools.npm_graph import load_npm_graph_snapshot_from_documents
 
-        if sandbox is not None:
-            documents = _read_npm_documents(
-                sandbox,
-                "",
-                time.monotonic() + 60.0,
-            )
-        else:
-            with _graph_module().DockerSandbox(
-                repo_root=None, workspace_volume=workspace_volume
-            ) as active_sandbox:
-                documents = _read_npm_documents(
-                    active_sandbox,
-                    "",
-                    time.monotonic() + 60.0,
+        def fingerprint(active_sandbox: Any) -> str | None:
+            deadline = time.monotonic() + 60.0
+            if is_maven:
+                documents = _read_maven_documents(active_sandbox, "", deadline)
+                return _maven_documents_fingerprint(documents) if documents else None
+            documents = _read_npm_documents(active_sandbox, "", deadline)
+            if not any(path.rsplit("/", 1)[-1] == "package.json" for path in documents):
+                return None
+            graph_snapshot = load_npm_graph_snapshot_from_documents(documents)
+            if graph_snapshot.diagnostics:
+                log.warning(
+                    "Could not trust QA workspace graph fingerprint: %s",
+                    " | ".join(graph_snapshot.diagnostics),
                 )
-        if not any(path.rsplit("/", 1)[-1] == "package.json" for path in documents):
-            return None
-        graph_snapshot = load_npm_graph_snapshot_from_documents(documents)
+                return None
+            return graph_snapshot.repository_fingerprint
+
+        if sandbox is not None:
+            return fingerprint(sandbox)
+        with _graph_module().DockerSandbox(
+            repo_root=None, workspace_volume=workspace_volume
+        ) as active_sandbox:
+            return fingerprint(active_sandbox)
     except Exception as exc:  # noqa: BLE001 - QA digest is optional, provenance fails closed
         log.warning("Could not fingerprint QA workspace graph: %s", exc)
         return None
-    if graph_snapshot.diagnostics:
-        log.warning(
-            "Could not trust QA workspace graph fingerprint: %s",
-            " | ".join(graph_snapshot.diagnostics),
-        )
-        return None
-    return graph_snapshot.repository_fingerprint
 
 
 def _create_qa_passed_workspace_snapshot(
@@ -123,14 +127,33 @@ def _create_qa_passed_workspace_snapshot(
         The verified graph digest, retained snapshot ID, and any capture errors.
     """
     workspace_volume = state.get("workspace_volume")
+    snapshots = state.get("attempt_snapshots_by_id") or {}
     if not workspace_volume or not attempt_ids:
         return None, None, []
+    managers: set[str] = set()
+    for attempt_id in attempt_ids:
+        snapshot = snapshots.get(attempt_id)
+        if snapshot is None:
+            return None, None, []
+        operation = (
+            snapshot.get("maven_target_operation")
+            if isinstance(snapshot, Mapping)
+            else getattr(snapshot, "maven_target_operation", None)
+        )
+        managers.add("maven" if operation else "npm")
+    if len(managers) != 1:
+        return None, None, []
+    package_manager = next(iter(managers))
     snapshot_id = f"qa-passed-{uuid.uuid4().hex}"
     try:
         with _graph_module().DockerSandbox(
             repo_root=None, workspace_volume=workspace_volume
         ) as sandbox:
-            graph_digest = _qa_workspace_graph_digest(workspace_volume, sandbox=sandbox)
+            graph_digest = _qa_workspace_graph_digest(
+                workspace_volume,
+                sandbox=sandbox,
+                package_manager=package_manager,
+            )
             if graph_digest is None:
                 return None, None, []
             sandbox.create_workspace_snapshot(snapshot_id)

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
+
 from ._qa_runtime import _maven_direct_dependency_present
 from ._tool_support import (
+    _JAVA_SOURCE_SUFFIXES,
     _LINT_CHECK_TIMEOUT_SECONDS,
     _NPM_TEST_TIMEOUT_SECONDS,
     _RUNTIME_SMOKE_TIMEOUT_SECONDS,
@@ -34,6 +37,8 @@ from ._tool_support import (
     tool,
 )
 from .tools_manifest import _is_allowlisted_no_fix_package_file, _is_prohibited_target
+
+_MAVEN_VALIDATION_TIMEOUT_SECONDS = 900
 
 
 def _parse_mocha_json_output(stdout: str) -> dict[str, Any] | None:
@@ -135,10 +140,62 @@ def _format_mocha_failure_output(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _maven_module_directory_for_test(sandbox: DockerSandbox, test_path: str) -> str | None:
+    """Find the nearest Maven module that owns a targeted Java test."""
+    current = Path(test_path).parent
+    while True:
+        relative = current.as_posix()
+        pom_path = "pom.xml" if relative == "." else f"{relative}/pom.xml"
+        if sandbox.read_file(pom_path) is not None:
+            return relative
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _maven_targeted_test_command(
+    sandbox: DockerSandbox,
+    test_path: str,
+    test_name: str | None,
+) -> tuple[str | None, str | None]:
+    """Build a Surefire command scoped to one checked-in Java test class."""
+    if "target" in Path(test_path).parts:
+        return None, "Generated Maven target files cannot be used as targeted test inputs."
+    class_name = Path(test_path).stem
+    if not re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", class_name):
+        return None, f"Java test class name '{class_name}' is not a safe Surefire target."
+
+    selector = class_name
+    selection_note = None
+    hint = str(test_name or "").strip()
+    if hint:
+        method_match = re.fullmatch(
+            rf"(?:{re.escape(class_name)}#)?([A-Za-z_$][A-Za-z0-9_$]*)",
+            hint,
+        )
+        if method_match:
+            selector = f"{class_name}#{method_match.group(1)}"
+        else:
+            selection_note = (
+                f"Test hint '{hint}' is not a Java method identifier; running only "
+                f"the selected Surefire class '{class_name}'."
+            )
+
+    module_directory = _maven_module_directory_for_test(sandbox, test_path)
+    if module_directory is None:
+        return None, f"No owning pom.xml was found for targeted Java test '{test_path}'."
+    command = f"mvn -B -Dtest={shlex.quote(selector)} -Dsurefire.useFile=false test"
+    if module_directory != ".":
+        command = f"cd {shlex.quote(module_directory)} && {command}"
+    return command, selection_note
+
+
 def _make_run_targeted_test_tool(
     sandbox: DockerSandbox,
     preferred_test_files: Sequence[str] | None = None,
     plan_state: dict[str, Any] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ):
     preferred = tuple(
         path.replace("\\", "/").strip().lstrip("/")
@@ -174,6 +231,11 @@ def _make_run_targeted_test_tool(
             preferred,
             accepted_alt,
             sandbox,
+            source_suffixes=(
+                _JAVA_SOURCE_SUFFIXES
+                if project_language == ProjectLanguage.JAVA
+                else _SOURCE_MODULE_SUFFIXES
+            ),
         )
         if selection_error:
             return f"ERROR: [INVALID_VALIDATION_INPUT] {selection_error}"
@@ -193,6 +255,55 @@ def _make_run_targeted_test_tool(
             return (
                 f"BLOCKED: Targeted test path '{norm_path}' could not be verified in the workspace. "
                 "Resolve the source test path from read_repository_map before choosing a replacement."
+            )
+
+        if project_language == ProjectLanguage.JAVA:
+            command, selection_note = _maven_targeted_test_command(
+                sandbox,
+                norm_path,
+                test_name,
+            )
+            if command is None:
+                return f"ERROR: [INVALID_VALIDATION_INPUT] {selection_note}"
+            try:
+                result = sandbox.run(command, timeout=_MAVEN_VALIDATION_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                return f"BLOCKED: Targeted Maven test execution was unavailable - {exc}"
+
+            output = (
+                str(getattr(result, "stdout", "") or "")
+                + "\n"
+                + str(getattr(result, "stderr", "") or "")
+            ).strip()
+            lowered_output = output.lower()
+            if (
+                result.exit_code == 124
+                or "command timed out after" in lowered_output
+                or "sandbox is not running" in lowered_output
+                or result.exit_code == 127
+                or "mvn: not found" in lowered_output
+                or "maven: command not found" in lowered_output
+            ):
+                return (
+                    f"BLOCKED: Targeted Maven test infrastructure failed ({norm_path}).\n"
+                    f"Command: {command}\nDiagnostic:\n{output[:2000]}"
+                )
+            if result.exit_code == 0:
+                executed = re.search(r"Tests run:\s*(\d+)", output, re.IGNORECASE)
+                if executed is None or int(executed.group(1)) == 0:
+                    return (
+                        f"FAILURE: Targeted Maven test result could not be verified: "
+                        f"Surefire reported no executed tests for {norm_path}.\n"
+                        f"Command: {command}\nDiagnostic:\n{output[:2000]}"
+                    )
+                note = f"\n{selection_note}" if selection_note else ""
+                return (
+                    f"SUCCESS: Targeted test passed (maven-surefire): {norm_path} "
+                    f"[{executed.group(1)} tests executed].{note}"
+                )
+            return (
+                f"FAILURE: Targeted Maven test failed: {norm_path} "
+                f"(exit {result.exit_code}).\nCommand: {command}\nDiagnostic:\n{output[:3000]}"
             )
 
         from remediation_engine.orchestration.qa_test_parsing import (
@@ -516,12 +627,13 @@ def _make_validate_workaround_tool(
     touched_files: set[str],
     plan_state: dict[str, Any] | None = None,
     preferred_test_files: Sequence[str] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ):
     """Build one short-circuiting validation gate for source workarounds.
 
-    The gate runs syntax, typecheck, lint, runtime-import, and targeted-test
-    checks in that order. It returns immediately after the first failed gate,
-    preserving the exact diagnostic for the worker's next reasoning turn.
+    The gate runs the selected language's compile and test operations inside
+    the shared typed validation lifecycle. It returns immediately after the
+    first failed gate, preserving the diagnostic for the worker's next turn.
     Individual check implementations remain private helpers so update workers
     can retain their manifest-specific validation contract, while workaround
     workers receive one atomic validation tool.
@@ -533,7 +645,12 @@ def _make_validate_workaround_tool(
     plan_state.setdefault("last_validation_input_error", None)
 
     syntax_tool = _make_validate_code_syntax_tool(sandbox)
-    targeted_test_tool = _make_run_targeted_test_tool(sandbox, preferred_test_files, plan_state)
+    targeted_test_tool = _make_run_targeted_test_tool(
+        sandbox,
+        preferred_test_files,
+        plan_state,
+        project_language=project_language,
+    )
 
     def _failure(gate: str, detail: str) -> str:
         return f"FAILURE: Workaround validation gate '{gate}' failed.\n{detail[:4000]}"
@@ -563,6 +680,40 @@ def _make_validate_workaround_tool(
         return result
 
     def _run_typecheck_gate() -> str:
+        if project_language == ProjectLanguage.JAVA:
+            command = LANGUAGE_CONFIGS[ProjectLanguage.JAVA].compile_command
+            if not command:
+                return "BLOCKED: Maven compilation is not configured for Java validation."
+            try:
+                result = sandbox.run(command, timeout=_MAVEN_VALIDATION_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                return f"BLOCKED: Maven compilation was unavailable: {exc}"
+            output = (
+                str(getattr(result, "stdout", "") or "")
+                + "\n"
+                + str(getattr(result, "stderr", "") or "")
+            ).strip()
+            lowered = output.lower()
+            if result.exit_code == 0:
+                return "SUCCESS: Maven compilation passed."
+            if (
+                result.exit_code == 124
+                or result.exit_code == 127
+                or "command timed out after" in lowered
+                or "sandbox is not running" in lowered
+                or "mvn: not found" in lowered
+                or "maven: command not found" in lowered
+                or _is_infrastructure_failure(output)
+            ):
+                return (
+                    f"BLOCKED: Maven compilation could not complete (exit {result.exit_code}).\n"
+                    f"Command: {command}\nDiagnostic:\n{output[:3000]}"
+                )
+            return (
+                f"FAILURE: Maven compilation failed (exit {result.exit_code}).\n"
+                f"Command: {command}\nDiagnostic:\n{output[:3000]}"
+            )
+
         tsconfig = sandbox.read_file("tsconfig.json")
         if not isinstance(tsconfig, str) or not tsconfig.strip():
             return "SKIPPED: TypeScript gate (tsconfig.json not found)."
@@ -589,6 +740,8 @@ def _make_validate_workaround_tool(
         return f"FAILURE: TypeScript compilation failed (exit {result.exit_code}).\n{output}"
 
     def _run_lint_gate(source_files: Sequence[str]) -> str:
+        if project_language == ProjectLanguage.JAVA:
+            return "SKIPPED: Java lint gate (no repository-configured Maven lint operation)."
         source_files = [
             path
             for path in source_files
@@ -835,6 +988,11 @@ def _make_validate_workaround_tool(
             preferred_test_files,
             accepted_alt,
             sandbox,
+            source_suffixes=(
+                _JAVA_SOURCE_SUFFIXES
+                if project_language == ProjectLanguage.JAVA
+                else _SOURCE_MODULE_SUFFIXES
+            ),
         )
         if target_selection_error:
             return _invalid_validation_request(target_selection_error)
@@ -855,15 +1013,16 @@ def _make_validate_workaround_tool(
                     f"Run one of these source test files instead: {', '.join(sorted(preferred_targets))}."
                 )
 
-        if not runtime_smoke_file or not runtime_smoke_file.strip():
+        smoke_target = None if project_language == ProjectLanguage.JAVA else runtime_smoke_file
+        smoke_selection_note = ""
+        if project_language != ProjectLanguage.JAVA and (
+            not smoke_target or not smoke_target.strip()
+        ):
             return _invalid_validation_request(
                 "Runtime smoke gate failed: runtime_smoke_file must be explicitly supplied for workaround validation.",
                 level="FAILURE",
             )
-
-        smoke_target = runtime_smoke_file
-        smoke_selection_note = ""
-        if smoke_target is not None and smoke_target.strip():
+        if project_language != ProjectLanguage.JAVA and smoke_target is not None:
             normalized_smoke, smoke_selection_message = _select_lightweight_runtime_smoke_target(
                 smoke_target,
                 files,
@@ -889,9 +1048,19 @@ def _make_validate_workaround_tool(
 
         if test_file:
             normalized_test = test_file
-            if Path(normalized_test).suffix.lower() not in _SOURCE_MODULE_SUFFIXES:
+            expected_suffixes = (
+                _JAVA_SOURCE_SUFFIXES
+                if project_language == ProjectLanguage.JAVA
+                else _SOURCE_MODULE_SUFFIXES
+            )
+            if Path(normalized_test).suffix.lower() not in expected_suffixes:
+                supported = (
+                    "a Java source test file"
+                    if project_language == ProjectLanguage.JAVA
+                    else "a JavaScript/TypeScript source test file"
+                )
                 return _invalid_validation_request(
-                    f"Targeted test '{normalized_test}' must be a JavaScript/TypeScript source test file."
+                    f"Targeted test '{normalized_test}' must be {supported}."
                 )
             if not _is_test_file_path(normalized_test):
                 return _invalid_validation_request(
@@ -910,7 +1079,9 @@ def _make_validate_workaround_tool(
         plan_state["validation_calls"] = int(plan_state.get("validation_calls", 0)) + 1
 
         syntax_msg = ""
-        for file_path in files:
+        if project_language == ProjectLanguage.JAVA:
+            syntax_msg = "SKIPPED: Java syntax is validated by the Maven compile gate."
+        for file_path in files if project_language != ProjectLanguage.JAVA else []:
             if _is_allowlisted_no_fix_package_file(file_path, plan_state):
                 continue
             current_content = sandbox.read_file(file_path)
@@ -1013,7 +1184,12 @@ def _make_validate_workaround_tool(
                 f"{_restoration_failure_suffix(restore_errors)}"
             )
 
-        if smoke_target is None and not plan_state.get("runtime_smoke_required", False) and files:
+        if project_language == ProjectLanguage.JAVA:
+            runtime_smoke_result = (
+                "SKIPPED: Java import-only runtime smoke is not applicable; Maven compilation "
+                "and the targeted Surefire test provide native validation."
+            )
+        elif smoke_target is None and not plan_state.get("runtime_smoke_required", False) and files:
             smoke_target = next(
                 (
                     path
@@ -1023,14 +1199,14 @@ def _make_validate_workaround_tool(
                 ),
                 None,
             )
-        if package_removal_mode and not any(
+        elif package_removal_mode and not any(
             Path(path).suffix.lower() in _SOURCE_MODULE_SUFFIXES and not _is_test_file_path(path)
             for path in files
         ):
             runtime_smoke_result = (
                 "SKIPPED: Runtime smoke gate (package removal changed no source modules)."
             )
-        else:
+        elif project_language != ProjectLanguage.JAVA:
             runtime_smoke_result = _run_runtime_smoke_gate(smoke_target)
         smoke_msg = runtime_smoke_result
         if smoke_selection_note:

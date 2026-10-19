@@ -748,6 +748,7 @@ def extract_solver_subgraph(
     *,
     peer_conflict_pairs: Sequence[tuple[str, str]] = (),
     forced_singleton_task_ids: Sequence[str] = (),
+    additional_occurrences: Sequence[SolverPackageOccurrence] = (),
 ) -> SolverSubgraph:
     """Extract a bounded immutable occurrence graph for portfolio solving.
 
@@ -796,6 +797,24 @@ def extract_solver_subgraph(
     valid = True
     target_ids = {target.occurrence_id for target in normalized_targets}
     evidence_occurrences = _bounded_occurrences(snapshot, normalized_targets)
+    additional_by_id: dict[str, SolverPackageOccurrence] = {}
+    for raw_occurrence in additional_occurrences:
+        occurrence = SolverPackageOccurrence.model_validate(raw_occurrence)
+        previous = additional_by_id.get(occurrence.occurrence_id)
+        if previous is not None and previous != occurrence:
+            valid = False
+            diagnostics.append(
+                f"additional occurrence {occurrence.occurrence_id!r} has conflicting evidence"
+            )
+            continue
+        additional_by_id[occurrence.occurrence_id] = occurrence
+    existing_ids = {occurrence.occurrence_id for occurrence in evidence_occurrences}
+    evidence_occurrences.extend(
+        occurrence
+        for occurrence_id, occurrence in sorted(additional_by_id.items())
+        if occurrence_id not in existing_ids
+    )
+    evidence_occurrences.sort(key=lambda item: item.occurrence_id)
     occurrence_index = {occurrence.occurrence_id: occurrence for occurrence in evidence_occurrences}
     for target in normalized_targets:
         occurrence = occurrence_index.get(target.occurrence_id)

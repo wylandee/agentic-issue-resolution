@@ -90,6 +90,7 @@ _READ_WEB_PAGE_TIMEOUT = 15
 _READ_WEB_PAGE_MAX_CHARS = 16_000
 
 _SOURCE_MODULE_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"})
+_JAVA_SOURCE_SUFFIXES = frozenset({".java"})
 _TEST_DIRECTORY_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs"})
 
 # Runtime smoke must prove that the changed module can load.  Application
@@ -246,6 +247,8 @@ def _select_lightweight_runtime_smoke_target(
     candidate_files: Sequence[str],
     targeted_test_file: str | None,
     sandbox: DockerSandbox,
+    *,
+    source_suffixes: frozenset[str] = _SOURCE_MODULE_SUFFIXES,
 ) -> tuple[str | None, str | None]:
     """Select a safe source module for import-only runtime smoke.
 
@@ -269,6 +272,7 @@ def _select_lightweight_runtime_smoke_target(
     normalized_requested, path_error = _runtime_smoke_path_error(
         requested_file,
         targeted_test_file=targeted_test_file,
+        source_suffixes=source_suffixes,
     )
     if path_error:
         return None, path_error
@@ -298,7 +302,7 @@ def _select_lightweight_runtime_smoke_target(
             continue
         if candidate in (normalized_requested, targeted_test_file):
             continue
-        if Path(candidate).suffix.lower() not in _SOURCE_MODULE_SUFFIXES:
+        if Path(candidate).suffix.lower() not in source_suffixes:
             continue
         if _is_test_file_path(candidate):
             continue
@@ -326,11 +330,16 @@ def _is_test_file_path(file_path: str) -> bool:
     path = Path(file_path.replace("\\", "/"))
     lowered_parts = {part.lower() for part in path.parts[:-1]}
     filename = path.name.lower()
+    is_java_test_class = path.suffix.lower() == ".java" and (
+        filename.startswith("test")
+        or filename.endswith(("test.java", "tests.java", "testcase.java"))
+    )
     return bool(
         lowered_parts & _TEST_DIRECTORY_NAMES
         or ".test." in filename
         or ".spec." in filename
         or filename.endswith((".test", ".spec"))
+        or is_java_test_class
     )
 
 
@@ -339,6 +348,8 @@ def _select_targeted_test_file(
     preferred_test_files: Sequence[str] | None,
     accepted_alternative_test: str | None,
     sandbox: DockerSandbox,
+    *,
+    source_suffixes: frozenset[str] = _SOURCE_MODULE_SUFFIXES,
 ) -> tuple[str | None, str | None, str | None]:
     """Resolve an agent test selection to one deterministic existing source test.
 
@@ -369,7 +380,7 @@ def _select_targeted_test_file(
             continue
         if (
             candidate in candidate_paths
-            or Path(candidate).suffix.lower() not in _SOURCE_MODULE_SUFFIXES
+            or Path(candidate).suffix.lower() not in source_suffixes
             or not _is_test_file_path(candidate)
             or sandbox.read_file(candidate) is None
         ):
@@ -403,9 +414,8 @@ def _select_targeted_test_file(
 
         requested_content = sandbox.read_file(normalized_requested)
         requested_suffix = Path(normalized_requested).suffix.lower()
-        requested_is_source_module = (
-            requested_suffix in _SOURCE_MODULE_SUFFIXES
-            and not _is_test_file_path(normalized_requested)
+        requested_is_source_module = requested_suffix in source_suffixes and not _is_test_file_path(
+            normalized_requested
         )
         requested_is_directory_hint = not requested_suffix or normalized_requested.endswith("/")
         requested_is_missing = requested_content is None
@@ -438,6 +448,8 @@ def _select_targeted_test_file(
 def _runtime_smoke_path_error(
     runtime_file: str,
     targeted_test_file: str | None = None,
+    *,
+    source_suffixes: frozenset[str] = _SOURCE_MODULE_SUFFIXES,
 ) -> tuple[str | None, str | None]:
     """Validate and normalize a lightweight source-module smoke target."""
     try:
@@ -445,9 +457,10 @@ def _runtime_smoke_path_error(
     except ValueError as exc:
         return None, str(exc)
 
-    if Path(rel_path).suffix.lower() not in _SOURCE_MODULE_SUFFIXES:
+    if Path(rel_path).suffix.lower() not in source_suffixes:
         return None, (
-            f"Runtime smoke target '{rel_path}' must be a JavaScript/TypeScript source module."
+            f"Runtime smoke target '{rel_path}' must use a supported source suffix: "
+            f"{', '.join(sorted(source_suffixes))}."
         )
     if _is_test_file_path(rel_path):
         return None, (

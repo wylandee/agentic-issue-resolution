@@ -176,6 +176,7 @@ class TestRunQACriticNode:
             workspace_volume="test-vol",
             image="maven:3.9-eclipse-temurin-17",
             maven_repository_volume="agent_maven_repository_test",
+            archive_excluded_dirs=frozenset({"target"}),
         )
         assert result["status"] == "qa_completed"
 

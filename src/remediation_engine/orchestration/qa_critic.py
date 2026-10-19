@@ -79,6 +79,7 @@ from ._qa_runtime import (
     _derive_qa_task_strategies,
     _load_npm_overrides,
     _maven_dependency_tree_occurrences,
+    _maven_odc_artifact_parity,
     _NonNpmInputProject,
     _parse_package_occurrence_key,
     _resolve_action_summary_task_ids,
@@ -124,7 +125,7 @@ def _missing_targeted_input_paths(
         while normalized.startswith("./"):
             normalized = normalized[2:]
         parts = [part for part in normalized.split("/") if part]
-        if len(parts) < 3 or parts[0] != ".odc-targeted":
+        if len(parts) < 2 or parts[0] != ".odc-targeted":
             continue
         relative_path = "/".join(parts[2:])
         if relative_path.rsplit("/", 1)[-1] in {
@@ -521,19 +522,82 @@ def _run_global_execution(
                         for project_path in artifact_manifest.input_paths_by_project
                     }
                     unexpected_packages: Counter[tuple[str, str, str]] = Counter()
-                    for occurrence in targeted_result.reported_package_occurrences or ():
+                    reported_occurrences = targeted_result.reported_package_occurrences or ()
+                    maven_project_paths = set(artifact_manifest.maven_artifacts_by_project)
+                    maven_reported_occurrences = [
+                        occurrence
+                        for occurrence in reported_occurrences
+                        if _targeted_project_for_report_path(
+                            _scan_result_value(occurrence, "file_path", None)
+                        )
+                        in maven_project_paths
+                    ]
+                    maven_parity_diagnostics: tuple[str, ...] = ()
+                    if maven_project_paths:
+                        maven_manifest = replace(
+                            artifact_manifest,
+                            occurrences_by_project={
+                                project_path: artifact_manifest.occurrences_by_project.get(
+                                    project_path, ()
+                                )
+                                for project_path in maven_project_paths
+                            },
+                            task_ids_by_project={
+                                project_path: artifact_manifest.task_ids_by_project.get(
+                                    project_path, ()
+                                )
+                                for project_path in maven_project_paths
+                            },
+                            input_paths_by_project={
+                                project_path: artifact_manifest.input_paths_by_project[project_path]
+                                for project_path in maven_project_paths
+                            },
+                            maven_artifacts_by_project={
+                                project_path: artifact_manifest.maven_artifacts_by_project[
+                                    project_path
+                                ]
+                                for project_path in maven_project_paths
+                            },
+                        )
+                        maven_parity_ok, maven_parity_diagnostics = _maven_odc_artifact_parity(
+                            maven_manifest,
+                            maven_reported_occurrences,
+                        )
+                        if not maven_parity_ok:
+                            logger.info(
+                                "qa_critic: Maven targeted scan path/GAV proof failed: %s",
+                                "; ".join(maven_parity_diagnostics),
+                            )
+
+                    for occurrence in reported_occurrences:
                         ecosystem = str(_scan_result_value(occurrence, "ecosystem", "")).casefold()
+                        project_path = _targeted_project_for_report_path(
+                            _scan_result_value(occurrence, "file_path", None)
+                        )
+                        if project_path not in expected_by_project:
+                            identity = (
+                                ecosystem,
+                                str(_scan_result_value(occurrence, "package_name", "")).casefold(),
+                                str(_scan_result_value(occurrence, "version", "")),
+                            )
+                            unexpected_packages[identity] += 1
+                            continue
+                        evidence_source = str(
+                            _scan_result_value(occurrence, "evidence_source", "odc_package_url")
+                        )
+                        if (
+                            project_path in maven_project_paths
+                            and evidence_source == "embedded_maven_pom"
+                        ):
+                            # Embedded POM rows are validated against their exact
+                            # staged archive owner above. Their nested metadata is
+                            # not a separate dependency-tree occurrence.
+                            continue
                         identity = (
                             ecosystem,
                             str(_scan_result_value(occurrence, "package_name", "")).casefold(),
                             str(_scan_result_value(occurrence, "version", "")),
                         )
-                        project_path = _targeted_project_for_report_path(
-                            _scan_result_value(occurrence, "file_path", None)
-                        )
-                        if project_path not in expected_by_project:
-                            unexpected_packages[identity] += 1
-                            continue
                         reported_by_project[project_path].add(identity)
                         if project_path not in authoritative_occurrence_projects:
                             continue
@@ -573,10 +637,21 @@ def _run_global_execution(
                                     )
                                 )
                             )
+                        if maven_parity_diagnostics:
+                            package_diagnostics.append(
+                                "Maven artifact path/GAV proof failed: "
+                                + "; ".join(maven_parity_diagnostics)
+                            )
                         incomplete_reason = ScanFallbackReason.TARGET_PACKAGE_NOT_REPORTED
                         incomplete_detail = (
                             "ODC report package occurrences differed from the targeted "
                             f"closure: {'; '.join(package_diagnostics)}."
+                        )
+                    elif maven_parity_diagnostics:
+                        incomplete_reason = ScanFallbackReason.TARGET_PACKAGE_NOT_REPORTED
+                        incomplete_detail = (
+                            "ODC Maven report paths did not prove the exact dependency:tree "
+                            f"GAV closure: {'; '.join(maven_parity_diagnostics)}."
                         )
                     elif missing_inputs:
                         incomplete_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
@@ -1676,7 +1751,7 @@ def run_workspace_setup_scan_node(state: OrchestratorState) -> dict[str, Any]:
         if manifest is not None:
             try:
                 with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-                    _cleanup_targeted_artifacts(sandbox, manifest.scan_subdir)
+                    _cleanup_targeted_artifacts(sandbox)
             except Exception as exc:  # noqa: BLE001
                 failure_details.append(f"workspace setup scan cleanup failed: {exc}")
                 failure_reason = failure_reason or ScanFallbackReason.TARGETED_SCAN_FAILED
@@ -1809,6 +1884,7 @@ def _run_maven_workspace_setup_scan_node(
                     task_ids=(setup_task_id,),
                     occurrences=tuple(occurrences),
                     preserve_relative_paths=True,
+                    package_manager="maven",
                 )
                 batch = _TargetedPackageBatch(
                     target_packages=(),
@@ -1849,45 +1925,15 @@ def _run_maven_workspace_setup_scan_node(
                         "ODC report did not contain parseable package ecosystem identities."
                     )
                 else:
-                    expected_by_project = {
-                        project_path: Counter(
-                            (
-                                occurrence.ecosystem.casefold(),
-                                occurrence.package_name.casefold(),
-                                occurrence.version,
-                            )
-                            for occurrence in package_occurrences
-                        )
-                        for project_path, package_occurrences in manifest.occurrences_by_project.items()
-                    }
-                    reported_by_project: dict[str, Counter[tuple[str, str, str]]] = {
-                        project_path: Counter() for project_path in manifest.input_paths_by_project
-                    }
-                    unexpected: Counter[tuple[str, str, str]] = Counter()
-                    for occurrence in scan_result.reported_package_occurrences:
-                        identity = (
-                            str(_scan_result_value(occurrence, "ecosystem", "")).casefold(),
-                            str(_scan_result_value(occurrence, "package_name", "")).casefold(),
-                            str(_scan_result_value(occurrence, "version", "")),
-                        )
-                        project_path = _targeted_project_for_report_path(
-                            _scan_result_value(occurrence, "file_path", None)
-                        )
-                        if project_path not in expected_by_project:
-                            unexpected[identity] += 1
-                            continue
-                        reported_by_project[project_path][identity] += 1
-
-                    mismatches: list[str] = []
-                    for project_path, expected in expected_by_project.items():
-                        reported = reported_by_project.get(project_path, Counter())
-                        if expected != reported:
-                            mismatches.append(project_path)
-                    if mismatches or unexpected:
+                    parity_ok, parity_diagnostics = _maven_odc_artifact_parity(
+                        manifest,
+                        scan_result.reported_package_occurrences,
+                    )
+                    if not parity_ok:
                         failure_reason = ScanFallbackReason.TARGET_PACKAGE_NOT_REPORTED
                         failure_details.append(
-                            "ODC report Maven GAV occurrences differed from dependency:tree "
-                            f"evidence (projects: {', '.join(mismatches) or 'unexpected input'})."
+                            "ODC report Maven artifact paths did not prove exact dependency:tree "
+                            f"coverage: {'; '.join(parity_diagnostics)}"
                         )
 
                     missing_inputs = _missing_targeted_input_paths(
@@ -1916,7 +1962,7 @@ def _run_maven_workspace_setup_scan_node(
             finally:
                 if manifest is not None:
                     try:
-                        _cleanup_targeted_artifacts(sandbox, manifest.scan_subdir)
+                        _cleanup_targeted_artifacts(sandbox)
                     except Exception as exc:  # noqa: BLE001 - cleanup is part of scan completeness
                         failure_reason = failure_reason or ScanFallbackReason.TARGETED_SCAN_FAILED
                         failure_details.append(f"targeted artifact cleanup failed: {exc}")

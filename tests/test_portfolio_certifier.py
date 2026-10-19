@@ -34,10 +34,14 @@ from remediation_engine.contracts.solver_models import (
     PackageResolutionStatus,
     PortfolioReplanRequest,
     QAPassedWorkspacePrefix,
+    SolverBatch,
     SolverCandidateCutKind,
+    SolverCandidatePlan,
     SolverCandidateRejectionReason,
     SolverCandidateRelation,
     SolverFindingRequirement,
+    SolverMutation,
+    SolverPhase,
     SolverRuntimeFingerprint,
     SolverStatus,
     SolverTarget,
@@ -1048,6 +1052,909 @@ def test_terminal_workaround_authorization_requires_qa_pass(terminal_status, exp
     )
 
     assert _authorized_workaround(finding, prepared, selected_plan) is expected
+
+
+@pytest.mark.parametrize(
+    ("resolved_version", "cleanup_exit_code", "expected_status"),
+    [
+        ("2.2", 0, PackageResolutionStatus.CERTIFIED),
+        ("2.1", 0, PackageResolutionStatus.REJECTED),
+        ("2.2", 1, PackageResolutionStatus.UNKNOWN),
+    ],
+)
+def test_maven_assignment_uses_exact_tool_and_native_resolution_evidence(
+    resolved_version: str,
+    cleanup_exit_code: int,
+    expected_status: PackageResolutionStatus,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from remediation_engine.contracts.solver_models import SolverTarget
+    from remediation_engine.orchestration import portfolio_certifier
+
+    original_pom = """<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example</groupId><artifactId>demo</artifactId><version>1.0</version>
+  <dependencies><dependency><groupId>org.yaml</groupId><artifactId>snakeyaml</artifactId>
+    <version>1.30</version></dependency></dependencies>
+</project>
+"""
+    occurrence_id = "pom.xml::org.yaml:snakeyaml"
+    assignment = {occurrence_id: "2.2"}
+    digest = portfolio_certifier._digest(dict(sorted(assignment.items())))
+    scratch_root = ".remedy-plan-cert/test-run"
+    scratch = f"{scratch_root}/{digest}"
+    target = SolverTarget(
+        occurrence_id=occurrence_id,
+        task_id="task-java",
+        group_id="group-java",
+        package_name="org.yaml:snakeyaml",
+        target_package_name="org.yaml:snakeyaml",
+        manifest_path="pom.xml",
+        lockfile_package_key=occurrence_id,
+        installed_version="1.30",
+        version_scheme="maven",
+        dependency_type="dependencies",
+    )
+    finding = SolverFindingRequirement(
+        finding_id="CVE-2026-0001",
+        vulnerable_occurrence_id=occurrence_id,
+        vulnerable_package="org.yaml:snakeyaml",
+        target_occurrence_id=occurrence_id,
+        fixed_version="2.0",
+    )
+    mutation = SolverMutation(
+        task_id="task-java",
+        occurrence_id=occurrence_id,
+        package_name="org.yaml:snakeyaml",
+        manifest_path="pom.xml",
+        target_version="2.2",
+        dependency_type="dependencies",
+    )
+    batch = SolverBatch(
+        batch_id="batch-java",
+        task_ids=["task-java"],
+        mutations=[mutation],
+    )
+    selected_plan = SolverCandidatePlan(
+        candidate_plan_id="candidate-java",
+        selected_candidate_versions=assignment,
+        batches=[batch],
+        phases=[SolverPhase(phase_number=1, batch_ids=[batch.batch_id])],
+    )
+    prepared = SimpleNamespace(
+        workspace_repository_fingerprint=portfolio_certifier._maven_documents_fingerprint(
+            {"pom.xml": original_pom}
+        ),
+        targets=[target],
+        findings=[finding],
+    )
+
+    class FakeSandbox:
+        def __init__(self) -> None:
+            self.files = {f"{scratch}/pom.xml": original_pom}
+            self.commands: list[str] = []
+
+        def read_file(self, path: str) -> str | None:
+            return self.files.get(path)
+
+        def write_file(self, path: str, content: str) -> None:
+            self.files[path] = content
+
+        def run(self, command: str, timeout: int | None = None) -> CommandResult:
+            self.commands.append(command)
+            exit_code = cleanup_exit_code if command.startswith("rm -rf --") else 0
+            return CommandResult(exit_code=exit_code, duration_seconds=0.0)
+
+    sandbox = FakeSandbox()
+
+    def read_maven_documents(_sandbox, root_prefix: str, _deadline: float) -> dict[str, str]:
+        path = f"{root_prefix}/pom.xml" if root_prefix else "pom.xml"
+        content = _sandbox.read_file(path) if root_prefix else original_pom
+        return {path: content} if content is not None else {}
+
+    def run_command(_sandbox, _command, _deadline, label, allow_nonzero=False):
+        if label == "native Maven dependency resolution":
+            output = (
+                "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ demo ---\n"
+                f"[INFO] +- org.yaml:snakeyaml:jar:{resolved_version}:compile\n"
+            )
+            return CommandResult(exit_code=0, stdout=output, duration_seconds=0.0)
+        return CommandResult(exit_code=0, duration_seconds=0.0)
+
+    monkeypatch.setattr(portfolio_certifier, "_read_maven_documents", read_maven_documents)
+    monkeypatch.setattr(portfolio_certifier, "_run_command", run_command)
+
+    result = portfolio_certifier._certify_maven_assignment(
+        sandbox,
+        prepared,
+        selected_plan,
+        assignment,
+        "/tmp/archive.tar",
+        scratch_root,
+        time.monotonic() + 60,
+    )
+
+    assert result.status == expected_status
+    assert any(command.startswith("rm -rf --") for command in sandbox.commands)
+    if expected_status == PackageResolutionStatus.CERTIFIED:
+        assert result.covered_coverage_ids == (finding.coverage_id,)
+        assert result.graph_digest
+        assert "2.2" in sandbox.read_file(f"{scratch}/pom.xml")
+    elif expected_status == PackageResolutionStatus.REJECTED:
+        assert result.rejection_conflict is not None
+        assert result.unresolved_coverage_ids == (finding.coverage_id,)
+    else:
+        assert result.diagnostics == ("Maven assignment scratch cleanup failed",)
+
+
+@pytest.mark.parametrize(
+    ("resolved_version", "expected_status"),
+    [
+        ("2.2", PackageResolutionStatus.CERTIFIED),
+        ("2.1", PackageResolutionStatus.REJECTED),
+    ],
+)
+def test_maven_portfolio_dispatch_uses_shared_solver_and_native_certifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_version: str,
+    expected_status: PackageResolutionStatus,
+):
+    from remediation_engine.contracts.solver_models import (
+        QAPassedWorkspacePrefix,
+        SolverRuntimeFingerprint,
+    )
+    from remediation_engine.language import ProjectLanguage
+    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.orchestration.supervisor_node import _portfolio_plan_is_stale
+    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+
+    pom = tmp_path / "pom.xml"
+    pom.write_text(
+        """<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example</groupId><artifactId>demo</artifactId><version>1.0</version>
+  <dependencies><dependency><groupId>org.yaml</groupId><artifactId>snakeyaml</artifactId>
+    <version>1.30</version></dependency></dependencies>
+</project>
+""",
+        encoding="utf-8",
+    )
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-0001",
+        package_name="org.yaml:snakeyaml",
+        package_version="1.30",
+        fixed_version="2.2",
+        purl="pkg:maven/org.yaml/snakeyaml@1.30",
+        ecosystem="Maven",
+        file_path="pom.xml",
+    )
+    group = VulnerabilityGroup(
+        group_id="maven:pom.xml:org.yaml:snakeyaml",
+        issue_type=IssueType.SCA,
+        vulnerable_component="org.yaml:snakeyaml",
+        file_path="pom.xml",
+        file_paths=["pom.xml"],
+        cve_ids=[issue.cve_id],
+        versions=["1.30"],
+        sources=[IssueSource.ODC],
+        representative_issue_id=issue.id,
+        issues=[issue],
+        localized_issues=[
+            LocalizedIssue(
+                issue=issue,
+                manifest_file="pom.xml",
+                is_direct_dependency=True,
+                package_manager="maven",
+                declaration_type="dependencies",
+                localization_confidence=1.0,
+            )
+        ],
+        fix_plan=FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version="2.2",
+            instruction="Update SnakeYAML to 2.2.",
+            strategy_used="osv_api",
+        ),
+    )
+    task = build_initial_remediation_task(
+        group,
+        "task-java",
+        project_language=ProjectLanguage.JAVA,
+    )
+
+    class MavenSandbox:
+        def __init__(self) -> None:
+            self.files = {"pom.xml": pom.read_text(encoding="utf-8")}
+            self.commands: list[str] = []
+            self.workspace_snapshots: dict[str, dict[str, str]] = {}
+            self.restored_workspace_snapshot_ids: list[str] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read_file(self, path: str) -> str | None:
+            return self.files.get(path)
+
+        def write_file(self, path: str, content: str) -> None:
+            self.files[path] = content
+
+        def create_workspace_snapshot(self, snapshot_id: str) -> None:
+            self.workspace_snapshots[snapshot_id] = dict(self.files)
+
+        def restore_workspace_snapshot(self, snapshot_id: str) -> None:
+            self.restored_workspace_snapshot_ids.append(snapshot_id)
+            self.files = dict(self.workspace_snapshots[snapshot_id])
+
+        def run(self, command: str, timeout: int | None = None) -> CommandResult:
+            self.commands.append(command)
+            return CommandResult(exit_code=0, duration_seconds=0.0)
+
+    sandbox = MavenSandbox()
+    prefix_pom = pom.read_text(encoding="utf-8").replace(
+        "</project>",
+        "  <properties><qa.checkpoint>true</qa.checkpoint></properties>\n</project>",
+    )
+    prefix_snapshot_id = "qa-maven-snapshot"
+    sandbox.workspace_snapshots[prefix_snapshot_id] = {"pom.xml": prefix_pom}
+    prefix = QAPassedWorkspacePrefix(
+        graph_digest=portfolio_certifier._maven_documents_fingerprint({"pom.xml": prefix_pom}),
+        certified_by_portfolio_plan_id="prior-plan",
+        batch_ids=["batch-prior"],
+        task_ids=[task.task_id],
+        task_revisions={task.task_id: task.task_revision},
+        qa_attempt_ids_by_task={task.task_id: "attempt-java"},
+        snapshot_id=prefix_snapshot_id,
+        snapshot_attempt_id="attempt-java",
+    )
+    monkeypatch.setattr(
+        portfolio_certifier,
+        "_last_qa_passed_prefix_provenance",
+        lambda *_args, **_kwargs: prefix,
+    )
+    sandbox_factory_calls: list[dict[str, Any]] = []
+
+    def sandbox_factory(**kwargs):
+        sandbox_factory_calls.append(kwargs)
+        return sandbox
+
+    def read_maven_documents(_sandbox, root_prefix: str, _deadline: float) -> dict[str, str]:
+        path = f"{root_prefix}/pom.xml" if root_prefix else "pom.xml"
+        content = _sandbox.read_file(path)
+        return {path: content} if content is not None else {}
+
+    def run_command(_sandbox, command, _deadline, label, allow_nonzero=False):
+        if label == "Maven workspace archive extraction":
+            arguments = shlex.split(command)
+            archive_root = arguments[arguments.index("-C") + 1].removeprefix("/workspace/")
+            _sandbox.files[f"{archive_root}/pom.xml"] = _sandbox.files["pom.xml"]
+        if label == "native Maven dependency resolution":
+            output = (
+                "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ demo ---\n"
+                f"[INFO] +- org.yaml:snakeyaml:jar:{resolved_version}:compile\n"
+            )
+            return CommandResult(exit_code=0, stdout=output, duration_seconds=0.0)
+        return CommandResult(exit_code=0, duration_seconds=0.0)
+
+    fetched: list[tuple[str, str, set[str]]] = []
+    solver_calls: list[tuple[str, list[dict[str, str]], list[list[str]]]] = []
+
+    def fetch_maven_candidates(coordinate: str, floor: str, attempted: set[str]):
+        fetched.append((coordinate, floor, set(attempted)))
+        return [SimpleNamespace(version="2.2", already_attempted=False)]
+
+    real_solve = portfolio_certifier.solve_portfolio
+
+    def record_solver_call(*args, **kwargs):
+        solver_plan = real_solve(*args, **kwargs)
+        solver_calls.append(
+            (
+                solver_plan.status.value,
+                [
+                    candidate.selected_candidate_versions
+                    for candidate in solver_plan.candidate_plans
+                ],
+                [
+                    [
+                        mutation.occurrence_id
+                        for batch in candidate.batches
+                        for mutation in batch.mutations
+                    ]
+                    for candidate in solver_plan.candidate_plans
+                ],
+            )
+        )
+        return solver_plan
+
+    monkeypatch.setattr(portfolio_certifier, "_read_maven_documents", read_maven_documents)
+    monkeypatch.setattr(
+        portfolio_certifier,
+        "_read_maven_runtime_fingerprint",
+        lambda *_args: SolverRuntimeFingerprint(
+            java_version="17.0.1", maven_version="3.9.0", platform="Linux", architecture="amd64"
+        ),
+    )
+    monkeypatch.setattr(
+        portfolio_certifier, "_build_workspace_archive", lambda *_args: (2048, 0.01)
+    )
+    monkeypatch.setattr(portfolio_certifier, "_run_command", run_command)
+    monkeypatch.setattr(portfolio_certifier, "solve_portfolio", record_solver_call)
+
+    plan = build_certified_portfolio_plan(
+        tmp_path,
+        "agent_workspace_test",
+        [group],
+        {task.task_id: task},
+        maven_cache_volume="agent_maven_repository_test",
+        settings=AppSettings(
+            solver_certification_timeout_seconds=60,
+            solver_timeout_seconds=5,
+            solver_num_search_workers=1,
+            solver_top_k=1,
+        ),
+        portfolio_replan_request=PortfolioReplanRequest(
+            reason="MAVEN_REPLAN_TEST",
+            source_portfolio_plan_id="prior-plan",
+        ),
+        qa_passed_workspace_prefix=prefix,
+        maven_registry_fetcher=fetch_maven_candidates,
+        sandbox_factory=sandbox_factory,
+    )
+    assert sandbox.restored_workspace_snapshot_ids == [prefix_snapshot_id]
+
+    assert plan.resolution_certificate is not None
+    assert plan.resolution_certificate.status == expected_status, (
+        plan.resolution_certificate.diagnostics,
+        solver_calls,
+        fetched,
+    )
+    assert plan.solver_plan is not None
+    if expected_status == PackageResolutionStatus.CERTIFIED:
+        assert plan.solver_plan.status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
+        assert plan.solver_plan.selected_plan is not None
+        assert (
+            plan.solver_plan.selected_plan.selected_candidate_versions[
+                "pom.xml::maven::org.yaml:snakeyaml"
+            ]
+            == "2.2"
+        )
+        assert plan.resolution_certificate.covered_coverage_ids
+        assert plan.workspace_graph_digest == prefix.graph_digest
+        assert plan.resolution_certificate.workspace_prefix_provenance is not None
+        assert (
+            plan.resolution_certificate.workspace_prefix_provenance.certified_by_portfolio_plan_id
+            == plan.portfolio_plan_id
+        )
+        assert fetched == [("org.yaml:snakeyaml", "2.2", set())]
+        assert sandbox_factory_calls[0]["image"] == "maven:3.9-eclipse-temurin-17"
+        assert sandbox_factory_calls[0]["maven_repository_volume"] == "agent_maven_repository_test"
+        assert any("dependency:resolve" in command for command in sandbox.commands)
+        committed_groups, committed_tasks, diagnostics = apply_portfolio_plan(
+            plan,
+            [group],
+            {task.task_id: task},
+        )
+        assert diagnostics == []
+        assert committed_tasks[task.task_id].selected_version == "2.2"
+        assert _portfolio_plan_violations(plan, committed_tasks, committed_groups) == []
+        assert not _portfolio_plan_is_stale(
+            plan,
+            committed_tasks,
+            committed_groups,
+            str(tmp_path),
+        )
+    else:
+        assert plan.solver_plan.status == SolverStatus.INFEASIBLE
+        assert plan.solver_plan.selected_plan is None
+        assert plan.resolution_certificate.rejected_assignment_digests
+        assert plan.resolution_certificate.rejection_conflicts
+
+
+def test_maven_resolved_dependency_paths_cluster_vulnerable_targets(tmp_path: Path):
+    from remediation_engine.language import ProjectLanguage
+    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.orchestration.portfolio_solver import maven_repository_fingerprint
+    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+    from remediation_engine.solver.graph import cluster_packages
+    from remediation_engine.tools.npm_graph import NpmGraphSnapshot
+
+    (tmp_path / "pom.xml").write_text(
+        """<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example</groupId><artifactId>demo</artifactId><version>1.0</version>
+</project>
+""",
+        encoding="utf-8",
+    )
+    coordinates = ("ch.qos.logback:logback-classic", "ch.qos.logback:logback-core")
+    groups: list[VulnerabilityGroup] = []
+    task_queue = {}
+    for index, coordinate in enumerate(coordinates, start=1):
+        issue = VulnerabilityIssue(
+            source=IssueSource.ODC,
+            issue_type=IssueType.SCA,
+            severity=Severity.HIGH,
+            cve_id=f"CVE-2026-7000{index}",
+            package_name=coordinate,
+            package_version="1.2.3",
+            fixed_version=None,
+            purl=f"pkg:maven/{coordinate.replace(':', '/')}@1.2.3",
+            ecosystem="Maven",
+            file_path="pom.xml",
+        )
+        group = VulnerabilityGroup(
+            group_id=f"maven:pom.xml:{coordinate}",
+            issue_type=IssueType.SCA,
+            vulnerable_component=coordinate,
+            file_path="pom.xml",
+            file_paths=["pom.xml"],
+            cve_ids=[issue.cve_id],
+            versions=["1.2.3"],
+            sources=[IssueSource.ODC],
+            representative_issue_id=str(issue.id),
+            issues=[issue],
+            localized_issues=[
+                LocalizedIssue(
+                    issue=issue,
+                    manifest_file="pom.xml",
+                    package_manager="maven",
+                    declaration_type="dependencyManagement",
+                    localization_confidence=1.0,
+                )
+            ],
+            fix_plan=FixPlan(
+                status=FixPlanStatus.VERSION_FOUND,
+                fixed_version="1.2.13",
+                instruction=f"Update {coordinate} to 1.2.13.",
+                strategy_used="osv_api",
+            ),
+        )
+        task_id = f"task-logback-{index}"
+        groups.append(group)
+        task_queue[task_id] = build_initial_remediation_task(
+            group, task_id, project_language=ProjectLanguage.JAVA
+        )
+
+    repository_fingerprint = maven_repository_fingerprint(tmp_path)
+    settings = AppSettings(solver_top_k=1, solver_num_search_workers=1)
+    npm_snapshot = NpmGraphSnapshot(repository_fingerprint=repository_fingerprint)
+
+    def candidate_fetcher(*_args: Any) -> list[SimpleNamespace]:
+        return [SimpleNamespace(version="1.2.13", already_attempted=False)]
+
+    unclustered = _prepare_portfolio_problem(
+        tmp_path,
+        groups,
+        task_queue,
+        npm_snapshot=npm_snapshot,
+        repository_fingerprint=repository_fingerprint,
+        maven_registry_fetcher=candidate_fetcher,
+        settings=settings,
+    )
+    tree_output = r"""[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ demo ---
+[INFO] +- org.springframework.boot:spring-boot-starter:jar:2.1.2.RELEASE:compile
+[INFO] |  +- ch.qos.logback:logback-classic:jar:1.2.3:compile
+[INFO] |  |  \- ch.qos.logback:logback-core:jar:1.2.3:compile
+"""
+    tree_commands: list[str] = []
+
+    class TreeSandbox:
+        def run(self, command: str, timeout: int | None = None) -> CommandResult:
+            tree_commands.append(command)
+            return CommandResult(
+                exit_code=0,
+                stdout=tree_output,
+                duration_seconds=0.0,
+            )
+
+    maven_dependency_paths = portfolio_certifier._maven_target_paths_by_manifest(
+        TreeSandbox(), unclustered.targets, time.monotonic() + 60.0
+    )
+    assert len(tree_commands) == 1
+    assert "maven-dependency-plugin:3.6.1:tree" in tree_commands[0]
+    prepared = _prepare_portfolio_problem(
+        tmp_path,
+        groups,
+        task_queue,
+        npm_snapshot=npm_snapshot,
+        repository_fingerprint=repository_fingerprint,
+        maven_dependency_paths_by_manifest=maven_dependency_paths,
+        maven_registry_fetcher=candidate_fetcher,
+        settings=settings,
+    )
+
+    dependency_edges = [
+        edge for edge in prepared.subgraph.edges if edge.edge_kind == "dependency_ancestry"
+    ]
+    assert len(dependency_edges) == 1
+    plan = solve_portfolio(
+        prepared.subgraph,
+        prepared.candidate_domains,
+        settings=settings,
+        candidate_catalog_complete=prepared.candidate_catalog_complete,
+        candidate_catalog_digest=prepared.candidate_catalog_digest,
+    )
+
+    assert plan.selected_plan is not None
+    decisions = {decision.task_id: decision for decision in plan.selected_plan.task_decisions}
+    assert {decision.selected_strategy for decision in decisions.values()} == {"version_bump"}
+    assert {decision.selected_version for decision in decisions.values()} == {"1.2.13"}
+    batches, _edges, diagnostics = cluster_packages(
+        prepared.subgraph, plan.selected_plan.task_decisions
+    )
+    assert diagnostics == []
+    batch = next(batch for batch in batches if batch.atomic)
+    assert set(batch.task_ids) == set(task_queue)
+    assert len(batch.mutations) == 2
+
+
+def test_maven_qa_passed_snapshot_uses_pom_fingerprint(monkeypatch: pytest.MonkeyPatch):
+    from remediation_engine.orchestration import graph_wrappers, portfolio_certifier
+
+    documents = {
+        "pom.xml": "<project><modelVersion>4.0.0</modelVersion></project>\n",
+    }
+    sandbox_snapshots: list[str] = []
+
+    class SnapshotSandbox:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def create_workspace_snapshot(self, snapshot_id: str) -> None:
+            sandbox_snapshots.append(snapshot_id)
+
+    sandbox = SnapshotSandbox()
+    monkeypatch.setattr(
+        portfolio_certifier,
+        "_read_maven_documents",
+        lambda *_args: documents,
+    )
+    monkeypatch.setattr(
+        graph_wrappers,
+        "_graph_module",
+        lambda: SimpleNamespace(DockerSandbox=lambda **_kwargs: sandbox),
+    )
+    state = {
+        "workspace_volume": "maven-workspace",
+        "attempt_snapshots_by_id": {
+            "attempt-java": SimpleNamespace(maven_target_operation="ensure_dependency_management")
+        },
+    }
+
+    graph_digest, snapshot_id, errors = graph_wrappers._create_qa_passed_workspace_snapshot(
+        state, ["attempt-java"]
+    )
+
+    assert errors == []
+    assert graph_digest == portfolio_certifier._maven_documents_fingerprint(documents)
+    assert snapshot_id is not None
+    assert sandbox_snapshots == [snapshot_id]
+
+
+def test_maven_no_fix_package_removal_does_not_require_release_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from remediation_engine.contracts.solver_models import SolverRuntimeFingerprint
+    from remediation_engine.language import ProjectLanguage
+    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.orchestration.supervisor_node import _portfolio_plan_violations
+    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+
+    pom = tmp_path / "pom.xml"
+    pom.write_text(
+        """<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example</groupId><artifactId>demo</artifactId><version>1.0</version>
+  <dependencies><dependency><groupId>org.example</groupId><artifactId>widget</artifactId>
+    <version>1.0</version></dependency></dependencies>
+</project>
+""",
+        encoding="utf-8",
+    )
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-0002",
+        package_name="org.example:widget",
+        package_version="1.0",
+        purl="pkg:maven/org.example/widget@1.0",
+        ecosystem="Maven",
+        file_path="pom.xml",
+    )
+    group = VulnerabilityGroup(
+        group_id="maven:pom.xml:org.example:widget:NO_FIX",
+        issue_type=IssueType.SCA,
+        vulnerable_component="org.example:widget",
+        file_path="pom.xml",
+        file_paths=["pom.xml"],
+        cve_ids=[issue.cve_id],
+        versions=["1.0"],
+        sources=[IssueSource.ODC],
+        representative_issue_id=str(issue.id),
+        issues=[issue],
+        localized_issues=[
+            LocalizedIssue(
+                issue=issue,
+                manifest_file="pom.xml",
+                is_direct_dependency=True,
+                package_manager="maven",
+                declaration_type="dependencies",
+                localization_confidence=1.0,
+            )
+        ],
+        fix_plan=FixPlan(
+            status=FixPlanStatus.NO_FIX,
+            instruction="No upstream fix is available.",
+            strategy_used="test",
+        ),
+    )
+    task = build_initial_remediation_task(
+        group,
+        "task-maven-no-fix",
+        project_language=ProjectLanguage.JAVA,
+    )
+
+    class MavenSandbox:
+        def __init__(self) -> None:
+            self.files = {"pom.xml": pom.read_text(encoding="utf-8")}
+            self.commands: list[str] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read_file(self, path: str) -> str | None:
+            return self.files.get(path)
+
+        def write_file(self, path: str, content: str) -> None:
+            self.files[path] = content
+
+        def run(self, command: str, timeout: int | None = None) -> CommandResult:
+            self.commands.append(command)
+            return CommandResult(exit_code=0, duration_seconds=0.0)
+
+    sandbox = MavenSandbox()
+
+    def read_maven_documents(
+        _sandbox: MavenSandbox,
+        root_prefix: str,
+        _deadline: float,
+    ) -> dict[str, str]:
+        path = f"{root_prefix}/pom.xml" if root_prefix else "pom.xml"
+        content = _sandbox.read_file(path)
+        return {path: content} if content is not None else {}
+
+    dependency_tree_calls: list[str] = []
+
+    def run_command(
+        _sandbox: MavenSandbox,
+        command: str,
+        _deadline: float,
+        label: str,
+        allow_nonzero: bool = False,
+    ) -> CommandResult:
+        if label == "Maven workspace archive extraction":
+            arguments = shlex.split(command)
+            archive_root = arguments[arguments.index("-C") + 1].removeprefix("/workspace/")
+            _sandbox.files[f"{archive_root}/pom.xml"] = pom.read_text(encoding="utf-8")
+        if label == "native Maven dependency resolution":
+            dependency_tree_calls.append(command)
+            output = (
+                "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ demo ---\n"
+                "[INFO] +- org.example:widget:jar:1.0:compile\n"
+            )
+            return CommandResult(exit_code=0, stdout=output, duration_seconds=0.0)
+        return CommandResult(exit_code=0, duration_seconds=0.0)
+
+    catalog_queries: list[tuple[str, str]] = []
+
+    def reject_unneeded_catalog_query(coordinate: str, floor: str, _attempted: set[str]):
+        catalog_queries.append((coordinate, floor))
+        raise AssertionError("NO_FIX package removal must not query Maven release candidates")
+
+    monkeypatch.setattr(portfolio_certifier, "_read_maven_documents", read_maven_documents)
+    monkeypatch.setattr(
+        portfolio_certifier,
+        "_read_maven_runtime_fingerprint",
+        lambda *_args: SolverRuntimeFingerprint(
+            java_version="17.0.1",
+            maven_version="3.9.0",
+            platform="Linux",
+            architecture="amd64",
+        ),
+    )
+    monkeypatch.setattr(
+        portfolio_certifier, "_build_workspace_archive", lambda *_args: (1024, 0.01)
+    )
+    monkeypatch.setattr(portfolio_certifier, "_run_command", run_command)
+
+    plan = build_certified_portfolio_plan(
+        tmp_path,
+        "agent_workspace_no_fix",
+        [group],
+        {task.task_id: task},
+        settings=AppSettings(
+            solver_certification_timeout_seconds=60,
+            solver_timeout_seconds=5,
+            solver_num_search_workers=1,
+            solver_top_k=1,
+        ),
+        maven_registry_fetcher=reject_unneeded_catalog_query,
+        sandbox_factory=lambda **_kwargs: sandbox,
+    )
+
+    assert catalog_queries == []
+    assert plan.solver_plan is not None
+    assert plan.solver_plan.candidate_catalog_complete is True
+    selected = plan.solver_plan.selected_plan
+    assert selected is not None
+    decision = selected.task_decisions[0]
+    assert decision.task_id == task.task_id
+    assert decision.selected_strategy == "no_fix"
+    assert decision.selected_version is None
+    assert selected.selected_candidate_versions == {"pom.xml::maven::org.example:widget": "1.0"}
+    batch = selected.batches[0]
+    assert batch.dispatchable is True
+    assert batch.mutations == []
+    assert plan.resolution_certificate is not None
+    assert plan.resolution_certificate.status == PackageResolutionStatus.CERTIFIED
+    assert plan.resolution_certificate.covered_coverage_ids == []
+    assert plan.resolution_certificate.unresolved_coverage_ids == batch.unresolved_coverage_ids
+    assert dependency_tree_calls
+
+    committed_groups, committed_tasks, diagnostics = apply_portfolio_plan(
+        plan,
+        [group],
+        {task.task_id: task},
+    )
+    assert diagnostics == []
+    committed = committed_tasks[task.task_id]
+    assert committed.status == TaskStatus.PENDING
+    assert committed.strategy.value == "code_workaround"
+    assert committed.no_fix_stage is not None
+    assert committed.no_fix_stage.value == "package_removal"
+    assert committed.selected_version is None
+    assert committed.allowed_target_versions == []
+    assert _portfolio_plan_violations(plan, committed_tasks, committed_groups) == []
+
+
+def test_maven_no_fix_target_does_not_invalidate_version_catalogs(tmp_path: Path):
+    from remediation_engine.language import ProjectLanguage
+    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+
+    (tmp_path / "pom.xml").write_text(
+        """<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example</groupId><artifactId>demo</artifactId><version>1.0</version>
+  <dependencies>
+    <dependency><groupId>org.yaml</groupId><artifactId>snakeyaml</artifactId>
+      <version>1.30</version></dependency>
+    <dependency><groupId>org.example</groupId><artifactId>widget</artifactId>
+      <version>1.0</version></dependency>
+  </dependencies>
+</project>
+""",
+        encoding="utf-8",
+    )
+
+    def group_for(
+        coordinate: str,
+        version: str,
+        cve_id: str,
+        *,
+        fixed_version: str | None,
+    ) -> VulnerabilityGroup:
+        issue = VulnerabilityIssue(
+            source=IssueSource.ODC,
+            issue_type=IssueType.SCA,
+            severity=Severity.HIGH,
+            cve_id=cve_id,
+            package_name=coordinate,
+            package_version=version,
+            fixed_version=fixed_version,
+            purl=f"pkg:maven/{coordinate.replace(':', '/')}@{version}",
+            ecosystem="Maven",
+            file_path="pom.xml",
+        )
+        group_id = f"maven:pom.xml:{coordinate}"
+        fix_plan = (
+            FixPlan(
+                status=FixPlanStatus.VERSION_FOUND,
+                fixed_version=fixed_version,
+                instruction="Use the authorized Maven release.",
+                strategy_used="test",
+            )
+            if fixed_version
+            else FixPlan(
+                status=FixPlanStatus.NO_FIX,
+                instruction="No upstream fix is available.",
+                strategy_used="test",
+            )
+        )
+        return VulnerabilityGroup(
+            group_id=group_id,
+            issue_type=IssueType.SCA,
+            vulnerable_component=coordinate,
+            file_path="pom.xml",
+            file_paths=["pom.xml"],
+            cve_ids=[cve_id],
+            versions=[version],
+            sources=[IssueSource.ODC],
+            representative_issue_id=str(issue.id),
+            issues=[issue],
+            localized_issues=[
+                LocalizedIssue(
+                    issue=issue,
+                    manifest_file="pom.xml",
+                    is_direct_dependency=True,
+                    package_manager="maven",
+                    declaration_type="dependencies",
+                    localization_confidence=1.0,
+                )
+            ],
+            fix_plan=fix_plan,
+        )
+
+    update_group = group_for(
+        "org.yaml:snakeyaml",
+        "1.30",
+        "CVE-2026-0003",
+        fixed_version="2.2",
+    )
+    no_fix_group = group_for(
+        "org.example:widget",
+        "1.0",
+        "CVE-2026-0004",
+        fixed_version=None,
+    )
+    groups = [update_group, no_fix_group]
+    task_queue = {
+        task.task_id: task
+        for task in (
+            build_initial_remediation_task(
+                update_group,
+                "task-maven-update",
+                project_language=ProjectLanguage.JAVA,
+            ),
+            build_initial_remediation_task(
+                no_fix_group,
+                "task-maven-no-fix",
+                project_language=ProjectLanguage.JAVA,
+            ),
+        )
+    }
+    catalog_queries: list[tuple[str, str]] = []
+
+    def fetch_maven_candidates(coordinate: str, floor: str, _attempted: set[str]):
+        catalog_queries.append((coordinate, floor))
+        return [SimpleNamespace(version="2.2", already_attempted=False)]
+
+    prepared = _prepare_portfolio_problem(
+        tmp_path,
+        groups,
+        task_queue,
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+        maven_registry_fetcher=fetch_maven_candidates,
+    )
+
+    assert prepared.candidate_catalog_complete is True
+    assert catalog_queries == [("org.yaml:snakeyaml", "2.2")]
+    no_fix_domain = prepared.candidate_domains["pom.xml::maven::org.example:widget"]
+    assert [candidate.version for candidate in no_fix_domain] == ["1.0"]
+    assert all(candidate.source != "maven_registry" for candidate in no_fix_domain)
 
 
 def test_active_transitive_workaround_keeps_physical_target_and_other_mutations(tmp_path: Path):

@@ -8,6 +8,7 @@ host repository.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import shlex
@@ -21,6 +22,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from remediation_engine.contracts.schemas import (
+    IssueType,
+    MavenTargetOperation,
     PackageMutation,
     PortfolioPlan,
     QAAttemptResult,
@@ -47,13 +50,17 @@ from remediation_engine.contracts.solver_models import (
     SolverStatus,
     SolverVersionCandidate,
 )
+from remediation_engine.contracts.version_policy import compare_maven_versions
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration._tool_support import _workspace_dir_for_manifest
 from remediation_engine.orchestration.portfolio_solver import (
     _digest,
+    _group_manager,
     _issue_identity,
     _prepare_portfolio_problem,
     _PreparedPortfolioProblem,
     _project_prepared_portfolio_plan,
+    maven_repository_fingerprint,
 )
 from remediation_engine.orchestration.qa_test_parsing import (
     _install_error_category,
@@ -75,6 +82,7 @@ from remediation_engine.orchestration.tools_manifest import (
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 from remediation_engine.settings import AppSettings
 from remediation_engine.solver.cpsat import solve_portfolio
+from remediation_engine.tools.maven_registry_tools import fetch_maven_registry_candidates
 from remediation_engine.tools.npm_graph import (
     NpmGraphSnapshot,
     check_npm_range,
@@ -115,6 +123,7 @@ class _AssignmentResult:
     batch_prefix_graph_digests: Mapping[str, str]
     diagnostics: tuple[str, ...]
     rejection_conflict: SolverCandidateConflict | None = None
+    graph_digest: str | None = None
 
 
 def _remaining_seconds(deadline: float) -> float:
@@ -401,6 +410,91 @@ def _read_runtime_fingerprint(
         )
     except Exception as exc:  # noqa: BLE001
         raise _CertificationUnknown(f"runtime fingerprint is incomplete: {exc}") from exc
+
+
+def _read_maven_runtime_fingerprint(
+    sandbox: DockerSandbox,
+    deadline: float,
+) -> SolverRuntimeFingerprint:
+    """Capture Java, Maven, platform, and architecture for native certification."""
+    result = _run_command(
+        sandbox,
+        "mvn --version && java -version 2>&1 && uname -s && uname -m",
+        deadline,
+        "Maven runtime fingerprint",
+    )
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    maven_version = next((line for line in lines if line.startswith("Apache Maven ")), None)
+    java_version = next((line for line in lines if "Java version:" in line), None)
+    if maven_version is None or java_version is None or len(lines) < 4:
+        raise _CertificationUnknown("Maven runtime fingerprint output is incomplete")
+    return SolverRuntimeFingerprint(
+        java_version=java_version,
+        maven_version=maven_version,
+        platform=lines[-2],
+        architecture=lines[-1],
+    )
+
+
+def _read_maven_documents(
+    sandbox: DockerSandbox,
+    root_prefix: str,
+    deadline: float,
+) -> dict[str, str]:
+    """Read every safely discovered POM in one workspace subtree."""
+    normalized_prefix = _validate_workspace_path(root_prefix) if root_prefix else ""
+    root_absolute = "/workspace" + (f"/{normalized_prefix}" if normalized_prefix else "")
+    command = (
+        f"find {shlex.quote(root_absolute)} "
+        r"-type d \( -name .git -o -name target -o -name node_modules "
+        r"-o -name .remedy-attempt-snapshots -o -name .remedy-plan-cert \) -prune -o "
+        r"-type f -name pom.xml -print | sort"
+    )
+    discovered = _run_command(sandbox, command, deadline, "Maven POM discovery")
+    prefix = root_absolute.rstrip("/") + "/"
+    paths: set[str] = set()
+    for raw in discovered.stdout.splitlines():
+        path = raw.strip().replace("\\", "/")
+        if not path:
+            continue
+        if path.startswith(prefix):
+            relative = path[len(prefix) :]
+        elif path.startswith("./"):
+            relative = path[2:]
+        elif not path.startswith("/"):
+            relative = path
+        else:
+            raise _CertificationUnknown("Maven POM discovery escaped workspace")
+        relative = _validate_workspace_path(relative)
+        paths.add(
+            _validate_workspace_path(f"{normalized_prefix}/{relative}")
+            if normalized_prefix
+            else relative
+        )
+    if not paths:
+        raise _CertificationUnknown("Maven workspace contains no safely discovered POMs")
+    contents = sandbox.read_files(sorted(paths))
+    if not isinstance(contents, Mapping) or any(
+        not isinstance(contents.get(path), str) for path in paths
+    ):
+        raise _CertificationUnknown("Maven POM batch read omitted discovered content")
+    return {path: contents[path] for path in sorted(paths)}
+
+
+def _maven_documents_fingerprint(
+    documents: Mapping[str, str],
+    root_prefix: str = "",
+) -> str:
+    """Fingerprint exact POM bytes using the shared portfolio identity format."""
+    prefix = _validate_workspace_path(root_prefix) + "/" if root_prefix else ""
+    normalized: dict[str, str] = {}
+    for path, content in documents.items():
+        if prefix:
+            if not path.startswith(prefix):
+                raise _CertificationUnknown("Maven POM batch read escaped its scratch root")
+            path = path[len(prefix) :]
+        normalized[path] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return _digest(dict(sorted(normalized.items())))
 
 
 def _read_npm_documents(
@@ -1978,6 +2072,293 @@ def _certify_assignment(
     )
 
 
+def _selected_no_fix_task_ids(selected_plan: Any) -> set[str]:
+    """Return task IDs whose selected solver decision follows the NO_FIX route."""
+    return {
+        decision.task_id
+        for decision in selected_plan.task_decisions
+        if str(decision.selected_strategy).strip().lower().replace("-", "_") == "no_fix"
+    }
+
+
+def _certify_maven_assignment(
+    sandbox: DockerSandbox,
+    prepared: _PreparedPortfolioProblem,
+    selected_plan: SolverCandidatePlan,
+    assignment: Mapping[str, str],
+    archive_path: str,
+    scratch_root: str,
+    deadline: float,
+) -> _AssignmentResult:
+    """Apply one exact Maven assignment in scratch and verify Maven mediation."""
+    from remediation_engine.orchestration._qa_runtime import _maven_dependency_tree_versions
+    from remediation_engine.orchestration.remedy_tools import build_update_toolbelt
+
+    digest = _digest(dict(sorted(assignment.items())))
+    scratch = _validate_workspace_path(f"{scratch_root}/{digest}")
+    absolute = f"/workspace/{scratch}"
+    diagnostics: list[str] = []
+    prefix_digests: dict[str, str] = {}
+    graph_digest: str | None = None
+    assignment_result: _AssignmentResult | None = None
+    cleanup_failed = False
+    try:
+        _run_command(
+            sandbox,
+            f"mkdir -p -- {shlex.quote('/workspace/' + _validate_workspace_path(scratch_root))} "
+            f"&& rm -rf -- {shlex.quote(absolute)} && mkdir -p -- {shlex.quote(absolute)}",
+            deadline,
+            "Maven scratch workspace creation",
+        )
+        _run_command(
+            sandbox,
+            f"tar -xf {shlex.quote(archive_path)} -C {shlex.quote(absolute)}",
+            deadline,
+            "Maven workspace archive extraction",
+        )
+        archived = _read_maven_documents(sandbox, scratch, deadline)
+        if (
+            _maven_documents_fingerprint(archived, scratch)
+            != prepared.workspace_repository_fingerprint
+        ):
+            raise _CertificationUnknown("extracted Maven workspace differs from prepared POMs")
+
+        targets_by_task = {target.task_id: target for target in prepared.targets}
+        no_fix_task_ids = _selected_no_fix_task_ids(selected_plan)
+        eligible_ids = {
+            target.occurrence_id for target in prepared.targets if target.eligible_for_atomic_update
+        }
+        if set(assignment) != eligible_ids:
+            raise _CertificationUnknown("Maven assignment does not cover every eligible task")
+        package_paths: dict[str, set[str]] = defaultdict(set)
+        package_versions: dict[str, set[str]] = defaultdict(set)
+        package_types: dict[str, set[str]] = defaultdict(set)
+        package_operations: dict[str, set[str]] = defaultdict(set)
+        for target in prepared.targets:
+            if target.occurrence_id not in assignment:
+                continue
+            package_paths[target.target_package_name].add(
+                _validate_workspace_path(f"{scratch}/{target.manifest_path}")
+            )
+            package_versions[target.target_package_name].add(assignment[target.occurrence_id])
+            package_types[target.target_package_name].add(target.dependency_type)
+            package_operations[target.target_package_name].add(
+                MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT.value
+                if target.dependency_type == "dependencyManagement"
+                else MavenTargetOperation.UPDATE_DECLARATION.value
+            )
+        if any(
+            len(package_types[name]) != 1 or len(package_operations[name]) != 1
+            for name in package_paths
+        ):
+            raise _CertificationUnknown("Maven targets have ambiguous declaration operations")
+        touched_files: set[str] = set()
+        allowed_paths = sorted({path for values in package_paths.values() for path in values})
+        tool = build_update_toolbelt(
+            sandbox,
+            touched_files,
+            allowed_paths,
+            {name: sorted(paths) for name, paths in package_paths.items()},
+            allowed_target_versions_by_package={
+                name: sorted(versions) for name, versions in package_versions.items()
+            },
+            allowed_dependency_types_by_package={
+                name: sorted(values) for name, values in package_types.items()
+            },
+            project_language=ProjectLanguage.JAVA,
+            maven_target_operations_by_package={
+                name: sorted(values) for name, values in package_operations.items()
+            },
+        )[0]
+
+        batches_by_id = {batch.batch_id: batch for batch in selected_plan.batches}
+        ordered_batch_ids = [
+            batch_id
+            for phase in sorted(selected_plan.phases, key=lambda item: item.phase_number)
+            for batch_id in phase.batch_ids
+            if batch_id in batches_by_id
+        ]
+        ordered_batch_ids.extend(
+            batch_id for batch_id in sorted(batches_by_id) if batch_id not in set(ordered_batch_ids)
+        )
+        executable_count = 0
+        for batch_id in ordered_batch_ids:
+            batch = batches_by_id[batch_id]
+            if not batch.dispatchable:
+                if batch.mutations:
+                    raise _CertificationUnknown("Maven plan has a non-dispatchable mutation batch")
+                continue
+            if not batch.mutations and (
+                not batch.task_ids
+                or any(task_id not in no_fix_task_ids for task_id in batch.task_ids)
+            ):
+                raise _CertificationUnknown("Maven plan has an empty non-NO_FIX dispatchable batch")
+            executable_count += 1
+            for mutation in batch.mutations:
+                target = targets_by_task.get(mutation.task_id)
+                if (
+                    target is None
+                    or assignment.get(target.occurrence_id) != mutation.target_version
+                ):
+                    raise _CertificationUnknown("Maven mutation differs from its exact assignment")
+                result = tool.invoke(
+                    {
+                        "package_name": mutation.package_name,
+                        "target_version": mutation.target_version,
+                        "dependency_type": mutation.dependency_type,
+                        "manifest_path": _validate_workspace_path(
+                            f"{scratch}/{mutation.manifest_path}"
+                        ),
+                    }
+                )
+                if not isinstance(result, str) or not result.startswith("SUCCESS:"):
+                    raise _CertificationUnknown("authorized Maven POM transaction failed")
+            resolver = _run_command(
+                sandbox,
+                f"cd {shlex.quote(absolute)} && mvn -B -DskipTests dependency:tree",
+                deadline,
+                "native Maven dependency resolution",
+                allow_nonzero=True,
+            )
+            if resolver.exit_code != 0:
+                raise _CertificationUnknown("Maven dependency-tree resolution failed")
+            output = f"{resolver.stdout}\n{resolver.stderr}"
+            for target in prepared.targets:
+                if target.occurrence_id not in assignment:
+                    continue
+                group_id, artifact_id = target.target_package_name.split(":", 1)
+                versions = _maven_dependency_tree_versions(output, group_id, artifact_id)
+                requested = assignment[target.occurrence_id]
+                if versions is None:
+                    raise _CertificationUnknown("Maven dependency-tree evidence is incomplete")
+                if requested not in versions:
+                    conflict = _reject_assignment(
+                        assignment,
+                        SolverCandidateRejectionReason.UNCLASSIFIED,
+                        evidence={
+                            "kind": "maven_resolution_mismatch",
+                            "coordinate": target.target_package_name,
+                            "requested_version": requested,
+                            "resolved_versions": sorted(versions),
+                        },
+                        summary="Maven resolved a different version than the selected assignment",
+                    )
+                    raise conflict
+            post_edit = _read_maven_documents(sandbox, scratch, deadline)
+            graph_digest = _digest(
+                {
+                    "pom_fingerprint": _maven_documents_fingerprint(post_edit, scratch),
+                    "dependency_tree": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+                }
+            )
+            prefix_digests[batch.batch_id] = graph_digest
+        if executable_count == 0 or graph_digest is None:
+            raise _CertificationUnknown("Maven plan contains no resolvable package batch")
+
+        covered: list[str] = []
+        unresolved: list[str] = []
+        no_fix_occurrence_ids = {
+            target.occurrence_id for target in prepared.targets if target.task_id in no_fix_task_ids
+        }
+        no_fix_coverage_ids = {
+            finding.coverage_id
+            for finding in prepared.findings
+            if finding.target_occurrence_id in no_fix_occurrence_ids
+        }
+        for finding in prepared.findings:
+            target = next(
+                (
+                    item
+                    for item in prepared.targets
+                    if item.occurrence_id == finding.target_occurrence_id
+                ),
+                None,
+            )
+            selected_version = assignment.get(finding.target_occurrence_id)
+            if target is None or selected_version is None or not finding.fixed_version:
+                unresolved.append(finding.coverage_id)
+                continue
+            group_id, artifact_id = target.target_package_name.split(":", 1)
+            versions = _maven_dependency_tree_versions(output, group_id, artifact_id)
+            if (
+                versions
+                and selected_version in versions
+                and compare_maven_versions(selected_version, finding.fixed_version) >= 0
+            ):
+                covered.append(finding.coverage_id)
+            else:
+                unresolved.append(finding.coverage_id)
+        if set(unresolved) - no_fix_coverage_ids:
+            raise _CertificationUnknown(
+                "Maven resolution did not prove all selected finding coverage"
+            )
+        assignment_result = _AssignmentResult(
+            status=PackageResolutionStatus.CERTIFIED,
+            snapshot=None,
+            covered_coverage_ids=tuple(sorted(covered)),
+            workaround_coverage_ids=(),
+            unresolved_coverage_ids=tuple(sorted(unresolved)),
+            resolved_lockfile_digests={},
+            batch_prefix_graph_digests=dict(sorted(prefix_digests.items())),
+            diagnostics=(),
+            graph_digest=graph_digest,
+        )
+    except _AssignmentRejected as exc:
+        assignment_result = _AssignmentResult(
+            status=PackageResolutionStatus.REJECTED,
+            snapshot=None,
+            covered_coverage_ids=(),
+            workaround_coverage_ids=(),
+            unresolved_coverage_ids=tuple(sorted(f.coverage_id for f in prepared.findings)),
+            resolved_lockfile_digests={},
+            batch_prefix_graph_digests=dict(sorted(prefix_digests.items())),
+            diagnostics=(exc.conflict.summary,),
+            rejection_conflict=exc.conflict,
+            graph_digest=graph_digest,
+        )
+    except _CertificationUnknown as exc:
+        diagnostics.append(str(exc))
+    except Exception as exc:  # noqa: BLE001 - native certification fails closed
+        diagnostics.append(f"unexpected Maven certification failure: {exc}")
+    finally:
+        try:
+            cleanup = sandbox.run(
+                f"rm -rf -- {shlex.quote(absolute)}",
+                timeout=max(1, math.floor(_remaining_seconds(deadline))),
+            )
+            if cleanup.exit_code != 0:
+                cleanup_failed = True
+                diagnostics.append("Maven assignment scratch cleanup failed")
+        except Exception:  # noqa: BLE001
+            cleanup_failed = True
+            diagnostics.append("Maven assignment scratch cleanup failed")
+    if cleanup_failed:
+        return _AssignmentResult(
+            status=PackageResolutionStatus.UNKNOWN,
+            snapshot=None,
+            covered_coverage_ids=(),
+            workaround_coverage_ids=(),
+            unresolved_coverage_ids=tuple(sorted(f.coverage_id for f in prepared.findings)),
+            resolved_lockfile_digests={},
+            batch_prefix_graph_digests=dict(sorted(prefix_digests.items())),
+            diagnostics=tuple(diagnostics),
+            graph_digest=graph_digest,
+        )
+    if assignment_result is not None:
+        return assignment_result
+    return _AssignmentResult(
+        status=PackageResolutionStatus.UNKNOWN,
+        snapshot=None,
+        covered_coverage_ids=(),
+        workaround_coverage_ids=(),
+        unresolved_coverage_ids=tuple(sorted(f.coverage_id for f in prepared.findings)),
+        resolved_lockfile_digests={},
+        batch_prefix_graph_digests=dict(sorted(prefix_digests.items())),
+        diagnostics=tuple(diagnostics),
+        graph_digest=graph_digest,
+    )
+
+
 def _unknown_solver_plan(
     prepared: _PreparedPortfolioProblem,
     diagnostics: Sequence[str],
@@ -2046,7 +2427,9 @@ def _make_certificate(
         candidate_catalog_digest=prepared.candidate_catalog_digest,
         candidate_assignment_digest=_digest(dict(sorted((assignment or {}).items()))),
         resolved_graph_digest=(
-            result.snapshot.repository_fingerprint
+            result.graph_digest
+            if result is not None and result.graph_digest is not None
+            else result.snapshot.repository_fingerprint
             if result is not None and result.snapshot is not None
             else _digest({})
         ),
@@ -2371,12 +2754,384 @@ def _timed_registry_fetcher(
     return fetch
 
 
+def _timed_maven_registry_fetcher(
+    registry_fetcher: Callable[[str, str, set[str]], Sequence[Any]] | None,
+    deadline: float,
+) -> Callable[[str, str, set[str]], Sequence[Any]]:
+    """Wrap Supervisor-only Maven Central access with the certification budget."""
+
+    def fetch(coordinate: str, floor: str, attempted: set[str]) -> Sequence[Any]:
+        if _remaining_seconds(deadline) < 1.0:
+            raise TimeoutError("solver certification deadline expired during Maven catalog fetch")
+        result = (
+            registry_fetcher(coordinate, floor, attempted)
+            if registry_fetcher is not None
+            else fetch_maven_registry_candidates(coordinate, floor, attempted)
+        )
+        if time.monotonic() >= deadline:
+            raise TimeoutError("solver certification deadline expired during Maven catalog fetch")
+        return result
+
+    return fetch
+
+
+def _maven_target_paths_by_manifest(
+    sandbox: DockerSandbox,
+    targets: Sequence[Any],
+    deadline: float,
+) -> dict[str, tuple[tuple[str, ...], ...]]:
+    """Read resolved Maven dependency paths for POMs with multiple update targets.
+
+    Args:
+        sandbox: Read-only workspace sandbox used for Maven resolution.
+        targets: Prepared mutation targets from one Maven portfolio.
+        deadline: Shared certification deadline.
+
+    Returns:
+        Parsed resolved paths keyed by the POM whose dependency tree was read.
+
+    Raises:
+        _CertificationUnknown: If a required Maven dependency tree is incomplete.
+    """
+    from remediation_engine.orchestration._qa_runtime import (
+        _parse_maven_dependency_tree_paths,
+    )
+
+    targets_by_manifest: dict[str, set[str]] = defaultdict(set)
+    for target in targets:
+        strategy = str(target.strategy).strip().lower().replace("-", "_")
+        if target.eligible_for_atomic_update and strategy in {"version_bump", "versionbump"}:
+            targets_by_manifest[target.manifest_path].add(target.target_package_name)
+
+    paths_by_manifest: dict[str, tuple[tuple[str, ...], ...]] = {}
+    for manifest_path, coordinates in sorted(targets_by_manifest.items()):
+        if len(coordinates) < 2:
+            continue
+        normalized_path = _validate_workspace_path(manifest_path)
+        cwd_path = Path(normalized_path).parent
+        cwd = "" if str(cwd_path) == "." else cwd_path.as_posix()
+        prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
+        command = (
+            f"{prefix}mvn -B -Dstyle.color=never -DoutputType=text "
+            "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree"
+        )
+        result = _run_command(
+            sandbox,
+            command,
+            deadline,
+            "Maven portfolio dependency graph",
+            allow_nonzero=True,
+        )
+        if result.exit_code != 0:
+            raise _CertificationUnknown(f"Maven dependency tree failed for {normalized_path!r}")
+        output = f"{result.stdout}\n{result.stderr}"
+        paths = _parse_maven_dependency_tree_paths(output)
+        if paths is None:
+            raise _CertificationUnknown(
+                f"Maven dependency tree for {normalized_path!r} is incomplete or unparseable"
+            )
+        paths_by_manifest[normalized_path] = paths
+    return paths_by_manifest
+
+
+def _build_certified_maven_portfolio_plan(
+    root: Path,
+    workspace_volume: str,
+    maven_cache_volume: str | None,
+    groups: list[VulnerabilityGroup],
+    queue: dict[str, RemediationTask],
+    *,
+    settings: AppSettings,
+    portfolio_iteration: int,
+    target_packages: Iterable[str] | None,
+    peer_conflict_pairs: Sequence[tuple[str, str]],
+    forced_singleton_task_ids: Sequence[str],
+    registry_fetcher: Callable[[str, str, set[str]], Sequence[Any]] | None,
+    sandbox_factory: Callable[..., DockerSandbox],
+    portfolio_replan_request: PortfolioReplanRequest | None = None,
+    qa_passed_prefix_provenance: QAPassedWorkspacePrefix | None = None,
+    prefix_diagnostics: Sequence[str] = (),
+    host_repository_fingerprint: str | None = None,
+) -> PortfolioPlan:
+    """Run the shared portfolio/certificate transaction with Maven-native I/O."""
+    started = time.monotonic()
+    deadline = started + settings.solver_certification_timeout_seconds
+    metrics = _new_certification_metrics()
+    prefix_diagnostics = list(prefix_diagnostics)
+    host_fingerprint = host_repository_fingerprint or maven_repository_fingerprint(root)
+    empty_npm_snapshot = NpmGraphSnapshot(repository_fingerprint=host_fingerprint)
+
+    def no_catalog(_coordinate: str, _floor: str, _attempted: set[str]) -> list[Any]:
+        return []
+
+    prepared = _prepare_portfolio_problem(
+        root,
+        groups,
+        queue,
+        target_packages=target_packages,
+        peer_conflict_pairs=peer_conflict_pairs,
+        forced_singleton_task_ids=forced_singleton_task_ids,
+        portfolio_replan_request=portfolio_replan_request,
+        npm_snapshot=empty_npm_snapshot,
+        repository_fingerprint=host_fingerprint,
+        workspace_repository_fingerprint=host_fingerprint,
+        maven_registry_fetcher=no_catalog,
+        settings=settings,
+    )
+    runtime = _unknown_runtime_fingerprint()
+
+    def unknown_plan(messages: Sequence[str]) -> PortfolioPlan:
+        diagnostics = [*prefix_diagnostics, *messages]
+        solver = _unknown_solver_plan(prepared, diagnostics)
+        plan = _project_prepared_portfolio_plan(
+            prepared, solver, portfolio_iteration=portfolio_iteration
+        )
+        certificate = _make_certificate(
+            plan,
+            prepared,
+            runtime,
+            status=PackageResolutionStatus.UNKNOWN,
+            diagnostics=diagnostics,
+            certification_statistics=_certification_statistics(prepared, metrics, started),
+        )
+        return _attach_resolution_certificate(plan, certificate)
+
+    if not workspace_volume.strip():
+        return unknown_plan(["workspace volume is missing for Maven certification"])
+    if not prepared.targets or any(target.version_scheme != "maven" for target in prepared.targets):
+        return unknown_plan(["Maven portfolio contains unsupported non-Maven targets"])
+    if not prepared.candidate_catalog_complete:
+        # Candidate evidence is refreshed only after the workspace is matched to the host.
+        pass
+
+    run_id = uuid.uuid4().hex
+    archive_path = f"/tmp/remedy-maven-cert-{run_id}.tar"
+    scratch_root = f".remedy-plan-cert/{run_id}"
+    java_config = LANGUAGE_CONFIGS[ProjectLanguage.JAVA]
+    try:
+        with sandbox_factory(
+            repo_root=None,
+            workspace_volume=workspace_volume,
+            image=java_config.docker_image,
+            maven_repository_volume=maven_cache_volume,
+        ) as sandbox:
+            runtime = _read_maven_runtime_fingerprint(sandbox, deadline)
+            if (
+                portfolio_replan_request is not None
+                and qa_passed_prefix_provenance is not None
+                and qa_passed_prefix_provenance.snapshot_id
+            ):
+                sandbox.restore_workspace_snapshot(qa_passed_prefix_provenance.snapshot_id)
+                prefix_diagnostics.append(
+                    "restored the verified QA-passed Maven workspace snapshot "
+                    f"{qa_passed_prefix_provenance.snapshot_id!r} before portfolio replan"
+                )
+            live_documents = _read_maven_documents(sandbox, "", deadline)
+            workspace_fingerprint = _maven_documents_fingerprint(live_documents)
+            expected_workspace_fingerprint = (
+                qa_passed_prefix_provenance.graph_digest
+                if qa_passed_prefix_provenance is not None
+                else host_fingerprint
+            )
+            if workspace_fingerprint != expected_workspace_fingerprint:
+                return unknown_plan(
+                    [
+                        "workspace Maven POM fingerprint does not match the host "
+                        "or verified QA-passed prefix"
+                    ]
+                )
+            maven_dependency_paths = _maven_target_paths_by_manifest(
+                sandbox, prepared.targets, deadline
+            )
+            prepared = _prepare_portfolio_problem(
+                root,
+                groups,
+                queue,
+                target_packages=target_packages,
+                peer_conflict_pairs=peer_conflict_pairs,
+                forced_singleton_task_ids=forced_singleton_task_ids,
+                portfolio_replan_request=portfolio_replan_request,
+                npm_snapshot=empty_npm_snapshot,
+                repository_fingerprint=host_fingerprint,
+                workspace_repository_fingerprint=workspace_fingerprint,
+                maven_dependency_paths_by_manifest=maven_dependency_paths,
+                maven_registry_fetcher=_timed_maven_registry_fetcher(registry_fetcher, deadline),
+                settings=settings,
+                runtime_fingerprint=runtime,
+            )
+            if not prepared.candidate_catalog_complete:
+                return unknown_plan(
+                    [*prepared.diagnostics, "Maven candidate catalog is incomplete"]
+                )
+            archive_bytes, archive_seconds = _build_workspace_archive(
+                sandbox, archive_path, deadline
+            )
+            metrics["archive_bytes"] = archive_bytes
+            metrics["archive_build_time_seconds"] = archive_seconds
+            rejected: list[dict[str, str]] = []
+            rejected_digests: list[str] = []
+            conflicts: list[SolverCandidateConflict] = []
+            no_op_plan_diagnostics: list[str] = []
+            with _certification_artifact_scope(
+                sandbox,
+                workspace_volume,
+                sandbox_factory,
+                scratch_root,
+                archive_path,
+                deadline,
+            ):
+                while _remaining_seconds(deadline) >= 1.0:
+                    solve_settings = replace(
+                        settings,
+                        solver_timeout_seconds=max(1, math.floor(_remaining_seconds(deadline))),
+                    )
+                    metrics["solver_calls"] += 1
+                    solver = solve_portfolio(
+                        prepared.subgraph,
+                        prepared.candidate_domains,
+                        settings=solve_settings,
+                        candidate_catalog_complete=prepared.candidate_catalog_complete,
+                        candidate_catalog_digest=prepared.candidate_catalog_digest,
+                        forbidden_assignments=rejected,
+                    )
+                    accepted_solver_statuses = {SolverStatus.OPTIMAL}
+                    if settings.solver_accept_feasible:
+                        accepted_solver_statuses.add(SolverStatus.FEASIBLE)
+                    if solver.status not in accepted_solver_statuses or not solver.candidate_plans:
+                        plan = _project_prepared_portfolio_plan(
+                            prepared, solver, portfolio_iteration=portfolio_iteration
+                        )
+                        resolution = (
+                            PackageResolutionStatus.REJECTED
+                            if rejected_digests
+                            else PackageResolutionStatus.UNKNOWN
+                        )
+                        certificate = _make_certificate(
+                            plan,
+                            prepared,
+                            runtime,
+                            status=resolution,
+                            rejected_assignment_digests=rejected_digests,
+                            rejection_conflicts=conflicts,
+                            diagnostics=[*solver.diagnostics, *no_op_plan_diagnostics],
+                            certification_statistics=_certification_statistics(
+                                prepared, metrics, started
+                            ),
+                        )
+                        return _attach_resolution_certificate(plan, certificate)
+                    candidate = solver.candidate_plans[0]
+                    selected_solver = solver.model_copy(update={"selected_plan": candidate})
+                    plan = _project_prepared_portfolio_plan(
+                        prepared, selected_solver, portfolio_iteration=portfolio_iteration
+                    )
+                    selected = plan.solver_plan.selected_plan if plan.solver_plan else None
+                    if selected is None:
+                        return unknown_plan(["Maven candidate projection lost its assignment"])
+                    assignment = _read_candidate_assignment(selected)
+                    no_fix_task_ids = _selected_no_fix_task_ids(selected)
+                    if any(
+                        batch.dispatchable
+                        and not batch.mutations
+                        and (
+                            not batch.task_ids
+                            or any(task_id not in no_fix_task_ids for task_id in batch.task_ids)
+                        )
+                        for batch in selected.batches
+                    ):
+                        if not assignment:
+                            return unknown_plan(
+                                [
+                                    *prepared.diagnostics,
+                                    "Maven solver returned a no-op plan without an assignment",
+                                ]
+                            )
+                        normalized_no_op = dict(sorted(assignment.items()))
+                        if normalized_no_op in rejected:
+                            return unknown_plan(
+                                [
+                                    *prepared.diagnostics,
+                                    *no_op_plan_diagnostics,
+                                    "Maven solver repeated a blocked no-op assignment",
+                                ]
+                            )
+                        rejected.append(normalized_no_op)
+                        no_op_plan_diagnostics.append(
+                            "Maven solver proposed a dispatchable batch without an authorized mutation"
+                        )
+                        continue
+                    metrics["candidate_attempts"] += 1
+                    result = _certify_maven_assignment(
+                        sandbox,
+                        prepared,
+                        selected,
+                        assignment,
+                        archive_path,
+                        scratch_root,
+                        deadline,
+                    )
+                    if result.status == PackageResolutionStatus.CERTIFIED:
+                        if maven_repository_fingerprint(root) != host_fingerprint:
+                            return unknown_plan(["host POMs changed during Maven certification"])
+                        certificate = _make_certificate(
+                            plan,
+                            prepared,
+                            runtime,
+                            status=PackageResolutionStatus.CERTIFIED,
+                            assignment=assignment,
+                            result=result,
+                            candidate_plan_id=selected.candidate_plan_id,
+                            rejected_assignment_digests=rejected_digests,
+                            rejection_conflicts=conflicts,
+                            diagnostics=[*prepared.diagnostics, *prefix_diagnostics],
+                            certification_statistics=_certification_statistics(
+                                prepared, metrics, started
+                            ),
+                            workspace_prefix_provenance=(
+                                qa_passed_prefix_provenance.model_copy(
+                                    update={
+                                        "certified_by_portfolio_plan_id": plan.portfolio_plan_id
+                                    }
+                                )
+                                if qa_passed_prefix_provenance is not None
+                                else None
+                            ),
+                        )
+                        return _attach_resolution_certificate(plan, certificate)
+                    if (
+                        result.status != PackageResolutionStatus.REJECTED
+                        or result.rejection_conflict is None
+                    ):
+                        return unknown_plan([*prepared.diagnostics, *result.diagnostics])
+                    assignment_digest = _digest(dict(sorted(assignment.items())))
+                    rejected.append(dict(sorted(assignment.items())))
+                    rejected_digests.append(assignment_digest)
+                    conflicts.append(result.rejection_conflict)
+                    metrics["rejection_counts_by_reason"][
+                        result.rejection_conflict.reason_code.value
+                    ] = (
+                        metrics["rejection_counts_by_reason"].get(
+                            result.rejection_conflict.reason_code.value, 0
+                        )
+                        + 1
+                    )
+                return unknown_plan(["Maven certification deadline expired during solver retries"])
+    except _CertificationUnknown as exc:
+        metrics["unknown_count"] += 1
+        return unknown_plan([*prepared.diagnostics, str(exc)])
+    except Exception as exc:  # noqa: BLE001 - shared portfolio boundary fails closed
+        metrics["unknown_count"] += 1
+        return unknown_plan(
+            [*prepared.diagnostics, f"unexpected Maven certification failure: {exc}"]
+        )
+
+
 def build_certified_portfolio_plan(
     repo_root: str | Path,
     workspace_volume: str,
     groups: Iterable[VulnerabilityGroup],
     task_queue: Mapping[str, RemediationTask],
     *,
+    maven_cache_volume: str | None = None,
     target_packages: Iterable[str] | None = None,
     peer_conflict_pairs: Iterable[tuple[str, str]] = (),
     forced_singleton_task_ids: Iterable[str] = (),
@@ -2388,6 +3143,7 @@ def build_certified_portfolio_plan(
     attempt_snapshots_by_id: Mapping[str, Any] | None = None,
     qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None = None,
     registry_fetcher: PackumentFetcher | None = None,
+    maven_registry_fetcher: Callable[[str, str, set[str]], Sequence[Any]] | None = None,
     sandbox_factory: Callable[..., DockerSandbox] = DockerSandbox,
 ) -> PortfolioPlan:
     """Build and certify one complete package assignment in the live workspace.
@@ -2395,6 +3151,7 @@ def build_certified_portfolio_plan(
     Args:
         repo_root: Host repository used only for fingerprints and stale-plan checks.
         workspace_volume: Docker volume populated by ``workspace_builder``.
+        maven_cache_volume: Optional run-owned Maven repository volume.
         groups: Current triaged and prepared vulnerability groups.
         task_queue: Supervisor-owned task revisions for this portfolio iteration.
         target_packages: Optional synthetic mutation-task allowlist.
@@ -2408,6 +3165,7 @@ def build_certified_portfolio_plan(
         attempt_snapshots_by_id: Supervisor-committed attempts indexed by attempt ID.
         qa_passed_workspace_prefix: Latest cumulative QA-passed workspace checkpoint.
         registry_fetcher: Injectable fresh raw-packument fetcher for deterministic tests.
+        maven_registry_fetcher: Injectable Maven Central candidate lookup for deterministic tests.
         sandbox_factory: Injectable DockerSandbox-compatible context manager.
 
     Returns:
@@ -2424,6 +3182,40 @@ def build_certified_portfolio_plan(
     root = Path(repo_root).resolve()
     group_list = [group.model_copy(deep=True) for group in groups]
     queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
+    if any(
+        group.issue_type == IssueType.SCA and _group_manager(group) == "maven"
+        for group in group_list
+    ):
+        host_fingerprint = maven_repository_fingerprint(root)
+        prefix_diagnostics: list[str] = []
+        qa_passed_prefix_provenance = _last_qa_passed_prefix_provenance(
+            prior_portfolio_plan,
+            queue,
+            portfolio_replan_request,
+            host_fingerprint,
+            qa_results_by_attempt=qa_results_by_attempt,
+            attempt_snapshots_by_id=attempt_snapshots_by_id,
+            qa_passed_workspace_prefix=qa_passed_workspace_prefix,
+            diagnostics=prefix_diagnostics,
+        )
+        return _build_certified_maven_portfolio_plan(
+            root,
+            workspace_volume,
+            maven_cache_volume,
+            group_list,
+            queue,
+            settings=resolved_settings,
+            portfolio_iteration=portfolio_iteration,
+            target_packages=target_packages,
+            peer_conflict_pairs=tuple(peer_conflict_pairs),
+            forced_singleton_task_ids=tuple(forced_singleton_task_ids),
+            registry_fetcher=maven_registry_fetcher,
+            sandbox_factory=sandbox_factory,
+            portfolio_replan_request=portfolio_replan_request,
+            qa_passed_prefix_provenance=qa_passed_prefix_provenance,
+            prefix_diagnostics=prefix_diagnostics,
+            host_repository_fingerprint=host_fingerprint,
+        )
     host_snapshot = load_npm_graph_snapshot(root)
     host_fingerprint = host_snapshot.repository_fingerprint
     prefix_diagnostics: list[str] = []

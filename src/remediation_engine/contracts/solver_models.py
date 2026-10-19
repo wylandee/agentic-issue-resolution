@@ -186,6 +186,7 @@ class SolverTarget(_SolverModel):
     manifest_path: str = Field(..., min_length=1)
     lockfile_package_key: str = Field(..., min_length=1)
     installed_version: str = Field(..., min_length=1)
+    version_scheme: Literal["semver", "maven"] = "semver"
     dependency_type: str = Field(default="dependencies", min_length=1)
     strategy: str = Field(default="version_bump", min_length=1)
     is_synthetic: bool = False
@@ -347,6 +348,7 @@ class SolverVersionCandidate(_SolverModel):
     """Bounded, validated registry candidate for one solver target."""
 
     version: str = Field(..., min_length=1)
+    version_scheme: Literal["semver", "maven"] = "semver"
     semver_key: tuple[int, ...] = Field(default_factory=tuple)
     source: str = "registry"
     meets_security_floor: bool = True
@@ -403,11 +405,22 @@ class SolverVersionCandidate(_SolverModel):
 
     @model_validator(mode="after")
     def _derive_semver_key(self) -> SolverVersionCandidate:
-        if self.semver_key:
+        if self.semver_key or self.version_scheme != "semver":
             return self
         match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$", self.version)
         if match:
             object.__setattr__(self, "semver_key", tuple(int(part) for part in match.groups()))
+        return self
+
+    @model_validator(mode="after")
+    def _validate_maven_version(self) -> SolverVersionCandidate:
+        if self.version_scheme == "maven":
+            if self.source != "current":
+                from remediation_engine.contracts.version_policy import compare_maven_versions
+
+                compare_maven_versions(self.version, self.version)
+            if self.semver_key:
+                raise ValueError("Maven candidates must not carry a semver_key.")
         return self
 
 
@@ -456,14 +469,24 @@ class SolverEvidenceDomain(_SolverModel):
 
 
 class SolverRuntimeFingerprint(_SolverModel):
-    """Node runtime identity used to certify package-manager compatibility."""
+    """Ecosystem runtime identity used to certify package-manager compatibility."""
 
-    node_version: str = Field(..., min_length=1)
-    npm_version: str = Field(..., min_length=1)
+    node_version: str = Field(default="not_applicable", min_length=1)
+    npm_version: str = Field(default="not_applicable", min_length=1)
+    java_version: str = Field(default="not_applicable", min_length=1)
+    maven_version: str = Field(default="not_applicable", min_length=1)
     platform: str = Field(..., min_length=1)
     architecture: str = Field(..., min_length=1)
 
-    @field_validator("node_version", "npm_version", "platform", "architecture", mode="before")
+    @field_validator(
+        "node_version",
+        "npm_version",
+        "java_version",
+        "maven_version",
+        "platform",
+        "architecture",
+        mode="before",
+    )
     @classmethod
     def _text(cls, value: Any, info: Any) -> str:
         return _required_text(value, info.field_name)

@@ -542,6 +542,8 @@ def _normalise_odc_report_path(value: str) -> str | None:
     normalized = value.strip().replace("\\", "/").split("?", 1)[0].split("#", 1)[0]
     if not normalized:
         return None
+    if ".." in normalized.split("/"):
+        return None
     targeted_marker = ".odc-targeted/"
     if targeted_marker in normalized:
         normalized = targeted_marker + normalized.split(targeted_marker, 1)[1]
@@ -556,6 +558,96 @@ def _normalise_odc_report_path(value: str) -> str | None:
     if not normalized or normalized == ".." or normalized.startswith("../") or "/../" in normalized:
         return None
     return normalized
+
+
+_MAVEN_ARTIFACT_SUFFIXES = frozenset({".aar", ".ear", ".jar", ".war", ".zip"})
+
+
+def _maven_repository_layout_coordinate(
+    report_path: str | None,
+) -> tuple[str, str] | None:
+    """Read one GAV from a Maven repository-layout artifact path.
+
+    Only direct artifacts under a targeted project's per-POM ``dependencies``
+    directory qualify. Embedded paths such as ``artifact.jar/META-INF/...``
+    are not direct artifacts and must be attributed through their containing
+    archive instead.
+    """
+    if not isinstance(report_path, str):
+        return None
+    normalized = _normalise_odc_report_path(report_path)
+    if normalized is None:
+        return None
+    parts = normalized.split("/")
+    try:
+        marker = parts.index(".odc-targeted")
+    except ValueError:
+        return None
+    if marker + 5 >= len(parts) or parts[marker + 2] != "dependencies":
+        return None
+    if not parts[marker + 1].isdigit() or not parts[marker + 3].isdigit():
+        return None
+    artifact_parts = parts[marker + 4 :]
+    if len(artifact_parts) < 4:
+        return None
+    if any(
+        Path(part).suffix.casefold() in _MAVEN_ARTIFACT_SUFFIXES for part in artifact_parts[:-1]
+    ):
+        return None
+    group_path = artifact_parts[:-3]
+    artifact_id, version, filename = artifact_parts[-3:]
+    suffix = Path(filename).suffix.casefold()
+    if not group_path or suffix not in _MAVEN_ARTIFACT_SUFFIXES:
+        return None
+    stem = filename[: -len(suffix)]
+    base = f"{artifact_id}-{version}"
+    if stem != base and not stem.startswith(f"{base}-"):
+        return None
+    group_id = ".".join(group_path)
+    if not group_id or not artifact_id or not version:
+        return None
+    return f"{group_id}:{artifact_id}", version
+
+
+def _maven_embedded_pom_owner_path(report_path: str | None) -> str | None:
+    """Return the containing Maven artifact path for embedded POM metadata."""
+    if not isinstance(report_path, str):
+        return None
+    normalized = _normalise_odc_report_path(report_path)
+    if normalized is None:
+        return None
+    parts = normalized.split("/")
+    try:
+        marker = parts.index(".odc-targeted")
+    except ValueError:
+        return None
+    if marker + 5 >= len(parts) or parts[marker + 2] != "dependencies":
+        return None
+    if not parts[marker + 1].isdigit() or not parts[marker + 3].isdigit():
+        return None
+    artifact_parts = parts[marker + 4 :]
+    artifact_index = next(
+        (
+            index
+            for index, part in enumerate(artifact_parts)
+            if Path(part).suffix.casefold() in _MAVEN_ARTIFACT_SUFFIXES
+        ),
+        None,
+    )
+    if artifact_index is None or artifact_index >= len(artifact_parts) - 1:
+        return None
+    owner_parts = parts[: marker + 4 + artifact_index + 1]
+    inner_parts = artifact_parts[artifact_index + 1 :]
+    if (
+        len(inner_parts) != 5
+        or inner_parts[0].casefold() != "meta-inf"
+        or inner_parts[1].casefold() != "maven"
+    ):
+        return None
+    if inner_parts[-1].casefold() != "pom.xml" or not inner_parts[2] or not inner_parts[3]:
+        return None
+    owner = "/".join(owner_parts)
+    return owner if _maven_repository_layout_coordinate(owner) is not None else None
 
 
 def _parse_report_dependency_paths(report_text: str) -> list[str] | None:
@@ -606,7 +698,7 @@ def _parse_report_package_occurrences(
         return None
 
     occurrences: list[_ODCReportedPackageOccurrence] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
 
     def add_packages(packages: Any, report_path: Any) -> None:
         if not isinstance(packages, list):
@@ -630,6 +722,47 @@ def _parse_report_package_occurrences(
         else:
             occurrence_path = None
 
+        maven_coordinate = _maven_repository_layout_coordinate(raw_path)
+        if maven_coordinate is not None:
+            package_name, version = maven_coordinate
+            identity = (occurrence_path or "", package_name.casefold(), version)
+            if identity not in seen:
+                seen.add(identity)
+                occurrences.append(
+                    _ODCReportedPackageOccurrence(
+                        package_name=package_name,
+                        version=version,
+                        ecosystem="maven",
+                        file_path=normalized_path,
+                        raw_file_path=raw_path,
+                        evidence_source="maven_repository_layout",
+                    )
+                )
+
+        embedded_owner_path = _maven_embedded_pom_owner_path(raw_path)
+        embedded_package_name: str | None = None
+        if embedded_owner_path is not None and raw_path is not None:
+            normalized_embedded_path = _normalise_odc_report_path(raw_path)
+            if normalized_embedded_path is not None:
+                embedded_parts = normalized_embedded_path.split("/")
+                embedded_index = next(
+                    (
+                        index
+                        for index, part in enumerate(embedded_parts)
+                        if Path(part).suffix.casefold() in _MAVEN_ARTIFACT_SUFFIXES
+                    ),
+                    None,
+                )
+                if embedded_index is not None:
+                    inner_parts = embedded_parts[embedded_index + 1 :]
+                    if (
+                        len(inner_parts) == 5
+                        and inner_parts[0].casefold() == "meta-inf"
+                        and inner_parts[1].casefold() == "maven"
+                        and inner_parts[-1].casefold() == "pom.xml"
+                    ):
+                        embedded_package_name = f"{inner_parts[2]}:{inner_parts[3]}"
+
         for package in packages:
             if not isinstance(package, dict):
                 continue
@@ -645,8 +778,23 @@ def _parse_report_package_occurrences(
             ecosystem = str(parsed.type or "").strip()
             if not package_name or not version or not ecosystem:
                 continue
+            if maven_coordinate is not None and (
+                package_name.casefold() == maven_coordinate[0].casefold()
+                and version == maven_coordinate[1]
+            ):
+                # The repository-layout file path is stronger physical evidence
+                # for the direct artifact and avoids double-counting its PURL.
+                continue
+            evidence_source = "odc_package_url"
+            if (
+                embedded_owner_path is not None
+                and embedded_package_name is not None
+                and ecosystem.casefold() == "maven"
+                and package_name.casefold() == embedded_package_name.casefold()
+            ):
+                evidence_source = "embedded_maven_pom"
             if occurrence_path is not None:
-                identity = (occurrence_path, purl)
+                identity = (occurrence_path, package_name.casefold(), version)
                 if identity in seen:
                     continue
                 seen.add(identity)
@@ -657,6 +805,8 @@ def _parse_report_package_occurrences(
                     ecosystem=ecosystem,
                     file_path=normalized_path,
                     raw_file_path=raw_path,
+                    evidence_source=evidence_source,
+                    owner_file_path=embedded_owner_path,
                 )
             )
 

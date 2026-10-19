@@ -15,7 +15,7 @@ import re
 import shlex
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +72,8 @@ from ._tool_support import _run_readonly
 from .qa_odc import (
     _ODC_HTML_REPORT_NAME,
     _ODC_REPORT_NAME,
+    _maven_embedded_pom_owner_path,
+    _maven_repository_layout_coordinate,
     _normalise_odc_report_path,
 )
 from .qa_test_parsing import _NPM_INSTALL_TIMEOUT_SECONDS, _workspace_json_file
@@ -108,6 +110,10 @@ _BULLET_LABEL_RE = re.compile(r"^- ([^:]+):\s*(.*)$")
 _REPORT_PREFIX = "# INVESTIGATIVE REPORT"
 _MAVEN_DEPENDENCY_TREE_TIMEOUT_SECONDS = 120
 _MAVEN_DEPENDENCY_TREE_GOAL = "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree"
+_MAVEN_DEPENDENCY_COPY_TIMEOUT_SECONDS = 180
+_MAVEN_DEPENDENCY_COPY_GOAL = (
+    "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:copy-dependencies"
+)
 
 
 def _maven_dependency_tree_output(sandbox: DockerSandbox, pom_path: str) -> str:
@@ -192,6 +198,115 @@ def _maven_dependency_tree_occurrences(
     return occurrences
 
 
+def _maven_dependency_copy_command(pom_path: str, output_directory: str) -> str:
+    """Build a fixed Maven command that copies one POM's resolved artifacts.
+
+    OWASP Dependency-Check extracts Maven coordinates from JAR metadata; it
+    does not enumerate a project's dependency tree from a standalone POM.
+    This command materializes Maven's resolved artifacts under the run-owned
+    targeted scan directory so ODC can inspect the actual artifacts.
+    """
+    normalized_pom = _validate_qa_path(pom_path)
+    if Path(normalized_pom).name.casefold() != "pom.xml":
+        raise ValueError(f"Maven dependency-copy input is not a POM: {pom_path}")
+    normalized_output = _validate_qa_path(output_directory)
+    cwd_path = Path(normalized_pom).parent
+    cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
+    prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
+    output_path = f"/workspace/{normalized_output}"
+    markers_path = f"{output_path}/.markers"
+    return (
+        f"mkdir -p -- {shlex.quote(output_path)} {shlex.quote(markers_path)} && "
+        f"{prefix}mvn -B -Dstyle.color=never "
+        f"-DoutputDirectory={shlex.quote(output_path)} "
+        "-Dmdep.useRepositoryLayout=true -DincludeScope=test "
+        f"-DmarkersDirectory={shlex.quote(markers_path)} {_MAVEN_DEPENDENCY_COPY_GOAL}"
+    )
+
+
+def _stage_maven_dependency_artifacts(
+    sandbox: DockerSandbox,
+    *,
+    pom_path: str,
+    output_directory: str,
+    expected_occurrences: Sequence[PackageScanOccurrence],
+) -> Mapping[str, tuple[str, str]]:
+    """Copy and constrain Maven artifacts to the exact dependency-tree GAV set."""
+    normalized_output = _validate_qa_path(output_directory)
+    command = _maven_dependency_copy_command(pom_path, normalized_output)
+    result = sandbox.run(command, timeout=_MAVEN_DEPENDENCY_COPY_TIMEOUT_SECONDS)
+    if getattr(result, "exit_code", None) != 0:
+        raise RuntimeError(
+            f"Maven dependency artifact staging failed for {pom_path} "
+            f"(exit {getattr(result, 'exit_code', None)})."
+        )
+
+    expected_gavs: set[tuple[str, str]] = set()
+    for occurrence in expected_occurrences:
+        package_name = str(occurrence.package_name or "")
+        if occurrence.ecosystem.casefold() != "maven" or package_name.count(":") != 1:
+            raise RuntimeError("Maven dependency-tree occurrence has an invalid GAV identity.")
+        group_id, artifact_id = package_name.split(":", 1)
+        if not group_id or not artifact_id or not occurrence.version:
+            raise RuntimeError("Maven dependency-tree occurrence has an incomplete GAV identity.")
+        expected_gavs.add((f"{group_id}:{artifact_id}".casefold(), occurrence.version))
+    # Dependency trees can repeat the same resolved GAV below several parents.
+    # The copied repository artifact is unique per POM/GAV; original tree
+    # occurrence IDs remain in the manifest for task attribution.
+    expected: Counter[tuple[str, str]] = Counter({identity: 1 for identity in expected_gavs})
+
+    def staged_artifacts() -> tuple[dict[str, tuple[str, str]], list[str]]:
+        expression = " -o ".join(
+            f"-name '{suffix}'" for suffix in ("*.aar", "*.ear", "*.jar", "*.war", "*.zip")
+        )
+        find_command = f"find {shlex.quote(normalized_output)} -type f \\( {expression} \\) -print"
+        listed = sandbox.run(find_command, timeout=30)
+        if getattr(listed, "exit_code", None) != 0:
+            raise RuntimeError("could not enumerate copied Maven dependency artifacts")
+        paths: dict[str, tuple[str, str]] = {}
+        counts: Counter[tuple[str, str]] = Counter()
+        output = str(getattr(listed, "stdout", "") or "")
+        for raw_path in output.splitlines():
+            path = _validate_qa_path(raw_path.strip())
+            if not path.startswith(f"{normalized_output}/"):
+                raise RuntimeError("copied Maven artifact path escaped its targeted directory")
+            if path in paths:
+                raise RuntimeError(f"Maven artifact path was listed more than once: {path}")
+            coordinate = _maven_repository_layout_coordinate(path)
+            if coordinate is None:
+                raise RuntimeError(
+                    f"copied Maven artifact path has no exact repository GAV: {path}"
+                )
+            identity = (coordinate[0].casefold(), coordinate[1])
+            paths[path] = identity
+            counts[identity] += 1
+        unexpected = counts - expected
+        missing = expected - counts
+        ambiguous = {
+            identity: count
+            for identity, count in counts.items()
+            if count > expected.get(identity, 0) and expected.get(identity, 0) > 0
+        }
+        if missing or ambiguous:
+            raise RuntimeError(
+                "copied Maven artifacts did not uniquely cover dependency:tree GAVs "
+                f"(missing={dict(missing)}, ambiguous={ambiguous})"
+            )
+        extras = [path for path, identity in paths.items() if identity in unexpected]
+        return paths, extras
+
+    paths, extras = staged_artifacts()
+    if extras:
+        remove_command = "rm -- " + " ".join(shlex.quote(path) for path in sorted(extras))
+        removed = sandbox.run(remove_command, timeout=30)
+        if getattr(removed, "exit_code", None) != 0:
+            raise RuntimeError("could not remove copied Maven artifacts outside dependency:tree")
+    final_paths, remaining_extras = staged_artifacts()
+    if remaining_extras:
+        raise RuntimeError("unlisted Maven artifacts remain after targeted-directory pruning")
+    return final_paths
+
+
 @dataclass(frozen=True)
 class _TargetedPackageResolutionFailure:
     """Task-scoped reason and diagnostic for a target that could not be resolved."""
@@ -209,6 +324,7 @@ class _NonNpmInputProject:
     task_ids: tuple[str, ...]
     occurrences: tuple[PackageScanOccurrence, ...] = ()
     preserve_relative_paths: bool = False
+    package_manager: str | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +342,9 @@ class _TargetedPackageBatch:
     fallback_reason: ScanFallbackReason | None = None
     fallback_detail: str | None = None
     skipped_task_ids: tuple[str, ...] = ()
+    task_scoped_closures_by_task: Mapping[str, tuple[DependencyClosure, ...]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -237,6 +356,9 @@ class _TargetedArtifactManifest:
     occurrences_by_project: Mapping[str, tuple[PackageScanOccurrence, ...]]
     task_ids_by_project: Mapping[str, tuple[str, ...]]
     input_paths_by_project: Mapping[str, tuple[str, ...]]
+    maven_artifacts_by_project: Mapping[str, Mapping[str, tuple[str, str]]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -971,6 +1093,7 @@ def _collect_non_npm_input_projects(
                 staged_input_paths=paths,
                 task_ids=tuple(sorted(task_ids)),
                 occurrences=occurrences,
+                package_manager=("maven" if source_input_path in maven_source_paths else None),
             )
         )
     return tuple(projects), failures, tuple(sorted(staged_input_paths))
@@ -1885,6 +2008,59 @@ _MAVEN_TREE_COORDINATE_RE = re.compile(
 )
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _MAVEN_TREE_GOAL_RE = re.compile(r"(?:maven-dependency-plugin|dependency)(?::[^:\s]+)?:tree")
+
+_MAVEN_TREE_NODE_RE = re.compile(
+    r"^\s*\[INFO\] (?P<prefix>(?:(?:\|  )|(?:   ))*)(?:\+-|\\-)\s+"
+    r"(?P<group>[^:\s]+):(?P<artifact>[^:\s]+):"
+    r"(?P<type>[^:\s]+):(?P<version>[^:\s]+):(?P<scope>[^:\s]+)(?:\s|$)"
+)
+_MAVEN_TREE_BRANCH_RE = re.compile(r"^\s*\[INFO\] .*?(?:\+-|\\-)\s+")
+
+
+def _parse_maven_dependency_tree_paths(output: str) -> tuple[tuple[str, ...], ...] | None:
+    """Return complete resolved dependency paths from Maven text tree output.
+
+    The root project is omitted from each path. Omitted-for-conflict nodes are
+    retained only as indentation markers, so they cannot establish a resolved
+    relationship between mutation targets.
+    """
+    plain_output = _ANSI_ESCAPE_RE.sub("", output)
+    if _MAVEN_TREE_GOAL_RE.search(plain_output) is None:
+        return None
+    no_dependencies = re.search(
+        r"^\s*\[INFO\]\s+No dependencies(?: found)?\.?\s*$",
+        plain_output,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    paths: set[tuple[str, ...]] = set()
+    stack: list[str | None] = []
+    saw_tree_entry = False
+    for line in plain_output.splitlines():
+        if not _MAVEN_TREE_BRANCH_RE.match(line):
+            continue
+        saw_tree_entry = True
+        match = _MAVEN_TREE_NODE_RE.match(line)
+        if match is None:
+            return None
+        prefix = match.group("prefix")
+        if len(prefix) % 3:
+            return None
+        depth = len(prefix) // 3 + 1
+        if depth > len(stack) + 1:
+            return None
+        while len(stack) >= depth:
+            stack.pop()
+        omitted = "(omitted for" in line[match.end() :].casefold()
+        parent = stack[-1] if depth > 1 and stack else None
+        if omitted or (depth > 1 and parent is None):
+            stack.append(None)
+            continue
+        coordinate = f"{match.group('group')}:{match.group('artifact')}"
+        paths.add((*stack, coordinate) if depth > 1 else (coordinate,))
+        stack.append(coordinate)
+    if not saw_tree_entry and no_dependencies is None:
+        return None
+    return tuple(sorted(paths))
 
 
 def _maven_dependency_tree_state(
@@ -3046,6 +3222,17 @@ def _resolve_targeted_packages(
     closures_by_task: dict[str, list[DependencyClosure]] = {
         task_id: list(closures) for task_id, closures in change_batch.closures_by_task.items()
     }
+    task_scoped_closures_by_task: dict[str, list[DependencyClosure]] = {
+        target.task_id: [] for target in targets
+    }
+    target_task_ids_by_lockfile: dict[str, set[str]] = {}
+    for target in targets:
+        for raw_source_lockfile in target.manifest_paths:
+            try:
+                source_lockfile = _validate_qa_path(raw_source_lockfile)
+            except ValueError:
+                continue
+            target_task_ids_by_lockfile.setdefault(source_lockfile, set()).add(target.task_id)
     covered_task_ids = set(closures_by_task)
     skipped_task_ids: set[str] = set()
     target_absent_input_paths: set[str] = set()
@@ -3223,6 +3410,7 @@ def _resolve_targeted_packages(
             continue
 
         covered_task_ids.add(target.task_id)
+        task_scoped_closures_by_task[target.task_id].extend(task_closures)
         for resolution in task_resolutions:
             node = resolution.target_node
             identity = (
@@ -3234,6 +3422,19 @@ def _resolve_targeted_packages(
                 resolved_identities.add(identity)
                 resolved_packages.append(resolution)
         closures_by_task.setdefault(target.task_id, []).extend(task_closures)
+
+    for task_id, changed_closures in change_batch.closures_by_task.items():
+        scoped_closures = task_scoped_closures_by_task.get(task_id)
+        if scoped_closures is None:
+            continue
+        scoped_roots = {(closure.source_lockfile, closure.root_keys) for closure in scoped_closures}
+        for closure in changed_closures:
+            if target_task_ids_by_lockfile.get(closure.source_lockfile) != {task_id}:
+                continue
+            root_identity = (closure.source_lockfile, closure.root_keys)
+            if root_identity not in scoped_roots:
+                scoped_closures.append(closure)
+                scoped_roots.add(root_identity)
 
     for task_id, closures in closures_by_task.items():
         if closures:
@@ -3262,6 +3463,9 @@ def _resolve_targeted_packages(
             else None
         ),
         skipped_task_ids=tuple(sorted(skipped_task_ids)),
+        task_scoped_closures_by_task={
+            task_id: tuple(closures) for task_id, closures in task_scoped_closures_by_task.items()
+        },
     )
 
 
@@ -3270,7 +3474,7 @@ def _write_targeted_artifacts(
     closures_by_task: Mapping[str, Sequence[DependencyClosure]],
     non_npm_input_projects: Sequence[_NonNpmInputProject] = (),
 ) -> _TargetedArtifactManifest:
-    """Stage each changed npm lockfile once to bound Node Audit requests."""
+    """Stage changed package inputs and Maven artifacts for scoped ODC scans."""
     targeted_subdir = ".odc-targeted"
     task_ids_by_lockfile: dict[str, set[str]] = {}
     for task_id, closures in sorted(closures_by_task.items()):
@@ -3287,6 +3491,7 @@ def _write_targeted_artifacts(
     occurrences_by_project: dict[str, tuple[PackageScanOccurrence, ...]] = {}
     task_ids_by_project: dict[str, tuple[str, ...]] = {}
     input_paths_by_project: dict[str, tuple[str, ...]] = {}
+    maven_artifacts_by_project: dict[str, dict[str, tuple[str, str]]] = {}
     artifact_index = 0
     staged_npm_files: dict[str, str] = {}
 
@@ -3415,6 +3620,31 @@ def _write_targeted_artifacts(
             if result.exit_code != 0:
                 raise ValueError(f"could not stage changed ODC input {source_path}")
 
+        if project.package_manager == "maven":
+            maven_inputs = [
+                path
+                for path in project.staged_input_paths
+                if Path(path).name.casefold() == "pom.xml"
+            ]
+            if not maven_inputs:
+                raise ValueError(
+                    f"Maven project {project.source_input_path} has no staged POM input"
+                )
+            for pom_index, pom_path in enumerate(sorted(maven_inputs)):
+                output_directory = f"{project_path}/dependencies/{pom_index:03d}"
+                pom_occurrences = tuple(
+                    occurrence
+                    for occurrence in project.occurrences
+                    if occurrence.source_input_path == pom_path
+                )
+                staged_paths = _stage_maven_dependency_artifacts(
+                    sandbox,
+                    pom_path=pom_path,
+                    output_directory=output_directory,
+                    expected_occurrences=pom_occurrences,
+                )
+                maven_artifacts_by_project.setdefault(project_path, {}).update(staged_paths)
+
         occurrences_by_project[project_path] = project.occurrences
         expected_package_occurrences.extend(
             (occurrence.package_name, occurrence.version) for occurrence in project.occurrences
@@ -3436,6 +3666,7 @@ def _write_targeted_artifacts(
         occurrences_by_project=occurrences_by_project,
         task_ids_by_project=task_ids_by_project,
         input_paths_by_project=input_paths_by_project,
+        maven_artifacts_by_project=maven_artifacts_by_project,
     )
 
 
@@ -3447,9 +3678,146 @@ def _targeted_project_for_report_path(file_path: str | None) -> str | None:
     if normalized is None:
         return None
     parts = normalized.split("/")
-    if len(parts) < 3 or parts[0] != ".odc-targeted":
+    if len(parts) < 2 or parts[0] != ".odc-targeted":
         return None
     return "/".join(parts[:2])
+
+
+def _maven_odc_artifact_parity(
+    artifact_manifest: _TargetedArtifactManifest,
+    reported_occurrences: Sequence[Any],
+) -> tuple[bool, tuple[str, ...]]:
+    """Prove that ODC reported each staged Maven artifact exactly once.
+
+    The expected multiset retains one physical GAV per original POM while
+    collapsing repeated dependency-tree branches within that POM. Original
+    dependency-tree occurrences remain unchanged for QA attribution.
+    """
+    expected: dict[str, Counter[tuple[str, str]]] = {
+        project_path: Counter() for project_path in artifact_manifest.input_paths_by_project
+    }
+    seen_tree_artifacts: set[tuple[str, str, str, str]] = set()
+    diagnostics: list[str] = []
+    for project_path, occurrences in artifact_manifest.occurrences_by_project.items():
+        for occurrence in occurrences:
+            if (
+                occurrence.ecosystem.casefold() != "maven"
+                or occurrence.package_name.count(":") != 1
+            ):
+                diagnostics.append(f"invalid Maven dependency-tree identity in {project_path}")
+                continue
+            source_key = (
+                project_path,
+                occurrence.source_input_path,
+                occurrence.package_name.casefold(),
+                occurrence.version,
+            )
+            if source_key in seen_tree_artifacts:
+                continue
+            seen_tree_artifacts.add(source_key)
+            expected[project_path][(occurrence.package_name.casefold(), occurrence.version)] += 1
+
+    actual: dict[str, Counter[tuple[str, str]]] = {
+        project_path: Counter() for project_path in artifact_manifest.input_paths_by_project
+    }
+    seen_report_paths: set[tuple[str, str]] = set()
+    for reported in reported_occurrences:
+        file_path = _scan_result_value(reported, "file_path", None)
+        project_path = _targeted_project_for_report_path(file_path)
+        if project_path is None or project_path not in expected:
+            diagnostics.append("ODC package occurrence is outside the Maven targeted projects")
+            continue
+        evidence_source = str(_scan_result_value(reported, "evidence_source", "odc_package_url"))
+        artifact_paths = artifact_manifest.maven_artifacts_by_project.get(project_path, {})
+        if evidence_source == "embedded_maven_pom":
+            owner_path = _normalise_odc_report_path(
+                _scan_result_value(reported, "owner_file_path", None)
+            )
+            coordinate = (
+                _maven_repository_layout_coordinate(owner_path) if owner_path is not None else None
+            )
+            owner_identity = (
+                (coordinate[0].casefold(), coordinate[1]) if coordinate is not None else None
+            )
+            if (
+                owner_path is None
+                or owner_identity is None
+                or artifact_paths.get(owner_path) != owner_identity
+            ):
+                diagnostics.append(
+                    "embedded Maven POM identity has no proven staged artifact owner"
+                )
+            continue
+        if evidence_source != "maven_repository_layout":
+            diagnostics.append("ODC Maven package identity lacks direct artifact-path evidence")
+            continue
+
+        normalized_path = _normalise_odc_report_path(file_path)
+        package_name = str(_scan_result_value(reported, "package_name", "")).casefold()
+        version = str(_scan_result_value(reported, "version", ""))
+        identity = (package_name, version)
+        coordinate = (
+            _maven_repository_layout_coordinate(normalized_path)
+            if normalized_path is not None
+            else None
+        )
+        coordinate_identity = (
+            (coordinate[0].casefold(), coordinate[1]) if coordinate is not None else None
+        )
+        if (
+            normalized_path is None
+            or coordinate_identity != identity
+            or artifact_paths.get(normalized_path) != identity
+        ):
+            diagnostics.append(
+                "ODC direct Maven identity did not match an existing staged artifact"
+            )
+            continue
+        report_key = (project_path, normalized_path)
+        if report_key in seen_report_paths:
+            diagnostics.append("ODC reported one staged Maven artifact more than once")
+            continue
+        seen_report_paths.add(report_key)
+        actual[project_path][identity] += 1
+
+    for project_path, expected_counter in expected.items():
+        if expected_counter != actual.get(project_path, Counter()):
+            diagnostics.append(
+                f"ODC direct artifact GAVs differed from dependency:tree for {project_path}"
+            )
+        if set(artifact_manifest.maven_artifacts_by_project.get(project_path, {})) == set():
+            if expected_counter:
+                diagnostics.append(f"no staged Maven artifacts were recorded for {project_path}")
+        elif len(artifact_manifest.maven_artifacts_by_project.get(project_path, {})) != sum(
+            expected_counter.values()
+        ):
+            diagnostics.append(f"staged Maven artifact paths were incomplete for {project_path}")
+    return not diagnostics, tuple(dict.fromkeys(diagnostics))
+
+
+def _maven_artifact_path_evidence(
+    artifact_manifest: _TargetedArtifactManifest,
+    project_path: str,
+    file_path: str | None,
+) -> tuple[str, tuple[str, str], bool] | None:
+    """Resolve one direct or embedded report path to its staged Maven artifact."""
+    normalized_path = _normalise_odc_report_path(file_path)
+    if normalized_path is None:
+        return None
+    coordinate = _maven_repository_layout_coordinate(normalized_path)
+    artifact_path = normalized_path
+    if coordinate is None:
+        artifact_path = _maven_embedded_pom_owner_path(normalized_path)
+        coordinate = (
+            _maven_repository_layout_coordinate(artifact_path)
+            if artifact_path is not None
+            else None
+        )
+    if artifact_path is None or coordinate is None:
+        return None
+    identity = (coordinate[0].casefold(), coordinate[1])
+    expected = artifact_manifest.maven_artifacts_by_project.get(project_path, {}).get(artifact_path)
+    return artifact_path, identity, expected == identity
 
 
 def _issue_identifiers(issues: Sequence[Any]) -> list[str]:
@@ -3485,6 +3853,29 @@ def _attribute_reported_occurrences(
         if project_path is None or project_path not in artifact_manifest.input_paths_by_project:
             mapping_complete = False
             continue
+        evidence_source = str(_scan_result_value(reported, "evidence_source", "odc_package_url"))
+        if evidence_source == "embedded_maven_pom":
+            owner_path = _normalise_odc_report_path(
+                _scan_result_value(reported, "owner_file_path", None)
+            )
+            owner_identity = (
+                artifact_manifest.maven_artifacts_by_project.get(project_path, {}).get(owner_path)
+                if owner_path is not None
+                else None
+            )
+            owner_coordinate = (
+                _maven_repository_layout_coordinate(owner_path) if owner_path is not None else None
+            )
+            normalized_owner_coordinate = (
+                (owner_coordinate[0].casefold(), owner_coordinate[1])
+                if owner_coordinate is not None
+                else None
+            )
+            if owner_identity is None or owner_identity != normalized_owner_coordinate:
+                mapping_complete = False
+            # Embedded Maven POM metadata is a supplemental identity contained
+            # by a scanned artifact, not a second dependency-tree occurrence.
+            continue
         reports_by_project.setdefault(project_path, []).append(reported)
 
     issues = _scan_result_value(scan_result, "found_issues", []) or []
@@ -3492,6 +3883,7 @@ def _attribute_reported_occurrences(
     issues_by_report_path: dict[tuple[str, str, str, str], list[Any]] = {}
     issues_by_project: dict[str, list[Any]] = {}
     unmapped_issues: list[Any] = []
+    issue_origin_ids: dict[int, int] = {}
     for issue in issues:
         package_name = _scan_result_value(issue, "package_name", None)
         package_version = _scan_result_value(issue, "package_version", None)
@@ -3507,15 +3899,54 @@ def _attribute_reported_occurrences(
             str(package_version or ""),
         )
         normalized_path = _normalise_odc_report_path(file_path)
-        issues_by_identity.setdefault(identity, []).append(issue)
-        issues_by_project.setdefault(project_path, []).append(issue)
+        artifact_evidence = _maven_artifact_path_evidence(
+            artifact_manifest,
+            project_path,
+            file_path,
+        )
+        attributed_issue = issue
+        if artifact_evidence is not None:
+            artifact_path, artifact_identity, proven = artifact_evidence
+            if not proven:
+                mapping_complete = False
+            else:
+                if identity[1:] != artifact_identity:
+                    try:
+                        attributed_issue = issue.model_copy(
+                            update={
+                                "package_name": artifact_identity[0],
+                                "package_version": artifact_identity[1],
+                            }
+                        )
+                    except AttributeError:
+                        copy_method = getattr(issue, "copy", None)
+                        if callable(copy_method):
+                            attributed_issue = copy_method(
+                                update={
+                                    "package_name": artifact_identity[0],
+                                    "package_version": artifact_identity[1],
+                                }
+                            )
+                        else:
+                            mapping_complete = False
+                    if attributed_issue is not issue:
+                        issue_origin_ids[id(attributed_issue)] = id(issue)
+                identity = (project_path, *artifact_identity)
+                normalized_path = artifact_path
+        issues_by_identity.setdefault(identity, []).append(attributed_issue)
+        issues_by_project.setdefault(project_path, []).append(attributed_issue)
         if normalized_path is not None:
             issues_by_report_path.setdefault(
                 (*identity, normalized_path),
                 [],
-            ).append(issue)
+            ).append(attributed_issue)
 
     consumed_issue_ids: set[int] = set()
+
+    def consume_issues(candidates: Sequence[Any]) -> None:
+        for candidate in candidates:
+            consumed_issue_ids.add(id(candidate))
+            consumed_issue_ids.add(issue_origin_ids.get(id(candidate), id(candidate)))
 
     def matching_issues(
         project_path: str,
@@ -3529,21 +3960,22 @@ def _attribute_reported_occurrences(
         nonlocal mapping_complete
         identity = (project_path, package_name.casefold(), version)
         identity_candidates = list(issues_by_identity.get(identity, []))
-        if not identity_candidates:
+        all_candidates = list({id(issue): issue for issue in identity_candidates}.values())
+        if not all_candidates:
             return []
         if identity_count > 1:
             if not report_path:
                 mapping_complete = False
-            consumed_issue_ids.update(id(issue) for issue in identity_candidates)
-            return identity_candidates
+            consume_issues(all_candidates)
+            return all_candidates
 
         candidates = issues_by_report_path.get((*identity, report_path), []) if report_path else []
         available = [issue for issue in candidates if id(issue) not in consumed_issue_ids]
         if available:
-            consumed_issue_ids.update(id(issue) for issue in available)
+            consume_issues(available)
             return available
-        available = [issue for issue in identity_candidates if id(issue) not in consumed_issue_ids]
-        consumed_issue_ids.update(id(issue) for issue in available)
+        available = [issue for issue in all_candidates if id(issue) not in consumed_issue_ids]
+        consume_issues(available)
         return available
 
     occurrences_by_project: dict[str, tuple[PackageScanOccurrence, ...]] = {}
@@ -3848,7 +4280,15 @@ def _scan_evidence_by_task(
     }
     result: dict[str, ODCScanEvidence] = {}
     for task_id in sorted(task_ids):
-        task_closures = batch.closures_by_task.get(task_id, ()) if batch is not None else ()
+        scoped_closures_by_task = (
+            getattr(batch, "task_scoped_closures_by_task", None) if batch is not None else None
+        )
+        if isinstance(scoped_closures_by_task, Mapping):
+            task_closures = scoped_closures_by_task.get(task_id, ())
+            has_task_closure_scope = task_id in scoped_closures_by_task
+        else:
+            task_closures = batch.closures_by_task.get(task_id, ()) if batch is not None else ()
+            has_task_closure_scope = bool(task_closures)
         task_occurrence_keys = {
             _package_occurrence_key(
                 closure.source_lockfile,
@@ -3859,7 +4299,6 @@ def _scan_evidence_by_task(
             for closure in task_closures
             for node in closure.nodes
         }
-        restrict_to_task_closure = bool(task_closures)
         project_paths = sorted(set(projects_by_task.get(task_id, [])))
         target_skipped = batch is not None and task_id in getattr(batch, "skipped_task_ids", ())
         occurrences_by_key: dict[str, PackageScanOccurrence] = {}
@@ -3867,9 +4306,14 @@ def _scan_evidence_by_task(
         for project_path in project_paths:
             if artifact_manifest is None:
                 continue
-            covered_input_paths.update(
-                artifact_manifest.input_paths_by_project.get(project_path, ())
+            project_input_paths = artifact_manifest.input_paths_by_project.get(project_path, ())
+            project_is_npm_lockfile = any(
+                Path(source_input_path).name.casefold()
+                in {"package-lock.json", "npm-shrinkwrap.json"}
+                for source_input_path in project_input_paths
             )
+            restrict_to_task_closure = has_task_closure_scope and project_is_npm_lockfile
+            covered_input_paths.update(project_input_paths)
             for occurrence in artifact_manifest.occurrences_by_project.get(project_path, ()):
                 occurrence_key = _package_occurrence_key(
                     occurrence.source_input_path,

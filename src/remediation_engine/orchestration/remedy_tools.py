@@ -46,7 +46,10 @@ from .tools_manifest import (
     apply_multi_package_action,
     rollback_pending_package_updates,
 )
-from .tools_manifest_java import _make_modify_and_validate_maven_dependency_tool
+from .tools_manifest_java import (
+    _make_modify_and_validate_maven_dependency_tool,
+    _make_modify_batch_maven_dependencies_tool,
+)
 from .tools_validation import (
     _make_record_plan_tool,
     _make_record_targeted_test_substitution_tool,
@@ -123,6 +126,7 @@ def build_multi_package_update_toolbelt(
     action: Any,
     execution_state: dict[str, Any] | None = None,
     package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> list:
     """Build the single committed-action toolbelt for a package cluster.
 
@@ -141,6 +145,22 @@ def build_multi_package_update_toolbelt(
     Returns:
         A one-tool list for the bounded update-subagent loop.
     """
+    if project_language == ProjectLanguage.JAVA:
+        if any(
+            getattr(mutation, "ecosystem", "") != "maven" for mutation in action.package_mutations
+        ):
+            raise ValueError("Java multi-package actions must contain only Maven mutations.")
+        return [
+            _make_modify_batch_maven_dependencies_tool(
+                sandbox,
+                action,
+                touched_files,
+                execution_state=execution_state,
+                package_checkpoints=package_checkpoints,
+            )
+        ]
+    if any(getattr(mutation, "ecosystem", "npm") != "npm" for mutation in action.package_mutations):
+        raise ValueError("Node multi-package actions must contain only npm mutations.")
     return [
         _make_modify_batch_npm_dependencies_tool(
             sandbox,
@@ -263,7 +283,13 @@ def build_workaround_toolbelt(
         _make_inspect_ast_symbol_tool(sandbox, plan_state),
         _make_deterministic_apply_edit_set_tool(sandbox, touched_files, plan_state),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
-        _make_validate_workaround_tool(sandbox, touched_files, plan_state, preferred_test_files),
+        _make_validate_workaround_tool(
+            sandbox,
+            touched_files,
+            plan_state,
+            preferred_test_files,
+            project_language=project_language,
+        ),
     ]
     if (
         effective_no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value

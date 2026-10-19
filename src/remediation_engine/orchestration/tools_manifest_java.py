@@ -20,7 +20,9 @@ from langchain_core.tools import tool
 
 from remediation_engine.contracts.schemas import (
     MavenTargetOperation,
+    MultiPackageAction,
     NoFixMitigationStage,
+    TacticalStrategy,
     WorkaroundExecutionPhase,
 )
 from remediation_engine.contracts.version_policy import (
@@ -967,6 +969,149 @@ def _make_modify_and_validate_maven_dependency_tool(
             )
 
     return modify_and_validate_maven_dependency
+
+
+def apply_multi_maven_package_action(
+    sandbox: Any,
+    action: MultiPackageAction,
+    touched_files: set[str],
+    checkpoint_store: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Apply the committed Maven package batch with one union POM checkpoint.
+
+    Each package edit uses the exact-GAV Maven transaction. The outer checkpoint
+    spans every POM authorized for every mutation, so a later package failure
+    restores earlier successful edits before the Supervisor sees the result.
+
+    Args:
+        sandbox: Running Docker workspace with Maven and the run-owned cache.
+        action: Immutable Supervisor-committed Maven batch.
+        touched_files: Mutable candidate-file projection for the worker result.
+        checkpoint_store: Optional store retaining the union checkpoint until
+            the worker attempt is accepted or surrendered.
+
+    Returns:
+        ``(True, "")`` when every Maven transaction succeeds; otherwise a
+        typed diagnostic after attempting to restore the full authorized POM set.
+    """
+    if action.selected_strategy != TacticalStrategy.VERSION_BUMP:
+        return False, "Maven batches only support Supervisor-committed version updates."
+    if not action.package_mutations or any(
+        mutation.ecosystem != "maven" for mutation in action.package_mutations
+    ):
+        return False, "Maven batch contains a mutation from a different ecosystem."
+
+    paths_by_package: dict[str, set[str]] = {}
+    versions_by_package: dict[str, set[str]] = {}
+    types_by_package: dict[str, set[str]] = {}
+    operations_by_package: dict[str, set[str]] = {}
+    authorized_paths: set[str] = set()
+    for mutation in action.package_mutations:
+        try:
+            manifest_path = _safe_manifest_path(mutation.manifest_path)
+            target_paths = {_safe_manifest_path(path) for path in mutation.target_manifest_paths}
+        except (TypeError, ValueError, WorkspacePathError) as exc:
+            return False, f"Maven batch contains an unsafe POM target: {exc}"
+        if not target_paths or manifest_path not in target_paths:
+            return False, "Maven batch target POM is outside its committed POM set."
+        if mutation.maven_target_operation is None:
+            return False, "Maven batch is missing a committed declaration operation."
+        if mutation.dependency_type not in {"dependencies", "dependencyManagement"}:
+            return False, "Maven batch contains an unsupported declaration type."
+        if (
+            mutation.maven_target_operation == MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT
+            and mutation.dependency_type != "dependencyManagement"
+        ):
+            return False, "Maven insertion operation does not match its declaration type."
+        paths_by_package[mutation.package_name] = target_paths
+        versions_by_package[mutation.package_name] = {mutation.target_version}
+        types_by_package[mutation.package_name] = {mutation.dependency_type}
+        operations_by_package[mutation.package_name] = {mutation.maven_target_operation.value}
+        authorized_paths.update(target_paths)
+
+    try:
+        checkpoint = _capture_checkpoint(sandbox, authorized_paths, touched_files)
+    except Exception as exc:  # noqa: BLE001 - checkpoint failure blocks mutation
+        return False, f"Maven batch could not capture its authorized POM checkpoint: {exc}"
+
+    checkpoints = checkpoint_store if checkpoint_store is not None else {}
+    checkpoint_key = "__multi_package_action__"
+    checkpoints[checkpoint_key] = checkpoint
+
+    def rollback(error: str) -> tuple[bool, str]:
+        from remediation_engine.orchestration.tools_manifest import (
+            rollback_pending_package_updates,
+        )
+
+        rollback_errors = rollback_pending_package_updates(
+            sandbox,
+            checkpoints,
+            touched_files,
+        )
+        suffix = (
+            " Rollback complete."
+            if not rollback_errors
+            else " Rollback incomplete: " + " | ".join(rollback_errors)
+        )
+        return False, f"Maven multi-package action failed: {error}.{suffix}"
+
+    try:
+        tool = _make_modify_and_validate_maven_dependency_tool(
+            sandbox,
+            touched_files,
+            paths_by_package,
+            versions_by_package,
+            types_by_package,
+            execution_state={},
+            maven_target_operations_by_package=operations_by_package,
+        )
+        for mutation in sorted(
+            action.package_mutations,
+            key=lambda item: (item.manifest_path, item.package_name, item.task_id),
+        ):
+            result = tool.invoke(
+                {
+                    "package_name": mutation.package_name,
+                    "target_version": mutation.target_version,
+                    "dependency_type": mutation.dependency_type,
+                    "manifest_path": mutation.manifest_path,
+                }
+            )
+            if not isinstance(result, str) or not result.startswith("SUCCESS:"):
+                return rollback(str(result or "Maven transaction returned no success evidence"))
+    except Exception as exc:  # noqa: BLE001 - the batch owns cross-package rollback
+        return rollback(f"unexpected Maven transaction error: {exc}")
+    return True, ""
+
+
+def _make_modify_batch_maven_dependencies_tool(
+    sandbox: Any,
+    action: MultiPackageAction,
+    touched_files: set[str],
+    execution_state: dict[str, Any] | None = None,
+    package_checkpoints: dict[str, Any] | None = None,
+):
+    """Build the sole LLM capability for one committed Maven batch."""
+    from remediation_engine.orchestration.tools_manifest import (
+        _execute_committed_multi_package_action,
+    )
+
+    state = execution_state if execution_state is not None else {}
+
+    @tool
+    def modify_batch_maven_dependencies() -> str:
+        """Apply the complete committed Maven batch exactly once."""
+        return _execute_committed_multi_package_action(
+            sandbox,
+            action,
+            touched_files,
+            state,
+            package_checkpoints,
+            executor=apply_multi_maven_package_action,
+            success_detail="every authorized POM mutation and Maven resolve passed",
+        )
+
+    return modify_batch_maven_dependencies
 
 
 def _remove_maven_no_fix_dependency_transaction(

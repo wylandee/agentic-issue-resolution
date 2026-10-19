@@ -12,7 +12,8 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import cmp_to_key
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +35,10 @@ from remediation_engine.contracts.solver_models import (
     PortfolioReplanRequest,
     SolverBatch,
     SolverDependencyRequirement,
+    SolverEdge,
     SolverEvidenceDomain,
     SolverFindingRequirement,
+    SolverPackageOccurrence,
     SolverPhase,
     SolverRemediationPlan,
     SolverRuntimeFingerprint,
@@ -44,6 +47,11 @@ from remediation_engine.contracts.solver_models import (
     SolverTarget,
     SolverVersionCandidate,
 )
+from remediation_engine.contracts.version_policy import (
+    compare_maven_versions,
+    is_stable_maven_version,
+)
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.settings import AppSettings
 from remediation_engine.solver.cpsat import _as_domain as _normalize_solver_candidate_domain
 from remediation_engine.solver.cpsat import solve_portfolio
@@ -54,6 +62,12 @@ from remediation_engine.solver.graph import (
     schedule_batches,
 )
 from remediation_engine.solver.subgraph import expand_candidate_relations, extract_solver_subgraph
+from remediation_engine.tools.maven_manifest_locator import (
+    find_dependency_in_pom,
+    locate_maven_manifests,
+    parse_pom_xml,
+)
+from remediation_engine.tools.maven_registry_tools import fetch_maven_registry_candidates
 from remediation_engine.tools.npm_graph import (
     NpmDependencyRecord,
     NpmGraphSnapshot,
@@ -128,6 +142,21 @@ def _digest(value: Any) -> str:
     ).hexdigest()
 
 
+def maven_repository_fingerprint(repo_root: str | Path) -> str:
+    """Fingerprint every safely discovered POM and its exact source bytes."""
+    root = Path(repo_root).resolve()
+    documents: dict[str, str] = {}
+    for path in locate_maven_manifests(root):
+        relative = path.relative_to(root).as_posix()
+        try:
+            documents[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise ValueError(f"cannot fingerprint Maven POM {relative!r}") from exc
+    if not documents:
+        raise ValueError("repository has no safely discoverable Maven POMs")
+    return _digest(documents)
+
+
 def _catalog_semantic_diagnostics(diagnostics: Iterable[str]) -> list[str]:
     """Exclude cache persistence failures from registry-evidence identity."""
     return sorted(
@@ -164,11 +193,12 @@ def _manifest_path(group: VulnerabilityGroup, repo_root: Path) -> str:
         if text.startswith(("~/", "//")) or ".." in Path(text).parts:
             return ""
         paths.add(text)
-    safe = [path for path in paths if Path(path).name == "package.json"]
+    manifest_name = "pom.xml" if _group_manager(group) == "maven" else "package.json"
+    safe = [path for path in paths if Path(path).name == manifest_name]
     if len(safe) == 1 and len(paths) == 1:
         return safe[0]
     if not paths:
-        return "package.json"
+        return manifest_name
     return ""
 
 
@@ -178,7 +208,17 @@ def _group_manager(group: VulnerabilityGroup) -> str:
         for localized in group.localized_issues
         if localized.package_manager
     }
-    return next(iter(managers)) if len(managers) == 1 else "npm"
+    if len(managers) > 1:
+        return "ambiguous"
+    if managers:
+        return next(iter(managers))
+    if any(
+        str(issue.ecosystem or "").casefold() == "maven"
+        or str(issue.purl or "").casefold().startswith("pkg:maven/")
+        for issue in group.issues
+    ):
+        return "maven"
+    return "npm"
 
 
 def _active_tasks(task_queue: Mapping[str, RemediationTask]) -> list[RemediationTask]:
@@ -227,7 +267,12 @@ def prepare_portfolio_inputs(
         while f"task-{next_index}" in prepared_queue:
             next_index += 1
         task_id = f"task-{next_index}"
-        prepared_queue[task_id] = build_initial_remediation_task(group, task_id)
+        language = (
+            ProjectLanguage.JAVA if _group_manager(group) == "maven" else ProjectLanguage.NODEJS
+        )
+        prepared_queue[task_id] = build_initial_remediation_task(
+            group, task_id, project_language=language
+        )
         represented.add(group.group_id)
         next_index += 1
 
@@ -532,7 +577,19 @@ def _build_targets_and_findings(
     snapshot: NpmGraphSnapshot,
     groups: Sequence[VulnerabilityGroup],
     task_queue: Mapping[str, RemediationTask],
+    *,
+    repo_root: Path | None = None,
+    additional_occurrences: list[SolverPackageOccurrence] | None = None,
 ) -> tuple[list[SolverTarget], list[SolverFindingRequirement], list[str]]:
+    if any(
+        _group_manager(group) == "maven" for group in groups if group.issue_type == IssueType.SCA
+    ):
+        return _build_maven_targets_and_findings(
+            groups,
+            task_queue,
+            repo_root=repo_root or Path("."),
+            additional_occurrences=additional_occurrences,
+        )
     records = _record_index(snapshot)
     groups_by_id = {group.group_id: group for group in groups}
     diagnostics: list[str] = []
@@ -741,6 +798,161 @@ def _build_targets_and_findings(
     return targets, findings, sorted(set(diagnostics))
 
 
+def _build_maven_targets_and_findings(
+    groups: Sequence[VulnerabilityGroup],
+    task_queue: Mapping[str, RemediationTask],
+    *,
+    repo_root: Path,
+    additional_occurrences: list[SolverPackageOccurrence] | None,
+) -> tuple[list[SolverTarget], list[SolverFindingRequirement], list[str]]:
+    """Build exact-GAV solver targets and finding evidence from localized POMs."""
+    root = Path(repo_root).resolve()
+    groups_by_id = {group.group_id: group for group in groups}
+    targets: list[SolverTarget] = []
+    findings: list[SolverFindingRequirement] = []
+    diagnostics: list[str] = []
+    for task in _active_tasks(task_queue):
+        group = groups_by_id.get(task.parent_group_id)
+        if group is None or group.issue_type != IssueType.SCA:
+            continue
+        if _group_manager(group) != "maven":
+            diagnostics.append(
+                f"task {task.task_id!r} uses a non-Maven target in a Maven portfolio"
+            )
+            continue
+        coordinate = (task.target_package_name or group.vulnerable_component or "").strip()
+        parts = coordinate.split(":")
+        manifest_path = _manifest_path(group, root)
+        if len(parts) != 2 or any(not part or part.strip() != part for part in parts):
+            diagnostics.append(f"task {task.task_id!r} has no canonical Maven group:artifact")
+            continue
+        absolute_manifest = (root / manifest_path).resolve()
+        try:
+            absolute_manifest.relative_to(root)
+            if absolute_manifest.name != "pom.xml" or absolute_manifest.is_symlink():
+                raise ValueError("localized Maven target is not a contained regular POM")
+            pom = parse_pom_xml(absolute_manifest)
+            entry = find_dependency_in_pom(parts[0], parts[1], pom)
+        except (OSError, ValueError) as exc:
+            entry = None
+            diagnostics.append(f"task {task.task_id!r} Maven target cannot be parsed: {exc}")
+        localized_types = {
+            str(item.declaration_type or "").strip()
+            for item in group.localized_issues
+            if item.package_manager == "maven" and item.declaration_type
+        }
+        dependency_type = (
+            task.target_dependency_type
+            if task.target_dependency_type in {"dependencies", "dependencyManagement"}
+            else next(iter(localized_types))
+            if len(localized_types) == 1
+            else "dependencyManagement"
+        )
+        if dependency_type not in {"dependencies", "dependencyManagement"}:
+            diagnostics.append(f"task {task.task_id!r} has an unsupported Maven declaration type")
+            continue
+        installed_version = (
+            (entry.declared_version if entry is not None else None)
+            or (group.versions[0] if group.versions else None)
+            or (group.issues[0].package_version if group.issues else None)
+            or task.parent_package_version
+            or "unknown"
+        )
+        occurrence_id = f"{manifest_path}::maven::{coordinate}"
+        finding_ids = sorted(
+            {
+                _issue_identity(issue)
+                for issue in group.issues
+                if issue.cve_id or issue.ghsa_id or issue.finding_id
+            }
+        )
+        has_floor = any(issue.fixed_version for issue in group.issues) or bool(
+            group.fix_plan and group.fix_plan.fixed_version
+        )
+        no_fix = task.no_fix_stage is not None or (
+            group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.NO_FIX
+        )
+        target = SolverTarget(
+            occurrence_id=occurrence_id,
+            task_id=task.task_id,
+            group_id=group.group_id,
+            package_name=(group.vulnerable_component or coordinate),
+            target_package_name=coordinate,
+            manifest_path=manifest_path,
+            lockfile_package_key=f"{coordinate}@{installed_version}",
+            installed_version=str(installed_version),
+            version_scheme="maven",
+            dependency_type=dependency_type,
+            strategy="no_fix" if no_fix else task.strategy.value,
+            is_synthetic=bool(task.is_synthetic or group.is_synthetic),
+            is_finding_backed=bool(finding_ids),
+            eligible_for_atomic_update=(
+                absolute_manifest.is_file()
+                and task.status not in _TERMINAL_STATUSES
+                and task.current_attempt_id is None
+                and (no_fix or (task.strategy == RoutingStrategy.VERSION_BUMP and has_floor))
+            ),
+            finding_ids=finding_ids,
+            is_terminal=task.status in _TERMINAL_STATUSES,
+            terminal_status=(task.status.value if task.status in _TERMINAL_STATUSES else None),
+            has_open_attempt=task.current_attempt_id is not None,
+        )
+        targets.append(target)
+        if additional_occurrences is not None:
+            additional_occurrences.append(
+                SolverPackageOccurrence(
+                    occurrence_id=occurrence_id,
+                    manifest_path=manifest_path,
+                    package_name=coordinate,
+                    lockfile_package_key=target.lockfile_package_key,
+                    installed_version=str(installed_version),
+                    dependency_type=dependency_type,
+                    is_direct=entry is not None,
+                )
+            )
+        for issue in sorted(group.issues, key=_issue_identity):
+            if not (issue.cve_id or issue.ghsa_id or issue.finding_id):
+                continue
+            floor = issue.fixed_version or (
+                group.fix_plan.fixed_version if group.fix_plan is not None else None
+            )
+            vulnerable_version = str(issue.package_version or installed_version)
+            vulnerable_occurrence_id = f"{manifest_path}::maven::{coordinate}@{vulnerable_version}"
+            findings.append(
+                SolverFindingRequirement(
+                    finding_id=_issue_identity(issue),
+                    vulnerable_occurrence_id=vulnerable_occurrence_id,
+                    cve_id=issue.cve_id,
+                    ghsa_id=issue.ghsa_id,
+                    severity=(
+                        issue.severity.value
+                        if isinstance(issue.severity, Severity)
+                        else str(issue.severity)
+                    ),
+                    vulnerable_package=coordinate,
+                    target_occurrence_id=occurrence_id,
+                    fixed_version=floor,
+                    strategy_stage=task.strategy_stage.value,
+                    workaround_available=bool(_workaround_plan_ids(group, issue)),
+                    workaround_plan_ids=_workaround_plan_ids(group, issue),
+                    is_transitive=not bool(entry),
+                )
+            )
+            if additional_occurrences is not None:
+                additional_occurrences.append(
+                    SolverPackageOccurrence(
+                        occurrence_id=vulnerable_occurrence_id,
+                        manifest_path=manifest_path,
+                        package_name=coordinate,
+                        lockfile_package_key=f"{coordinate}@{vulnerable_version}",
+                        installed_version=vulnerable_version,
+                        dependency_type=dependency_type,
+                        is_direct=not bool(entry),
+                    )
+                )
+    return targets, findings, sorted(set(diagnostics))
+
+
 def _required_candidate_package_names(
     targets: Sequence[SolverTarget],
     findings: Sequence[SolverFindingRequirement],
@@ -840,6 +1052,11 @@ def _resolve_transitive_parent_floors(
         return cache.get(package_name) if cache is not None else None
 
     for target in sorted(targets, key=lambda item: item.occurrence_id):
+        if target.version_scheme == "maven":
+            # Maven candidate floors come from the exact GAV finding and are
+            # certified by native dependency resolution. This helper only
+            # proves npm parent/child compatibility from packument metadata.
+            continue
         task = tasks_by_id.get(target.task_id)
         group = groups_by_id.get(task.parent_group_id) if task else None
         if (
@@ -946,6 +1163,34 @@ def _candidate(
         engines=dict(engines or {}),
         os=list(os),
         cpu=list(cpu),
+    )
+
+
+def _maven_candidate(
+    version: str,
+    *,
+    source: str,
+    floor: str | None,
+    attempted: bool = False,
+) -> SolverVersionCandidate | None:
+    """Build a Maven candidate using native ComparableVersion semantics."""
+    normalized = str(version or "").strip()
+    if not normalized:
+        return None
+    if source != "current" and not is_stable_maven_version(normalized):
+        return None
+    try:
+        meets_floor = not floor or compare_maven_versions(normalized, floor) >= 0
+    except ValueError:
+        if source != "current":
+            return None
+        meets_floor = False
+    return SolverVersionCandidate(
+        version=normalized,
+        version_scheme="maven",
+        source=source,
+        meets_security_floor=meets_floor,
+        attempted=attempted,
     )
 
 
@@ -1237,6 +1482,14 @@ def _effective_candidate_requirements(
     return result
 
 
+def _requires_version_catalog(target: SolverTarget) -> bool:
+    """Return whether an eligible target needs a release catalog."""
+    if not target.eligible_for_atomic_update:
+        return False
+    strategy = target.strategy.strip().lower().replace("-", "_")
+    return not (target.version_scheme == "maven" and strategy == "no_fix")
+
+
 def _candidate_domains(
     snapshot: NpmGraphSnapshot,
     targets: Sequence[SolverTarget],
@@ -1248,6 +1501,7 @@ def _candidate_domains(
     *,
     transitive_compatible_versions: Mapping[str, set[str]] | None = None,
     packuments: Mapping[str, Mapping[str, Any]] | None = None,
+    maven_registry_fetcher: Any | None = None,
 ) -> tuple[dict[str, list[SolverVersionCandidate]], bool, str]:
     """Prepare candidate-specific registry domains with goal-directed pruning."""
     groups_by_task = {
@@ -1261,16 +1515,25 @@ def _candidate_domains(
         current = floors_by_target.get(finding.target_occurrence_id)
         if finding.fixed_version and (
             current is None
-            or (_semver_key(finding.fixed_version) or (0, 0, 0))
-            > (_semver_key(current) or (0, 0, 0))
+            or (
+                compare_maven_versions(finding.fixed_version, current) > 0
+                if any(
+                    target.occurrence_id == finding.target_occurrence_id
+                    and target.version_scheme == "maven"
+                    for target in targets
+                )
+                else (_semver_key(finding.fixed_version) or (0, 0, 0))
+                > (_semver_key(current) or (0, 0, 0))
+            )
         ):
             floors_by_target[finding.target_occurrence_id] = finding.fixed_version
     cache = RegistryPackumentCache(settings.solver_cache_dir) if settings.solver_cache_dir else None
     compatible_versions = transitive_compatible_versions or {}
     domains: dict[str, list[SolverVersionCandidate]] = {}
     observed_packuments: dict[str, Mapping[str, Any]] = dict(packuments or {})
-    complete = packuments is not None
+    complete = True
     completeness_diagnostics: list[str] = []
+    maven_catalogs: dict[str, list[str]] = {}
     limit = max(1, settings.solver_max_candidates_per_target)
 
     for target in sorted(targets, key=lambda item: item.occurrence_id):
@@ -1300,6 +1563,84 @@ def _candidate_domains(
                 "published compatibility proof"
             )
         values: list[SolverVersionCandidate] = []
+        no_fix_target = target.strategy.strip().lower().replace("-", "_") == "no_fix"
+
+        if target.version_scheme == "maven":
+            installed_candidate = _maven_candidate(
+                target.installed_version, source="current", floor=floor
+            )
+            if installed_candidate is not None:
+                values.append(installed_candidate)
+            if not no_fix_target:
+                selected_candidate = _maven_candidate(
+                    task.selected_version if task and task.selected_version else "",
+                    source="selected",
+                    floor=floor,
+                )
+                if selected_candidate is not None:
+                    values.append(selected_candidate)
+            if _requires_version_catalog(target):
+                try:
+                    if not floor:
+                        raise ValueError("Maven target has no validated security floor")
+                    fetcher = maven_registry_fetcher or fetch_maven_registry_candidates
+                    catalog = fetcher(target.target_package_name, floor, set())
+                    candidate_versions: list[str] = []
+                    for item in catalog:
+                        version = str(getattr(item, "version", "") or "").strip()
+                        if not version:
+                            continue
+                        candidate_versions.append(version)
+                        values.append(
+                            SolverVersionCandidate(
+                                version=version,
+                                version_scheme="maven",
+                                source="maven_registry",
+                                meets_security_floor=(compare_maven_versions(version, floor) >= 0),
+                                attempted=bool(getattr(item, "already_attempted", False)),
+                            )
+                        )
+                    maven_catalogs[target.target_package_name] = sorted(
+                        set(candidate_versions),
+                        key=cmp_to_key(compare_maven_versions),
+                    )
+                    if not candidate_versions:
+                        raise ValueError("Maven registry returned no stable candidates")
+                except Exception as exc:  # noqa: BLE001 - candidate evidence fails closed
+                    complete = False
+                    completeness_diagnostics.append(
+                        f"required Maven candidate catalog unavailable for "
+                        f"{target.target_package_name!r}: {exc}"
+                    )
+            if floor and not no_fix_target:
+                floor_candidate = _maven_candidate(floor, source="security_floor", floor=floor)
+                if floor_candidate is not None:
+                    values.append(floor_candidate)
+            if not no_fix_target:
+                for version in task.allowed_target_versions if task else ():
+                    approved_candidate = _maven_candidate(
+                        version, source="approved_alternative", floor=floor
+                    )
+                    if approved_candidate is not None:
+                        values.append(approved_candidate)
+            dedup_maven: dict[str, SolverVersionCandidate] = {}
+            for candidate in values:
+                previous = dedup_maven.get(candidate.version)
+                if previous is None or candidate.source == "maven_registry":
+                    dedup_maven[candidate.version] = candidate
+            ordered_maven = _normalize_solver_candidate_domain(
+                target,
+                {target.occurrence_id: list(dedup_maven.values())},
+                max_candidates=limit,
+                security_floor=floor,
+                diagnostics=diagnostics,
+            )
+            domains[target.occurrence_id] = ordered_maven
+            if not ordered_maven and target.eligible_for_atomic_update:
+                completeness_diagnostics.append(
+                    f"empty Maven candidate domain for {target.occurrence_id!r}"
+                )
+            continue
 
         def add_candidate(
             candidate: SolverVersionCandidate | None,
@@ -1447,6 +1788,7 @@ def _candidate_domains(
     catalog_digest = _digest(
         {
             "raw_packument_digests": raw_packument_digests,
+            "maven_candidate_catalogs": maven_catalogs,
             "candidate_domains": {
                 occurrence_id: [item.model_dump(mode="json") for item in values]
                 for occurrence_id, values in sorted(domains.items())
@@ -1780,6 +2122,66 @@ def _project_clusters(
     return clusters, task_to_cluster, cluster_order, task_order
 
 
+def _attach_maven_dependency_paths(
+    subgraph: SolverSubgraph,
+    targets: Sequence[SolverTarget],
+    paths_by_manifest: Mapping[str, Sequence[Sequence[str]]] | None,
+) -> SolverSubgraph:
+    """Add hard edges for vulnerable targets on the same resolved Maven path.
+
+    Args:
+        subgraph: Solver graph extracted from the package-manager snapshot.
+        targets: Exact Maven mutation targets represented in the graph.
+        paths_by_manifest: Resolved group:artifact paths keyed by source POM.
+
+    Returns:
+        The graph with dependency-ancestry edges between targets on a shared
+        resolved path.
+    """
+    if not paths_by_manifest:
+        return subgraph
+    targets_by_manifest_and_coordinate: dict[tuple[str, str], SolverTarget] = {}
+    for target in targets:
+        targets_by_manifest_and_coordinate.setdefault(
+            (target.manifest_path, target.target_package_name), target
+        )
+    existing = {
+        (edge.source_occurrence_id, edge.target_occurrence_id, edge.edge_kind)
+        for edge in subgraph.edges
+    }
+    added: dict[tuple[str, str, str], SolverEdge] = {}
+    for manifest_path, paths in sorted(paths_by_manifest.items()):
+        for path in paths:
+            target_path: list[SolverTarget] = []
+            seen_occurrences: set[str] = set()
+            for coordinate in path:
+                target = targets_by_manifest_and_coordinate.get((manifest_path, coordinate))
+                if target is not None and target.occurrence_id not in seen_occurrences:
+                    target_path.append(target)
+                    seen_occurrences.add(target.occurrence_id)
+            for left, right in zip(target_path, target_path[1:], strict=False):
+                key = (left.occurrence_id, right.occurrence_id, "dependency_ancestry")
+                if key in existing or key in added:
+                    continue
+                added[key] = SolverEdge(
+                    source_occurrence_id=left.occurrence_id,
+                    target_occurrence_id=right.occurrence_id,
+                    source_task_id=left.task_id,
+                    target_task_id=right.task_id,
+                    edge_kind="dependency_ancestry",
+                )
+    if not added:
+        return subgraph
+    return subgraph.model_copy(
+        update={
+            "edges": [
+                *subgraph.edges,
+                *(added[key] for key in sorted(added)),
+            ]
+        }
+    )
+
+
 def _prepare_portfolio_problem(
     repo_root: str | Path,
     groups: Sequence[VulnerabilityGroup],
@@ -1791,7 +2193,10 @@ def _prepare_portfolio_problem(
     portfolio_replan_request: PortfolioReplanRequest | None = None,
     npm_snapshot: NpmGraphSnapshot | None = None,
     repository_fingerprint: str | None = None,
+    workspace_repository_fingerprint: str | None = None,
+    maven_dependency_paths_by_manifest: Mapping[str, Sequence[Sequence[str]]] | None = None,
     registry_fetcher: PackumentFetcher | None = None,
+    maven_registry_fetcher: Any | None = None,
     settings: AppSettings,
     runtime_fingerprint: SolverRuntimeFingerprint | None = None,
 ) -> _PreparedPortfolioProblem:
@@ -1801,11 +2206,20 @@ def _prepare_portfolio_problem(
     if npm_snapshot is None or repository_fingerprint is None:
         host_snapshot = load_npm_graph_snapshot(root)
     snapshot = npm_snapshot or host_snapshot or NpmGraphSnapshot()
+    is_maven_portfolio = any(
+        _group_manager(group) == "maven" for group in groups if group.issue_type == IssueType.SCA
+    )
+    maven_fingerprint = maven_repository_fingerprint(root) if is_maven_portfolio else None
     host_fingerprint = (
         repository_fingerprint
+        or maven_fingerprint
         or (host_snapshot.repository_fingerprint if host_snapshot is not None else None)
         or snapshot.repository_fingerprint
     )
+    if is_maven_portfolio:
+        workspace_fingerprint = workspace_repository_fingerprint or host_fingerprint
+        if snapshot.repository_fingerprint != workspace_fingerprint:
+            snapshot = replace(snapshot, repository_fingerprint=workspace_fingerprint)
     group_list = [group.model_copy(deep=True) for group in groups]
     queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
     target_scope = (
@@ -1826,14 +2240,22 @@ def _prepare_portfolio_problem(
             )
         )
     )
-    targets, findings, diagnostics = _build_targets_and_findings(snapshot, group_list, queue)
+    additional_occurrences: list[SolverPackageOccurrence] = []
+    targets, findings, diagnostics = _build_targets_and_findings(
+        snapshot,
+        group_list,
+        queue,
+        repo_root=root,
+        additional_occurrences=additional_occurrences,
+    )
     if not targets:
         raise ValueError("Cannot build a portfolio plan without active SCA package tasks.")
 
-    required_names = _required_candidate_package_names(targets, findings)
+    npm_targets = [target for target in targets if target.version_scheme == "semver"]
+    required_names = _required_candidate_package_names(npm_targets, findings)
     packuments: dict[str, Mapping[str, Any]] = {}
     packument_digest = _digest({"required_packages": required_names, "fresh_snapshot": False})
-    if registry_fetcher is not None:
+    if npm_targets and registry_fetcher is not None:
         (
             packuments,
             _,
@@ -1852,7 +2274,7 @@ def _prepare_portfolio_problem(
         group_list,
         settings,
         diagnostics,
-        packuments=packuments if registry_fetcher is not None else None,
+        packuments=packuments if npm_targets and registry_fetcher is not None else None,
     )
     subgraph = extract_solver_subgraph(
         snapshot,
@@ -1860,6 +2282,7 @@ def _prepare_portfolio_problem(
         findings,
         peer_conflict_pairs=explicit_pairs,
         forced_singleton_task_ids=forced,
+        additional_occurrences=additional_occurrences,
     )
     diagnostics.extend(subgraph.diagnostics)
     domains, domain_complete, domain_digest = _candidate_domains(
@@ -1871,18 +2294,24 @@ def _prepare_portfolio_problem(
         settings,
         diagnostics,
         transitive_compatible_versions=transitive_compatible_versions,
-        packuments=packuments if registry_fetcher is not None else None,
+        packuments=packuments if npm_targets and registry_fetcher is not None else None,
+        maven_registry_fetcher=maven_registry_fetcher,
     )
-    evidence_domains, evidence_domain_digest, evidence_diagnostics = _build_evidence_domains(
-        snapshot,
-        targets,
-        findings,
-        domains,
-        packuments,
-        settings,
-        registry_fetcher=registry_fetcher,
-        runtime_fingerprint=runtime_fingerprint,
-    )
+    if npm_targets:
+        evidence_domains, evidence_domain_digest, evidence_diagnostics = _build_evidence_domains(
+            snapshot,
+            targets,
+            findings,
+            domains,
+            packuments,
+            settings,
+            registry_fetcher=registry_fetcher,
+            runtime_fingerprint=runtime_fingerprint,
+        )
+    else:
+        evidence_domains = []
+        evidence_domain_digest = _digest({"manager": "maven", "domains": domains})
+        evidence_diagnostics = []
     diagnostics.extend(evidence_diagnostics)
     subgraph = expand_candidate_relations(
         subgraph,
@@ -1890,21 +2319,36 @@ def _prepare_portfolio_problem(
         npm_snapshot=snapshot,
         evidence_domains=evidence_domains,
     )
+    subgraph = _attach_maven_dependency_paths(subgraph, targets, maven_dependency_paths_by_manifest)
     diagnostics.extend(subgraph.diagnostics)
     mutation_catalog_available = all(
-        bool(target.target_package_name) and target.target_package_name in packuments
+        bool(target.target_package_name)
+        and (
+            any(
+                candidate.source == "maven_registry"
+                for candidate in domains.get(target.occurrence_id, ())
+            )
+            if target.version_scheme == "maven"
+            else target.target_package_name in packuments
+        )
         for target in targets
-        if target.eligible_for_atomic_update
+        if _requires_version_catalog(target)
     )
-    # Completeness is about every package the solver may mutate.  Missing or
-    # oversized third-party evidence witnesses relax dependency constraints,
-    # but do not invalidate the target release catalogs.
+    # Completeness covers every target that may change package versions.
+    # NO_FIX Maven targets remain package-resolution evidence but use a
+    # separate removal/workaround action instead of a replacement release.
+    # Missing third-party evidence may relax constraints, not release catalogs.
     candidate_catalog_complete = (
-        registry_fetcher is not None and mutation_catalog_available and domain_complete
+        (registry_fetcher is not None or any(t.version_scheme == "maven" for t in targets))
+        and mutation_catalog_available
+        and domain_complete
     )
     candidate_catalog_digest = _digest(
         {
             "fresh_packument_digest": packument_digest,
+            "maven_candidate_domain_digest": (
+                domain_digest if any(t.version_scheme == "maven" for t in targets) else None
+            ),
             "domain_digest": domain_digest,
             "complete": candidate_catalog_complete,
             "evidence_domain_digest": evidence_domain_digest,
@@ -2124,6 +2568,7 @@ def build_portfolio_plan(
     forced_singleton_task_ids: Iterable[str] = (),
     settings: AppSettings | None = None,
     registry_fetcher: PackumentFetcher | None = None,
+    maven_registry_fetcher: Any | None = None,
     portfolio_iteration: int = 0,
     portfolio_replan_request: PortfolioReplanRequest | None = None,
 ) -> Any:
@@ -2142,6 +2587,7 @@ def build_portfolio_plan(
         forced_singleton_task_ids=tuple(forced_singleton_task_ids),
         portfolio_replan_request=portfolio_replan_request,
         registry_fetcher=registry_fetcher,
+        maven_registry_fetcher=maven_registry_fetcher,
         settings=resolved_settings,
     )
     solver_plan = solve_portfolio(
@@ -2351,12 +2797,33 @@ def apply_portfolio_plan(
             task,
         )
         decision_lockfile_key = str(decision.lockfile_package_key or "").replace("\\", "/")
-        direct_occurrence = make_occurrence_id(expected_manifest, expected_package)
-        physical_occurrence = make_occurrence_id(
-            expected_manifest,
-            expected_package,
-            decision_lockfile_key,
-        )
+        is_maven_target = _group_manager(group) == "maven"
+        if is_maven_target:
+            # Maven targets are keyed by the exact POM and GAV. They have no
+            # npm lockfile occurrence, so validate the typed native identity
+            # emitted by the same solver instead of manufacturing a JS key.
+            expected_occurrence = f"{expected_manifest}::maven::{expected_package}"
+            expected_lockfile_key = (
+                f"{expected_package}@{decision.installed_version}"
+                if decision.installed_version
+                else None
+            )
+            direct_occurrence = expected_occurrence
+            physical_occurrence = expected_occurrence
+            lockfile_key_valid = (
+                expected_lockfile_key is not None and decision_lockfile_key == expected_lockfile_key
+            )
+        else:
+            direct_occurrence = make_occurrence_id(expected_manifest, expected_package)
+            physical_occurrence = make_occurrence_id(
+                expected_manifest,
+                expected_package,
+                decision_lockfile_key,
+            )
+            lockfile_key_valid = lockfile_key_matches_package(
+                decision_lockfile_key,
+                expected_package,
+            )
         decision_occurrence = str(decision.target_occurrence_id or "")
         decision_strategy = str(decision.selected_strategy).lower().replace("-", "_")
         non_mutating_workaround = (
@@ -2366,7 +2833,7 @@ def apply_portfolio_plan(
             and not decision.allowed_alternative_versions
             and bool(decision.selected_plan_issue_ids)
         )
-        if not lockfile_key_matches_package(decision_lockfile_key, expected_package):
+        if not lockfile_key_valid:
             raise ValueError(
                 f"portfolio decision for task {task_id!r} has invalid lockfile_package_key "
                 f"{decision_lockfile_key!r}"
@@ -2403,7 +2870,8 @@ def apply_portfolio_plan(
             )
             continue
         if (
-            decision_occurrence == physical_occurrence
+            not is_maven_target
+            and decision_occurrence == physical_occurrence
             and physical_occurrence != direct_occurrence
             and decision.dependency_type not in _OVERRIDE_DEPENDENCY_TYPES
             and not non_mutating_workaround

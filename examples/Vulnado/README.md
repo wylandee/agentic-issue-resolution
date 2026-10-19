@@ -30,6 +30,24 @@ python examples/Vulnado/run_batch.py --iterations 2 --batch-size 3 --seed 7 --dr
 
 Remove `--dry-run` to run remediation. The batch runner copies the generated `suppressions.xml` into the clone before each iteration, including dry runs, so use a disposable clone when you need to preserve the checkout. Results and patches are written under `data/trajectories/`; the aggregate summary is `vulnado-batch-runs-summary.json`.
 
+To run one explicit package batch instead of sampling, pass exact Maven package
+coordinates from the baseline. For example, to select the aligned Tomcat
+artifacts:
+
+```bash
+python examples/Vulnado/run_batch.py \
+  --packages \
+  org.apache.tomcat.embed:tomcat-embed-core \
+  org.apache.tomcat.embed:tomcat-embed-websocket \
+  --dry-run
+```
+
+Explicit selections are trimmed, deduplicated, sorted, and checked against the
+baseline before any fixture files are written. They produce one batch regardless
+of `--iterations` or `--batch-size`. Batch requests pass their selected package
+names as a development-only engine allowlist; the single-run `run.py` entrypoint
+remains full-repository scoped.
+
 The full baseline and the suppressed fixture use canonical JSONL. To regenerate the full baseline from the raw report, run:
 
 ```bash

@@ -372,11 +372,15 @@ def run_batch_iteration(
         request = RemediationRequest(
             repo_root=repo_root,
             issues=filtered_issues,
+            # Batch fixtures are explicitly package-scoped development runs.
+            # The normal Vulnado single-run entrypoint retains full-repository
+            # production behavior.
+            target_packages=selected_packages,
             system_context=SystemContext(
                 public_facing=True,
                 deployment_os="linux",
                 deployment_architecture="containerized",
-                environment="production",
+                environment="development",
                 primary_language="java",
             ),
         )
@@ -428,6 +432,7 @@ def run_batch(
     *,
     iterations: int = 10,
     batch_size: int = 3,
+    target_packages: list[str] | None = None,
     repo_root: Path = _DEFAULT_REPO,
     baseline_path: Path = _DEFAULT_BASELINE,
     suppressed_issues_path: Path = _DEFAULT_SUPPRESSED_ISSUES,
@@ -441,6 +446,8 @@ def run_batch(
     Args:
         iterations: Total number of iterations to run.
         batch_size: Number of packages per iteration.
+        target_packages: Optional explicit package batch. When supplied, sampling is
+            skipped and exactly one development-scoped iteration is run.
         repo_root: Path to repository clone.
         baseline_path: Path to baseline issues fixture (read-only).
         suppressed_issues_path: Path to suppressed issues output JSONL.
@@ -468,13 +475,29 @@ def run_batch(
         len(packages),
     )
 
-    # Generate distinct package batches
-    batches = sample_package_batches(
-        packages,
-        batch_size=batch_size,
-        num_batches=iterations,
-        seed=seed,
-    )
+    if target_packages is not None:
+        selected_packages = sorted(
+            {package.strip() for package in target_packages if package.strip()}
+        )
+        if not selected_packages:
+            raise ValueError("packages must contain at least one non-empty package name")
+        unknown_packages = sorted(set(selected_packages) - set(packages))
+        if unknown_packages:
+            raise ValueError(
+                "Requested package(s) are not present in the baseline: "
+                + ", ".join(unknown_packages)
+            )
+        # Explicit selections are one-shot development batches; ordinary batch
+        # runs continue to sample from the full baseline.
+        batches = [selected_packages]
+    else:
+        # Generate distinct package batches
+        batches = sample_package_batches(
+            packages,
+            batch_size=batch_size,
+            num_batches=iterations,
+            seed=seed,
+        )
     logger.info("Planned %d distinct package batches", len(batches))
 
     summaries: list[IterationSummary] = []
@@ -533,6 +556,15 @@ def main() -> int:
         type=int,
         default=3,
         help="Number of packages per batch (default: 3)",
+    )
+    parser.add_argument(
+        "--packages",
+        nargs="+",
+        default=None,
+        help=(
+            "Run one development-scoped batch for these exact Maven package names "
+            "instead of sampling packages"
+        ),
     )
     parser.add_argument(
         "--repo",
@@ -596,6 +628,7 @@ def main() -> int:
         summaries = run_batch(
             iterations=args.iterations,
             batch_size=args.batch_size,
+            target_packages=args.packages,
             repo_root=repo_root,
             baseline_path=baseline_path,
             suppressed_issues_path=suppressed_issues_path,

@@ -445,44 +445,62 @@ def _make_modify_batch_npm_dependencies_tool(
     @tool
     def modify_batch_npm_dependencies() -> str:
         """Modify and synchronize the complete committed npm batch once."""
-        if execution_state.get("multi_package_action_executed"):
-            return _tool_error(
-                "MULTI_PACKAGE_ACTION_ALREADY_EXECUTED",
-                "The committed cluster action has already been executed; return control to the Supervisor.",
-            )
-
-        # Set the barrier before entering the atomic executor. Even a failed
-        # action is returned to the Supervisor for a new committed attempt;
-        # the model must not replay a failed batch in the same worker turn.
-        execution_state["multi_package_action_executed"] = True
-        try:
-            if package_checkpoints is None:
-                succeeded, error = apply_multi_package_action(sandbox, action, touched_files)
-            else:
-                succeeded, error = apply_multi_package_action(
-                    sandbox,
-                    action,
-                    touched_files,
-                    checkpoint_store=package_checkpoints,
-                )
-        except Exception as exc:  # noqa: BLE001 - tool boundary returns typed failure
-            succeeded = False
-            error = f"Multi-package action raised an unexpected error: {exc}"
-
-        execution_state["multi_package_action_succeeded"] = succeeded
-        execution_state["multi_package_action_error"] = error or None
-        if succeeded:
-            cluster_label = action.cluster_id or "unclustered"
-            return (
-                "SUCCESS: Applied the Supervisor-committed multi-package action "
-                f"for cluster {cluster_label}; every mutation and lockfile check passed."
-            )
-        return _tool_error(
-            "MULTI_PACKAGE_ACTION_FAILED",
-            error or "The committed multi-package action failed and was rolled back.",
+        return _execute_committed_multi_package_action(
+            sandbox,
+            action,
+            touched_files,
+            execution_state,
+            package_checkpoints,
+            executor=apply_multi_package_action,
+            success_detail="every mutation and lockfile check passed",
         )
 
     return modify_batch_npm_dependencies
+
+
+def _execute_committed_multi_package_action(
+    sandbox: DockerSandbox,
+    action: MultiPackageAction,
+    touched_files: set[str],
+    execution_state: dict[str, Any],
+    package_checkpoints: dict[str, Any] | None,
+    *,
+    executor: Any,
+    success_detail: str,
+) -> str:
+    """Apply one captured action under the shared single-execution barrier."""
+    if execution_state.get("multi_package_action_executed"):
+        return _tool_error(
+            "MULTI_PACKAGE_ACTION_ALREADY_EXECUTED",
+            "The committed cluster action has already been executed; return control to the Supervisor.",
+        )
+    execution_state["multi_package_action_executed"] = True
+    try:
+        if package_checkpoints is None:
+            succeeded, error = executor(sandbox, action, touched_files)
+        else:
+            succeeded, error = executor(
+                sandbox,
+                action,
+                touched_files,
+                checkpoint_store=package_checkpoints,
+            )
+    except Exception as exc:  # noqa: BLE001 - tool boundary returns typed failure
+        succeeded = False
+        error = f"Multi-package action raised an unexpected error: {exc}"
+
+    execution_state["multi_package_action_succeeded"] = succeeded
+    execution_state["multi_package_action_error"] = error or None
+    if succeeded:
+        cluster_label = action.cluster_id or "unclustered"
+        return (
+            "SUCCESS: Applied the Supervisor-committed multi-package action "
+            f"for cluster {cluster_label}; {success_detail}."
+        )
+    return _tool_error(
+        "MULTI_PACKAGE_ACTION_FAILED",
+        error or "The committed multi-package action failed and was rolled back.",
+    )
 
 
 def _make_modify_and_validate_npm_dependency_tool(

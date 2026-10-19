@@ -1539,6 +1539,7 @@ def build_portfolio_plan(
     forced_singleton_task_ids: Iterable[str] = (),
     settings: Any | None = None,
     registry_fetcher: Any | None = None,
+    maven_registry_fetcher: Any | None = None,
     portfolio_iteration: int = 0,
     portfolio_replan_request: Any | None = None,
 ) -> PortfolioPlan:
@@ -1568,6 +1569,7 @@ def build_portfolio_plan(
         forced_singleton_task_ids=forced_singleton_task_ids,
         settings=settings,
         registry_fetcher=registry_fetcher,
+        maven_registry_fetcher=maven_registry_fetcher,
         portfolio_iteration=portfolio_iteration,
         portfolio_replan_request=portfolio_replan_request,
     )

@@ -352,6 +352,7 @@ class TrajectoryRecorder(BaseCallbackHandler):
         self._token_cost: float | None = None
         self._cached_input_tokens: int | None = None
         self._workspace_volume: str | None = None
+        self._maven_cache_volume: str | None = None
 
     def _start(
         self,
@@ -482,6 +483,24 @@ class TrajectoryRecorder(BaseCallbackHandler):
         with self._lock:
             if self._workspace_volume == volume_name:
                 self._workspace_volume = None
+
+    @property
+    def maven_cache_volume(self) -> str | None:
+        """Return the run-owned Maven cache volume registered by setup."""
+        with self._lock:
+            return self._maven_cache_volume
+
+    def register_maven_cache_volume(self, volume_name: str) -> None:
+        """Record the Maven cache volume created by this run's workspace setup."""
+        if volume_name.startswith("agent_maven_repository_"):
+            with self._lock:
+                self._maven_cache_volume = volume_name
+
+    def clear_maven_cache_volume(self, volume_name: str) -> None:
+        """Clear the cache record after Docker confirms its removal."""
+        with self._lock:
+            if self._maven_cache_volume == volume_name:
+                self._maven_cache_volume = None
 
     def has_span_since(self, sequence: int, run_type: str | None = None) -> bool:
         """Return whether a span of the requested type started after a sequence."""

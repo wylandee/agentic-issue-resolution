@@ -5,6 +5,8 @@ from remediation_engine.orchestration.workaround_subagent import (
     _WORKAROUND_STATIC_INSTRUCTIONS,
     WorkaroundPhase,
     _build_workaround_prompt,
+    _preferred_targeted_test_files,
+    _primary_non_test_source_files,
     _workaround_search_recommendation,
 )
 
@@ -51,6 +53,26 @@ def test_supervisor_task_instruction_is_not_truncated():
     prompt = _build_workaround_prompt(target_task=task, target_group=group)
 
     assert f"Task Instruction: {instruction.strip()}" in prompt
+
+
+def test_java_qa_evidence_selects_source_test_and_excludes_it_from_source_files():
+    qa_evidence = QAFailureEvidence(
+        attempt_id="att-java-1",
+        task_revision=1,
+        exact_diagnostics=["mvn test FAILED"],
+        failed_tests=["src/test/java/org/example/AuthTest.java: rejectsMissingAuth"],
+        source_locations=[
+            "src/main/java/org/example/Auth.java:27",
+            "src/test/java/org/example/AuthTest.java:12",
+        ],
+        affected_files=["src/main/java/org/example/Auth.java"],
+        raw_excerpt="Tests run: 1, Failures: 1, Errors: 0, Skipped: 0",
+    )
+
+    assert _preferred_targeted_test_files(qa_evidence) == [
+        "src/test/java/org/example/AuthTest.java"
+    ]
+    assert _primary_non_test_source_files(qa_evidence) == ["src/main/java/org/example/Auth.java"]
 
 
 def test_compact_qa_regression_repair_prompt():

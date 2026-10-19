@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 from remediation_engine.contracts.schemas import (
     ODCScanEvidence,
@@ -33,13 +33,17 @@ class _QALogRecord:
 
 @dataclass(frozen=True)
 class _ODCReportedPackageOccurrence:
-    """One package identity and report path emitted by ODC."""
+    """One package identity and the report evidence that supports it."""
 
     package_name: str
     version: str
     ecosystem: str
     file_path: str | None
     raw_file_path: str | None = None
+    evidence_source: Literal["odc_package_url", "maven_repository_layout", "embedded_maven_pom"] = (
+        "odc_package_url"
+    )
+    owner_file_path: str | None = None
 
 
 @dataclass(frozen=True)

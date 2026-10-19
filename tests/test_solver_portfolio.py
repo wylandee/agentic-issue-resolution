@@ -1887,3 +1887,27 @@ def test_evidence_versions_participate_in_candidate_domain_and_input_digests():
     assert infeasible.selected_plan is None
     assert feasible.domain_digest != infeasible.domain_digest
     assert feasible.input_digest != infeasible.input_digest
+
+
+def test_maven_portfolio_uses_native_qualifier_order_for_security_floor():
+    target = _target().model_copy(
+        update={"installed_version": "1.0-RC1", "version_scheme": "maven"}
+    )
+    finding = _finding_for_target(target, "CVE-MAVEN-1", "1.0")
+    result = solve_portfolio(
+        _solver_subgraph(targets=[target], findings=[finding]),
+        {
+            target.occurrence_id: [
+                SolverVersionCandidate(version="1.0-RC1", version_scheme="maven"),
+                SolverVersionCandidate(version="1.0-alpha1", version_scheme="maven"),
+                SolverVersionCandidate(version="1.0", version_scheme="maven"),
+                SolverVersionCandidate(version="1.0-sp1", version_scheme="maven"),
+            ]
+        },
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+    )
+
+    assert result.selected_plan is not None
+    decision = result.selected_plan.task_decisions[0]
+    assert decision.selected_version == "1.0"
+    assert decision.selected_strategy == "version_bump"
