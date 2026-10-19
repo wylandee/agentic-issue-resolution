@@ -483,6 +483,33 @@ class TestParseVulnerabilities:
         assert issues[0].package_name == "requests-tool-kit"
         assert issues[0].package_version == "2.31.0"
 
+    def test_odc_cpe_exclusive_upper_bound_becomes_package_fixed_version(self):
+        dep = _minimal_dep(
+            file_name="certifi:2022.12.7",
+            file_path="/src/requirements.txt",
+            purl="pkg:pypi/certifi@2022.12.7",
+            cve_name="CVE-2024-39689",
+        )
+        dep["vulnerabilities"][0]["vulnerableSoftware"] = [
+            {
+                "software": {
+                    "id": "cpe:2.3:a:certifi:certifi:*:*:*:*:*:python:*:*",
+                    "versionEndExcluding": "2024.7.4",
+                }
+            },
+            {
+                "software": {
+                    "id": "cpe:2.3:a:netapp:other-product:*:*:*:*:*:python:*:*",
+                    "versionEndExcluding": "99.0.0",
+                }
+            },
+        ]
+
+        issues = parse_vulnerabilities({"dependencies": [dep]})
+
+        assert len(issues) == 1
+        assert issues[0].fixed_version == "2024.7.4"
+
 
 # ===========================================================================
 # odc_parser â€” export functions

@@ -1,9 +1,13 @@
+"""Python parent evidence and retry behavior at the shared Supervisor boundary."""
+
 from __future__ import annotations
 
-from unittest.mock import patch
+import hashlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from packaging.version import Version
 
 from remediation_engine.contracts import (
     FixPlan,
@@ -11,42 +15,55 @@ from remediation_engine.contracts import (
     IssueSource,
     IssueType,
     LocalizedIssue,
-    RemediationTask,
-    RoutingStrategy,
     SCARemediationStage,
     Severity,
     TaskStatus,
+    UpdateRetryDiagnostics,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from remediation_engine.orchestration.supervisor_node import _plan_initial_transitive_task
+from remediation_engine.contracts.solver_models import SolverTaskDecision
+from remediation_engine.contracts.version_policy import RegistryCandidate
+from remediation_engine.orchestration.portfolio_solver import prepare_python_portfolio_problem
+from remediation_engine.orchestration.supervisor_node import (
+    _portfolio_plan_is_stale,
+    _portfolio_plan_violations,
+)
+from remediation_engine.orchestration.supervisor_planner import (
+    _needs_planner,
+    _run_deterministic_retry_planner,
+)
+from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+from remediation_engine.settings import AppSettings
 from remediation_engine.triage.grouper import group_issues
 
 
-def _group(*, ecosystem: str = "pypi", direct: bool | None = False) -> VulnerabilityGroup:
-    package = "vulnerable-child"
+def _group(*, direct: bool = False, include_parent_hint: bool = True) -> VulnerabilityGroup:
+    child = "vulnerable-child"
     issue = VulnerabilityIssue(
         source=IssueSource.ODC,
         issue_type=IssueType.SCA,
         severity=Severity.HIGH,
-        package_name=package,
+        package_name=child,
         package_version="1.0.0",
-        purl=f"pkg:{ecosystem}/{package}@1.0.0",
+        purl=f"pkg:pypi/{child}@1.0.0",
         cve_id="CVE-2026-1000",
-        ecosystem=ecosystem,
-        file_path="Pipfile.lock" if ecosystem == "pypi" else "package-lock.json",
+        ecosystem="pypi",
+        file_path="Pipfile.lock",
     )
+    ancestry = [] if direct else [child] if not include_parent_hint else ["direct-parent", child]
+    parent_name = None if direct or not include_parent_hint else "direct-parent"
     localized = LocalizedIssue(
         issue=issue,
-        manifest_file="Pipfile" if ecosystem == "pypi" else "package.json",
-        package_manager="pipenv" if ecosystem == "pypi" else "npm",
+        manifest_file="Pipfile",
+        package_manager="pipenv",
         is_direct_dependency=direct,
-        declaration_type="packages" if ecosystem == "pypi" else "dependencies",
-        dependency_ancestry=[] if ecosystem == "pypi" else ["direct-parent", package],
+        declaration_type="packages",
+        dependency_ancestry=ancestry,
         dependency_versions={"direct-parent": "1.0.0"},
-        parent_package_name=None if ecosystem == "pypi" else "direct-parent",
-        parent_package_version=None if ecosystem == "pypi" else "1.0.0",
-        parent_declaration_type=None if ecosystem == "pypi" else "dependencies",
+        parent_package_name=parent_name,
+        parent_package_version="1.0.0" if parent_name else None,
+        parent_declaration_type="packages" if parent_name else None,
         localization_confidence=1.0,
     )
     fix_plan = FixPlan(
@@ -55,213 +72,271 @@ def _group(*, ecosystem: str = "pypi", direct: bool | None = False) -> Vulnerabi
         instruction="Install the fixed release.",
         strategy_used="osv_api",
     )
-    return group_issues([issue], sca_issue_plans=[(localized, fix_plan)])[0]
-
-
-def _task(group: VulnerabilityGroup, *, ecosystem: str = "pypi") -> RemediationTask:
-    return RemediationTask(
-        task_id=f"{ecosystem}-task",
-        parent_group_id=group.group_id,
-        strategy=RoutingStrategy.VERSION_BUMP,
-        strategy_stage=SCARemediationStage.OSV_MINIMUM,
-        target_package_name=None,
-        target_dependency_type=None,
-        parent_package_name=None,
-        parent_package_version=None,
-        instruction="Await supervisor planning.",
-        status=TaskStatus.PENDING,
+    group = group_issues([issue], sca_issue_plans=[(localized, fix_plan)])[0]
+    return group.model_copy(
+        update={
+            "parent_package_name": parent_name,
+            "dependency_ancestry": ancestry,
+        }
     )
 
 
-def _report(version: str, other_candidate: str) -> str:
-    pypi_latest = "3.1.0.post1"
-    return (
-        f"- Selected Version: {version}\n"
-        f"- Eligible Candidates: {version}, {other_candidate}, 99.0.0\n"
-        f"- Compatible Parent Versions: {version}, {other_candidate}\n"
-        "- Latest Stable: 99.0.0\n"
-        f"- PyPI Latest: {pypi_latest}"
+def _pipfile_fixture(
+    tmp_path: Path,
+    *,
+    declarations: dict[str, str],
+    locked_parents: dict[str, str],
+) -> None:
+    lines = ["[packages]", *(f'{name} = "{value}"' for name, value in declarations.items())]
+    (tmp_path / "Pipfile").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    locked = {name: {"version": f"=={version}"} for name, version in locked_parents.items()}
+    locked["vulnerable-child"] = {"version": "==1.0.0"}
+    (tmp_path / "Pipfile.lock").write_text(
+        json.dumps({"default": locked, "develop": {}}), encoding="utf-8"
     )
 
 
-@pytest.mark.parametrize("direct", [True, None], ids=["direct", "non-transitive"])
-def test_direct_or_non_transitive_pypi_task_is_not_replanned_as_a_parent_update(direct):
+def _candidate(version: str) -> RegistryCandidate:
+    return RegistryCandidate(
+        version=version,
+        ecosystem="pypi",
+        semver_key=None,
+        security_floor_met=True,
+        is_stable=True,
+        same_major=True,
+        already_attempted=False,
+        selection_roles=("same_major",),
+    )
+
+
+@pytest.mark.parametrize("direct", [True, False], ids=["direct", "no-parent-proof"])
+def test_unproven_pipfile_target_never_dispatches_to_registry(
+    tmp_path: Path, direct: bool
+) -> None:
+    _pipfile_fixture(
+        tmp_path,
+        declarations={"vulnerable-child": "==1.0.0"},
+        locked_parents={},
+    )
     group = _group(direct=direct)
-    task = _task(group)
+    task = build_initial_remediation_task(group, "task-1")
+    calls: list[tuple[str, str, set[str]]] = []
 
-    with (
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn._resolve_pipfile_parent_context"
-        ) as proof,
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn.plan_python_parent_version"
-        ) as planner,
-    ):
-        planned = _plan_initial_transitive_task(task, group, workspace_volume="workspace")
+    def registry(package: str, floor: str, attempted: set[str]):
+        calls.append((package, floor, attempted))
+        return [_candidate("1.2.0")]
 
-    assert planned == task
-    proof.assert_not_called()
-    planner.invoke.assert_not_called()
+    prepared = prepare_python_portfolio_problem(
+        tmp_path,
+        [group],
+        {task.task_id: task},
+        settings=AppSettings(),
+        registry_fetcher=registry,
+        parent_requires_dist_fetcher=lambda *_: ["vulnerable-child>=1.0"],
+    )
+
+    assert prepared.targets == []
+    assert not prepared.candidate_catalog_complete
+    assert calls == []
 
 
-@pytest.mark.parametrize(
-    ("selection", "stage", "version"),
-    [
-        ("minimum", SCARemediationStage.OSV_MINIMUM, "1.2.0.post1"),
-        ("same_major", SCARemediationStage.PYPI_SAME_MAJOR, "1.8.0.post1"),
-        ("latest", SCARemediationStage.PYPI_LATEST, "3.1.0.post1"),
-    ],
-)
-def test_proven_one_hop_pipfile_parent_commits_selected_parent_only(selection, stage, version):
+@pytest.mark.parametrize("proof_shape", ["missing", "ambiguous"])
+def test_missing_or_ambiguous_pipfile_parent_proof_fails_closed_before_candidates(
+    tmp_path: Path, proof_shape: str
+) -> None:
+    if proof_shape == "missing":
+        declarations = {"direct-parent": ">=1.0,<2"}
+        locked_parents = {"direct-parent": "1.0.0"}
+        group = _group()
+
+        def requires_dist(_package: str, _version: str):
+            return []
+
+    else:
+        declarations = {
+            "direct-parent": ">=1.0,<2",
+            "second-parent": ">=1.0,<2",
+        }
+        locked_parents = {"direct-parent": "1.0.0", "second-parent": "1.0.0"}
+        group = _group(include_parent_hint=False)
+
+        def requires_dist(_package: str, _version: str):
+            return ["vulnerable-child>=1.0"]
+
+    _pipfile_fixture(tmp_path, declarations=declarations, locked_parents=locked_parents)
+    task = build_initial_remediation_task(group, "task-1")
+    registry_called = False
+
+    def registry(*_args):
+        nonlocal registry_called
+        registry_called = True
+        return [_candidate("1.2.0")]
+
+    prepared = prepare_python_portfolio_problem(
+        tmp_path,
+        [group],
+        {task.task_id: task},
+        settings=AppSettings(),
+        registry_fetcher=registry,
+        parent_requires_dist_fetcher=requires_dist,
+    )
+
+    assert prepared.targets == []
+    assert not prepared.candidate_catalog_complete
+    assert not registry_called
+    assert any("parent proof" in item or "parent" in item for item in prepared.diagnostics)
+
+
+def test_python_retry_uses_only_unattempted_pypi_candidates_from_shared_plan() -> None:
     group = _group()
-    task = _task(group)
-    candidates: list[str] = ["stale-version"]
+    task = build_initial_remediation_task(group, "pypi-task").model_copy(
+        update={
+            "status": TaskStatus.NEEDS_RETRY,
+            "retry_count": 1,
+            "strategy_stage": SCARemediationStage.PYPI_SAME_MAJOR,
+            "target_package_name": "direct-parent",
+            "parent_package_name": "direct-parent",
+            "parent_package_version": "1.0.0",
+            "parent_minimum_version": "1.2.0",
+            "selected_version": "1.2.0",
+            "allowed_target_versions": ["1.2.0", "1.8.0.post1", "3.1.0.post1"],
+            "allowed_dependency_types": ["packages"],
+        }
+    )
+    diagnostics = UpdateRetryDiagnostics(
+        task_id=task.task_id,
+        strategy_stage=SCARemediationStage.PYPI_SAME_MAJOR,
+        target_package_name="direct-parent",
+        attempted_versions=["1.2.0"],
+        executed_versions=["1.2.0"],
+        attempted_versions_by_target={"Direct_Parent": ["1.2.0"]},
+        candidate_versions_considered=["1.2.0", "1.8.0.post1", "3.1.0.post1"],
+    )
+    queue = {task.task_id: task}
+    group_by_id = {group.group_id: group}
 
-    def plan_parent(inputs: dict[str, str]) -> str:
-        if inputs["selection"] == selection:
-            return _report(
-                version,
-                {"minimum": "2.0.0", "same_major": "1.9.0", "latest": "3.0.0"}[selection],
+    assert _needs_planner(queue, {}, {task.task_id: diagnostics}, "qa_completed")
+    updated, plans = _run_deterministic_retry_planner(
+        queue,
+        group_by_id,
+        {task.task_id: diagnostics},
+    )
+
+    plan = plans[task.task_id]
+    assert plan.selected_version == "1.8.0.post1"
+    assert plan.action == "retry_update"
+    assert plan.target_package_name == "direct-parent"
+    assert updated[task.task_id].registry_query_performed is False
+    assert updated[task.task_id].attempted_versions == ["1.2.0"]
+
+
+def test_committed_python_portfolio_accepts_language_specific_target_identity(
+    tmp_path: Path,
+) -> None:
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        package_name="certifi",
+        package_version="2024.5.22",
+        purl="pkg:pypi/certifi@2024.5.22",
+        cve_id="CVE-2026-1001",
+        ecosystem="pypi",
+        file_path="requirements.txt",
+    )
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file="requirements.txt",
+        package_manager="pip",
+        is_direct_dependency=True,
+        declaration_type="requirements",
+        localization_confidence=1.0,
+    )
+    fix_plan = FixPlan(
+        status=FixPlanStatus.VERSION_FOUND,
+        fixed_version="2024.7.4",
+        instruction="Install the fixed release.",
+        strategy_used="odc_cpe_bound",
+    )
+    group = group_issues([issue], sca_issue_plans=[(localized, fix_plan)])[0]
+    group = group.model_copy(
+        update={"file_path": "requirements.txt", "file_paths": ["requirements.txt"]}
+    )
+    manifest_content = "certifi==2024.5.22\n"
+    (tmp_path / "requirements.txt").write_text(manifest_content, encoding="utf-8")
+    manifest_digest = hashlib.sha256(manifest_content.encode("utf-8")).hexdigest()
+    repository_fingerprint = hashlib.sha256(
+        json.dumps(
+            {"requirements.txt": manifest_digest}, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    task = build_initial_remediation_task(group, "task-1").model_copy(
+        update={
+            "portfolio_plan_id": "portfolio-python",
+            "selected_version": "2024.7.4",
+            "allowed_target_versions": ["2024.7.4"],
+            "allowed_dependency_types": ["requirements"],
+            "target_dependency_type": "requirements",
+        }
+    )
+    decision = SolverTaskDecision(
+        task_id=task.task_id,
+        selected_strategy="version_bump",
+        selected_version="2024.7.4",
+        strategy_stage=task.strategy_stage.value,
+        target_occurrence_id="python:requirements.txt:certifi",
+        target_group_id=group.group_id,
+        target_package_name="certifi",
+        manifest_path="requirements.txt",
+        dependency_type="requirements",
+        allowed_dependency_types=["requirements"],
+    )
+    plan = SimpleNamespace(
+        clusters=[],
+        portfolio_plan_id="portfolio-python",
+        repository_fingerprint=repository_fingerprint,
+        solver_plan=SimpleNamespace(
+            selected_plan=SimpleNamespace(
+                task_decisions=[decision],
+                selected_candidate_versions={
+                    "python:requirements.txt:certifi": "2024.7.4"
+                },
+                batches=[],
             )
-        return "- Status: no eligible candidate"
-
-    with (
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn._resolve_pipfile_parent_context",
-            return_value=("direct-parent", "1.0.0", ["direct-parent", "vulnerable-child"]),
         ),
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn._pipfile_parent_declaration_type",
-            return_value="dev-packages",
-        ) as category,
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn.plan_python_parent_version"
-        ) as planner,
+        task_ids=[task.task_id],
+        planned_task_revisions={task.task_id: task.task_revision},
+        task_strategies={},
+    )
+
+    task_queue = {task.task_id: task}
+    assert _portfolio_plan_violations(plan, task_queue, [group]) == []
+    assert _portfolio_plan_is_stale(plan, task_queue, [group], str(tmp_path)) is False
+    (tmp_path / "requirements.txt").write_text("certifi==2024.7.4\n", encoding="utf-8")
+    assert _portfolio_plan_is_stale(plan, task_queue, [group], str(tmp_path)) is True
+
+    for field_name, invalid_value in (
+        ("target_occurrence_id", "package.json::certifi"),
+        ("manifest_path", "other-requirements.txt"),
+        ("lockfile_package_key", "node_modules/certifi"),
     ):
-        planner.invoke.side_effect = plan_parent
-        planned = _plan_initial_transitive_task(
-            task,
-            group,
-            candidate_versions=candidates,
-            workspace_volume="workspace",
+        invalid_decision = decision.model_copy(update={field_name: invalid_value})
+        invalid_plan = SimpleNamespace(
+            clusters=[],
+            portfolio_plan_id="portfolio-python",
+            repository_fingerprint=repository_fingerprint,
+            solver_plan=SimpleNamespace(
+                selected_plan=SimpleNamespace(
+                    task_decisions=[invalid_decision],
+                    selected_candidate_versions={
+                        "python:requirements.txt:certifi": "2024.7.4"
+                    },
+                    batches=[],
+                )
+            ),
+            task_ids=[task.task_id],
+            planned_task_revisions={task.task_id: task.task_revision},
+            task_strategies={},
         )
-
-    assert planned.strategy == RoutingStrategy.VERSION_BUMP
-    assert planned.strategy_stage == stage
-    assert planned.target_package_name == "direct-parent"
-    assert planned.target_dependency_type == "dev-packages"
-    assert planned.parent_package_name == "direct-parent"
-    assert planned.parent_package_version == "1.0.0"
-    assert planned.selected_version == version
-    assert planned.target_package_name != group.vulnerable_component
-    assert "modify_and_validate_python_dependency" in planned.instruction
-    assert "Do not edit the vulnerable child declaration or add an override." in planned.instruction
-    assert candidates == sorted(
-        [
-            version,
-            {"minimum": "2.0.0", "same_major": "1.9.0", "latest": "3.0.0"}[selection],
-        ],
-        key=Version,
-    )
-    assert "99.0.0" not in candidates
-    category.assert_called_once_with("workspace", "direct-parent")
-    calls = planner.invoke.call_args_list
-    assert [call.args[0]["selection"] for call in calls] == [
-        "minimum",
-        "same_major",
-        "latest",
-    ][: ["minimum", "same_major", "latest"].index(selection) + 1]
-    chosen = calls[-1].args[0]
-    assert chosen["parent_package_name"] == "direct-parent"
-    assert chosen["child_package_name"] == "vulnerable-child"
-    assert chosen["child_fixed_version"] == "1.2.0"
-    assert chosen["installed_parent_version"] == "1.0.0"
-    assert chosen["dependency_ancestry"] == "direct-parent,vulnerable-child"
-
-
-@pytest.mark.parametrize("proof_failure", ["missing", "ambiguous"])
-def test_missing_or_ambiguous_pipfile_parent_fails_closed(proof_failure):
-    group = _group()
-    task = _task(group)
-    proof_options = (
-        {"return_value": None}
-        if proof_failure == "missing"
-        else {"side_effect": ValueError("ambiguous direct parents")}
-    )
-
-    with (
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn._resolve_pipfile_parent_context",
-            **proof_options,
-        ) as proof,
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn.plan_python_parent_version"
-        ) as planner,
-    ):
-        planned = _plan_initial_transitive_task(task, group, workspace_volume="workspace")
-
-    assert planned.strategy == RoutingStrategy.CODE_WORKAROUND
-    assert planned.strategy_stage == SCARemediationStage.CODE_WORKAROUND
-    assert planned.target_package_name is None
-    assert planned.target_dependency_type is None
-    assert planned.parent_package_name is None
-    assert planned.selected_version is None
-    assert "Do not pin the vulnerable child" in planned.instruction
-    proof.assert_called_once_with("workspace", group)
-    planner.invoke.assert_not_called()
-
-
-def test_missing_workspace_volume_fails_closed_without_parent_lookup():
-    group = _group()
-    task = _task(group)
-    candidates: list[str] = ["stale-version"]
-
-    with (
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn._resolve_pipfile_parent_context"
-        ) as proof,
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn.plan_python_parent_version"
-        ) as planner,
-    ):
-        planned = _plan_initial_transitive_task(task, group, candidate_versions=candidates)
-
-    assert planned.strategy == RoutingStrategy.CODE_WORKAROUND
-    assert planned.strategy_stage == SCARemediationStage.CODE_WORKAROUND
-    assert planned.target_package_name is None
-    assert planned.target_dependency_type is None
-    assert planned.selected_version is None
-    assert candidates == []
-    proof.assert_not_called()
-    planner.invoke.assert_not_called()
-
-
-def test_npm_parent_planning_keeps_existing_override_progression_contract():
-    group = _group(ecosystem="npm")
-    task = _task(group, ecosystem="npm").model_copy(
-        update={"parent_package_name": "direct-parent", "parent_package_version": "1.0.0"}
-    )
-    candidates: list[str] = []
-
-    with (
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn.plan_npm_parent_version"
-        ) as npm_planner,
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn._resolve_pipfile_parent_context"
-        ) as proof,
-        patch(
-            "remediation_engine.orchestration.supervisor_spawn.plan_python_parent_version"
-        ) as python_planner,
-    ):
-        npm_planner.invoke.return_value = "- Selected Version: 1.0.1\n- Eligible Candidates: 1.0.1"
-        planned = _plan_initial_transitive_task(task, group, candidate_versions=candidates)
-
-    assert planned.strategy_stage == SCARemediationStage.OSV_MINIMUM
-    assert planned.target_package_name == "direct-parent"
-    assert planned.target_dependency_type == "dependencies"
-    assert planned.selected_version == "1.0.1"
-    assert candidates == ["1.0.1"]
-    npm_planner.invoke.assert_called_once()
-    proof.assert_not_called()
-    python_planner.invoke.assert_not_called()
+        violations = _portfolio_plan_violations(invalid_plan, task_queue, [group])
+        assert any(f"solver identity field {field_name} is invalid" in item for item in violations)

@@ -29,6 +29,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration import qa_odc
 from remediation_engine.orchestration._qa_runtime import (
     _attribute_reported_occurrences,
@@ -711,6 +712,96 @@ def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
     sandbox.run.assert_called_once_with("rm -rf -- .odc-targeted", timeout=30)
 
 
+def test_python_target_runs_pip_inspect_closure_and_pypi_targeted_scan() -> None:
+    target = QAScanTarget(
+        task_id="python-task",
+        group_id="python-group",
+        target_package="certifi",
+        expected_version="2026.2.25",
+        manifest_paths=("requirements.txt",),
+        dependency_ancestry=(),
+        target_identifiers=frozenset({"CVE-2026-0001"}),
+    )
+    inspect_report = {
+        "version": "1",
+        "environment": {"python_version": "3.11", "sys_platform": "linux"},
+        "installed": [
+            {
+                "metadata": {
+                    "name": "certifi",
+                    "version": "2026.2.25",
+                    "requires_dist": [],
+                    "provides_extra": [],
+                }
+            }
+        ],
+    }
+    targeted_result = _SecurityScanResult(
+        True,
+        "ok",
+        set(),
+        {"CVE-2026-0001"},
+        set(),
+        [],
+        execution_status=ScannerExecutionStatus.SUCCESS,
+        reported_paths=[".odc-targeted/000/requirements.txt"],
+        reported_package_occurrences=[
+            SimpleNamespace(
+                package_name="certifi",
+                version="2026.2.25",
+                ecosystem="pypi",
+                file_path=".odc-targeted/000/requirements.txt",
+            )
+        ],
+    )
+    sandbox = MagicMock()
+    with (
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_install",
+            return_value=_install_outcome(),
+        ),
+        patch(
+            "remediation_engine.orchestration._qa_runtime._run_readonly",
+            return_value=SimpleNamespace(exit_code=0, stdout=json.dumps(inspect_report)),
+        ) as pip_inspect,
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan",
+            return_value=targeted_result,
+        ) as targeted_scan,
+        patch("remediation_engine.orchestration.qa_odc._run_security_scan") as full_scan,
+        patch(
+            "remediation_engine.orchestration.qa_test_parsing._run_unit_tests",
+            return_value=_test_outcome(),
+        ),
+    ):
+        results = _run_global_execution(
+            sandbox,
+            "workspace-volume",
+            {"CVE-2026-0001"},
+            {"CVE-2026-0001"},
+            scan_targets=[target],
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+    pip_inspect.assert_called_once_with(
+        sandbox,
+        ".venv/bin/python -m pip inspect --local",
+        timeout=60,
+    )
+    targeted_scan.assert_called_once()
+    assert targeted_scan.call_args.kwargs["project_language"] == ProjectLanguage.PYTHON
+    full_scan.assert_not_called()
+    assert sandbox.write_file.call_args.args == (
+        ".odc-targeted/000/requirements.txt",
+        "certifi==2026.2.25\n",
+    )
+    assert results.scan_evidence is not None
+    assert results.scan_evidence.complete is True
+    assert results.scan_evidence.covered_task_ids == ["python-task"]
+    assert results.scan_evidence.closure_package_names == ["certifi"]
+    assert results.scan_evidence.covered_occurrences[0].source_input_path == "requirements.txt"
+
+
 def test_successful_scan_records_removed_package_occurrence_tombstones() -> None:
     baseline_lockfile = {
         "lockfileVersion": 3,
@@ -1131,7 +1222,7 @@ def test_unreadable_or_invalid_lockfile_is_not_absence_evidence(
     assert batch.failures_by_task["task-1"].reason == reason
 
 
-def test_absent_target_keeps_other_changed_closures_and_findings() -> None:
+def test_absent_target_does_not_attribute_other_changed_closures_and_findings() -> None:
     baseline_lockfile = {
         "lockfileVersion": 3,
         "packages": {
@@ -1218,8 +1309,8 @@ def test_absent_target_keeps_other_changed_closures_and_findings() -> None:
     assert task_evidence.complete is True
     assert task_evidence.scan_performed is True
     assert task_evidence.scan_skip_reason == "no_matching_target"
-    assert task_evidence.covered_occurrences == [occurrence]
-    assert task_evidence.new_identifiers == ["CVE-2026-70001"]
+    assert task_evidence.covered_occurrences == []
+    assert task_evidence.new_identifiers == []
 
 
 def test_missing_target_does_not_invalidate_other_targets_new_identifier_list() -> None:
@@ -1657,6 +1748,35 @@ def test_report_coverage_requires_every_non_npm_companion_path() -> None:
     ) == ["frontend/Cargo.lock"]
 
 
+def test_report_coverage_accepts_odc_package_suffix_but_keeps_missing_paths() -> None:
+    manifest = SimpleNamespace(
+        occurrences_by_project={".odc-targeted/001": ()},
+        input_paths_by_project={".odc-targeted/001": ("requirements.txt", "pyproject.toml")},
+    )
+
+    assert _missing_targeted_input_paths(
+        manifest,
+        [".odc-targeted/001/requirements.txt:certifi/2024.7.4"],
+    ) == ["pyproject.toml"]
+
+    requirements_only = SimpleNamespace(
+        occurrences_by_project={".odc-targeted/001": ()},
+        input_paths_by_project={".odc-targeted/001": ("requirements.txt",)},
+    )
+    assert (
+        _missing_targeted_input_paths(
+            requirements_only,
+            [".odc-targeted/001/requirements.txt:certifi/2024.7.4"],
+        )
+        == []
+    )
+
+    assert _missing_targeted_input_paths(
+        requirements_only,
+        [".odc-targeted/001/requirements.txt:unrecognized"],
+    ) == ["requirements.txt"]
+
+
 def test_active_task_without_package_target_uses_incremental_input_scanner() -> None:
     sandbox = MagicMock()
     sandbox.run.side_effect = lambda _command, timeout=30: SimpleNamespace(
@@ -2005,10 +2125,23 @@ def test_shared_lockfile_report_projects_only_task_owned_occurrences() -> None:
         found_identifiers=["CVE-2026-10002"],
         found_issues=[issue_b],
     )
+    occurrence_extra = PackageScanOccurrence(
+        source_input_path="package-lock.json",
+        package_name="ip-address",
+        version="10.2.0",
+        lockfile_key="node_modules/ip-address",
+        found_identifiers=["CVE-2026-10003"],
+    )
     manifest = _TargetedArtifactManifest(
         scan_subdir=".odc-targeted",
-        expected_package_occurrences=(("a", "1.0.0"), ("b", "2.0.0")),
-        occurrences_by_project={".odc-targeted/000": (occurrence_a, occurrence_b)},
+        expected_package_occurrences=(
+            ("a", "1.0.0"),
+            ("b", "2.0.0"),
+            ("ip-address", "10.2.0"),
+        ),
+        occurrences_by_project={
+            ".odc-targeted/000": (occurrence_a, occurrence_b, occurrence_extra)
+        },
         task_ids_by_project={".odc-targeted/000": ("task-1", "task-2")},
         input_paths_by_project={".odc-targeted/000": ("package-lock.json",)},
     )
@@ -2016,12 +2149,13 @@ def test_shared_lockfile_report_projects_only_task_owned_occurrences() -> None:
         requested_scope=ScanScope.TARGETED,
         effective_scope=ScanScope.TARGETED,
         covered_task_ids=["task-1", "task-2"],
-        found_identifiers=["CVE-2026-10001", "CVE-2026-10002"],
-        new_identifiers=["CVE-2026-10001", "CVE-2026-10002"],
+        found_identifiers=["CVE-2026-10001", "CVE-2026-10002", "CVE-2026-10003"],
+        new_identifiers=["CVE-2026-10001", "CVE-2026-10002", "CVE-2026-10003"],
         complete=True,
     )
     closure_a = SimpleNamespace(
         source_lockfile="package-lock.json",
+        root_keys=("node_modules/a",),
         nodes=(
             SimpleNamespace(
                 lockfile_key="node_modules/a",
@@ -2032,6 +2166,7 @@ def test_shared_lockfile_report_projects_only_task_owned_occurrences() -> None:
     )
     closure_b = SimpleNamespace(
         source_lockfile="package-lock.json",
+        root_keys=("node_modules/b",),
         nodes=(
             SimpleNamespace(
                 lockfile_key="node_modules/b",
@@ -2040,10 +2175,24 @@ def test_shared_lockfile_report_projects_only_task_owned_occurrences() -> None:
             ),
         ),
     )
+    changed_closure = SimpleNamespace(
+        source_lockfile="package-lock.json",
+        root_keys=("node_modules/ip-address",),
+        nodes=(
+            SimpleNamespace(
+                lockfile_key="node_modules/ip-address",
+                package_name="ip-address",
+                version="10.2.0",
+            ),
+        ),
+    )
     batch = SimpleNamespace(
         covered_task_ids=("task-1", "task-2"),
         failures_by_task={},
-        closures_by_task={"task-1": (closure_a,), "task-2": (closure_b,)},
+        closures_by_task={
+            "task-1": (closure_a, changed_closure),
+            "task-2": (closure_b, changed_closure),
+        },
         covered_input_paths=("package-lock.json",),
         inventory_updates={},
         inventory_removals=(),
@@ -2565,8 +2714,6 @@ def test_unmapped_setup_lockfile_delta_prevents_clean_coverage(tmp_path):
     assert result["setup_scan_evidence"].complete is False
     assert result["setup_scan_evidence"].fallback_reason == ScanFallbackReason.INVALID_LOCKFILE
 
-# Stage-2 behavior retained during the architecture merge.
-from remediation_engine.language import ProjectLanguage
 
 def _python_target(
     package: str = "demo-root",
@@ -2582,6 +2729,7 @@ def _python_target(
         dependency_ancestry=(),
         target_identifiers=frozenset({"CVE-2026-0001"}),
     )
+
 
 def _pip_inspect_report(*, missing_leaf: bool = False) -> str:
     """Return a deterministic pip-inspect graph for targeted-scan tests."""
@@ -2633,7 +2781,8 @@ def _pip_inspect_report(*, missing_leaf: bool = False) -> str:
         }
     )
 
-def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
+
+def test_multiple_target_occurrences_are_retained_in_the_task_batch() -> None:
     sandbox = MagicMock()
     sandbox.read_file.return_value = json.dumps(
         {
@@ -2645,41 +2794,16 @@ def test_multiple_targets_falls_back_to_existing_full_scan() -> None:
             },
         }
     )
-    full_result = _SecurityScanResult(True, "full", set(), set(), set(), [])
-    with (
-        patch(
-            "remediation_engine.orchestration.qa_test_parsing._run_install",
-            return_value=_install_outcome(),
-        ),
-        patch(
-            "remediation_engine.orchestration.qa_odc._run_targeted_security_scan"
-        ) as targeted_scan,
-        patch(
-            "remediation_engine.orchestration.qa_odc._run_security_scan",
-            return_value=full_result,
-        ) as full_scan,
-        patch(
-            "remediation_engine.orchestration.qa_test_parsing._run_unit_tests",
-            return_value=_test_outcome(),
-        ),
-    ):
-        results = _run_global_execution(
-            sandbox,
-            "workspace-volume",
-            {"CVE-2026-0001"},
-            {"CVE-2026-0001"},
-            scan_targets=[_target()],
-        )
+    batch = _resolve_targeted_packages(sandbox, [_target()])
 
-    assert results.scan is not None
-    assert [record.label for record in results.scan.scan_records] == ["odc:fallback-full"]
-    targeted_scan.assert_not_called()
-    full_scan.assert_called_once()
-    evidence: ODCScanEvidence = results.scan_evidence
-    assert evidence.effective_scope == ScanScope.FULL
-    assert evidence.fallback_reason == ScanFallbackReason.MULTIPLE_TARGETS
-    assert evidence.complete is False
+    assert batch.failures_by_task == {}
+    assert {
+        resolution.target_node.lockfile_key
+        for resolution in batch.target_packages
+        if resolution.target_node is not None
+    } == {"node_modules/a", "node_modules/nested/node_modules/a"}
     sandbox.run.assert_not_called()
+
 
 def test_python_targeted_request_scans_installed_dependency_closure() -> None:
     sandbox = MagicMock()
@@ -2699,6 +2823,21 @@ def test_python_targeted_request_scans_installed_dependency_closure() -> None:
         set(),
         [],
         execution_status=ScannerExecutionStatus.SUCCESS,
+        reported_paths=[".odc-targeted/000/requirements.txt"],
+        reported_package_occurrences=[
+            SimpleNamespace(
+                package_name="demo-root",
+                version="2.0.0",
+                ecosystem="pypi",
+                file_path=".odc-targeted/000/requirements.txt",
+            ),
+            SimpleNamespace(
+                package_name="leaf",
+                version="1.5.0",
+                ecosystem="pypi",
+                file_path=".odc-targeted/000/requirements.txt",
+            ),
+        ],
         scanned_packages={("demo-root", "2.0.0"), ("leaf", "1.5.0")},
     )
 
@@ -2729,7 +2868,7 @@ def test_python_targeted_request_scans_installed_dependency_closure() -> None:
     full_scan.assert_not_called()
     targeted_scan.assert_called_once()
     assert targeted_scan.call_args.kwargs["project_language"] == ProjectLanguage.PYTHON
-    assert sandbox.run.call_args_list[0].args[0] == (".venv/bin/python -m pip inspect --local")
+    assert sandbox.run.call_args_list[0].args[0] == ".venv/bin/python -m pip inspect --local"
     sandbox.write_file.assert_called_once_with(
         ".odc-targeted/000/requirements.txt",
         "demo-root==2.0.0\nleaf==1.5.0\n",
@@ -2738,10 +2877,10 @@ def test_python_targeted_request_scans_installed_dependency_closure() -> None:
     assert results.scan_evidence.effective_scope == ScanScope.TARGETED
     assert results.scan_evidence.complete is True
     assert results.scan_evidence.closure_package_names == ["demo-root", "leaf"]
-    assert results.scan_evidence.scanned_package_specs == [
-        "demo-root==2.0.0",
-        "leaf==1.5.0",
-    ]
+    assert [
+        (item.package_name, item.version) for item in results.scan_evidence.covered_occurrences
+    ] == [("demo-root", "2.0.0"), ("leaf", "1.5.0")]
+
 
 def test_python_targeted_scan_falls_back_for_unresolved_dependency() -> None:
     sandbox = MagicMock()
@@ -2787,12 +2926,13 @@ def test_python_targeted_scan_falls_back_for_unresolved_dependency() -> None:
         )
 
     targeted_scan.assert_not_called()
-    full_scan.assert_called_once()
+    full_scan.assert_not_called()
     sandbox.write_file.assert_not_called()
     assert results.scan_evidence is not None
-    assert results.scan_evidence.effective_scope == ScanScope.FULL
+    assert results.scan_evidence.effective_scope == ScanScope.TARGETED
     assert results.scan_evidence.fallback_reason == ScanFallbackReason.INCOMPLETE_CLOSURE
     assert results.scan_evidence.complete is False
+
 
 def test_python_targeted_scan_falls_back_when_odc_misses_closure_packages() -> None:
     sandbox = MagicMock()
@@ -2812,6 +2952,15 @@ def test_python_targeted_scan_falls_back_when_odc_misses_closure_packages() -> N
         set(),
         [],
         execution_status=ScannerExecutionStatus.SUCCESS,
+        reported_paths=[".odc-targeted/000/requirements.txt"],
+        reported_package_occurrences=[
+            SimpleNamespace(
+                package_name="demo-root",
+                version="2.0.0",
+                ecosystem="pypi",
+                file_path=".odc-targeted/000/requirements.txt",
+            )
+        ],
         scanned_packages={("demo-root", "2.0.0")},
     )
     full_result = _SecurityScanResult(
@@ -2852,11 +3001,12 @@ def test_python_targeted_scan_falls_back_when_odc_misses_closure_packages() -> N
         )
 
     targeted_scan.assert_called_once()
-    full_scan.assert_called_once()
+    full_scan.assert_not_called()
     assert results.scan_evidence is not None
-    assert results.scan_evidence.effective_scope == ScanScope.FULL
-    assert results.scan_evidence.fallback_reason == ScanFallbackReason.INCOMPLETE_CLOSURE
+    assert results.scan_evidence.effective_scope == ScanScope.TARGETED
+    assert results.scan_evidence.fallback_reason == ScanFallbackReason.TARGET_PACKAGE_NOT_REPORTED
     assert results.scan_evidence.complete is False
+
 
 def test_unparseable_targeted_scan_is_not_misclassified_as_incomplete_closure() -> None:
     sandbox = MagicMock()
@@ -2912,7 +3062,7 @@ def test_unparseable_targeted_scan_is_not_misclassified_as_incomplete_closure() 
         )
 
     targeted_scan.assert_called_once()
-    full_scan.assert_called_once()
+    full_scan.assert_not_called()
     assert results.scan_evidence is not None
-    assert results.scan_evidence.fallback_reason == ScanFallbackReason.TARGETED_SCAN_FAILED
+    assert results.scan_evidence.fallback_reason == ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
     assert results.scan_evidence.complete is False

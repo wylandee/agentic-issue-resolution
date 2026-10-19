@@ -19,6 +19,7 @@ from uuid import uuid4
 from packageurl import PackageURL
 
 from remediation_engine.contracts.schemas import ScannerExecutionStatus, VulnerabilityIssue
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 from remediation_engine.tools.package_identity import package_name_from_purl
@@ -46,6 +47,7 @@ _ODC_INTERNAL_FULL_SCAN_EXCLUDES = (
     "**/.remedy-attempt-snapshots/**",
     "**/.odc-targeted/**",
 )
+_ODC_PYTHON_FULL_SCAN_EXCLUDES = ("**/.remedy-pipenv/**", "**/.venv/**")
 _ODC_SENSITIVE_OPTION_PATTERN = (
     r"--[A-Za-z0-9_.-]*(?:api.?key|password|pass|secret|token|credential|authorization)"
     r"[A-Za-z0-9_.-]*"
@@ -380,11 +382,21 @@ def _odc_timeout_summary(exc: subprocess.TimeoutExpired) -> str:
 def _run_odc_process(
     workspace_volume: str,
     scan_subdir: str | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> subprocess.CompletedProcess[str]:
     """Run ODC with a unique container identity and durable diagnostics."""
     scope = "targeted" if scan_subdir else "full"
     execution = _new_odc_execution(scope)
-    cmd = _odc_command(workspace_volume, scan_subdir, execution.container_name)
+    cmd = (
+        _odc_command(workspace_volume, scan_subdir, execution.container_name)
+        if project_language == ProjectLanguage.NODEJS
+        else _odc_command(
+            workspace_volume,
+            scan_subdir,
+            execution.container_name,
+            project_language,
+        )
+    )
     safe_command = shlex.join(_redact_odc_command(cmd))
     logger.info("qa_critic: running %s ODC in Docker: %s", scope, safe_command)
     try:
@@ -689,10 +701,26 @@ def _parse_report_package_identities(report_text: str) -> list[tuple[str, str]] 
     ]
 
 
+def _parse_report_python_packages(report_text: str) -> set[tuple[str, str]] | None:
+    """Extract PyPI package/version identities, including clean report entries."""
+    try:
+        report = json.loads(report_text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    try:
+        from remediation_engine.tools.odc_parser import parse_python_packages
+
+        return parse_python_packages(report)
+    except Exception as exc:  # noqa: BLE001 - malformed package metadata is not evidence
+        logger.warning("qa_critic: failed to parse ODC Python package inventory: %s", exc)
+        return None
+
+
 def _odc_command(
     workspace_volume: str,
     scan_subdir: str | None = None,
     container_name: str | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> list[str]:
     """Build a safe ODC Docker command for the full or targeted workspace."""
     scan_path = "/scan"
@@ -728,27 +756,40 @@ def _odc_command(
     ]
 
     if scan_subdir is None:
-        for pattern in _ODC_INTERNAL_FULL_SCAN_EXCLUDES:
+        excludes = _ODC_INTERNAL_FULL_SCAN_EXCLUDES
+        if project_language == ProjectLanguage.PYTHON:
+            excludes = (*excludes, *_ODC_PYTHON_FULL_SCAN_EXCLUDES)
+        for pattern in excludes:
             cmd.extend(["--exclude", pattern])
 
     extra_args = get_runtime_settings().odc_extra_args
-    if extra_args:
-        cmd.extend(shlex.split(extra_args))
+    extra_args_list = shlex.split(extra_args) if extra_args else []
+    if project_language == ProjectLanguage.PYTHON and "--enableExperimental" not in extra_args_list:
+        extra_args_list.append("--enableExperimental")
+    cmd.extend(extra_args_list)
 
     return cmd
 
 
-def _run_odc(workspace_volume: str) -> subprocess.CompletedProcess[str]:
+def _run_odc(
+    workspace_volume: str,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> subprocess.CompletedProcess[str]:
     """Execute OWASP Dependency-Check in Docker against the shared workspace volume."""
-    return _run_odc_process(workspace_volume)
+    if project_language == ProjectLanguage.NODEJS:
+        return _run_odc_process(workspace_volume)
+    return _run_odc_process(workspace_volume, project_language=project_language)
 
 
 def _run_targeted_odc(
     workspace_volume: str,
     targeted_subdir: str,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> subprocess.CompletedProcess[str]:
     """Execute ODC against a validated workspace-relative targeted directory."""
-    return _run_odc_process(workspace_volume, targeted_subdir)
+    if project_language == ProjectLanguage.NODEJS:
+        return _run_odc_process(workspace_volume, targeted_subdir)
+    return _run_odc_process(workspace_volume, targeted_subdir, project_language)
 
 
 def _record_scan_result(
@@ -790,6 +831,7 @@ def _run_security_scan(
     workspace_volume: str,
     target_identifiers: set[str],
     baseline_identifiers: set[str] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _SecurityScanResult:
     """Run Dependency-Check and return typed scan evidence.
 
@@ -801,6 +843,7 @@ def _run_security_scan(
         baseline_identifiers: Pre-remediation identifiers used to distinguish
             remaining target findings from newly introduced findings. When
             omitted, the target identifiers provide the comparison baseline.
+        project_language: Language profile used to configure the scanner.
 
     Returns:
         An ``_SecurityScanResult`` with named identifier sets, execution
@@ -850,7 +893,10 @@ def _run_security_scan(
         )
 
     try:
-        proc = _run_odc(workspace_volume)
+        if project_language == ProjectLanguage.NODEJS:
+            proc = _run_odc(workspace_volume)
+        else:
+            proc = _run_odc(workspace_volume, project_language=project_language)
     except FileNotFoundError as exc:
         msg = (
             "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
@@ -1047,6 +1093,7 @@ def _run_targeted_security_scan(
     target_identifiers: set[str],
     baseline_identifiers: set[str],
     targeted_subdir: str,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _SecurityScanResult:
     """Run and classify ODC against a synthetic targeted workspace."""
     baseline = {
@@ -1089,7 +1136,14 @@ def _run_targeted_security_scan(
         )
 
     try:
-        proc = _run_targeted_odc(workspace_volume, _validate_qa_path(targeted_subdir))
+        if project_language == ProjectLanguage.NODEJS:
+            proc = _run_targeted_odc(workspace_volume, _validate_qa_path(targeted_subdir))
+        else:
+            proc = _run_targeted_odc(
+                workspace_volume,
+                _validate_qa_path(targeted_subdir),
+                project_language,
+            )
     except FileNotFoundError as exc:
         msg = (
             "FAILURE: docker is not available on PATH; Dependency-Check cannot run."
@@ -1186,9 +1240,19 @@ def _run_targeted_security_scan(
     reported_paths = (
         _parse_report_dependency_paths(report_text) if report_text is not None else None
     )
+    scanned_packages = (
+        _parse_report_python_packages(report_text)
+        if report_text is not None and project_language == ProjectLanguage.PYTHON
+        else set()
+    )
     if found_issues is None and found_identifiers is not None:
         found_issues = []
-    if exit_code != 0 and (found_identifiers is None or found_issues is None):
+    python_inventory_unparseable = (
+        project_language == ProjectLanguage.PYTHON and scanned_packages is None
+    )
+    if exit_code != 0 and (
+        found_identifiers is None or found_issues is None or python_inventory_unparseable
+    ):
         summary = (
             f"FAILURE: Dependency-Check exited {exit_code} and produced no parseable report.\n"
             f"stdout:\n{stdout[:2000]}\n"
@@ -1209,7 +1273,7 @@ def _run_targeted_security_scan(
             diagnostic_log_path=diagnostic_log_path,
             error=summary,
         )
-    if found_identifiers is None or found_issues is None:
+    if found_identifiers is None or found_issues is None or python_inventory_unparseable:
         summary = (
             "FAILURE: Dependency-Check report was not parseable "
             f"(exit {exit_code}).\n"
@@ -1230,7 +1294,7 @@ def _run_targeted_security_scan(
             diagnostic_log_path=diagnostic_log_path,
             error=summary,
         )
-    if exit_code != 0:
+    if exit_code != 0 and project_language != ProjectLanguage.PYTHON:
         summary = (
             f"FAILURE: targeted Dependency-Check exited {exit_code}.\nstderr:\n{stderr[:2000]}"
         )
@@ -1274,6 +1338,7 @@ def _run_targeted_security_scan(
                 reported_packages=reported_packages,
                 reported_paths=reported_paths,
                 reported_package_occurrences=reported_package_occurrences,
+                scanned_packages=scanned_packages or set(),
             ),
             exit_code=exit_code,
             stdout=stdout,
@@ -1296,6 +1361,7 @@ def _run_targeted_security_scan(
             reported_packages=reported_packages,
             reported_paths=reported_paths,
             reported_package_occurrences=reported_package_occurrences,
+            scanned_packages=scanned_packages or set(),
         ),
         exit_code=exit_code,
         stdout=stdout,
@@ -1309,6 +1375,7 @@ def _run_incremental_security_scan(
     workspace_volume: str,
     scan_subdir: str,
     baseline_identifiers: set[str],
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _SecurityScanResult:
     """Scan changed-input projects that have no task-target identifiers.
 
@@ -1316,10 +1383,19 @@ def _run_incremental_security_scan(
     extraction, and failure classification. Supplying no target identifiers
     leaves only the immutable baseline subtraction as the result projection.
     """
+    if project_language == ProjectLanguage.NODEJS:
+        return _run_targeted_security_scan(
+            sandbox,
+            workspace_volume,
+            set(),
+            baseline_identifiers,
+            scan_subdir,
+        )
     return _run_targeted_security_scan(
         sandbox,
         workspace_volume,
         set(),
         baseline_identifiers,
         scan_subdir,
+        project_language,
     )

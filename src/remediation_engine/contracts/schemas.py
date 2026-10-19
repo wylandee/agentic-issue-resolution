@@ -1685,6 +1685,13 @@ class QADeterministicGates(BaseModel):
     scanner_execution_status: ScannerExecutionStatus
     target_remaining_identifiers: list[str] = Field(default_factory=list)
     target_scanner_cleared: bool | None = None
+    scan_evidence_complete: bool | None = Field(
+        default=None,
+        description=(
+            "Whether scanner evidence covered the requested task-owned dependency scope. "
+            "False means an empty report cannot clear the target."
+        ),
+    )
     target_package_absent: bool = Field(
         default=False,
         description="Complete task-owned lockfile evidence proves the SCA target is absent.",

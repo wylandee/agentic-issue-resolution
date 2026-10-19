@@ -275,6 +275,7 @@ def run_batch(
     *,
     iterations: int = 10,
     batch_size: int = 3,
+    target_packages: list[str] | None = None,
     repo_root: Path = _DEFAULT_REPO,
     baseline_path: Path = _DEFAULT_BASELINE,
     output_dir: Path = _DEFAULT_OUTPUT_DIR,
@@ -286,6 +287,8 @@ def run_batch(
     Args:
         iterations: Maximum number of distinct package batches to run.
         batch_size: Number of packages selected for each batch.
+        target_packages: Optional explicit package selection. When provided,
+            sampling is skipped and one batch containing these packages runs.
         repo_root: PyGoat checkout used for live runs.
         baseline_path: Canonical baseline issues file; never modified.
         output_dir: Directory for per-iteration artifacts and summary JSON.
@@ -298,8 +301,8 @@ def run_batch(
     Raises:
         FileNotFoundError: If the baseline is missing, or if a live run's
             repository is missing.
-        ValueError: If batch arguments are invalid or the baseline has too few
-            unique packages for the requested batch size.
+        ValueError: If batch arguments are invalid, explicit package names are
+            empty or absent from the baseline, or sampling has too few packages.
     """
     if iterations < 1:
         raise ValueError("iterations must be at least 1")
@@ -317,12 +320,26 @@ def run_batch(
         len(baseline_issues),
         len(packages),
     )
-    batches = sample_package_batches(
-        packages,
-        batch_size=batch_size,
-        num_batches=iterations,
-        seed=seed,
-    )
+    if target_packages is not None:
+        selected_packages = sorted(
+            {package.strip() for package in target_packages if package.strip()}
+        )
+        if not selected_packages:
+            raise ValueError("packages must contain at least one non-empty package name")
+        unknown_packages = sorted(set(selected_packages) - set(packages))
+        if unknown_packages:
+            raise ValueError(
+                "Requested package(s) are not present in the baseline: "
+                + ", ".join(unknown_packages)
+            )
+        batches = [selected_packages]
+    else:
+        batches = sample_package_batches(
+            packages,
+            batch_size=batch_size,
+            num_batches=iterations,
+            seed=seed,
+        )
     logger.info("Planned %d distinct package batches", len(batches))
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -379,6 +396,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--iterations", type=int, default=10, help="Maximum number of batches")
     parser.add_argument("--batch-size", type=int, default=3, help="Packages selected per batch")
     parser.add_argument(
+        "--packages",
+        nargs="+",
+        default=None,
+        help="Run one batch for these exact package names instead of sampling packages",
+    )
+    parser.add_argument(
         "--repo",
         type=Path,
         default=Path(os.environ.get("TEST_REPO_ROOT", str(_DEFAULT_REPO))),
@@ -415,6 +438,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         summaries = run_batch(
             iterations=args.iterations,
             batch_size=args.batch_size,
+            target_packages=args.packages,
             repo_root=args.repo.expanduser().resolve(),
             baseline_path=args.baseline.expanduser().resolve(),
             output_dir=args.output_dir.expanduser().resolve(),

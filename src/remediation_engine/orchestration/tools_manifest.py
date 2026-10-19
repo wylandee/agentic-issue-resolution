@@ -846,6 +846,7 @@ def _is_prohibited_target(rel_path: str) -> bool:
         "pipfile.lock",
         "setup.cfg",
         "pyproject.toml",
+        "setup.py",
     ):
         return True
 

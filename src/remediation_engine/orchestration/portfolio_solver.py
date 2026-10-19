@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tomllib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,9 +35,12 @@ from remediation_engine.contracts.solver_models import (
     PortfolioReplanRequest,
     SolverBatch,
     SolverDependencyRequirement,
+    SolverEdge,
     SolverEvidenceDomain,
     SolverFindingRequirement,
+    SolverPackageOccurrence,
     SolverPhase,
+    SolverPythonRuntimeFingerprint,
     SolverRemediationPlan,
     SolverRuntimeFingerprint,
     SolverStatus,
@@ -44,6 +48,7 @@ from remediation_engine.contracts.solver_models import (
     SolverTarget,
     SolverVersionCandidate,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.settings import AppSettings
 from remediation_engine.solver.cpsat import _as_domain as _normalize_solver_candidate_domain
 from remediation_engine.solver.cpsat import solve_portfolio
@@ -65,6 +70,7 @@ from remediation_engine.tools.npm_graph import (
     normalize_dependency_ancestry,
     resolve_lockfile_dependency_package,
 )
+from remediation_engine.tools.odc_parser import extract_odc_fixed_version_floor
 from remediation_engine.tools.registry_cache import (
     DEFAULT_MAX_PAYLOAD_BYTES,
     PackumentFetcher,
@@ -96,6 +102,310 @@ _SEVERITY_RANK = {
 }
 
 
+def _python_numeric_solver_version(value: str) -> tuple[str, tuple[int, ...]]:
+    """Normalize stable final/post PEP 440 releases into an ordered key.
+
+    The adapter maps epoch-zero final and post releases (without local
+    versions) into a lexicographic tuple. A post discriminator preserves
+    ``final < post < next release``. Short releases are zero-padded, and
+    equivalent release spellings collapse to one canonical version.
+    """
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        parsed = Version(str(value).strip())
+    except InvalidVersion as exc:
+        raise ValueError(f"invalid PEP 440 version {value!r}") from exc
+    if (
+        parsed.epoch != 0
+        or parsed.is_prerelease
+        or parsed.is_devrelease
+        or parsed.local is not None
+        or len(parsed.release) > 3
+    ):
+        raise ValueError(f"PEP 440 version {value!r} is outside the supported stable subset")
+    release_key = tuple(parsed.release) + (0,) * (3 - len(parsed.release))
+    post_key = (1, parsed.post or 0) if parsed.is_postrelease else (0, 0)
+    normalized = ".".join(str(part) for part in release_key)
+    if parsed.is_postrelease:
+        normalized += f".post{parsed.post or 0}"
+    return normalized, (*release_key, *post_key)
+
+
+def _python_scanner_fixed_version(issue: Any) -> str | None:
+    """Return an explicit scanner floor or a package-matched ODC CPE bound."""
+    explicit = str(getattr(issue, "fixed_version", None) or "").strip()
+    if explicit:
+        return explicit
+    source = getattr(issue, "source", None)
+    source_name = str(getattr(source, "value", source) or "").strip().casefold()
+    if source_name != "odc":
+        return None
+    raw_payload = getattr(issue, "raw_payload", None)
+    vulnerability = raw_payload.get("vulnerability") if isinstance(raw_payload, Mapping) else None
+    package_name = str(getattr(issue, "package_name", None) or "").strip()
+    if not isinstance(vulnerability, dict) or not package_name:
+        return None
+    return extract_odc_fixed_version_floor(vulnerability, package_name)
+
+
+def _pipfile_declaration_is_unconditional(raw_name: str, value: Any) -> bool:
+    """Return whether a Pipfile declaration is a static, unconditional pin."""
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    try:
+        parsed_name = Requirement(raw_name)
+    except InvalidRequirement:
+        return False
+    if parsed_name.extras or parsed_name.marker:
+        return False
+    if isinstance(value, str):
+        version_specifier = value.strip()
+    elif isinstance(value, Mapping):
+        if set(value) - {"version"}:
+            return False
+        version_specifier = value.get("version", "*")
+        if not isinstance(version_specifier, str):
+            return False
+        version_specifier = version_specifier.strip()
+    else:
+        return False
+    if version_specifier == "*":
+        return True
+    try:
+        requirement = Requirement(f"{parsed_name.name}{version_specifier}")
+    except InvalidRequirement:
+        return False
+    return not requirement.extras and requirement.marker is None
+
+
+def _pipfile_declaration_matches_locked_version(
+    raw_name: str, value: Any, locked_version: str
+) -> bool:
+    """Require one unconditional Pipfile constraint to admit its exact lock version."""
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.version import InvalidVersion, Version
+
+    if not _pipfile_declaration_is_unconditional(raw_name, value):
+        return False
+    try:
+        parsed_name = Requirement(raw_name)
+        if isinstance(value, Mapping):
+            specifier_text = str(value.get("version", "*")).strip()
+        else:
+            specifier_text = str(value).strip()
+        if specifier_text == "*":
+            return True
+        declaration = Requirement(f"{parsed_name.name}{specifier_text}")
+        return declaration.specifier.contains(Version(locked_version), prereleases=False)
+    except (InvalidRequirement, InvalidVersion, TypeError, ValueError):
+        return False
+
+
+def _locked_python_version(category: Any, package_name: str) -> str | None:
+    """Read one stable PEP 440 package version from a Pipfile.lock category."""
+    from packaging.version import InvalidVersion, Version
+
+    from remediation_engine.tools.package_identity import normalize_python_package_name
+
+    if not isinstance(category, Mapping):
+        return None
+    records = [
+        value
+        for name, value in category.items()
+        if normalize_python_package_name(str(name)) == package_name
+    ]
+    if len(records) != 1 or not isinstance(records[0], Mapping):
+        return None
+    raw = str(records[0].get("version") or "").strip()
+    if raw.startswith("=="):
+        raw = raw[2:]
+    elif raw.startswith("="):
+        raw = raw[1:]
+    try:
+        parsed = Version(raw)
+    except InvalidVersion:
+        return None
+    if parsed.is_prerelease or parsed.is_devrelease or parsed.local is not None or parsed.epoch:
+        return None
+    return str(parsed)
+
+
+def _resolve_python_pipfile_parent_context(
+    repo_root: Path,
+    manifest_path: str,
+    group: VulnerabilityGroup,
+    task: RemediationTask,
+    requires_dist_fetcher: Any,
+) -> dict[str, str] | None:
+    """Prove one category-matched, unconditional Pipfile parent edge.
+
+    The proof binds the declared parent and vulnerable child to the same
+    Pipfile/Pipfile.lock category, verifies the current locked versions against
+    the parent's PyPI ``Requires-Dist`` metadata, and rejects ambiguous,
+    conditional, or deeper ancestry. Registry metadata is read by the
+    Supervisor portfolio preparation boundary and a lookup failure is not
+    evidence.
+    """
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.version import InvalidVersion, Version
+
+    from remediation_engine.tools.package_identity import normalize_python_package_name
+    from remediation_engine.tools.pypi_registry_tools import get_pypi_release_requires_dist
+
+    child_name = normalize_python_package_name(str(group.vulnerable_component or ""))
+    if not child_name or Path(manifest_path).name.casefold() != "pipfile":
+        return None
+    ancestry = [
+        normalize_python_package_name(str(name))
+        for name in group.dependency_ancestry
+        if str(name).strip()
+    ]
+    if len(ancestry) > 2 or (ancestry and ancestry[-1] != child_name):
+        return None
+    parent_hints = {
+        normalize_python_package_name(str(value))
+        for value in (
+            task.parent_package_name,
+            group.parent_package_name,
+            task.target_package_name if task.target_package_name != child_name else None,
+            ancestry[0] if len(ancestry) == 2 else None,
+        )
+        if value
+    }
+    if len(parent_hints) > 1:
+        return None
+    hinted_parent = next(iter(parent_hints), None)
+    root = repo_root.resolve()
+    pipfile = (root / manifest_path).resolve()
+    try:
+        pipfile.relative_to(root)
+        pipfile_data = tomllib.loads(pipfile.read_text(encoding="utf-8"))
+        lock_path = pipfile.with_name("Pipfile.lock")
+        lock_data = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, tomllib.TOMLDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(pipfile_data, Mapping) or not isinstance(lock_data, Mapping):
+        return None
+
+    # The group's scanner evidence is the only source of the child's fix floor.
+    child_floors = {
+        floor
+        for issue in group.issues
+        if (issue.cve_id or issue.ghsa_id or issue.finding_id)
+        and (floor := _python_scanner_fixed_version(issue))
+    }
+    try:
+        child_floor = max(
+            (_python_numeric_solver_version(value) for value in child_floors),
+            key=lambda item: item[1],
+        )[0]
+    except (ValueError, TypeError):
+        return None
+
+    possible_edges: list[tuple[str, str, str, str, bool]] = []
+    for pip_category, lock_category in (("packages", "default"), ("dev-packages", "develop")):
+        declarations = pipfile_data.get(pip_category)
+        if declarations is None:
+            continue
+        if not isinstance(declarations, Mapping):
+            return None
+        locked = lock_data.get(lock_category)
+        child_version = _locked_python_version(locked, child_name)
+        if child_version is None:
+            continue
+        for raw_name, declaration in declarations.items():
+            try:
+                parsed_name = Requirement(str(raw_name))
+            except InvalidRequirement:
+                return None
+            parent_name = normalize_python_package_name(parsed_name.name)
+            if hinted_parent and parent_name != hinted_parent:
+                continue
+            parent_version = _locked_python_version(locked, parent_name)
+            if parent_version is None:
+                continue
+            possible_edges.append(
+                (
+                    parent_name,
+                    parent_version,
+                    child_version,
+                    pip_category,
+                    _pipfile_declaration_matches_locked_version(
+                        str(raw_name), declaration, parent_version
+                    ),
+                )
+            )
+
+    proven: list[tuple[str, str, str, str, str]] = []
+    unproven_child_edge = False
+    fetch_requires = requires_dist_fetcher or get_pypi_release_requires_dist
+    try:
+        for parent_name, parent_version, child_version, category, unconditional in possible_edges:
+            locked_child = Version(child_version)
+            for raw_requirement in fetch_requires(parent_name, parent_version):
+                requirement = Requirement(raw_requirement)
+                if normalize_python_package_name(requirement.name) != child_name:
+                    continue
+                if not requirement.specifier.contains(locked_child, prereleases=False):
+                    continue
+                if requirement.marker is not None or requirement.extras or not unconditional:
+                    unproven_child_edge = True
+                    continue
+                proven.append((parent_name, parent_version, child_version, category, "default" if category == "packages" else "develop"))
+    except (InvalidRequirement, InvalidVersion, TypeError, ValueError):
+        return None
+    except Exception:  # noqa: BLE001 - missing PyPI metadata is not ancestry proof
+        return None
+    unique = list(dict.fromkeys(proven))
+    if unproven_child_edge or len(unique) != 1:
+        return None
+    parent_name, parent_version, child_version, category, lock_category = unique[0]
+    return {
+        "parent_name": parent_name,
+        "parent_version": parent_version,
+        "child_name": child_name,
+        "child_version": child_version,
+        "child_floor": child_floor,
+        "category": category,
+        "lock_category": lock_category,
+        "manifest_path": pipfile.relative_to(root).as_posix(),
+        "lock_path": lock_path.relative_to(root).as_posix(),
+    }
+
+
+def _python_parent_release_accepts_child_floor(
+    parent_name: str,
+    parent_version: str,
+    child_name: str,
+    child_floor: str,
+    requires_dist_fetcher: Any,
+) -> bool:
+    """Return whether one parent release unconditionally allows the child fix."""
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.version import InvalidVersion, Version
+
+    from remediation_engine.tools.package_identity import normalize_python_package_name
+
+    try:
+        fixed = Version(child_floor)
+        for raw_requirement in requires_dist_fetcher(parent_name, parent_version):
+            try:
+                requirement = Requirement(raw_requirement)
+            except InvalidRequirement:
+                return False
+            if normalize_python_package_name(requirement.name) != child_name:
+                continue
+            if requirement.marker is not None or requirement.extras:
+                continue
+            return requirement.specifier.contains(fixed, prereleases=False)
+    except (InvalidVersion, TypeError, ValueError):
+        return False
+    except Exception:  # noqa: BLE001 - metadata failure cannot authorize a candidate
+        return False
+    return False
+
+
 @dataclass(frozen=True)
 class _PreparedPortfolioProblem:
     """One immutable portfolio input bundle reused across portfolio solves."""
@@ -119,6 +429,32 @@ class _PreparedPortfolioProblem:
     target_packages: tuple[str, ...] | None
     peer_conflict_pairs: tuple[tuple[str, str], ...]
     forced_singleton_task_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _PreparedPythonPortfolioProblem:
+    """Common solver projection inputs for a statically declared PyPI target."""
+
+    repo_root: Path
+    host_repository_fingerprint: str
+    workspace_repository_fingerprint: str
+    groups: list[VulnerabilityGroup]
+    task_queue: dict[str, RemediationTask]
+    targets: list[SolverTarget]
+    findings: list[SolverFindingRequirement]
+    subgraph: SolverSubgraph
+    packuments: Mapping[str, Mapping[str, Any]]
+    candidate_domains: Mapping[str, list[SolverVersionCandidate]]
+    runtime_fingerprint: SolverPythonRuntimeFingerprint | None
+    candidate_catalog_complete: bool
+    candidate_catalog_digest: str
+    settings: AppSettings
+    diagnostics: list[str]
+    target_packages: tuple[str, ...] | None
+    peer_conflict_pairs: tuple[tuple[str, str], ...]
+    forced_singleton_task_ids: tuple[str, ...]
+    manifest_fingerprints: Mapping[str, str]
+    parent_contexts: Mapping[str, Mapping[str, str]]
 
 
 def _digest(value: Any) -> str:
@@ -202,6 +538,7 @@ def prepare_portfolio_inputs(
     groups: Iterable[VulnerabilityGroup],
     task_queue: Mapping[str, RemediationTask],
     target_packages: Iterable[str] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
     """Create missing finding tasks and synthetic direct-dependency tasks copy-on-write.
 
@@ -211,6 +548,7 @@ def prepare_portfolio_inputs(
         task_queue: Existing immutable task projection.
         target_packages: Optional development package allowlist. ``None`` or an
             empty iterable preserves full-repository synthetic discovery.
+        project_language: Language selected by the workspace setup boundary.
 
     Returns:
         ``(groups, task_queue, diagnostics)`` containing detached Pydantic objects.
@@ -230,6 +568,12 @@ def prepare_portfolio_inputs(
         prepared_queue[task_id] = build_initial_remediation_task(group, task_id)
         represented.add(group.group_id)
         next_index += 1
+
+    if project_language == ProjectLanguage.PYTHON:
+        # Python portfolio discovery is finding-backed and declaration-scoped.
+        # Do not pass a requirements-only repository through the npm synthetic
+        # dependency materializer or invent package-lock occurrence identities.
+        return prepared_groups, prepared_queue, []
 
     # A pure SAST portfolio must stay on the existing code-remediation path.
     # Synthetic npm coordination is meaningful only when triage supplied an SCA
@@ -268,6 +612,484 @@ def _issue_identity(issue: Any) -> str:
     if internal_identity:
         return f"record:{internal_identity}"
     raise ValueError("finding record has no stable identity")
+
+
+def prepare_python_portfolio_problem(
+    repo_root: str | Path,
+    groups: Sequence[VulnerabilityGroup],
+    task_queue: Mapping[str, RemediationTask],
+    *,
+    settings: AppSettings,
+    registry_fetcher: Any | None = None,
+    runtime_fingerprint: SolverPythonRuntimeFingerprint | None = None,
+    parent_requires_dist_fetcher: Any | None = None,
+    retry_diagnostics_by_task: Mapping[str, Any] | None = None,
+) -> _PreparedPythonPortfolioProblem:
+    """Build Python declaration occurrences and bounded PyPI candidate domains.
+
+    Direct requirements files and one-hop, category-matched Pipfile parent
+    updates enter the common portfolio. A Pipfile parent is dispatchable only
+    when the lockfile, declaration, ancestry, and PyPI ``Requires-Dist`` proof
+    agree. This adapter never invents npm lock records or trusts a worker hint
+    as a security floor.
+    """
+    from remediation_engine.orchestration.tools_manifest_python import (
+        _declaration_is_editable,
+        _matching_declarations,
+    )
+    from remediation_engine.tools.package_identity import normalize_python_package_name
+    if registry_fetcher is not None and parent_requires_dist_fetcher is None:
+        from remediation_engine.tools.pypi_registry_tools import get_pypi_release_requires_dist
+
+        parent_requires_dist_fetcher = get_pypi_release_requires_dist
+    root = Path(repo_root).resolve()
+    prepared_groups = [group.model_copy(deep=True) for group in groups]
+    queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
+    diagnostics: list[str] = []
+    targets: list[SolverTarget] = []
+    findings: list[SolverFindingRequirement] = []
+    occurrences: list[SolverPackageOccurrence] = []
+    domains: dict[str, list[SolverVersionCandidate]] = {}
+    parent_contexts: dict[str, dict[str, str]] = {}
+    group_by_id = {group.group_id: group for group in prepared_groups}
+    active = _active_tasks(queue)
+    active_groups: dict[str, list[RemediationTask]] = {}
+    for task in queue.values():
+        if task.status not in _TERMINAL_STATUSES:
+            active_groups.setdefault(task.parent_group_id, []).append(task)
+    for group_id, group_tasks in active_groups.items():
+        if len(group_tasks) > 1:
+            diagnostics.append(
+                f"group {group_id!r} has multiple nonterminal tasks; Python portfolio is blocked"
+            )
+
+    manifest_fingerprints: dict[str, str] = {}
+    for task in active:
+        group = group_by_id.get(task.parent_group_id)
+        if group is None or group.issue_type != IssueType.SCA:
+            continue
+        package_name = normalize_python_package_name(str(group.vulnerable_component or ""))
+        target_name = normalize_python_package_name(
+            str(task.target_package_name or group.vulnerable_component or "")
+        )
+        transitive = bool(
+            target_name != package_name
+            or task.parent_package_name
+            or group.parent_package_name
+            or any(item.is_direct_dependency is False for item in group.localized_issues)
+            or any(item.parent_package_name for item in group.localized_issues)
+            or any(item.dependency_ancestry for item in group.localized_issues)
+            or group.dependency_ancestry
+        )
+        non_python_evidence = any(
+            issue.ecosystem
+            and issue.ecosystem.casefold() not in {"pypi", "pip", "python"}
+            for issue in group.issues
+        )
+        if not package_name or non_python_evidence:
+            diagnostics.append(
+                f"task {task.task_id!r} has missing package identity or non-PyPI evidence"
+            )
+            continue
+        raw_paths = {
+            str(value).replace("\\", "/").strip()
+            for value in [
+                *(localized.manifest_file for localized in group.localized_issues),
+                *group.file_paths,
+                group.file_path,
+            ]
+            if value
+        }
+        manifest_paths: set[str] = set()
+        path_error = False
+        for raw_path in raw_paths:
+            candidate = Path(raw_path)
+            if candidate.is_absolute():
+                try:
+                    candidate = candidate.resolve().relative_to(root)
+                except ValueError:
+                    path_error = True
+                    continue
+            if ".." in candidate.parts:
+                path_error = True
+                continue
+            basename = candidate.name.casefold()
+            if basename in {
+                "requirements.txt",
+                "pyproject.toml",
+                "setup.cfg",
+                "pipfile",
+            } or (basename.startswith("requirements") and candidate.suffix.casefold() == ".txt"):
+                manifest_paths.add(candidate.as_posix())
+        if path_error or len(manifest_paths) != 1:
+            diagnostics.append(
+                f"task {task.task_id!r} lacks one safe, unambiguous Python manifest path"
+            )
+            continue
+        manifest_path = next(iter(manifest_paths))
+        manifest_name = Path(manifest_path).name.casefold()
+        is_pipfile = manifest_name == "pipfile"
+        is_requirements = (
+            manifest_name.startswith("requirements")
+            and Path(manifest_path).suffix.casefold() == ".txt"
+        )
+        if is_pipfile and not transitive:
+            diagnostics.append(
+                f"task {task.task_id!r} uses unsupported Python manifest {manifest_path!r}; "
+                "direct Pipfile targets are not supported by the shared certifier"
+            )
+            continue
+        if not is_pipfile and (not is_requirements or transitive):
+            diagnostics.append(
+                f"task {task.task_id!r} uses unsupported Python target/manifest {manifest_path!r}; "
+                "transitive targets require a proven Pipfile parent"
+            )
+            continue
+        resolved_manifest = (root / manifest_path).resolve()
+        try:
+            resolved_manifest.relative_to(root)
+            content = resolved_manifest.read_text(encoding="utf-8")
+        except (OSError, UnicodeError, ValueError):
+            diagnostics.append(f"task {task.task_id!r} Python manifest cannot be read safely")
+            continue
+        manifest_fingerprints[manifest_path] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        pipfile_lock_path: str | None = None
+        parent_context: dict[str, str] | None = None
+        if is_pipfile:
+            pipfile_lock_path = (Path(manifest_path).parent / "Pipfile.lock").as_posix()
+            lock_file = (root / pipfile_lock_path).resolve()
+            try:
+                lock_file.relative_to(root)
+                lock_content = lock_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeError, ValueError):
+                diagnostics.append(f"task {task.task_id!r} Pipfile.lock evidence is unreadable")
+                continue
+            manifest_fingerprints[pipfile_lock_path] = hashlib.sha256(
+                lock_content.encode("utf-8")
+            ).hexdigest()
+            if registry_fetcher is None:
+                diagnostics.append(
+                    f"task {task.task_id!r} Pipfile parent proof is pending workspace validation"
+                )
+                continue
+            try:
+                parent_context = _resolve_python_pipfile_parent_context(
+                    root,
+                    manifest_path,
+                    group,
+                    task,
+                    parent_requires_dist_fetcher,
+                )
+            except Exception as exc:  # noqa: BLE001 - uncertain ancestry fails closed
+                diagnostics.append(f"task {task.task_id!r} Pipfile parent proof failed: {exc}")
+                continue
+            if parent_context is None:
+                diagnostics.append(
+                    f"task {task.task_id!r} lacks a unique, unconditional Pipfile.lock parent proof"
+                )
+                continue
+            target_name = parent_context["parent_name"]
+        elif any(line.lstrip().startswith("-") for line in content.splitlines()):
+            diagnostics.append(
+                f"task {task.task_id!r} requirements file uses pip directives; "
+                "nested requirements, constraints, and resolver options are unsupported"
+            )
+            continue
+        declarations = [
+            item
+            for item in _matching_declarations(
+                manifest_path, content, target_name if is_pipfile else package_name
+            )
+            if _declaration_is_editable(manifest_path, item[1], item[3])
+        ]
+        if len(declarations) != 1:
+            diagnostics.append(
+                f"task {task.task_id!r} does not map to exactly one static editable "
+                "Python dependency declaration"
+            )
+            continue
+        declaration_type, requirement, _, _ = declarations[0]
+        installed_version = parent_context["parent_version"] if parent_context else None
+        if installed_version is None and len(list(requirement.specifier)) == 1:
+            specifier = next(iter(requirement.specifier))
+            if specifier.operator in {"==", "==="} and "*" not in specifier.version:
+                installed_version = specifier.version
+        installed_version = installed_version or next(
+            (str(issue.package_version).strip() for issue in group.issues if issue.package_version),
+            None,
+        ) or next((str(value).strip() for value in group.versions if value), None)
+        try:
+            if not installed_version:
+                raise ValueError("missing installed version evidence")
+            installed_version, _ = _python_numeric_solver_version(installed_version)
+        except ValueError:
+            diagnostics.append(f"task {task.task_id!r} has no valid installed PEP 440 version")
+            continue
+        fixed_versions = sorted(
+            {
+                floor
+                for issue in group.issues
+                if (issue.cve_id or issue.ghsa_id)
+                and (floor := _python_scanner_fixed_version(issue))
+            }
+        )
+        if not fixed_versions:
+            diagnostics.append(
+                f"task {task.task_id!r} has no scanner-backed fixed-version floor"
+            )
+            continue
+        try:
+            normalized_floors = [_python_numeric_solver_version(value) for value in fixed_versions]
+            floor = max(normalized_floors, key=lambda value: value[1])[0]
+        except ValueError:
+            diagnostics.append(f"task {task.task_id!r} has an invalid PEP 440 security floor")
+            continue
+        parent_candidates: list[tuple[str, tuple[int, ...]]] = []
+        parent_floor: str | None = None
+        if parent_context is not None:
+            try:
+                retry_diagnostics = (retry_diagnostics_by_task or {}).get(task.task_id)
+                attempted_by_target = getattr(
+                    retry_diagnostics, "attempted_versions_by_target", {}
+                )
+                attempted_for_parent: list[str] = []
+                if isinstance(attempted_by_target, Mapping):
+                    attempted_for_parent = [
+                        str(version)
+                        for attempted_target, versions in attempted_by_target.items()
+                        if normalize_python_package_name(str(attempted_target)) == target_name
+                        for version in (versions or ())
+                    ]
+                attempted = {
+                    str(value).strip()
+                    for value in (
+                        *getattr(retry_diagnostics, "attempted_versions", ()),
+                        *getattr(retry_diagnostics, "executed_versions", ()),
+                        *attempted_for_parent,
+                    )
+                    if str(value).strip()
+                }
+                attempted.add(installed_version)
+                attempted_keys = {
+                    key
+                    for value in attempted
+                    for _, key in [_python_numeric_solver_version(value)]
+                }
+                for candidate in registry_fetcher(
+                    target_name, installed_version, attempted
+                ):
+                    version, key = _python_numeric_solver_version(str(candidate.version))
+                    if key in attempted_keys:
+                        continue
+                    if _python_parent_release_accepts_child_floor(
+                        target_name,
+                        version,
+                        package_name,
+                        floor,
+                        parent_requires_dist_fetcher,
+                    ):
+                        parent_candidates.append((version, key))
+            except Exception as exc:  # noqa: BLE001 - registry evidence fails closed
+                diagnostics.append(
+                    f"PyPI parent candidate lookup failed for {target_name!r}: {exc}"
+                )
+                continue
+            if not parent_candidates:
+                diagnostics.append(
+                    f"task {task.task_id!r} has no PyPI parent release that accepts "
+                    f"the child security floor {floor}"
+                )
+                continue
+            parent_floor = min(parent_candidates, key=lambda item: item[1])[0]
+            parent_context["parent_minimum_version"] = parent_floor
+            task = task.model_copy(
+                update={
+                    "target_package_name": target_name,
+                    "parent_package_name": target_name,
+                    "parent_package_version": installed_version,
+                    "parent_minimum_version": parent_floor,
+                    "target_dependency_type": declaration_type,
+                }
+            )
+            queue[task.task_id] = task
+
+        occurrence_id = f"python:{manifest_path}:{target_name}"
+        finding_ids = sorted(
+            {
+                _issue_identity(issue)
+                for issue in group.issues
+                if issue.cve_id or issue.ghsa_id or issue.finding_id
+            }
+        )
+        target = SolverTarget(
+            occurrence_id=occurrence_id,
+            task_id=task.task_id,
+            group_id=group.group_id,
+            package_name=package_name,
+            target_package_name=target_name,
+            manifest_path=manifest_path,
+            lockfile_package_key=None,
+            installed_version=installed_version,
+            dependency_type=declaration_type,
+            strategy=task.strategy.value,
+            is_synthetic=bool(task.is_synthetic or group.is_synthetic),
+            is_finding_backed=bool(finding_ids),
+            eligible_for_atomic_update=(
+                task.status not in _TERMINAL_STATUSES
+                and task.current_attempt_id is None
+                and task.strategy == RoutingStrategy.VERSION_BUMP
+            ),
+            finding_ids=finding_ids,
+            is_terminal=task.status in _TERMINAL_STATUSES,
+            terminal_status=(task.status.value if task.status in _TERMINAL_STATUSES else None),
+            has_open_attempt=task.current_attempt_id is not None,
+        )
+        targets.append(target)
+        occurrences.append(
+            SolverPackageOccurrence(
+                occurrence_id=occurrence_id,
+                manifest_path=manifest_path,
+                package_name=target_name,
+                lockfile_package_key=None,
+                installed_version=installed_version,
+                dependency_type=declaration_type,
+                is_direct=True,
+            )
+        )
+        vulnerable_occurrence_id = occurrence_id
+        if parent_context is not None:
+            vulnerable_occurrence_id = (
+                f"python-lock:{parent_context['lock_path']}:{parent_context['lock_category']}:{package_name}"
+            )
+            occurrences.append(
+                SolverPackageOccurrence(
+                    occurrence_id=vulnerable_occurrence_id,
+                    manifest_path=parent_context["lock_path"],
+                    package_name=package_name,
+                    lockfile_package_key=None,
+                    installed_version=parent_context["child_version"],
+                    dependency_type=declaration_type,
+                    is_direct=False,
+                    ancestry=[target_name, package_name],
+                )
+            )
+            parent_contexts[occurrence_id] = dict(parent_context)
+        supported_issues = [
+            issue for issue in group.issues if issue.cve_id or issue.ghsa_id or issue.finding_id
+        ]
+        for issue in sorted(supported_issues, key=_issue_identity):
+            if not (issue.cve_id or issue.ghsa_id or issue.finding_id):
+                continue
+            findings.append(
+                SolverFindingRequirement(
+                    finding_id=_issue_identity(issue),
+                    vulnerable_occurrence_id=vulnerable_occurrence_id,
+                    cve_id=issue.cve_id,
+                    ghsa_id=issue.ghsa_id,
+                    severity=issue.severity.value,
+                    vulnerable_package=package_name,
+                    target_occurrence_id=occurrence_id,
+                    fixed_version=floor,
+                    direct_parent_name=(target_name if parent_context is not None else None),
+                    direct_parent_minimum_version=parent_floor,
+                    is_transitive=parent_context is not None,
+                )
+            )
+        if target.eligible_for_atomic_update and registry_fetcher is not None:
+            try:
+                converted_by_version: dict[str, SolverVersionCandidate] = {}
+                if parent_context is not None:
+                    parent_floor_key = _python_numeric_solver_version(parent_floor or "")[1]
+                    for version, key in parent_candidates:
+                        converted_by_version[version] = SolverVersionCandidate(
+                            version=version,
+                            semver_key=key,
+                            source="pypi-parent-compatibility",
+                            meets_security_floor=key >= parent_floor_key,
+                        )
+                else:
+                    raw_candidates = registry_fetcher(package_name, floor, set())
+                    floor_key = _python_numeric_solver_version(floor)[1]
+                    for candidate in raw_candidates:
+                        version, key = _python_numeric_solver_version(str(candidate.version))
+                        converted_by_version[version] = SolverVersionCandidate(
+                            version=version,
+                            semver_key=key,
+                            source="pypi",
+                            meets_security_floor=key >= floor_key,
+                        )
+                domains[occurrence_id] = sorted(
+                    converted_by_version.values(), key=lambda item: (item.semver_key, item.version)
+                )
+                if not converted_by_version:
+                    diagnostics.append(f"task {task.task_id!r} has no stable PyPI candidate")
+            except Exception as exc:  # noqa: BLE001 - registry evidence is fail-closed
+                diagnostics.append(f"PyPI candidate lookup failed for {package_name!r}: {exc}")
+
+    # Pip resolves the complete requirements set in one environment. Couple
+    # all selected direct mutations into one atomic solver batch so QA/certifier
+    # evidence always describes the combined declaration change.
+    python_edges = [
+        SolverEdge(
+            source_occurrence_id=left.occurrence_id,
+            target_occurrence_id=right.occurrence_id,
+            source_task_id=left.task_id,
+            target_task_id=right.task_id,
+            edge_kind="workspace",
+            is_peer_coupling=True,
+        )
+        for index, left in enumerate(sorted(targets, key=lambda item: item.occurrence_id))
+        for right in sorted(targets, key=lambda item: item.occurrence_id)[index + 1 :]
+    ]
+    subgraph = SolverSubgraph(
+        targets=targets,
+        occurrences=occurrences,
+        findings=findings,
+        edges=python_edges,
+        valid=bool(targets and findings) and not diagnostics,
+        diagnostics=sorted(set(diagnostics)),
+    )
+    host_fingerprint = _digest(manifest_fingerprints)
+    candidate_catalog_complete = bool(targets and findings) and all(
+        target.eligible_for_atomic_update
+        and target.occurrence_id in domains
+        and bool(domains[target.occurrence_id])
+        for target in targets
+    ) and not diagnostics
+    catalog_digest = _digest(
+        {
+            "ecosystem": "pypi",
+            "manifest_fingerprints": manifest_fingerprints,
+            "domains": {
+                key: [item.model_dump(mode="json") for item in values]
+                for key, values in sorted(domains.items())
+            },
+            "complete": candidate_catalog_complete,
+            "diagnostics": sorted(set(diagnostics)),
+        }
+    )
+    return _PreparedPythonPortfolioProblem(
+        repo_root=root,
+        host_repository_fingerprint=host_fingerprint,
+        workspace_repository_fingerprint=host_fingerprint,
+        groups=prepared_groups,
+        task_queue=queue,
+        targets=targets,
+        findings=findings,
+        subgraph=subgraph,
+        packuments={},
+        candidate_domains=domains,
+        runtime_fingerprint=runtime_fingerprint,
+        candidate_catalog_complete=candidate_catalog_complete,
+        candidate_catalog_digest=catalog_digest,
+        settings=settings,
+        diagnostics=sorted(set(diagnostics)),
+        target_packages=None,
+        peer_conflict_pairs=(),
+        forced_singleton_task_ids=(),
+        manifest_fingerprints=dict(sorted(manifest_fingerprints.items())),
+        parent_contexts={key: dict(value) for key, value in sorted(parent_contexts.items())},
+    )
 
 
 def _record_index(snapshot: NpmGraphSnapshot) -> dict[tuple[str, str], NpmDependencyRecord]:
@@ -693,11 +1515,7 @@ def _build_targets_and_findings(
                 target_name != package_name
                 and (task.parent_package_name or group.parent_package_name)
             )
-            fixed = (
-                task.parent_minimum_version
-                if transitive_parent_target
-                else issue.fixed_version or _group_fixed_version(group, task)
-            )
+            fixed = issue.fixed_version or _group_fixed_version(group, task)
             workaround_plan_ids = _workaround_plan_ids(group, issue)
             vulnerable_occurrence_ids = _finding_occurrences(
                 snapshot,
@@ -728,8 +1546,14 @@ def _build_targets_and_findings(
                         vulnerable_package=package_name,
                         target_occurrence_id=occurrence_id,
                         fixed_version=fixed,
-                        direct_parent_name=(group.parent_package_name or task.parent_package_name),
-                        direct_parent_minimum_version=task.parent_minimum_version,
+                        direct_parent_name=(
+                            (group.parent_package_name or task.parent_package_name)
+                            if transitive_parent_target and task.parent_minimum_version
+                            else None
+                        ),
+                        direct_parent_minimum_version=(
+                            task.parent_minimum_version if transitive_parent_target else None
+                        ),
                         strategy_stage=task.strategy_stage.value,
                         workaround_available=bool(workaround_plan_ids),
                         workaround_plan_ids=workaround_plan_ids,
@@ -901,7 +1725,12 @@ def _resolve_transitive_parent_floors(
                 parent_floor = min(compatible, key=lambda value: _semver_key(value) or (0, 0, 0))
                 for index, finding in enumerate(findings):
                     if finding.target_occurrence_id == target.occurrence_id:
-                        findings[index] = finding.model_copy(update={"fixed_version": parent_floor})
+                        findings[index] = finding.model_copy(
+                            update={
+                                "direct_parent_name": parent_name,
+                                "direct_parent_minimum_version": parent_floor,
+                            }
+                        )
             else:
                 diagnostics.append(
                     f"no published {parent_name!r} release resolves "
@@ -1282,8 +2111,18 @@ def _candidate_domains(
             and (task and task.parent_package_name or group.parent_package_name)
         )
         floor = floors_by_target.get(target.occurrence_id)
-        if floor is None and parent_target and task is not None:
-            floor = task.parent_minimum_version
+        if parent_target and task is not None:
+            parent_floors = [
+                finding.direct_parent_minimum_version
+                for finding in findings
+                if finding.target_occurrence_id == target.occurrence_id
+                and finding.direct_parent_minimum_version
+            ]
+            floor = (
+                max(parent_floors, key=lambda value: _semver_key(value) or (0, 0, 0))
+                if parent_floors
+                else task.parent_minimum_version
+            )
         parent_proof = (
             compatible_versions.get(target.occurrence_id, set())
             if parent_target and task is not None and not task.parent_minimum_version
@@ -2158,6 +2997,50 @@ def build_portfolio_plan(
     )
 
 
+def build_python_portfolio_plan(
+    repo_root: str | Path,
+    groups: Iterable[VulnerabilityGroup],
+    task_queue: Mapping[str, RemediationTask],
+    *,
+    settings: AppSettings | None = None,
+    registry_fetcher: Any | None = None,
+    parent_requires_dist_fetcher: Any | None = None,
+    runtime_fingerprint: SolverPythonRuntimeFingerprint | None = None,
+    retry_diagnostics_by_task: Mapping[str, Any] | None = None,
+    portfolio_iteration: int = 0,
+) -> tuple[Any, SolverRemediationPlan, Any]:
+    """Prepare PyPI evidence and solve through the common occurrence portfolio.
+
+    Returns the prepared evidence, the shared CP-SAT result, and the same
+    ``PortfolioPlan`` contract used by npm.  Resolver certification remains a
+    separate outer Supervisor gate and is added by ``portfolio_certifier``.
+    """
+    resolved_settings = settings or AppSettings()
+    prepared = prepare_python_portfolio_problem(
+        repo_root,
+        list(groups),
+        task_queue,
+        settings=resolved_settings,
+        registry_fetcher=registry_fetcher,
+        parent_requires_dist_fetcher=parent_requires_dist_fetcher,
+        runtime_fingerprint=runtime_fingerprint,
+        retry_diagnostics_by_task=retry_diagnostics_by_task,
+    )
+    solver_plan = solve_portfolio(
+        prepared.subgraph,
+        prepared.candidate_domains,
+        settings=resolved_settings,
+        candidate_catalog_complete=prepared.candidate_catalog_complete,
+        candidate_catalog_digest=prepared.candidate_catalog_digest,
+    )
+    plan = _project_prepared_portfolio_plan(
+        prepared,
+        solver_plan,
+        portfolio_iteration=portfolio_iteration,
+    )
+    return prepared, plan.solver_plan, plan
+
+
 def _expected_target_identity(
     group: VulnerabilityGroup, task: RemediationTask
 ) -> tuple[str, str, str]:
@@ -2166,7 +3049,134 @@ def _expected_target_identity(
     package_name = (task.target_package_name or group.vulnerable_component or "").strip()
     if not package_name:
         raise ValueError(f"task {task.task_id!r} has no target package identity")
+    if not _manifest_path(group, Path(".")):
+        python_manifest = _python_requirements_manifest_path(group) or _python_pipfile_manifest_path(
+            group
+        )
+        python_evidence = any(
+            str(issue.ecosystem or "").strip().casefold() in {"pypi", "pip", "python"}
+            for issue in group.issues
+        ) or any(
+            str(localized.package_manager or "").strip().casefold() in {"pip", "pipenv"}
+            for localized in group.localized_issues
+        )
+        if python_manifest and python_evidence:
+            from remediation_engine.tools.package_identity import normalize_python_package_name
+
+            package_name = normalize_python_package_name(package_name)
+            manifest_path = python_manifest
     return task.parent_group_id, manifest_path, package_name
+
+
+def _python_requirements_manifest_path(group: VulnerabilityGroup) -> str | None:
+    """Return a unique safe requirements-file path for an explicitly Python group."""
+    raw_paths = [
+        *(localized.manifest_file for localized in group.localized_issues),
+        *group.file_paths,
+        group.file_path,
+    ]
+    paths: set[str] = set()
+    for raw_path in raw_paths:
+        if not raw_path:
+            continue
+        text = str(raw_path).replace("\\", "/").strip()
+        candidate = Path(text)
+        if (
+            not text
+            or "\x00" in text
+            or candidate.is_absolute()
+            or ".." in candidate.parts
+            or text.startswith(("~/", "//"))
+        ):
+            return None
+        normalized = candidate.as_posix()
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        paths.add(normalized)
+    if len(paths) != 1:
+        return None
+    manifest = next(iter(paths))
+    name = Path(manifest).name.casefold()
+    if name.startswith("requirements") and Path(manifest).suffix.casefold() == ".txt":
+        return manifest
+    return None
+
+
+def _python_pipfile_manifest_path(group: VulnerabilityGroup) -> str | None:
+    """Return one safe Pipfile path for a Python finding group."""
+    raw_paths = [
+        *(localized.manifest_file for localized in group.localized_issues),
+        *group.file_paths,
+        group.file_path,
+    ]
+    paths: set[str] = set()
+    for raw_path in raw_paths:
+        if not raw_path:
+            continue
+        text = str(raw_path).replace("\\", "/").strip()
+        candidate = Path(text)
+        if (
+            not text
+            or "\x00" in text
+            or candidate.is_absolute()
+            or ".." in candidate.parts
+            or text.startswith(("~/", "//"))
+        ):
+            return None
+        normalized = candidate.as_posix()
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        if candidate.name.casefold() == "pipfile":
+            paths.add(normalized)
+    return next(iter(paths)) if len(paths) == 1 else None
+
+
+def python_manifest_repository_fingerprint(
+    repo_root: str | Path, manifest_paths: Iterable[str]
+) -> str | None:
+    """Recompute the Python portfolio fingerprint from its committed manifests.
+
+    The digest covers the same declaration files used to prepare the Python
+    portfolio, including the adjacent Pipfile.lock for certified Pipfile
+    parent targets. Unsafe, missing, or unreadable paths fail closed by
+    returning ``None``.
+    """
+    root = Path(repo_root).resolve()
+    normalized_paths: set[str] = set()
+    for raw_path in manifest_paths:
+        text = str(raw_path or "").replace("\\", "/").strip()
+        candidate = Path(text)
+        if (
+            not text
+            or "\x00" in text
+            or candidate.is_absolute()
+            or ".." in candidate.parts
+            or text.startswith(("~/", "//"))
+        ):
+            return None
+        normalized = candidate.as_posix()
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        name = candidate.name.casefold()
+        is_requirements = name.startswith("requirements") and candidate.suffix.casefold() == ".txt"
+        if not (is_requirements or name in {"pipfile", "pyproject.toml", "setup.cfg"}):
+            return None
+        normalized_paths.add(normalized)
+        if name == "pipfile":
+            normalized_paths.add((candidate.parent / "Pipfile.lock").as_posix())
+
+    if not normalized_paths:
+        return None
+    content_digests: dict[str, str] = {}
+    for relative_path in sorted(normalized_paths):
+        path = (root / relative_path).resolve()
+        try:
+            path.relative_to(root)
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError, ValueError):
+            return None
+        content_digests[relative_path] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return _digest(content_digests)
 
 
 def _override_instruction(
@@ -2240,9 +3250,9 @@ def _version_bump_instruction(
             if group.fix_plan and group.fix_plan.fixed_version
             else next(
                 (
-                    str(issue.fixed_version).strip()
+                    floor
                     for issue in group.issues
-                    if issue.fixed_version and str(issue.fixed_version).strip()
+                    if (floor := _python_scanner_fixed_version(issue))
                 ),
                 None,
             )
@@ -2350,12 +3360,76 @@ def apply_portfolio_plan(
             group,
             task,
         )
-        decision_lockfile_key = str(decision.lockfile_package_key or "").replace("\\", "/")
-        direct_occurrence = make_occurrence_id(expected_manifest, expected_package)
-        physical_occurrence = make_occurrence_id(
-            expected_manifest,
-            expected_package,
-            decision_lockfile_key,
+        requirements_manifest = _python_requirements_manifest_path(group)
+        pipfile_manifest = _python_pipfile_manifest_path(group)
+        python_target = expected_manifest in {requirements_manifest, pipfile_manifest}
+        pipfile_target = expected_manifest == pipfile_manifest and pipfile_manifest is not None
+        decision_target_name = str(decision.target_package_name or "").strip()
+        certified_parent_target = False
+        target_identity_package = expected_package
+        if pipfile_target:
+            from remediation_engine.tools.package_identity import normalize_python_package_name
+
+            child_name = normalize_python_package_name(str(group.vulnerable_component or ""))
+            parent_name = normalize_python_package_name(
+                str(decision.parent_package_name or decision_target_name)
+            )
+            selected_version = str(decision.selected_version or "")
+            parent_floor = str(decision.parent_minimum_version or "")
+            scanner_floors = [
+                floor
+                for issue in group.issues
+                if (issue.cve_id or issue.ghsa_id)
+                and (floor := _python_scanner_fixed_version(issue))
+            ]
+            try:
+                expected_child_floor = max(
+                    (_python_numeric_solver_version(value) for value in scanner_floors),
+                    key=lambda item: item[1],
+                )[0]
+                parent_selected_key = _python_numeric_solver_version(selected_version)[1]
+                parent_floor_key = _python_numeric_solver_version(parent_floor)[1]
+            except (ValueError, TypeError):
+                expected_child_floor = ""
+                parent_selected_key = None
+                parent_floor_key = None
+            certified_parent_target = bool(
+                certificate is not None
+                and str(certificate_status or "").upper() == "CERTIFIED"
+                and group.issue_type == IssueType.SCA
+                and child_name
+                and parent_name
+                and parent_name == normalize_python_package_name(decision_target_name)
+                and parent_name != child_name
+                and normalize_python_package_name(str(decision.vulnerable_package_name or ""))
+                == child_name
+                and str(decision.vulnerable_fixed_version or "") == expected_child_floor
+                and decision.parent_package_version
+                and parent_floor_key is not None
+                and parent_selected_key is not None
+                and parent_selected_key >= parent_floor_key
+                and expected_manifest == pipfile_manifest
+                and decision.lockfile_package_key is None
+            )
+            if not certified_parent_target:
+                raise ValueError(
+                    f"Pipfile decision for task {task_id!r} lacks a certified one-hop parent target"
+                )
+            target_identity_package = parent_name
+        decision_lockfile_key = (
+            None
+            if python_target
+            else str(decision.lockfile_package_key or "").replace("\\", "/")
+        )
+        direct_occurrence = (
+            f"python:{expected_manifest}:{target_identity_package}"
+            if python_target
+            else make_occurrence_id(expected_manifest, target_identity_package)
+        )
+        physical_occurrence = (
+            direct_occurrence
+            if python_target
+            else make_occurrence_id(expected_manifest, target_identity_package, decision_lockfile_key)
         )
         decision_occurrence = str(decision.target_occurrence_id or "")
         decision_strategy = str(decision.selected_strategy).lower().replace("-", "_")
@@ -2366,7 +3440,17 @@ def apply_portfolio_plan(
             and not decision.allowed_alternative_versions
             and bool(decision.selected_plan_issue_ids)
         )
-        if not lockfile_key_matches_package(decision_lockfile_key, expected_package):
+        if python_target and decision.lockfile_package_key is not None:
+            raise ValueError(
+                f"Python portfolio decision for task {task_id!r} must use the no-lockfile identity"
+            )
+        if python_target and not certified_parent_target and decision_target_name != expected_package:
+            raise ValueError(
+                f"Python portfolio decision for task {task_id!r} changed its package target"
+            )
+        if not python_target and not lockfile_key_matches_package(
+            decision_lockfile_key, target_identity_package
+        ):
             raise ValueError(
                 f"portfolio decision for task {task_id!r} has invalid lockfile_package_key "
                 f"{decision_lockfile_key!r}"
@@ -2378,7 +3462,7 @@ def apply_portfolio_plan(
             )
         identity_values = {
             "target_group_id": expected_group_id,
-            "target_package_name": expected_package,
+            "target_package_name": target_identity_package,
             "manifest_path": expected_manifest,
             "lockfile_package_key": decision_lockfile_key,
         }
@@ -2404,6 +3488,7 @@ def apply_portfolio_plan(
             continue
         if (
             decision_occurrence == physical_occurrence
+            and not python_target
             and physical_occurrence != direct_occurrence
             and decision.dependency_type not in _OVERRIDE_DEPENDENCY_TYPES
             and not non_mutating_workaround
@@ -2427,6 +3512,15 @@ def apply_portfolio_plan(
             )
             continue
         updates: dict[str, Any] = {}
+        if certified_parent_target:
+            updates.update(
+                {
+                    "target_package_name": target_identity_package,
+                    "parent_package_name": target_identity_package,
+                    "parent_package_version": decision.parent_package_version,
+                    "parent_minimum_version": decision.parent_minimum_version,
+                }
+            )
         decision_strategy = str(decision.selected_strategy).lower().replace("-", "_")
         if decision_strategy in {"version_bump", "versionbump"}:
             updates["strategy"] = RoutingStrategy.VERSION_BUMP
@@ -2506,7 +3600,17 @@ def apply_portfolio_plan(
             )
         elif decision_strategy in {"version_bump", "versionbump"} and decision.selected_version:
             updates["instruction"] = _version_bump_instruction(
-                task,
+                task.model_copy(
+                    update=(
+                        {
+                            "parent_package_name": target_identity_package,
+                            "parent_package_version": decision.parent_package_version,
+                            "parent_minimum_version": decision.parent_minimum_version,
+                        }
+                        if certified_parent_target
+                        else {}
+                    )
+                ),
                 group,
                 expected_package,
                 decision.selected_version,

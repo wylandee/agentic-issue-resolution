@@ -104,6 +104,15 @@ patch. The summary is `pygoat-batch-runs-summary.json`. PyGoat has no checked-in
 suppression XML, so each request receives only its selected issues. The runner
 does not rewrite the baseline fixture or the host checkout.
 
+Use `--packages` to run one explicitly selected batch instead of sampling. The
+names must match packages present in the baseline issues:
+
+```bash
+python examples/pygoat/run_batch.py \
+  --packages certifi pyjwt \
+  --dry-run
+```
+
 ## Offline fixture test
 
 The test ingests the separately named synthetic PyPI report into canonical

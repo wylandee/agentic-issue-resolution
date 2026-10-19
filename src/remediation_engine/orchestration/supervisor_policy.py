@@ -78,6 +78,29 @@ def _group_uses_pypi(group: VulnerabilityGroup) -> bool:
     return False
 
 
+def _task_uses_pypi(
+    task: RemediationTask | None,
+    group: VulnerabilityGroup | None,
+) -> bool:
+    """Resolve the package ecosystem from finding evidence or committed stage."""
+    if group is not None and _group_uses_pypi(group):
+        return True
+    return task is not None and task.strategy_stage in {
+        SCARemediationStage.PYPI_SAME_MAJOR,
+        SCARemediationStage.PYPI_LATEST,
+    }
+
+
+def _latest_sca_stage(
+    task: RemediationTask | None,
+    group: VulnerabilityGroup | None,
+) -> SCARemediationStage:
+    """Return the latest bounded update stage for a task's package ecosystem."""
+    if _task_uses_pypi(task, group):
+        return SCARemediationStage.PYPI_LATEST
+    return SCARemediationStage.NPM_LATEST
+
+
 def _canonical_security_floor(
     group: VulnerabilityGroup | None,
 ) -> tuple[str | None, str | None]:

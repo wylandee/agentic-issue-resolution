@@ -1672,6 +1672,232 @@ class TestToolbeltFactoriesStage2Parity:
             npm_factory.assert_not_called()
             python_factory.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("language", "ecosystem", "manifest", "package", "target_tool", "wrong_tool"),
+        [
+            (
+                ProjectLanguage.NODEJS,
+                "npm",
+                "package.json",
+                "lodash",
+                "modify_batch_npm_dependencies",
+                "modify_batch_python_dependencies",
+            ),
+            (
+                ProjectLanguage.PYTHON,
+                "pypi",
+                "requirements.txt",
+                "certifi",
+                "modify_batch_python_dependencies",
+                "modify_batch_npm_dependencies",
+            ),
+        ],
+    )
+    def test_multi_package_toolbelt_exposes_only_the_matching_ecosystem(
+        self, language, ecosystem, manifest, package, target_tool, wrong_tool
+    ):
+        action = MultiPackageAction(
+            cluster_id="cluster-language-test",
+            dispatch_batch_id="batch-language-test",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-language-test",
+                    package_name=package,
+                    manifest_path=manifest,
+                    target_version="1.2.3",
+                    ecosystem=ecosystem,
+                    dependency_type=("requirements" if ecosystem == "pypi" else "dependencies"),
+                )
+            ],
+            rationale="Exercise the language-specific sealed batch tool.",
+        )
+        tools = build_multi_package_update_toolbelt(
+            MagicMock(),
+            set(),
+            action,
+            project_language=language,
+        )
+        assert [tool.name for tool in tools] == [target_tool]
+        assert wrong_tool not in {tool.name for tool in tools}
+
+    def test_multi_package_toolbelt_rejects_wrong_language_action(self):
+        action = MultiPackageAction(
+            cluster_id="cluster-python-test",
+            dispatch_batch_id="batch-python-test",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-python-test",
+                    package_name="certifi",
+                    manifest_path="requirements.txt",
+                    target_version="2025.1.31",
+                    ecosystem="pypi",
+                    dependency_type="requirements",
+                )
+            ],
+            rationale="The action ecosystem must match its worker.",
+        )
+        with pytest.raises(ValueError, match="nodejs batch toolbelt requires"):
+            build_multi_package_update_toolbelt(
+                MagicMock(), set(), action, project_language=ProjectLanguage.NODEJS
+            )
+
+    def test_python_batch_resolves_same_environment_manifests_together_and_retains_union(self):
+        from remediation_engine.orchestration.tools_manifest import _PackageCheckpoint
+
+        class Sandbox:
+            def __init__(self):
+                self.files = {
+                    "requirements-a.txt": "alpha==1.0\n",
+                    "requirements-b.txt": "beta==2.0\n",
+                }
+                self.commands = []
+
+            def read_file(self, path):
+                return self.files.get(path)
+
+            def write_file(self, path, content):
+                self.files[path] = content
+
+            def run(self, command, timeout=None):
+                self.commands.append(command)
+                assert self.files["requirements-a.txt"] == "alpha==1.1\n"
+                assert self.files["requirements-b.txt"] == "beta==2.1\n"
+                return CommandResult(
+                    exit_code=0,
+                    stdout="resolved",
+                    stderr="",
+                    duration_seconds=0.01,
+                )
+
+        sandbox = Sandbox()
+        action = MultiPackageAction(
+            cluster_id="cluster-python-batch",
+            dispatch_batch_id="batch-python-batch",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-alpha",
+                    package_name="alpha",
+                    manifest_path="requirements-a.txt",
+                    target_version="1.1",
+                    ecosystem="pypi",
+                    dependency_type="requirements",
+                ),
+                PackageMutation(
+                    task_id="task-beta",
+                    package_name="beta",
+                    manifest_path="requirements-b.txt",
+                    target_version="2.1",
+                    ecosystem="pypi",
+                    dependency_type="requirements",
+                ),
+            ],
+            rationale="Both approved package changes belong to one atomic action.",
+        )
+        touched_files = {"prior.py"}
+        execution_state = {}
+        package_checkpoints = {}
+        tools = build_multi_package_update_toolbelt(
+            sandbox,
+            touched_files,
+            action,
+            execution_state=execution_state,
+            package_checkpoints=package_checkpoints,
+            project_language=ProjectLanguage.PYTHON,
+        )
+        assert [tool.name for tool in tools] == ["modify_batch_python_dependencies"]
+        tool = tools[0]
+        result = tool.invoke({})
+
+        assert result.startswith("SUCCESS:")
+        assert len(sandbox.commands) == 1
+        assert "pip install --dry-run" in sandbox.commands[0]
+        assert "-r /workspace/requirements-a.txt" in sandbox.commands[0]
+        assert "-r /workspace/requirements-b.txt" in sandbox.commands[0]
+        assert touched_files == {"prior.py", "requirements-a.txt", "requirements-b.txt"}
+        checkpoint = package_checkpoints["__multi_package_action__"]
+        assert isinstance(checkpoint, _PackageCheckpoint)
+        assert checkpoint.files == {
+            "requirements-a.txt": "alpha==1.0\n",
+            "requirements-b.txt": "beta==2.0\n",
+        }
+        repeated = tool.invoke({})
+        assert repeated.startswith("ERROR_CODE: MULTI_PACKAGE_ACTION_ALREADY_EXECUTED:")
+        assert len(sandbox.commands) == 1
+
+    def test_python_batch_failure_restores_every_manifest_before_return(self):
+        from remediation_engine.orchestration.tools_manifest_python import (
+            apply_multi_package_python_action,
+        )
+
+        class Sandbox:
+            def __init__(self):
+                self.files = {
+                    "requirements-a.txt": "alpha==1.0\n",
+                    "requirements-b.txt": "beta==2.0\n",
+                }
+                self.calls = 0
+
+            def read_file(self, path):
+                return self.files.get(path)
+
+            def write_file(self, path, content):
+                self.files[path] = content
+
+            def run(self, command, timeout=None):
+                self.calls += 1
+                return CommandResult(
+                    exit_code=1 if self.calls == 1 else 0,
+                    stdout="validation",
+                    stderr="resolver failure" if self.calls == 1 else "",
+                    duration_seconds=0.01,
+                )
+
+        sandbox = Sandbox()
+        action = MultiPackageAction(
+            cluster_id="cluster-python-rollback",
+            dispatch_batch_id="batch-python-rollback",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-alpha",
+                    package_name="alpha",
+                    manifest_path="requirements-a.txt",
+                    target_version="1.1",
+                    ecosystem="pypi",
+                    dependency_type="requirements",
+                ),
+                PackageMutation(
+                    task_id="task-beta",
+                    package_name="beta",
+                    manifest_path="requirements-b.txt",
+                    target_version="2.1",
+                    ecosystem="pypi",
+                    dependency_type="requirements",
+                ),
+            ],
+            rationale="A failed resolver check must restore the complete committed batch.",
+        )
+        touched_files = {"prior.py"}
+        package_checkpoints = {}
+        succeeded, diagnostic = apply_multi_package_python_action(
+            sandbox,
+            action,
+            touched_files,
+            checkpoint_store=package_checkpoints,
+        )
+
+        assert not succeeded
+        assert "Rollback: union package checkpoint restored" in diagnostic
+        assert sandbox.files == {
+            "requirements-a.txt": "alpha==1.0\n",
+            "requirements-b.txt": "beta==2.0\n",
+        }
+        assert touched_files == {"prior.py"}
+        assert package_checkpoints == {}
+
     def test_python_no_fix_exposes_only_python_removal_and_protects_manifests(self):
         sandbox = MagicMock()
         plan_state = {

@@ -80,6 +80,33 @@ def _filter_constraints_ledger(
     return filter_constraints_ledger(constraints_ledger, target_group)
 
 
+def _default_no_fix_package_manager(
+    project_language: ProjectLanguage,
+    manifest_paths: Sequence[str],
+) -> str:
+    """Infer a safe package manager from the selected language and manifests.
+
+    Python package removal is exposed only when all recognized target
+    manifests use one manager. Mixed or unrecognized Python targets fail
+    closed so a worker cannot remove a declaration with the wrong resolver.
+    """
+    if project_language != ProjectLanguage.PYTHON:
+        return "npm"
+
+    managers: set[str] = set()
+    for raw_path in manifest_paths:
+        name = Path(str(raw_path or "")).name.casefold()
+        if name in {"pipfile", "pipfile.lock"}:
+            managers.add("pipenv")
+        elif (name.startswith("requirements") and name.endswith(".txt")) or name in {
+            "pyproject.toml",
+            "setup.cfg",
+            "setup.py",
+        }:
+            managers.add("pip")
+    return next(iter(managers)) if len(managers) == 1 else ""
+
+
 _QA_ERROR_MARKER = re.compile(
     r"(?:error|exception|failed|failure|not\s+a\s+function|undefined|cannot|invalid|missing|required\s+option|not\s+exported|cannot\s+find)",
     re.IGNORECASE,
@@ -717,48 +744,18 @@ _WORKAROUND_STATIC_INSTRUCTIONS = "\n\n".join(
 )
 
 
-_PYTHON_WORKAROUND_STATIC_INSTRUCTIONS = """You are a Python code security
-specialist operating in the shared workspace. Work on Python source files
-(`.py`) and use the project's pip or Pipenv environment; tests are run with
-pytest. Follow Investigate -> Plan -> Execute -> Validate. Make one minimal,
-semantic source patch per iteration with deterministic_apply_edit_set, including
-imports and causally related call sites in the same atomic edit set. Use
-validate_python_syntax to check Python syntax, run_targeted_python_test for a
-focused pytest run, and validate_python_workaround to validate the cumulative
-modified files. Do not edit unrelated code or weaken the security invariant.
-
-For INITIAL_MITIGATION, inspect local code first, then perform the initial
-search_web call once and read authoritative results with read_web_page. Adapt
-guidance to the local Python code; do not copy an external patch blindly.
-
-For QA_REGRESSION_REPAIR, trace pytest evidence to modified Python source. Use
-search_web only for migration guidance or exact breaking-change diagnostics. An
-alternative targeted test may be substituted once only for a proven
-infrastructure-only failure, with a recorded mapping; never substitute for an
-assertion, syntax, type, or application-runtime failure.
+_PYTHON_WORKAROUND_LANGUAGE_INSTRUCTIONS = """Python-specific environment and
+capabilities: Work on Python source files (`.py`) and use pip or Pipenv; tests
+are run with pytest. Use validate_python_syntax to check syntax and
+run_targeted_python_test for the focused pytest run.
 
 Supported dependency declarations include requirements files such as
 requirements.txt, static PEP 621 pyproject.toml, static setup.cfg, and Pipfile.
-Ordinary workarounds must not
-modify dependency manifests or lockfiles. For NO_FIX PACKAGE_REMOVAL only,
-remove_no_fix_python_dependency is the sole manifest operation; never manually
-edit Pipfile.lock. Remove source imports and dependent usage when inspection
-shows them, then validate the cumulative Python source patch.
-
-Test files are read-only. Runtime smoke must import a lightweight Python source
-module, never a test/spec file or build/dist artifact, and remain separate from
-the targeted pytest run. Supply the complete cumulative modified-file list to
-validate_python_workaround. Resolve infrastructure-only failures through the
-permitted alternative targeted-test path; do not edit for infrastructure noise.
-
-Each deterministic_apply_edit_set is provisional until
-validate_python_workaround returns PASS. CODE_FAILURE rolls back the whole
-pending set; the next plan must re-include every required change. PASS promotes
-it into the cumulative patch. INFRA_FAILURE or BLOCKED retains the pending set
-for recovery; never re-apply the same patch. Always report modified_files
-cumulatively. Before source edits or package removal, call record_plan. Never
-modify tests to make assertions pass, use absolute paths, or bump library
-versions."""
+Ordinary workarounds must not modify dependency manifests or lockfiles. For
+NO_FIX PACKAGE_REMOVAL, the Python manifest-removal tool is the sole manifest
+operation; never manually edit Pipfile.lock. Runtime smoke must import a
+lightweight Python source module and remain separate from the targeted pytest
+run."""
 
 
 def _build_workaround_system_prompt(
@@ -768,7 +765,23 @@ def _build_workaround_system_prompt(
     if not isinstance(project_language, ProjectLanguage):
         project_language = ProjectLanguage(project_language)
     if project_language == ProjectLanguage.PYTHON:
-        return _PYTHON_WORKAROUND_STATIC_INSTRUCTIONS
+        shared_instructions = (
+            _WORKAROUND_STATIC_INSTRUCTIONS.replace(
+                "You are a code security specialist",
+                "You are a Python code security specialist",
+            )
+            .replace("validate_workaround", "validate_python_workaround")
+            .replace("remove_no_fix_dependency", "remove_no_fix_python_dependency")
+            .replace(
+                "configured authorized package.json and lockfile paths",
+                "configured authorized Python manifest paths (and Pipfile.lock when applicable)",
+            )
+            .replace(
+                "Never manually edit or delete lockfile nodes",
+                "Never manually edit or delete dependency lockfiles",
+            )
+        )
+        return "\n\n".join([shared_instructions, _PYTHON_WORKAROUND_LANGUAGE_INSTRUCTIONS])
     return _WORKAROUND_STATIC_INSTRUCTIONS
 
 
@@ -1394,6 +1407,15 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                     if normalized and normalized not in no_fix_manifest_paths:
                         no_fix_manifest_paths.append(normalized)
 
+            no_fix_package_manager = next(
+                (
+                    issue.package_manager
+                    for issue in getattr(target_group, "localized_issues", []) or []
+                    if getattr(issue, "package_manager", None)
+                ),
+                None,
+            ) or _default_no_fix_package_manager(project_language, no_fix_manifest_paths)
+
             toolbelt = build_workaround_toolbelt(
                 sandbox,
                 touched_files,
@@ -1415,16 +1437,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                     if getattr(target_task, "no_fix_stage", None) is not None
                     else []
                 ),
-                no_fix_package_manager=(
-                    next(
-                        (
-                            issue.package_manager
-                            for issue in getattr(target_group, "localized_issues", []) or []
-                            if getattr(issue, "package_manager", None)
-                        ),
-                        "npm",
-                    )
-                ),
+                no_fix_package_manager=no_fix_package_manager,
                 language=project_language,
             )
             context_manager = ContextManager(toolbelt)

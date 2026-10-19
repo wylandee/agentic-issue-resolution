@@ -220,6 +220,53 @@ def _extract_ghsa_id(vulnerability: dict[str, Any]) -> str | None:
     return None
 
 
+def extract_odc_fixed_version_floor(
+    vulnerability: dict[str, Any], package_name: str
+) -> str | None:
+    """Return one unambiguous ODC exclusive upper bound for a package.
+
+    Args:
+        vulnerability: Raw ODC vulnerability object.
+        package_name: Package identity obtained from the dependency PURL.
+
+    Returns:
+        The matching CPE ``versionEndExcluding`` value when exactly one unique
+        package-specific floor is present; otherwise ``None``. An exclusive
+        vulnerable-version bound is also the first version outside that
+        vulnerable range.
+    """
+    target = re.sub(r"[-_.]+", "-", str(package_name or "").strip()).casefold()
+    if not target:
+        return None
+    vulnerable_software = vulnerability.get("vulnerableSoftware")
+    if not isinstance(vulnerable_software, list):
+        return None
+
+    floors: set[str] = set()
+    for record in vulnerable_software:
+        if not isinstance(record, dict):
+            continue
+        software = record.get("software")
+        if not isinstance(software, dict):
+            continue
+        cpe_name = str(software.get("id") or "").strip()
+        if cpe_name.startswith("cpe:2.3:"):
+            fields = cpe_name.split(":")
+            product = fields[4] if len(fields) > 4 else ""
+        elif cpe_name.startswith("cpe:/"):
+            fields = cpe_name[5:].split(":")
+            product = fields[2] if len(fields) > 2 else ""
+        else:
+            continue
+        normalized_product = re.sub(r"[-_.]+", "-", product).casefold()
+        if normalized_product != target:
+            continue
+        floor = str(software.get("versionEndExcluding") or "").strip()
+        if floor and floor not in {"*", "-"}:
+            floors.add(floor)
+    return next(iter(floors)) if len(floors) == 1 else None
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -284,6 +331,9 @@ def parse_vulnerabilities(
             cve_id = _extract_cve_id(vuln)
             ghsa_id = _extract_ghsa_id(vuln)
             vuln_id = (vuln.get("name") or "").strip()
+            fixed_version = extract_odc_fixed_version_floor(
+                vuln, package_name or file_name or ""
+            )
 
             issue = VulnerabilityIssue(
                 source=IssueSource.ODC,
@@ -297,6 +347,7 @@ def parse_vulnerabilities(
                 cwe=cwes,
                 package_name=package_name or file_name or None,
                 package_version=package_version,
+                fixed_version=fixed_version,
                 purl=purl_str,
                 ecosystem=ecosystem,
                 file_path=file_path or None,

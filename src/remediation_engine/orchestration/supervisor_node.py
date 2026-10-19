@@ -36,6 +36,7 @@ import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from remediation_engine.contracts.decision_codes import (
@@ -80,12 +81,18 @@ from remediation_engine.contracts.solver_models import (
     PackageResolutionStatus,
     PortfolioReplanRequest,
 )
+from remediation_engine.language import ProjectLanguage, resolve_project_language
 from remediation_engine.orchestration import _supervisor_execution as _supervisor_execution_helpers
 from remediation_engine.orchestration._qa_runtime import (
     _lockfile_paths_for_group,
     _parse_package_occurrence_key,
 )
 from remediation_engine.orchestration.issue_identity import stable_issue_fingerprint
+from remediation_engine.orchestration.portfolio_solver import (
+    _python_pipfile_manifest_path,
+    _python_requirements_manifest_path,
+    python_manifest_repository_fingerprint,
+)
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.scan_identity import package_scan_occurrence_key
 from remediation_engine.orchestration.state import OrchestratorState
@@ -160,6 +167,7 @@ from remediation_engine.tools.npm_graph import (
     make_occurrence_id,
     npm_range_contains,
 )
+from remediation_engine.tools.package_identity import normalize_python_package_name
 
 logger = logging.getLogger(__name__)
 
@@ -810,8 +818,20 @@ def _ordered_update_candidates(
     plan: SupervisorRetryPlan | None = None,
     diagnostics: UpdateRetryDiagnostics | None = None,
     allow_attempted_selected_version: bool = False,
+    ecosystem: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Return candidates within the task's solver and retry allowlists."""
+    stage = plan.strategy_stage if plan is not None else task.strategy_stage
+    normalized_ecosystem = str(ecosystem or "").strip().casefold()
+    python_ecosystem = normalized_ecosystem == "pypi" or (
+        not normalized_ecosystem
+        and stage in {SCARemediationStage.PYPI_SAME_MAJOR, SCARemediationStage.PYPI_LATEST}
+    )
+
+    def package_key(value: str | None) -> str:
+        raw = str(value or "").strip()
+        return normalize_python_package_name(raw) if python_ecosystem else raw
+
     solver_authoritative = (
         bool(task.portfolio_plan_id)
         or bool(task.allowed_target_versions)
@@ -819,7 +839,7 @@ def _ordered_update_candidates(
     )
     diagnostics_match_target = diagnostics is not None and (
         not diagnostics.target_package_name
-        or diagnostics.target_package_name == task.target_package_name
+        or package_key(diagnostics.target_package_name) == package_key(task.target_package_name)
     )
     approved_versions = list(
         dict.fromkeys(
@@ -871,9 +891,9 @@ def _ordered_update_candidates(
         attempted_values.extend(diagnostics.attempted_versions)
         attempted_values.extend(diagnostics.executed_versions)
         if task.target_package_name:
-            attempted_values.extend(
-                diagnostics.attempted_versions_by_target.get(task.target_package_name, [])
-            )
+            for package_name, versions in diagnostics.attempted_versions_by_target.items():
+                if package_key(package_name) == package_key(task.target_package_name):
+                    attempted_values.extend(versions)
     if plan is not None:
         attempted_values.extend(plan.attempted_versions)
     attempted_versions = {
@@ -973,6 +993,7 @@ def _authorize_update_dispatch(
     plan: SupervisorRetryPlan | None = None,
     diagnostics: UpdateRetryDiagnostics | None = None,
     allow_attempted_selected_version: bool = False,
+    ecosystem: str | None = None,
 ) -> _UpdateDispatchAuthorization | None:
     """Return a dispatch authorization or reject incomplete update state.
 
@@ -985,6 +1006,7 @@ def _authorize_update_dispatch(
         plan=plan,
         diagnostics=diagnostics,
         allow_attempted_selected_version=allow_attempted_selected_version,
+        ecosystem=ecosystem,
     )
     if not task.instruction.strip():
         return None
@@ -1004,7 +1026,16 @@ def _authorize_update_dispatch(
         if diagnostics is not None
         else None
     )
-    if expected_package and task.target_package_name != expected_package:
+    normalized_ecosystem = str(ecosystem or "").strip().casefold()
+    python_ecosystem = normalized_ecosystem == "pypi" or (
+        not normalized_ecosystem
+        and (plan.strategy_stage if plan is not None else task.strategy_stage)
+        in {SCARemediationStage.PYPI_SAME_MAJOR, SCARemediationStage.PYPI_LATEST}
+    )
+    package_identity = normalize_python_package_name if python_ecosystem else lambda value: value
+    if expected_package and package_identity(task.target_package_name or "") != package_identity(
+        expected_package
+    ):
         return None
     if expected_type and task.target_dependency_type != expected_type:
         return None
@@ -1461,6 +1492,7 @@ def _apply_tactical_supervisor(
     attempt_snapshots_by_id: dict[str, TaskAttemptSnapshot] | None = None,
     *,
     target_task_id: str | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
     consistency_events: list[StateConsistencyEvent],
     errors: list[str],
     staged_resolutions: list[_StagedTacticalResolution] | None = None,
@@ -1473,6 +1505,11 @@ def _apply_tactical_supervisor(
     disabled/unavailable/rejected proposal returns ``None`` so the existing
     deterministic router remains authoritative.
     """
+    if project_language == ProjectLanguage.PYTHON:
+        # The tactical registry adapter currently implements npm candidate
+        # semantics. Keep Python QA retries on the deterministic Supervisor
+        # planner until a PEP 440 adapter is available here.
+        return None
     settings = get_runtime_settings()
 
     candidates = sorted(
@@ -1878,6 +1915,23 @@ def _recover_active_target_task_ids(
     return recovered
 
 
+def _is_committed_workaround_child(
+    task: RemediationTask,
+    task_queue: dict[str, RemediationTask],
+    planned_task_ids: set[str],
+) -> bool:
+    """Return whether a workaround child continues a planned update task."""
+    parent = task_queue.get(task.parent_task_id or "")
+    return (
+        task.strategy == RoutingStrategy.CODE_WORKAROUND
+        and parent is not None
+        and parent.task_id in planned_task_ids
+        and parent.parent_group_id == task.parent_group_id
+        and parent.strategy == RoutingStrategy.VERSION_BUMP
+        and parent.exhausted_update_path
+    )
+
+
 def _portfolio_plan_violations(
     plan: Any,
     task_queue: dict[str, RemediationTask],
@@ -1983,19 +2037,11 @@ def _portfolio_plan_violations(
     for task in task_queue.values():
         if task.parent_group_id not in sca_group_ids:
             continue
-        # A source-workaround child continues its solver-backed package task; it
-        # is not a new version-selection task in the immutable portfolio.
-        parent = task_queue.get(task.parent_task_id or "")
-        is_committed_workaround_child = (
-            task.strategy == RoutingStrategy.CODE_WORKAROUND
-            and parent is not None
-            and parent.task_id in planned_ids
-            and parent.parent_group_id == task.parent_group_id
-            and parent.strategy == RoutingStrategy.VERSION_BUMP
-            and parent.exhausted_update_path
-        )
-        if not is_committed_workaround_child:
-            tasks_by_group.setdefault(task.parent_group_id, []).append(task)
+        # A committed workaround child continues its planned package task; it
+        # is not an additional portfolio member.
+        if _is_committed_workaround_child(task, task_queue, planned_ids):
+            continue
+        tasks_by_group.setdefault(task.parent_group_id, []).append(task)
     terminal_statuses = {
         TaskStatus.QA_PASSED,
         TaskStatus.UNFIXABLE,
@@ -2066,20 +2112,38 @@ def _portfolio_plan_violations(
             else ""
         )
         expected_manifest = _group_manifest_path(group) if group is not None else None
+        python_target = bool(
+            expected_manifest
+            and Path(expected_manifest).name.casefold() != "package.json"
+        )
+        if python_target and expected_package:
+            from remediation_engine.tools.package_identity import normalize_python_package_name
+
+            expected_package = normalize_python_package_name(expected_package)
         direct_occurrence = (
-            make_occurrence_id(expected_manifest, expected_package)
+            f"python:{expected_manifest}:{expected_package}"
+            if python_target and expected_manifest and expected_package
+            else make_occurrence_id(expected_manifest, expected_package)
             if expected_manifest and expected_package
             else None
         )
         decision_lockfile_key = str(decision.lockfile_package_key or "").replace("\\", "/")
-        lockfile_key_valid = bool(
-            expected_package
-            and lockfile_key_matches_package(decision_lockfile_key, expected_package)
+        lockfile_key_valid = (
+            decision.lockfile_package_key is None
+            if python_target
+            else bool(
+                expected_package
+                and lockfile_key_matches_package(decision_lockfile_key, expected_package)
+            )
         )
         physical_occurrence = (
-            make_occurrence_id(expected_manifest, expected_package, decision_lockfile_key)
-            if expected_manifest and expected_package and lockfile_key_valid
-            else None
+            direct_occurrence
+            if python_target
+            else (
+                make_occurrence_id(expected_manifest, expected_package, decision_lockfile_key)
+                if expected_manifest and expected_package and lockfile_key_valid
+                else None
+            )
         )
         decision_occurrence = str(decision.target_occurrence_id or "")
         valid_occurrences = {
@@ -2106,7 +2170,9 @@ def _portfolio_plan_violations(
             "target_group_id": task.parent_group_id,
             "target_package_name": expected_package or None,
             "manifest_path": expected_manifest,
-            "lockfile_package_key": decision_lockfile_key if lockfile_key_valid else None,
+            "lockfile_package_key": (
+                None if python_target else decision_lockfile_key if lockfile_key_valid else None
+            ),
         }
         for field_name, expected_value in expected_identity.items():
             if getattr(decision, field_name, None) != expected_value:
@@ -2177,10 +2243,27 @@ def _portfolio_plan_is_stale(
     violations = _portfolio_plan_violations(plan, task_queue, valid_groups)
     if repo_root and plan is not None:
         expected_fingerprint = getattr(plan, "repository_fingerprint", None)
-        try:
-            actual_fingerprint = load_npm_graph_snapshot(repo_root).repository_fingerprint
-        except (OSError, ValueError):
-            actual_fingerprint = None
+        solver_plan = getattr(plan, "solver_plan", None)
+        selected = getattr(solver_plan, "selected_plan", None)
+        decisions = list(getattr(selected, "task_decisions", ()) or ())
+        python_decisions = [
+            decision
+            for decision in decisions
+            if str(getattr(decision, "target_occurrence_id", "") or "").startswith("python:")
+        ]
+        if python_decisions:
+            if len(python_decisions) != len(decisions):
+                actual_fingerprint = None
+            else:
+                actual_fingerprint = python_manifest_repository_fingerprint(
+                    repo_root,
+                    [str(getattr(decision, "manifest_path", "") or "") for decision in decisions],
+                )
+        else:
+            try:
+                actual_fingerprint = load_npm_graph_snapshot(repo_root).repository_fingerprint
+            except (OSError, ValueError):
+                actual_fingerprint = None
         if not expected_fingerprint or actual_fingerprint != expected_fingerprint:
             violations.append("repository fingerprint differs from committed portfolio plan")
     return bool(violations)
@@ -2189,14 +2272,17 @@ def _portfolio_plan_is_stale(
 def _nonterminal_sca_task_ids(
     task_queue: dict[str, RemediationTask],
     group_by_id: dict[str, VulnerabilityGroup],
+    portfolio_plan: Any = None,
 ) -> list[str]:
-    """Return sorted nonterminal tasks whose parent group is SCA."""
+    """Return nonterminal SCA portfolio tasks, excluding pivot workaround children."""
+    planned_task_ids = set(getattr(portfolio_plan, "task_ids", ()) or ())
     return sorted(
         task_id
         for task_id, task in task_queue.items()
         if task.status not in _TERMINAL_STATUSES
         and (group := group_by_id.get(task.parent_group_id)) is not None
         and group.issue_type == IssueType.SCA
+        and not _is_committed_workaround_child(task, task_queue, planned_task_ids)
     )
 
 
@@ -2206,7 +2292,7 @@ def _build_multi_package_action(
     task_queue: dict[str, RemediationTask],
     group_by_id: dict[str, VulnerabilityGroup],
 ) -> MultiPackageAction | None:
-    """Build an exact atomic action from Supervisor-committed task inputs."""
+    """Build an exact atomic action from supported npm/Python manifests."""
     mutations: list[PackageMutation] = []
     for task_id in target_task_ids:
         task = task_queue.get(task_id)
@@ -2217,16 +2303,23 @@ def _build_multi_package_action(
         target_version = (task.selected_version or "").strip()
         manifest_path = _group_manifest_path(group) or ""
         dependency_type = task.target_dependency_type or "dependencies"
-        if (
-            not package_name
-            or not target_version
-            or not manifest_path
-            or manifest_path.split("/")[-1] != "package.json"
+        manifest_name = manifest_path.replace("\\", "/").rsplit("/", 1)[-1]
+        if manifest_name == "package.json":
+            ecosystem = "npm"
+        elif (
+            manifest_name.casefold().startswith("requirements")
+            and manifest_name.casefold().endswith(".txt")
+            and dependency_type == "requirements"
         ):
+            ecosystem = "pypi"
+        else:
+            return None
+        if not package_name or not target_version or not manifest_path:
             return None
         mutations.append(
             PackageMutation(
                 task_id=task_id,
+                ecosystem=ecosystem,
                 package_name=package_name,
                 manifest_path=manifest_path,
                 target_version=target_version,
@@ -2309,7 +2402,17 @@ def _validated_active_qa_multi_package_action(
 
 
 def _group_manifest_path(group: VulnerabilityGroup) -> str | None:
-    """Return the one canonical package.json path committed for a group."""
+    """Return the one canonical dependency manifest path committed for a group."""
+    python_evidence = any(
+        str(issue.ecosystem or "").strip().casefold() in {"pypi", "pip", "python"}
+        for issue in group.issues
+    ) or any(
+        str(localized.package_manager or "").strip().casefold() in {"pip", "pipenv"}
+        for localized in group.localized_issues
+    )
+    if python_evidence:
+        return _python_requirements_manifest_path(group) or _python_pipfile_manifest_path(group)
+
     manifest_paths = sorted(
         {
             (localized.manifest_file or "").replace("\\", "/").lstrip("/")
@@ -3142,7 +3245,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
     unfixable_replan_cleared = bool(
         isinstance(pending_request_at_entry, PortfolioReplanRequest)
         and pending_request_at_entry.reason == "UNFIXABLE_REPLAN"
-        and not _nonterminal_sca_task_ids(task_queue, group_by_id)
+        and not _nonterminal_sca_task_ids(
+            task_queue, group_by_id, state.get("portfolio_plan")
+        )
     )
     active_target_task_ids = _recover_active_target_task_ids(
         state.get("active_target_task_ids") or [],
@@ -4483,6 +4588,10 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 worker_results_by_attempt,
                 attempt_snapshots_by_id,
                 target_task_id=target_task_id,
+                project_language=resolve_project_language(
+                    Path(str(state.get("repo_root") or ".")),
+                    str(state.get("project_language") or "") or None,
+                ),
                 consistency_events=consistency_events,
                 errors=errors,
                 staged_resolutions=staged_tactical_resolutions,
@@ -4506,6 +4615,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             parsed_plans,
             task_queue,
             parsed_diagnostics,
+            group_by_id,
         )
         if planner_violations:
             errors.extend(
@@ -4523,6 +4633,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 parsed_plans,
                 task_queue,
                 parsed_diagnostics,
+                group_by_id,
             )
             if repair_violations:
                 errors.extend(
@@ -4530,7 +4641,12 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     for violation in repair_violations
                 )
         retry_diagnostics_by_task = parsed_diagnostics
-        if not _planner_plan_violations(parsed_plans, task_queue, parsed_diagnostics):
+        if not _planner_plan_violations(
+            parsed_plans,
+            task_queue,
+            parsed_diagnostics,
+            group_by_id,
+        ):
             _commit_retry_plans(
                 task_queue,
                 retry_diagnostics_by_task,
@@ -5588,6 +5704,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                         recovered_plans,
                         {task_id: task},
                         recovered_diagnostics,
+                        {task.parent_group_id: group},
                     ):
                         retry_diagnostics_by_task.update(recovered_diagnostics)
                         _commit_retry_plans(
@@ -5727,7 +5844,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         and (group := group_by_id.get(task.parent_group_id)) is not None
         and group.issue_type == IssueType.SCA
     )
-    remaining_nonterminal_sca_task_ids = _nonterminal_sca_task_ids(task_queue, group_by_id)
+    remaining_nonterminal_sca_task_ids = _nonterminal_sca_task_ids(
+        task_queue, group_by_id, committed_plan
+    )
     unfixable_replan_required = bool(
         newly_unfixable_sca_task_ids and remaining_nonterminal_sca_task_ids
     )

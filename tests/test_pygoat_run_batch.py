@@ -11,6 +11,7 @@ from examples.pygoat.run_batch import (
     filter_issues_for_packages,
     get_unique_packages,
     load_baseline_issues,
+    main,
     run_batch,
     sample_package_batches,
     write_issues_jsonl,
@@ -135,6 +136,75 @@ def test_run_batch_dry_run_writes_per_batch_inputs_without_repo_or_engine(
     assert payload["dry_run"] is True
     assert len(payload["results"]) == 3
     assert not missing_repo.exists()
+
+
+def test_run_batch_cli_accepts_explicit_packages_as_one_batch(tmp_path: Path) -> None:
+    """The --packages selector bypasses sampling and scopes the dry-run input."""
+    baseline_path = tmp_path / "baseline.jsonl"
+    _write_baseline(
+        baseline_path,
+        [
+            _issue(1, "django"),
+            _issue(2, "pyjwt"),
+            _issue(3, "certifi"),
+            _issue(4, "pyjwt"),
+        ],
+    )
+    output_dir = tmp_path / "trajectories"
+
+    exit_code = main(
+        [
+            "--iterations",
+            "10",
+            "--batch-size",
+            "3",
+            "--packages",
+            "pyjwt",
+            "certifi",
+            "pyjwt",
+            "--baseline",
+            str(baseline_path),
+            "--output-dir",
+            str(output_dir),
+            "--repo",
+            str(tmp_path / "missing-pygoat"),
+            "--dry-run",
+        ]
+    )
+
+    assert exit_code == 0
+    summary_path = output_dir / "pygoat-batch-runs-summary.json"
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert payload["total_iterations"] == 1
+    assert payload["results"][0]["selected_packages"] == ["certifi", "pyjwt"]
+    batch_issues = load_baseline_issues(Path(payload["results"][0]["issues_path"]))
+    assert {issue.package_name for issue in batch_issues} == {"certifi", "pyjwt"}
+    assert len(batch_issues) == 3
+
+
+@pytest.mark.parametrize(
+    ("target_packages", "message"),
+    [
+        ([], "at least one non-empty package name"),
+        (["missing-package"], "not present in the baseline: missing-package"),
+    ],
+)
+def test_run_batch_validates_explicit_package_names(
+    tmp_path: Path,
+    target_packages: list[str],
+    message: str,
+) -> None:
+    """Reject empty selectors and package names absent from the baseline."""
+    baseline_path = tmp_path / "baseline.jsonl"
+    _write_baseline(baseline_path, [_issue(1, "pyjwt")])
+
+    with pytest.raises(ValueError, match=message):
+        run_batch(
+            target_packages=target_packages,
+            baseline_path=baseline_path,
+            output_dir=tmp_path / "trajectories",
+            dry_run=True,
+        )
 
 
 def test_run_batch_calls_python_remediation_and_writes_result_artifacts(tmp_path: Path) -> None:

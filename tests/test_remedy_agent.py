@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from langchain_core.messages import AIMessage
 
 from remediation_engine.contracts.schemas import (
@@ -1253,6 +1255,117 @@ from remediation_engine.orchestration.update_subagent import _build_update_syste
 from remediation_engine.orchestration.workaround_subagent import _WORKAROUND_STATIC_INSTRUCTIONS
 
 from remediation_engine.orchestration.workaround_subagent import _build_workaround_system_prompt
+
+from remediation_engine.orchestration.update_subagent import (
+    _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS,
+    _build_multi_package_update_prompt,
+)
+
+
+class TestUpdateWorkerPromptLanguageParity:
+    @pytest.mark.parametrize(
+        ("language", "ecosystem", "package", "manifest", "expected_tool", "wrong_tool"),
+        [
+            (
+                ProjectLanguage.NODEJS,
+                "npm",
+                "lodash",
+                "package.json",
+                "modify_and_validate_npm_dependency",
+                "modify_and_validate_python_dependency",
+            ),
+            (
+                ProjectLanguage.PYTHON,
+                "pypi",
+                "certifi",
+                "requirements.txt",
+                "modify_and_validate_python_dependency",
+                "modify_and_validate_npm_dependency",
+            ),
+        ],
+    )
+    def test_singleton_prompts_share_authorization_policy_and_expose_matching_tool(
+        self, language, ecosystem, package, manifest, expected_tool, wrong_tool
+    ):
+        from remediation_engine.orchestration.update_subagent import _build_update_system_prompt
+
+        system_prompt = " ".join(_build_update_system_prompt(language).split())
+        assert "If the exact Supervisor instruction requires a major-version migration" in (
+            system_prompt
+        )
+        assert "authorized and required to update affected production and test code" in (
+            system_prompt
+        )
+        assert "Otherwise, do not edit source-code files" in system_prompt
+        assert expected_tool in system_prompt
+        assert wrong_tool not in system_prompt
+
+    @pytest.mark.parametrize(
+        ("language", "ecosystem", "package", "manifest", "expected_tool", "wrong_tool"),
+        [
+            (
+                ProjectLanguage.NODEJS,
+                "npm",
+                "lodash",
+                "package.json",
+                "modify_batch_npm_dependencies",
+                "modify_batch_python_dependencies",
+            ),
+            (
+                ProjectLanguage.PYTHON,
+                "pypi",
+                "certifi",
+                "requirements.txt",
+                "modify_batch_python_dependencies",
+                "modify_batch_npm_dependencies",
+            ),
+        ],
+    )
+    def test_batch_prompts_share_authorization_policy_and_expose_matching_tool(
+        self, language, ecosystem, package, manifest, expected_tool, wrong_tool
+    ):
+        from remediation_engine.orchestration.update_subagent import (
+            _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS,
+        )
+
+        action = MultiPackageAction(
+            cluster_id="cluster-prompt-test",
+            dispatch_batch_id="batch-prompt-test",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-prompt-test",
+                    package_name=package,
+                    manifest_path=manifest,
+                    target_version="1.2.3",
+                    ecosystem=ecosystem,
+                    dependency_type="requirements" if ecosystem == "pypi" else "dependencies",
+                )
+            ],
+            rationale="Check language-specific package tool selection.",
+        )
+        dynamic_prompt = _build_multi_package_update_prompt(
+            [],
+            action,
+            [],
+            {},
+            {},
+            project_language=language,
+        )
+        static_prompt = (
+            _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS
+            if language == ProjectLanguage.PYTHON
+            else _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS
+        )
+        normalized_static = " ".join(static_prompt.split())
+        normalized_dynamic = " ".join(dynamic_prompt.split())
+        assert "major-version migration" in normalized_static
+        assert "source and test migration to the committed package API is authorized and required" in (
+            normalized_static
+        )
+        assert "Do not reselect or change any package name or version" in normalized_static
+        assert f"Invoke {expected_tool} exactly once" in normalized_dynamic
+        assert wrong_tool not in normalized_static + normalized_dynamic
 
 class TestUpdateSubagentWrapperStage2Parity:
     def test_language_matched_worker_prompts_limit_python_authority(self):

@@ -243,9 +243,8 @@ def _candidate_finding_ids(
             workaround_coverage.append(requirement.coverage_id)
             status_by_issue[requirement.finding_id].add("workaround")
         elif strategy in {"version_bump", "version-bump", "version bump"} and selected:
-            floor = _version_key(requirement.fixed_version)
-            actual = _version_key(selected)
-            if floor is not None and actual is not None and actual[:3] >= floor[:3]:
+            floor = requirement.direct_parent_minimum_version or requirement.fixed_version
+            if _candidate_meets_finding_floor(selected, floor):
                 resolved_coverage.append(requirement.coverage_id)
                 status_by_issue[requirement.finding_id].add("resolved")
             else:
@@ -274,6 +273,27 @@ def _candidate_finding_ids(
         sorted(workaround_coverage),
         sorted(unresolved_coverage),
     )
+
+
+def _candidate_meets_finding_floor(candidate: str, floor: str | None) -> bool:
+    """Compare a selected version with its finding or parent-version floor.
+
+    Most solver inputs are npm three-part versions. Python parent updates may
+    use stable PEP 440 post releases, which require PEP 440 ordering instead
+    of comparing only the numeric release prefix.
+    """
+    if not floor:
+        return False
+    if ".post" in candidate.casefold() or ".post" in floor.casefold():
+        try:
+            from packaging.version import Version
+
+            return Version(candidate) >= Version(floor)
+        except Exception:  # noqa: BLE001 - malformed version evidence cannot resolve a finding
+            return False
+    floor_key = _version_key(floor)
+    candidate_key = _version_key(candidate)
+    return floor_key is not None and candidate_key is not None and candidate_key[:3] >= floor_key[:3]
 
 
 def _boundary(left: SolverTarget, right: SolverTarget) -> bool:

@@ -31,6 +31,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.portfolio_certifier import build_certified_portfolio_plan
 from remediation_engine.orchestration.portfolio_solver import (
     apply_portfolio_plan as _apply_solver_portfolio_plan,
@@ -1506,6 +1507,7 @@ def prepare_portfolio_inputs(
     groups: Iterable[VulnerabilityGroup],
     task_queue: dict[str, RemediationTask],
     target_packages: Iterable[str] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
     """Prepare the outer portfolio inputs using detached task/group objects.
 
@@ -1517,6 +1519,8 @@ def prepare_portfolio_inputs(
         target_packages: Optional development package allowlist. When supplied,
             synthetic dependency discovery is restricted to the selected
             packages and their coordination closure.
+        project_language: Language selected by workspace setup. Python inputs
+            remain finding-backed and are not sent through npm discovery.
 
     Returns:
         Detached prepared groups, task queue, and preparation diagnostics.
@@ -1526,6 +1530,7 @@ def prepare_portfolio_inputs(
         groups,
         task_queue,
         target_packages=target_packages,
+        project_language=project_language,
     )
 
 

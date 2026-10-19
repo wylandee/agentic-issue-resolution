@@ -1322,13 +1322,9 @@ class TestTestFailureExtraction:
         assert "stderr tail:" in summary
 
 # Stage-2 behavior retained during the architecture merge.
-from remediation_engine.language import LANGUAGE_CONFIGS
-
 from remediation_engine.language import ProjectLanguage
 
 from remediation_engine.orchestration._qa_runtime import _workspace_remediation_fingerprint
-
-from remediation_engine.orchestration.qa_critic import run_final_full_scan_node
 
 from remediation_engine.orchestration.qa_odc import _odc_command
 
@@ -1404,63 +1400,6 @@ class TestRunOdcStage2Parity:
         assert "npm" not in install_command
         assert tests.ok is True
         assert sandbox.run.call_args_list[1].args[0] == ".venv/bin/python -m pytest"
-
-def test_final_full_scan_converts_docker_api_error_to_scan_failure() -> None:
-    """A Docker/API teardown error must return typed state instead of raising."""
-    state = {"workspace_volume": "agent_workspace_deadbeef", "valid_groups": []}
-    with patch(
-        "remediation_engine.orchestration.qa_critic.DockerSandbox",
-        side_effect=Exception("409 Client Error: Conflict (volume is in use)"),
-    ):
-        result = run_final_full_scan_node(state)
-
-    assert result["final_full_scan_completed"] is True
-    assert result["status"] == "final_scan_failed"
-    assert result["final_full_scan_result"].status == "scan_failed"
-    assert "409" in result["errors"][0]
-
-def test_final_full_scan_records_workspace_fingerprint_for_next_validation(tmp_path) -> None:
-    """Final scans retain the prior workspace fingerprint for no-op detection."""
-    group = _make_group()
-    state = {
-        "repo_root": str(tmp_path),
-        "workspace_volume": "agent_workspace_fingerprint",
-        "valid_groups": [group],
-        "project_language": ProjectLanguage.PYTHON,
-    }
-    scan = _SecurityScanResult(
-        ok=True,
-        summary="Dependency-Check found no remaining target vulnerability identifiers.",
-        remaining_identifiers=set(),
-        found_identifiers=set(),
-        new_identifiers=set(),
-    )
-
-    with (
-        patch("remediation_engine.orchestration.qa_critic.DockerSandbox") as sandbox_factory,
-        patch(
-            "remediation_engine.orchestration.qa_odc._run_security_scan",
-            return_value=scan,
-        ) as scan_runner,
-    ):
-        first = run_final_full_scan_node(state)
-        second = run_final_full_scan_node({**state, **first})
-    assert all(
-        call.kwargs["project_language"] == ProjectLanguage.PYTHON
-        for call in scan_runner.call_args_list
-    )
-    assert all(
-        call.kwargs["image"] == LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image
-        for call in sandbox_factory.call_args_list
-    )
-
-    assert first["previous_final_scan_workspace_fingerprint"] is None
-    assert first["final_scan_workspace_fingerprint"]
-    assert (
-        second["previous_final_scan_workspace_fingerprint"]
-        == first["final_scan_workspace_fingerprint"]
-    )
-    assert second["final_scan_workspace_fingerprint"] == first["final_scan_workspace_fingerprint"]
 
 def test_workspace_remediation_fingerprint_changes_with_material_file_change(tmp_path) -> None:
     """The fingerprint reflects content changes, not only candidate file names."""

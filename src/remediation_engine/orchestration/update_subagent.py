@@ -64,6 +64,7 @@ _UPDATE_MANIFEST_TOOL_NAMES = frozenset(
     {_UPDATE_MANIFEST_TOOL_NAME, _PYTHON_UPDATE_MANIFEST_TOOL_NAME}
 )
 _BATCH_NPM_DEPENDENCIES_TOOL_NAME = "modify_batch_npm_dependencies"
+_BATCH_PYTHON_DEPENDENCIES_TOOL_NAME = "modify_batch_python_dependencies"
 _MAJOR_MIGRATION_DIRECTIVE = (
     "Migrate all affected production and test code to the selected package API "
     "while preserving behavior; do not change the solver-approved package or version."
@@ -156,7 +157,9 @@ def _resolve_manifest_targets(
             )
             continue
         if abs_target.is_dir():
-            errors.append(f"Group '{group.group_id}': manifest target '{candidate}' is a directory.")
+            errors.append(
+                f"Group '{group.group_id}': manifest target '{candidate}' is a directory."
+            )
             continue
         if _group_ecosystem(group) == "pypi":
             try:
@@ -363,14 +366,20 @@ def _has_successful_manifest_transaction_for_package(
     task: RemediationTask,
     group: VulnerabilityGroup,
     tool_events: Sequence[Any] | None,
+    manifest_paths: Sequence[str] | None = None,
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]]
+    | None = None,
 ) -> bool:
     """Return whether the package has a successful edit-and-sync transaction."""
     if not tool_events:
         return False
-    package_name = _target_package_name(task, group)
     return any(
         getattr(event, "name", "") in _UPDATE_MANIFEST_TOOL_NAMES
-        and _event_package_name(event) == package_name
+        and (
+            task.task_id in _event_matching_task_ids(event, resolved_tasks)
+            if resolved_tasks is not None
+            else _event_matches_task_target(event, task, group, manifest_paths or ())
+        )
         and str(getattr(event, "content", "")).startswith("SUCCESS:")
         for event in tool_events
     )
@@ -392,6 +401,82 @@ def _event_package_name(event: Any) -> str:
     if getattr(event, "name", "") == _PYTHON_UPDATE_MANIFEST_TOOL_NAME:
         return normalize_python_package_name(package)
     return package
+
+
+def _event_matches_task_target(
+    event: Any,
+    task: RemediationTask,
+    group: VulnerabilityGroup,
+    manifest_paths: Sequence[str],
+) -> bool:
+    """Match an execution event to its sealed package, declaration, and manifest."""
+    ecosystem = _group_ecosystem(group)
+    event_name = getattr(event, "name", "")
+    if (event_name == _PYTHON_UPDATE_MANIFEST_TOOL_NAME) != (ecosystem == "pypi"):
+        return False
+    if _event_package_name(event) != _target_package_name(task, group):
+        return False
+    args = getattr(event, "args", {}) or {}
+    event_dependency_type = str(args.get("dependency_type", "")).strip().casefold()
+    target_dependency_type = str(_target_dependency_type(task, group) or "").strip().casefold()
+    if (
+        event_dependency_type
+        and target_dependency_type
+        and event_dependency_type != target_dependency_type
+    ):
+        return False
+    event_manifest = str(args.get("manifest_path", "")).replace("\\", "/").lstrip("/")
+    allowed_manifests = {
+        str(path).replace("\\", "/").lstrip("/") for path in manifest_paths if str(path).strip()
+    }
+    return not event_manifest or not allowed_manifests or event_manifest in allowed_manifests
+
+
+def _event_matching_task_ids(
+    event: Any,
+    resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
+) -> set[str]:
+    """Return unambiguous task owners for a manifest transaction event."""
+    matched = [
+        (task, group, manifest_paths)
+        for task, group, manifest_paths in resolved_tasks
+        if _event_matches_task_target(event, task, group, manifest_paths)
+    ]
+    if not matched:
+        return set()
+
+    args = getattr(event, "args", {}) or {}
+    event_manifest = str(args.get("manifest_path", "")).replace("\\", "/").lstrip("/")
+    if not event_manifest:
+        # Older tool traces may omit the manifest. Keep them usable when the
+        # package/declaration identifies one target, but do not credit the
+        # same package in distinct Python or JavaScript manifests.
+        target_identities = {
+            (
+                _group_ecosystem(group),
+                _target_package_name(task, group),
+                (_target_dependency_type(task, group) or "").casefold(),
+                tuple(sorted(path.replace("\\", "/").lstrip("/") for path in manifest_paths)),
+            )
+            for task, group, manifest_paths in matched
+        }
+        if len(target_identities) > 1:
+            return set()
+    return {task.task_id for task, _group, _manifest_paths in matched}
+
+
+def _event_target_version(event: Any, ecosystem: str) -> str:
+    """Return the exact version target supplied to the manifest tool."""
+    del ecosystem
+    raw = str((getattr(event, "args", {}) or {}).get("target_version", "")).strip()
+    return raw.lstrip("vV")
+
+
+def _append_attempted_version(versions: list[str], candidate: str, ecosystem: str) -> None:
+    """Append an exact version argument once, preserving the execution trace."""
+    del ecosystem
+    if candidate and candidate not in versions:
+        versions.append(candidate)
 
 
 _UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a dependency-manifest execution worker.
@@ -424,20 +509,26 @@ execution worker. The Supervisor owns candidate generation, version selection,
 retry planning, and task routing. Execute only the Supervisor's committed task
 instruction, target package, candidate rule, and declaration type.
 
-Supported editable declarations are requirements files, static PEP 621
+Supported editable declarations are requirements.txt variants, static PEP 621
 dependencies in pyproject.toml, static setup.cfg declarations, and Pipfile.
-setup.py is install-only and must not be edited. Use only
-modify_and_validate_python_dependency for dependency-manifest changes. Do not
-search PyPI or another package registry, read registry evidence, or perform
+setup.py is install-only and must not be edited. Use only modify_and_validate_python_dependency
+for dependency-manifest changes. Do
+not search PyPI or another package registry, read registry evidence, or perform
 version selection. Keep package_name and manifest_path within the committed task
 allowlists.
 
-If a transaction fails, retry only with a target version or dependency type
-explicitly allowed by the committed attempt. Do not invent alternatives or
-expand the candidate set. A package may receive at most three combined
-transaction attempts; failed transactions roll back automatically. Continue
-with the next independent package after a package succeeds or exhausts its
-attempts. Never edit source-code files in this worker.
+If the exact Supervisor instruction requires a major-version migration, you are
+authorized and required to update affected production and test code to the
+selected package API while preserving behavior. Do not reselect or change the
+committed package or version. Otherwise, do not edit source-code files.
+
+If a transaction returns ERROR_CODE or FAILURE, retry only with a target version
+or dependency type explicitly allowed by the committed attempt. A major-version
+migration instruction never authorizes another package or version. Do not invent
+alternatives or expand the candidate set. A package may receive at most three
+combined transaction attempts; failed transactions roll back automatically.
+Continue with the next independent package after a package succeeds or exhausts
+its attempts.
 
 Return control only after every package has one successful combined transaction
 or has exhausted its three attempts and been surrendered."""
@@ -476,16 +567,25 @@ control to the Supervisor. A failed or rolled-back action must be surrendered fo
 a new Supervisor-committed attempt."""
 
 _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a Python
-dependency-manifest cluster execution worker. The Supervisor selected and
-validated one atomic multi-package action and owns package/version selection,
-declaration types, task routing, and cluster membership.
+dependency-manifest cluster execution worker.
+
+The Supervisor has already selected and validated one atomic multi-package action.
+It owns candidate generation, package/version selection, declaration types, retry
+planning, task routing, and cluster membership. Your only job is to execute that
+committed action in the Docker workspace.
 
 You have exactly one tool: modify_batch_python_dependencies. Call it exactly
-once, with no arguments. It applies the complete committed action, validates
-Python dependency resolution, and rolls back the complete cluster if any step
-fails. Do not call singleton tools, search PyPI, select versions, or perform
-retry planning. After the tool returns, report its result to the Supervisor.
-Never edit source-code files."""
+once, with no arguments. The tool applies every package mutation in the committed
+action, synchronizes each affected Python manifest, validates the requested
+results, and rolls back the complete cluster if any step fails.
+
+When a task's exact Supervisor instruction requires a major-version migration,
+source and test migration to the committed package API is authorized and required;
+preserve behavior. Do not reselect or change any package name or version in the
+committed action. Do not call the singleton dependency tool, search PyPI, or
+perform retry planning. After the tool returns, report its result and return
+control to the Supervisor. A failed or rolled-back action must be surrendered for
+a new Supervisor-committed attempt."""
 
 
 def _build_multi_package_update_prompt(
@@ -517,8 +617,10 @@ def _build_multi_package_update_prompt(
         allowed_dependency_types_by_task=allowed_dependency_types_by_task,
         project_language=project_language,
     )
+    if not isinstance(project_language, ProjectLanguage):
+        project_language = ProjectLanguage(project_language)
     tool_name = (
-        "modify_batch_python_dependencies"
+        _BATCH_PYTHON_DEPENDENCIES_TOOL_NAME
         if project_language == ProjectLanguage.PYTHON
         else _BATCH_NPM_DEPENDENCIES_TOOL_NAME
     )
@@ -568,7 +670,7 @@ def _build_update_prompt(
         "Constraints ledger:",
     ]
     if python_project:
-        sections.append("Canonical project language: python.")
+        sections.append("Canonical project language: python (Python).")
     sections.extend(f"- {item}" for item in constraints_ledger)
     if not constraints_ledger:
         sections.append("- none")
@@ -615,7 +717,7 @@ def _build_update_prompt(
                     else f"- Allowed target versions: {', '.join(allowed_versions) or 'none supplied'}"
                 ),
                 (
-                    f"- Committed declaration type: {_target_dependency_type(task, group) or 'none supplied'}"
+                    f"- Committed dependency type: {_target_dependency_type(task, group) or 'none supplied'}"
                     if python_project
                     else f"- Allowed dependency types: {', '.join(dict.fromkeys(allowed_types)) or 'none supplied'}"
                 ),
@@ -649,7 +751,7 @@ def _build_action_summaries(
     summaries: list[AgentActionSummary] = []
     for task, group, manifest_paths in resolved_tasks:
         package_modified = _has_successful_manifest_transaction_for_package(
-            task, group, tool_events
+            task, group, tool_events, manifest_paths, resolved_tasks
         )
         package_validated = package_modified
         task_succeeded = package_modified and package_validated
@@ -776,11 +878,44 @@ def _changed_files_by_task(
             if isinstance(path, str) and path.strip()
         )
     )
+
+    def is_foreign_package_artifact(
+        path: str,
+        ecosystem: str,
+    ) -> bool:
+        """Reject incidental manifests and lockfiles from the other ecosystem."""
+        name = PurePosixPath(path).name.casefold()
+        if ecosystem == "pypi":
+            return name in {
+                "package.json",
+                "package-lock.json",
+                "npm-shrinkwrap.json",
+                "yarn.lock",
+                "pnpm-lock.yaml",
+            }
+        return name in {
+            "pyproject.toml",
+            "setup.cfg",
+            "pipfile",
+            "pipfile.lock",
+            "poetry.lock",
+            "uv.lock",
+        } or (name.startswith("requirements") and name.endswith(".txt"))
+
     if len(resolved_tasks) == 1:
-        return {resolved_tasks[0][0].task_id: normalized_files}
+        task, group, _manifest_paths = resolved_tasks[0]
+        ecosystem = _group_ecosystem(group)
+        return {
+            task.task_id: [
+                path
+                for path in normalized_files
+                if not is_foreign_package_artifact(path, ecosystem)
+            ]
+        }
 
     result: dict[str, list[str]] = {}
     for task, _group, manifest_paths in resolved_tasks:
+        ecosystem = _group_ecosystem(_group)
         manifest_set = {
             path.replace("\\", "/").lstrip("/")
             for path in manifest_paths
@@ -803,6 +938,21 @@ def _changed_files_by_task(
             # every per-task result. Associate package lockfiles with tasks
             # whose manifest lives in the lockfile's directory or below it.
             path_obj = PurePosixPath(path)
+            if (
+                ecosystem == "pypi"
+                and path_obj.name.casefold() == "pipfile.lock"
+                and any(
+                    PurePosixPath(manifest).name.casefold() == "pipfile"
+                    for manifest in manifest_set
+                )
+                and any(
+                    PurePosixPath(manifest).parent == path_obj.parent
+                    for manifest in manifest_set
+                    if PurePosixPath(manifest).name.casefold() == "pipfile"
+                )
+            ):
+                task_files.append(path)
+                continue
             if path_obj.name not in {"package-lock.json", "npm-shrinkwrap.json"}:
                 continue
             if any(
@@ -820,24 +970,18 @@ def _attempted_versions_for_current_run(
     tool_events: Sequence[Any],
 ) -> dict[str, list[str]]:
     """Collect version targets from combined transactions in this worker run."""
-    package_to_task_ids: dict[str, list[str]] = {}
-    for task, group, _manifest_paths in resolved_tasks:
-        package = _target_package_name(task, group)
-        if package:
-            package_to_task_ids.setdefault(package, []).append(task.task_id)
-
     result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
     for event in tool_events:
         if not _is_executed_manifest_transaction(event):
             continue
-        args = getattr(event, "args", {}) or {}
-        package = str(args.get("package_name", "")).strip()
-        target = str(args.get("target_version", "")).strip().lstrip("vV")
-        if not package or not target:
+        ecosystem = (
+            "pypi" if getattr(event, "name", "") == _PYTHON_UPDATE_MANIFEST_TOOL_NAME else "npm"
+        )
+        target = _event_target_version(event, ecosystem)
+        if not target:
             continue
-        for task_id in package_to_task_ids.get(package, []):
-            if target not in result[task_id]:
-                result[task_id].append(target)
+        for task_id in _event_matching_task_ids(event, resolved_tasks):
+            _append_attempted_version(result[task_id], target, ecosystem)
     return result
 
 
@@ -847,24 +991,19 @@ def _executed_versions_for_current_run(
 ) -> dict[str, list[str]]:
     """Collect only successful version targets from this worker run."""
     result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
-    package_to_task_ids: dict[str, list[str]] = {}
-    for task, group, _manifest_paths in resolved_tasks:
-        package = _target_package_name(task, group)
-        if package:
-            package_to_task_ids.setdefault(package, []).append(task.task_id)
     for event in tool_events:
         if not _is_executed_manifest_transaction(event):
             continue
         if not str(getattr(event, "content", "")).startswith("SUCCESS:"):
             continue
-        args = getattr(event, "args", {}) or {}
-        package = str(args.get("package_name", "")).strip()
-        target = str(args.get("target_version", "")).strip().lstrip("vV")
-        if not package or not target:
+        ecosystem = (
+            "pypi" if getattr(event, "name", "") == _PYTHON_UPDATE_MANIFEST_TOOL_NAME else "npm"
+        )
+        target = _event_target_version(event, ecosystem)
+        if not target:
             continue
-        for task_id in package_to_task_ids.get(package, []):
-            if target not in result[task_id]:
-                result[task_id].append(target)
+        for task_id in _event_matching_task_ids(event, resolved_tasks):
+            _append_attempted_version(result[task_id], target, ecosystem)
     return result
 
 
@@ -874,20 +1013,14 @@ def _attempted_dependency_types_for_current_run(
 ) -> dict[str, list[str]]:
     """Collect dependency declaration types from combined transactions."""
     result: dict[str, list[str]] = {task.task_id: [] for task, _, _ in resolved_tasks}
-    package_to_task_ids: dict[str, list[str]] = {}
-    for task, group, _manifest_paths in resolved_tasks:
-        package = _target_package_name(task, group)
-        if package:
-            package_to_task_ids.setdefault(package, []).append(task.task_id)
     for event in tool_events:
         if not _is_executed_manifest_transaction(event):
             continue
         args = getattr(event, "args", {}) or {}
-        package = str(args.get("package_name", "")).strip()
         dependency_type = str(args.get("dependency_type", "")).strip()
-        if not package or not dependency_type:
+        if not dependency_type:
             continue
-        for task_id in package_to_task_ids.get(package, []):
+        for task_id in _event_matching_task_ids(event, resolved_tasks):
             if dependency_type not in result[task_id]:
                 result[task_id].append(dependency_type)
     return result
@@ -898,12 +1031,6 @@ def _effective_targets_for_current_run(
     tool_events: Sequence[Any],
 ) -> tuple[dict[str, str | None], dict[str, str | None]]:
     """Collect effective version and dependency type from successful transactions."""
-    package_to_task_ids: dict[str, list[str]] = {}
-    for task, group, _manifest_paths in resolved_tasks:
-        package = _target_package_name(task, group)
-        if package:
-            package_to_task_ids.setdefault(package, []).append(task.task_id)
-
     versions: dict[str, str | None] = {task.task_id: None for task, _, _ in resolved_tasks}
     dependency_types: dict[str, str | None] = {task.task_id: None for task, _, _ in resolved_tasks}
     for event in tool_events:
@@ -912,10 +1039,12 @@ def _effective_targets_for_current_run(
         if not str(getattr(event, "content", "")).startswith("SUCCESS:"):
             continue
         args = getattr(event, "args", {}) or {}
-        package = str(args.get("package_name", "")).strip()
-        version = str(args.get("target_version", "")).strip().lstrip("vV") or None
+        ecosystem = (
+            "pypi" if getattr(event, "name", "") == _PYTHON_UPDATE_MANIFEST_TOOL_NAME else "npm"
+        )
+        version = _event_target_version(event, ecosystem) or None
         dependency_type = str(args.get("dependency_type", "")).strip() or None
-        for task_id in package_to_task_ids.get(package, []):
+        for task_id in _event_matching_task_ids(event, resolved_tasks):
             versions[task_id] = version
             dependency_types[task_id] = dependency_type
     return versions, dependency_types
@@ -1221,9 +1350,9 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": resolution_errors + [message],
         }
     package_ecosystem = next(iter(package_ecosystems))
-    worker_language = (
-        ProjectLanguage.PYTHON if package_ecosystem == "pypi" else ProjectLanguage.NODEJS
-    )
+    worker_language = state.get("project_language", ProjectLanguage.NODEJS)
+    if not isinstance(worker_language, ProjectLanguage):
+        worker_language = ProjectLanguage(worker_language)
 
     committed_action = state.get("multi_package_action")
     if committed_action is None and _is_mixed_retry_batch(resolved_tasks):
@@ -1418,10 +1547,13 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                     touched_files,
                     execution_state=execution_state,
                 )
+                action_tool_name = (
+                    _BATCH_PYTHON_DEPENDENCIES_TOOL_NAME
+                    if worker_language == ProjectLanguage.PYTHON
+                    else _BATCH_NPM_DEPENDENCIES_TOOL_NAME
+                )
                 action_tool_events = [
-                    event
-                    for event in runtime.tool_events
-                    if event.name == _BATCH_NPM_DEPENDENCIES_TOOL_NAME
+                    event for event in runtime.tool_events if event.name == action_tool_name
                 ]
                 action_executed = bool(
                     execution_state.get("multi_package_action_executed") or action_tool_events
@@ -1642,7 +1774,8 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
                 allowed_dependency_types_by_package=allowed_dependency_types_by_package,
                 execution_state=execution_state,
                 package_checkpoints=package_checkpoints,
-                project_language=worker_language,
+                language=worker_language,
+                package_ecosystem=package_ecosystem,
             )
             try:
                 runtime = run_bounded_subagent_loop(
@@ -1673,20 +1806,17 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
             "errors": resolution_errors + cleanup_errors + [msg],
         }
 
-    package_names = {
-        _target_package_name(task, group)
-        for task, group, _ in resolved_tasks
-        if _target_package_name(task, group)
-    }
-    successful_packages = {
-        _target_package_name(task, group)
-        for task, group, _ in resolved_tasks
-        if _has_successful_manifest_transaction_for_package(task, group, runtime.tool_events)
+    successful_task_ids = {
+        task.task_id
+        for task, group, manifest_paths in resolved_tasks
+        if _has_successful_manifest_transaction_for_package(
+            task, group, runtime.tool_events, manifest_paths, resolved_tasks
+        )
     }
     unvalidated_manifest_paths = {
         path.replace("\\", "/")
         for task, group, manifest_paths in resolved_tasks
-        if _target_package_name(task, group) not in successful_packages
+        if task.task_id not in successful_task_ids
         for path in manifest_paths
     }
     committed_changed_files = sorted(touched_files)
@@ -1700,9 +1830,8 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     # combined edit-and-sync transaction. Failed transactions may precede a
     # later success, so neither raw event counts nor changed-file counts are
     # used as a proxy for completion.
-    succeeded = bool(package_names) and all(
-        _has_successful_manifest_transaction_for_package(task, group, runtime.tool_events)
-        for task, group, _ in resolved_tasks
+    succeeded = bool(resolved_tasks) and all(
+        task.task_id in successful_task_ids for task, _group, _manifest_paths in resolved_tasks
     )
     attempted_by_task = _attempted_versions_for_current_run(
         resolved_tasks,

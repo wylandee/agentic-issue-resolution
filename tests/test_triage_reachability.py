@@ -11,16 +11,28 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.triage.reachability import analyze_reachability
 
 
-def _sca_issue(package_name: str) -> VulnerabilityIssue:
+def _sca_issue(
+    package_name: str,
+    *,
+    ecosystem: str | None = None,
+    purl: str | None = None,
+) -> VulnerabilityIssue:
     return VulnerabilityIssue(
         source=IssueSource.ODC,
         issue_type=IssueType.SCA,
         package_name=package_name,
+        ecosystem=ecosystem,
+        purl=purl,
     )
 
 
-def _sca_group(package_name: str) -> VulnerabilityGroup:
-    issue = _sca_issue(package_name)
+def _sca_group(
+    package_name: str,
+    *,
+    ecosystem: str | None = None,
+    purl: str | None = None,
+) -> VulnerabilityGroup:
+    issue = _sca_issue(package_name, ecosystem=ecosystem, purl=purl)
     return VulnerabilityGroup(
         group_id=f"sca:package.json:{package_name}",
         issue_type=IssueType.SCA,

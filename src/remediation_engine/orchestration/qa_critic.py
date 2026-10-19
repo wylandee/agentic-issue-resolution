@@ -49,6 +49,7 @@ from remediation_engine.contracts.schemas import (
     ScanScope,
     VulnerabilityGroup,
 )
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.task_utils import is_no_fix_package_removal_task
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
@@ -137,7 +138,12 @@ def _missing_targeted_input_paths(
         for input_path in input_paths:
             basename = input_path.replace("\\", "/").rsplit("/", 1)[-1]
             if not any(
-                report_file == basename or report_file.startswith(f"{basename}/")
+                report_file == basename
+                or report_file.startswith(f"{basename}/")
+                or (
+                    report_file.startswith(f"{basename}:")
+                    and "/" in report_file[len(basename) + 1 :]
+                )
                 for report_file in report_files
             ):
                 missing_paths.add(input_path)
@@ -235,6 +241,7 @@ def _run_global_execution(
     package_state_collector: Callable[[DockerSandbox, bool], Mapping[str, _QAPackageState]]
     | None = None,
     scan_state: OrchestratorState | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _QAExecutionResults:
     """
     Run install, optional package evidence, security scan, and unit tests in order.
@@ -245,8 +252,12 @@ def _run_global_execution(
     """
     results = _QAExecutionResults()
 
-    logger.info("qa_critic: [Step 0] running npm install.")
-    install_outcome = _qa_test_parsing_module._run_install(sandbox)
+    logger.info("qa_critic: [Step 0] running dependency install.")
+    install_outcome = (
+        _qa_test_parsing_module._run_install(sandbox, project_language)
+        if project_language == ProjectLanguage.PYTHON
+        else _qa_test_parsing_module._run_install(sandbox)
+    )
     _qa_test_parsing_module._store_install_outcome(results, install_outcome)
     install_ok = results.install[0]
     if package_state_collector is not None:
@@ -255,11 +266,19 @@ def _run_global_execution(
     deletion_only_skip = False
     precomputed_resolution_batch = None
     if skip_scan and scan_skip_reason == "no_fix_package_removal" and scan_targets:
-        precomputed_resolution_batch = _resolve_targeted_packages(
-            sandbox,
-            scan_targets or (),
-            scan_state,
-        )
+        if project_language == ProjectLanguage.PYTHON:
+            precomputed_resolution_batch = _resolve_targeted_packages(
+                sandbox,
+                scan_targets or (),
+                scan_state,
+                project_language=project_language,
+            )
+        else:
+            precomputed_resolution_batch = _resolve_targeted_packages(
+                sandbox,
+                scan_targets or (),
+                scan_state,
+            )
         precomputed_resolution_batch = _clear_expected_removed_target_failures(
             precomputed_resolution_batch,
             scan_targets or (),
@@ -346,24 +365,39 @@ def _run_global_execution(
         and scan_skip_reason != "no_fix_package_removal"
     ):
         if baseline_identifiers is None:
-            _store_scan_outcome(
-                results,
+            full_scan = (
                 _qa_odc_module._run_security_scan(
                     sandbox,
                     workspace_volume,
                     target_identifiers,
-                ),
+                    project_language=project_language,
+                )
+                if project_language == ProjectLanguage.PYTHON
+                else _qa_odc_module._run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                )
             )
+            _store_scan_outcome(results, full_scan)
         else:
-            _store_scan_outcome(
-                results,
+            full_scan = (
                 _qa_odc_module._run_security_scan(
                     sandbox,
                     workspace_volume,
                     target_identifiers,
                     baseline_identifiers,
-                ),
+                    project_language=project_language,
+                )
+                if project_language == ProjectLanguage.PYTHON
+                else _qa_odc_module._run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                    baseline_identifiers,
+                )
             )
+            _store_scan_outcome(results, full_scan)
     elif not skip_scan:
         baseline = baseline_identifiers or target_identifiers
         active_scan_targets = scan_targets or ()
@@ -383,11 +417,21 @@ def _run_global_execution(
                 incomplete_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
                 incomplete_detail = "ODC_EXTRA_ARGS conflicts with safe targeted scan scope."
             else:
-                resolution_batch = precomputed_resolution_batch or _resolve_targeted_packages(
-                    sandbox,
-                    active_scan_targets,
-                    scan_state,
-                )
+                if precomputed_resolution_batch is not None:
+                    resolution_batch = precomputed_resolution_batch
+                elif project_language == ProjectLanguage.PYTHON:
+                    resolution_batch = _resolve_targeted_packages(
+                        sandbox,
+                        active_scan_targets,
+                        scan_state,
+                        project_language=project_language,
+                    )
+                else:
+                    resolution_batch = _resolve_targeted_packages(
+                        sandbox,
+                        active_scan_targets,
+                        scan_state,
+                    )
                 target_packages = list(resolution_batch.target_packages)
                 results.scan_target_skipped_by_task = {
                     task_id: ScanFallbackReason.NO_MATCHING_TARGET.value
@@ -397,6 +441,7 @@ def _run_global_execution(
                     target_packages
                     or resolution_batch.non_npm_input_projects
                     or any(resolution_batch.closures_by_task.values())
+                    or any(resolution_batch.python_closures_by_task.values())
                 )
                 results.scan_target_failures_by_task = {
                     task_id: (failure.reason, failure.detail)
@@ -437,28 +482,56 @@ def _run_global_execution(
                         )
             if incomplete_reason is None and has_targeted_inputs:
                 targeted_subdir = ".odc-targeted"
-                artifact_manifest = _write_targeted_artifacts(
-                    sandbox,
-                    resolution_batch.closures_by_task,
-                    resolution_batch.non_npm_input_projects,
-                )
-                targeted_subdir = artifact_manifest.scan_subdir
-                if target_identifiers:
-                    targeted_result = _qa_odc_module._run_targeted_security_scan(
+                if project_language == ProjectLanguage.PYTHON:
+                    artifact_manifest = _write_targeted_artifacts(
                         sandbox,
-                        workspace_volume,
-                        target_identifiers,
-                        baseline,
-                        targeted_subdir,
+                        resolution_batch.closures_by_task,
+                        resolution_batch.non_npm_input_projects,
+                        python_closures_by_task=resolution_batch.python_closures_by_task,
+                        project_language=project_language,
                     )
                 else:
-                    targeted_scan_label = "odc:incremental"
-                    targeted_result = _qa_odc_module._run_incremental_security_scan(
+                    artifact_manifest = _write_targeted_artifacts(
                         sandbox,
-                        workspace_volume,
-                        targeted_subdir,
-                        baseline,
+                        resolution_batch.closures_by_task,
+                        resolution_batch.non_npm_input_projects,
                     )
+                targeted_subdir = artifact_manifest.scan_subdir
+                if target_identifiers:
+                    if project_language == ProjectLanguage.PYTHON:
+                        targeted_result = _qa_odc_module._run_targeted_security_scan(
+                            sandbox,
+                            workspace_volume,
+                            target_identifiers,
+                            baseline,
+                            targeted_subdir,
+                            project_language=project_language,
+                        )
+                    else:
+                        targeted_result = _qa_odc_module._run_targeted_security_scan(
+                            sandbox,
+                            workspace_volume,
+                            target_identifiers,
+                            baseline,
+                            targeted_subdir,
+                        )
+                else:
+                    targeted_scan_label = "odc:incremental"
+                    if project_language == ProjectLanguage.PYTHON:
+                        targeted_result = _qa_odc_module._run_incremental_security_scan(
+                            sandbox,
+                            workspace_volume,
+                            targeted_subdir,
+                            baseline,
+                            project_language=project_language,
+                        )
+                    else:
+                        targeted_result = _qa_odc_module._run_incremental_security_scan(
+                            sandbox,
+                            workspace_volume,
+                            targeted_subdir,
+                            baseline,
+                        )
                 if targeted_result.execution_status != ScannerExecutionStatus.SUCCESS:
                     incomplete_reason = (
                         ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
@@ -488,8 +561,6 @@ def _run_global_execution(
                     }
                     unexpected_packages: Counter[tuple[str, str]] = Counter()
                     for occurrence in targeted_result.reported_package_occurrences or ():
-                        if str(_scan_result_value(occurrence, "ecosystem", "")).casefold() != "npm":
-                            continue
                         identity = (
                             str(_scan_result_value(occurrence, "package_name", "")).casefold(),
                             str(_scan_result_value(occurrence, "version", "")),
@@ -498,6 +569,20 @@ def _run_global_execution(
                             _scan_result_value(occurrence, "file_path", None)
                         )
                         if project_path not in expected_by_project:
+                            unexpected_packages[identity] += 1
+                            continue
+                        expected_ecosystem = artifact_manifest.ecosystem_by_project.get(
+                            project_path,
+                            "npm",
+                        )
+                        reported_ecosystem = str(
+                            _scan_result_value(occurrence, "ecosystem", "")
+                        ).casefold()
+                        if not artifact_manifest.occurrences_by_project.get(project_path):
+                            if expected_ecosystem != "pypi" and reported_ecosystem == "npm":
+                                unexpected_packages[identity] += 1
+                            continue
+                        if reported_ecosystem != expected_ecosystem:
                             unexpected_packages[identity] += 1
                             continue
                         reported_by_project[project_path].add(identity)
@@ -683,7 +768,11 @@ def _run_global_execution(
         )
 
     logger.info("qa_critic: [Step 0] running unit tests.")
-    test_outcome = _qa_test_parsing_module._run_unit_tests(sandbox)
+    test_outcome = (
+        _qa_test_parsing_module._run_unit_tests(sandbox, project_language)
+        if project_language == ProjectLanguage.PYTHON
+        else _qa_test_parsing_module._run_unit_tests(sandbox)
+    )
     _qa_test_parsing_module._store_test_outcome(results, test_outcome)
 
     return results
@@ -914,7 +1003,17 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
         return package_states
 
     try:
-        with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
+        project_language = state.get("project_language", ProjectLanguage.NODEJS)
+        if not isinstance(project_language, ProjectLanguage):
+            try:
+                project_language = ProjectLanguage(project_language)
+            except (TypeError, ValueError):
+                project_language = ProjectLanguage.NODEJS
+        with DockerSandbox(
+            repo_root=None,
+            workspace_volume=workspace_volume,
+            image=LANGUAGE_CONFIGS[project_language].docker_image,
+        ) as sandbox:
             # ------------------------------------------------------------------
             # Step 0: Global Execution (deterministic Python, exactly once)
             # ------------------------------------------------------------------
@@ -927,6 +1026,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 skip_scan=skip_scan,
                 scan_state=state,
                 scan_skip_reason="no_fix_package_removal" if skip_scan else None,
+                project_language=project_language,
                 package_state_collector=(
                     collect_package_states
                     if _qa_policy_engine_module._QA_PACKAGE_STATE_CHECKS_ENABLED
@@ -1120,6 +1220,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 results=results,
                 task_policies=task_policies,
                 singleton_scope=singleton_scope,
+                project_language=project_language,
             )
 
     except RuntimeError as exc:

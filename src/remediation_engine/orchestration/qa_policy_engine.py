@@ -225,6 +225,18 @@ def _evaluate_policy_gates(
         group = context.group
         policy = task_policies.get(task_id)
         task_scan_evidence = results.scan_evidence_by_task.get(task_id)
+        scan_evidence_complete = (
+            task_scan_evidence.complete
+            if task_scan_evidence is not None
+            else False
+            if results.scan_evidence is not None
+            else None
+        )
+        task_scan_projection_missing = (
+            task_scan_evidence is None
+            and results.scan_evidence is not None
+            and results.scan_evidence.complete
+        )
         target_package_absent = (
             group.issue_type == IssueType.SCA
             and results.scan_target_skipped_by_task.get(task_id)
@@ -252,15 +264,12 @@ def _evaluate_policy_gates(
         )
         package_state = results.package_state_by_task.get(task_id, _QAPackageState())
         dependency_evidence = package_state.dependency_evidence
-        target_scan_complete = (
-            task_scan_evidence.complete
-            if task_scan_evidence is not None
-            else results.scan_evidence is None
-        )
         target_cleared = (
-            effective_scanner_status == ScannerExecutionStatus.SUCCESS
-            and target_scan_complete
-            and not remaining
+            False
+            if task_scan_projection_missing
+            else None
+            if scan_evidence_complete is False
+            else effective_scanner_status == ScannerExecutionStatus.SUCCESS and not remaining
         )
         diagnostics: list[str] = []
         if not install_passed:
@@ -275,8 +284,12 @@ def _evaluate_policy_gates(
                 "Targeted ODC was skipped because complete lockfile evidence proved "
                 "the target package absent."
             )
-        elif not target_scan_complete:
+        elif task_scan_projection_missing:
             diagnostics.append("Task-specific scanner occurrence coverage is incomplete.")
+        elif scan_evidence_complete is False:
+            diagnostics.append(
+                "ODC scan evidence was incomplete; target clearance is inconclusive."
+            )
         if _QA_PACKAGE_STATE_CHECKS_ENABLED and not target_package_absent:
             diagnostics.extend(package_state.diagnostics)
         if (
@@ -323,6 +336,7 @@ def _evaluate_policy_gates(
             scanner_execution_status=effective_scanner_status,
             target_remaining_identifiers=remaining,
             target_scanner_cleared=target_cleared,
+            scan_evidence_complete=scan_evidence_complete,
             target_package_absent=target_package_absent,
             tests_passed=tests_passed,
             package_manifest_state=package_state.manifest_state,
@@ -377,7 +391,9 @@ def _install_conflict_is_terminal(
 
 def _install_conflict_retry_feedback(gates: QADeterministicGates) -> str:
     """Build retry guidance without claiming unavailable post-install validation."""
-    install_summary = gates.diagnostics[0] if gates.diagnostics else "npm install failed."
+    install_summary = (
+        gates.diagnostics[0] if gates.diagnostics else "Dependency installation failed."
+    )
     return (
         f"{install_summary} Dependency installation failed before post-install QA validation; "
         "resolve the dependency conflict before retrying."
@@ -530,7 +546,7 @@ def _apply_policy_decision(
         gates_by_task: Python-owned deterministic gates by task ID.
         task_policies: Supervisor-owned QA policies by task ID.
         investigations_by_task: Optional evaluator investigation metadata.
-        install_error_category: Deterministic npm install error category.
+        install_error_category: Deterministic dependency-install error category.
         terminal_install_conflict: Whether dependency conflicts terminate QA.
         singleton_scope: Whether exactly one active task owns this QA run.
         deterministic_test_evidence: Optional parsed failed-test evidence.
@@ -662,6 +678,9 @@ def _apply_policy_decision(
                 or gates.dependency_evidence.status == DependencyEvidenceStatus.INCONCLUSIVE
             )
         )
+        scan_evidence_inconclusive = (
+            policy in _STRICT_SCANNER_QA_POLICIES and gates.scan_evidence_complete is False
+        )
         if policy == QAPolicy.VERSION_BUMP:
             if not _disabled_package_state_failure(
                 current, policy
@@ -701,7 +720,10 @@ def _apply_policy_decision(
                 else FailureCategory.SECURITY_FLAG
             )
             failures.append(
-                (category, "Shared npm install failed; every task in this QA batch is failed.")
+                (
+                    category,
+                    "Shared dependency installation failed; every task in this QA batch is failed.",
+                )
             )
         if policy is None:
             failures.append(
@@ -824,13 +846,23 @@ def _apply_policy_decision(
         # An unavailable dependency graph is a QA-only rerun when it is the
         # sole blocker. Preserve actionable install, scanner, test, and
         # semantic failures so the Supervisor can repair the candidate.
-        if dependency_evidence_inconclusive and not failures:
+        if (dependency_evidence_inconclusive or scan_evidence_inconclusive) and not failures:
+            if dependency_evidence_inconclusive and scan_evidence_inconclusive:
+                evidence_diagnostic = (
+                    "Dependency and ODC scan evidence were unavailable or incomplete."
+                )
+            elif scan_evidence_inconclusive:
+                evidence_diagnostic = "ODC scan evidence was incomplete."
+            else:
+                evidence_diagnostic = (
+                    "Deterministic dependency evidence was unavailable or incomplete."
+                )
             final[task_id] = QAEvaluation(
                 task_id=task_id,
                 passed=False,
                 failure_category=FailureCategory.SECURITY_FLAG,
                 retry_feedback=(
-                    "Deterministic dependency evidence was unavailable or incomplete. "
+                    f"{evidence_diagnostic} "
                     "Re-run QA evidence collection; no remediation retry should be consumed."
                 ),
                 failure_evidence=current.failure_evidence,

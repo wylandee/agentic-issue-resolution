@@ -12,6 +12,7 @@ from remediation_engine.contracts.schemas import (
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
+    TaskAttemptSnapshot,
     TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
@@ -20,6 +21,7 @@ from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration import update_subagent as update_subagent_module
 from remediation_engine.orchestration.state import initial_update_subagent_state
 from remediation_engine.orchestration.subagent_runtime import ToolEvent
+from remediation_engine.orchestration.supervisor_planner import instruction_digest
 from remediation_engine.orchestration.update_subagent import (
     _attempted_versions_for_current_run,
     _changed_files_by_task,
@@ -209,12 +211,27 @@ def _dispatch_state(repo_root, language: ProjectLanguage, ecosystem: str, manife
         target_dependency_type=dependency_type,
         selected_version="2.0.0",
         instruction=f"Update sample in {manifest}.",
+        current_attempt_id=f"attempt-{ecosystem}",
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=f"attempt-{ecosystem}",
+        task_id=task.task_id,
+        manifest_path=manifest,
+        selected_version=task.selected_version,
+        allowed_target_versions=[task.selected_version],
+        target_package_name=task.target_package_name,
+        target_dependency_type=task.target_dependency_type,
+        allowed_dependency_types=[dependency_type],
+        instruction=task.instruction,
+        instruction_digest=instruction_digest(task.instruction),
+        dispatch_node="update_subagent",
     )
     return initial_update_subagent_state(
         str(repo_root),
         "test-workspace",
         [task],
         [group],
+        target_attempt_snapshots={task.task_id: snapshot},
         project_language=language,
     )
 
@@ -237,7 +254,7 @@ def _stub_update_dispatch(monkeypatch, *, belt, runtime):
     monkeypatch.setattr(
         update_subagent_module,
         "get_runtime_settings",
-        lambda: SimpleNamespace(update_llm_model="test-model"),
+        lambda: SimpleNamespace(update_llm_model="test-model", openai_api_key="test-key"),
     )
     monkeypatch.setattr(update_subagent_module, "build_repository_map", lambda _root: "map")
     monkeypatch.setattr(

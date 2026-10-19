@@ -58,6 +58,7 @@ from .tools_validation import (
 from remediation_engine.language import ProjectLanguage
 
 from .tools_manifest_python import (
+    _make_modify_batch_python_dependencies_tool,
     _make_modify_and_validate_python_dependency_tool,
     _make_remove_no_fix_python_dependency_tool,
     _normalize_python_package_manifest_targets,
@@ -174,8 +175,28 @@ def build_multi_package_update_toolbelt(
     """
     if not isinstance(project_language, ProjectLanguage):
         project_language = ProjectLanguage(project_language)
+    mutations = list(getattr(action, "package_mutations", ()) or ())
+    expected_ecosystem = (
+        "pypi" if project_language == ProjectLanguage.PYTHON else "npm"
+    )
+    if not mutations or any(
+        getattr(mutation, "ecosystem", "npm") != expected_ecosystem
+        for mutation in mutations
+    ):
+        raise ValueError(
+            f"{project_language.value} batch toolbelt requires a non-empty "
+            f"{expected_ecosystem} action."
+        )
     if project_language == ProjectLanguage.PYTHON:
-        raise ValueError("Atomic Python package actions are not yet supported by this toolbelt.")
+        return [
+            _make_modify_batch_python_dependencies_tool(
+                sandbox,
+                action,
+                touched_files,
+                execution_state=execution_state,
+                package_checkpoints=package_checkpoints,
+            )
+        ]
     return [_make_modify_batch_npm_dependencies_tool(
         sandbox,
         action,

@@ -37,11 +37,15 @@ from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
 import requests
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
 
 from remediation_engine.contracts import FixPlanStatus, LocalizedIssue
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
-from remediation_engine.tools.package_identity import package_name_from_purl
+from remediation_engine.tools.package_identity import (
+    normalize_python_package_name,
+    package_name_from_purl,
+)
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +79,17 @@ _OVERRIDE_YARN_TMPL = (
 _OVERRIDE_PNPM_TMPL = (
     'Add or update "pnpm": {{"overrides": {{"{package}": "{version}"}}}} in {manifest} '
     "to pin the transitive dependency via pnpm overrides."
+)
+_PYTHON_DECLARATION_TYPES = frozenset(
+    {
+        "requirements",
+        "dependencies",
+        "optional-dependencies",
+        "install_requires",
+        "extras_require",
+        "packages",
+        "dev-packages",
+    }
 )
 _WORKAROUND_INSTRUCTION = (
     "Analyze the provided workaround_snippets to determine if a code edit "
@@ -129,6 +144,8 @@ def _build_instruction(
     manifest_file: str | None,
     parent_package_name: str | None = None,
     parent_declaration_type: str | None = None,
+    ecosystem: str | None = None,
+    declaration_type: str | None = None,
 ) -> str:
     """
     Generate a terse, actionable instruction for the Remedy agent.
@@ -137,8 +154,45 @@ def _build_instruction(
     directly declared parent are explicitly parent-first; the Supervisor will
     choose the parent version before an override is considered.
     """
-    manifest_name = os.path.basename(manifest_file) if manifest_file else "package.json"
     pm = (package_manager or "npm").lower()
+    normalized_ecosystem = (ecosystem or "").strip().casefold()
+    is_python = normalized_ecosystem in {"pypi", "pip", "python"} or pm in {
+        "pip",
+        "pipenv",
+        "poetry",
+        "uv",
+    }
+    manifest_name = (
+        os.path.basename(manifest_file)
+        if manifest_file
+        else "pyproject.toml"
+        if is_python
+        else "package.json"
+    )
+
+    if is_python:
+        if parent_package_name and not is_direct:
+            declaration = parent_declaration_type or "the declared dependency section"
+            return (
+                f'Update the directly declared Python parent "{parent_package_name}" in '
+                f"{manifest_name} ({declaration}) to the minimum compatible released version "
+                f'that resolves transitive package "{package_name}" to at least "{fixed_version}".'
+            )
+        if not is_direct or declaration_type not in _PYTHON_DECLARATION_TYPES:
+            return (
+                f'no supported Python declaration was identified for "{package_name}" in '
+                f"{manifest_name}; do not prescribe a manifest pin."
+            )
+        normalized_name = normalize_python_package_name(package_name)
+        if not normalized_name:
+            return (
+                f'no supported Python declaration was identified for "{package_name}" in '
+                f"{manifest_name}; do not prescribe a manifest pin."
+            )
+        return (
+            f'Pin "{normalized_name}=={fixed_version}" in {manifest_name} '
+            f"({declaration_type}) using the approved Supervisor-selected version."
+        )
 
     if is_direct:
         return _DIRECT_TMPL.format(
@@ -227,6 +281,7 @@ def _extract_fixed_from_osv_vuln(
     vuln: dict[str, Any],
     package_name: str,
     current_version: str | None = None,
+    ecosystem: str | None = None,
 ) -> tuple[str | None, list[str] | None]:
     """
     Walk an OSV vuln object's ``affected[].ranges[].events[]`` to find a
@@ -264,7 +319,20 @@ def _extract_fixed_from_osv_vuln(
                     else:
                         fallback.append(str(fixed))
 
-    fixed = _minimum_fixed_version(preferred or fallback, current_version=current_version)
+    package_ecosystems = {
+        str((affected.get("package") or {}).get("ecosystem") or ecosystem or "").strip().casefold()
+        for affected in vuln.get("affected") or []
+        if not (affected.get("package") or {}).get("name")
+        or str((affected.get("package") or {}).get("name")).casefold() == package_name.casefold()
+    }
+    version_ecosystem = (
+        next(iter(package_ecosystems)) if len(package_ecosystems) == 1 else ecosystem
+    )
+    fixed = _minimum_fixed_version(
+        preferred or fallback,
+        current_version=current_version,
+        ecosystem=version_ecosystem,
+    )
     if fixed:
         return fixed, None
 
@@ -274,12 +342,46 @@ def _extract_fixed_from_osv_vuln(
 def _minimum_fixed_version(
     versions: list[str],
     current_version: str | None = None,
+    ecosystem: str | None = None,
 ) -> str | None:
     """Return the lowest appropriate semver-like version from a collection of fixes.
 
     If current_version is provided, prioritizes fixes in the same major series
     (or the lowest fix >= current_version) over lower major backports.
     """
+    if (ecosystem or "").strip().casefold() in {"pypi", "pip", "python"}:
+        parsed_python: list[tuple[Version, str]] = []
+        for raw in versions:
+            candidate = str(raw).strip()
+            try:
+                version = Version(candidate)
+            except InvalidVersion:
+                continue
+            if version.is_prerelease or version.is_devrelease:
+                continue
+            parsed_python.append((version, str(version)))
+        if not parsed_python:
+            return None
+
+        current: Version | None = None
+        if current_version:
+            try:
+                current = Version(str(current_version).strip())
+            except InvalidVersion:
+                current = None
+        if current is not None:
+            same_major = [
+                item
+                for item in parsed_python
+                if item[0].major == current.major and item[0] >= current
+            ]
+            if same_major:
+                return min(same_major, key=lambda item: item[0])[1]
+            higher_fixes = [item for item in parsed_python if item[0] >= current]
+            if higher_fixes:
+                return min(higher_fixes, key=lambda item: item[0])[1]
+        return min(parsed_python, key=lambda item: item[0])[1]
+
     parsed: list[tuple[tuple[int, int, int, int, str], str]] = []
     for raw in versions:
         match = re.search(
@@ -353,9 +455,14 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
         "npm": "npm",
         "maven": "Maven",
         "pypi": "PyPI",
+        "python": "PyPI",
+        "pip": "PyPI",
         "javascript": "npm",
     }
     eco = mapping.get(eco, eco.capitalize())
+
+    if eco == "PyPI":
+        package_name = normalize_python_package_name(package_name)
 
     query: dict[str, Any] = {"package": {"name": package_name, "ecosystem": eco}}
 
@@ -441,7 +548,10 @@ def _query_osv_fixed_version(issue: Any) -> tuple[str | None, list[str] | None]:
                 vuln_to_process = detail
 
         fixed, snippets = _extract_fixed_from_osv_vuln(
-            vuln_to_process, package_name, current_version=current_version
+            vuln_to_process,
+            package_name,
+            current_version=current_version,
+            ecosystem=getattr(issue, "ecosystem", None),
         )
         if fixed:
             fixed_versions.append(fixed)
@@ -827,6 +937,8 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
             strategy="osv_api",
             parent_package_name=localized_issue.parent_package_name,
             parent_declaration_type=localized_issue.parent_declaration_type,
+            ecosystem=issue.ecosystem,
+            declaration_type=localized_issue.declaration_type,
         )
     if snippets:
         return {
@@ -851,6 +963,8 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
                 strategy="serper_llm",
                 parent_package_name=localized_issue.parent_package_name,
                 parent_declaration_type=localized_issue.parent_declaration_type,
+                ecosystem=issue.ecosystem,
+                declaration_type=localized_issue.declaration_type,
             )
         if strategy == "CODE_WORKAROUND" and serper_llm_result.get("workaround_snippets"):
             return {
@@ -885,6 +999,8 @@ def _version_plan(
     strategy: str,
     parent_package_name: str | None = None,
     parent_declaration_type: str | None = None,
+    ecosystem: str | None = None,
+    declaration_type: str | None = None,
 ) -> dict:
     """Return a ``version_found`` plan dict."""
     instruction = _build_instruction(
@@ -895,6 +1011,8 @@ def _version_plan(
         manifest_file=manifest_file,
         parent_package_name=parent_package_name,
         parent_declaration_type=parent_declaration_type,
+        ecosystem=ecosystem,
+        declaration_type=declaration_type,
     )
     return {
         "status": FixPlanStatus.VERSION_FOUND.value,

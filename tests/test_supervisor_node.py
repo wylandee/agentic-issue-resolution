@@ -64,11 +64,13 @@ from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _authorize_update_dispatch,
     _build_consistency_event,
+    _build_multi_package_action,
     _calculate_cumulative_scan_metrics,
     _create_attempt_snapshot,
     _deterministic_routing,
     _incremental_scan_coverage_complete,
     _materialize_spawn_requests,
+    _nonterminal_sca_task_ids,
     _normalize_target_task_ids_for_node,
     _ordered_update_candidates,
     _peer_conflict_escalation,
@@ -866,6 +868,63 @@ class TestRunSupervisorNodeNormalization:
 
 
 class TestRunSupervisorNodeVersionBump:
+    def test_python_requirements_atomic_cluster_builds_pypi_action(self):
+        task_specs = [
+            ("task-1", "group-certifi", "certifi", "2024.7.4"),
+            ("task-2", "group-sqlparse", "sqlparse", "0.4.4"),
+        ]
+        groups = {}
+        tasks = {}
+        for task_id, group_id, package_name, selected_version in task_specs:
+            issue = _issue().model_copy(
+                update={
+                    "source": IssueSource.ODC,
+                    "issue_type": IssueType.SCA,
+                    "ecosystem": "pypi",
+                    "package_name": package_name,
+                }
+            )
+            group = _sca_group(group_id).model_copy(
+                update={
+                    "vulnerable_component": package_name,
+                    "file_path": "requirements.txt",
+                    "file_paths": ["requirements.txt"],
+                    "sources": [IssueSource.ODC],
+                    "issues": [issue],
+                }
+            )
+            groups[group_id] = group
+            tasks[task_id] = _make_task(task_id, group_id).model_copy(
+                update={
+                    "target_package_name": package_name,
+                    "target_dependency_type": "requirements",
+                    "selected_version": selected_version,
+                }
+            )
+
+        action = _build_multi_package_action(
+            "batch-python",
+            ["task-1", "task-2"],
+            tasks,
+            groups,
+        )
+
+        assert action is not None
+        assert action.cluster_id == "batch-python"
+        assert [
+            (
+                mutation.manifest_path,
+                mutation.package_name,
+                mutation.target_version,
+                mutation.dependency_type,
+                mutation.ecosystem,
+            )
+            for mutation in action.package_mutations
+        ] == [
+            ("requirements.txt", "certifi", "2024.7.4", "requirements", "pypi"),
+            ("requirements.txt", "sqlparse", "0.4.4", "requirements", "pypi"),
+        ]
+
     def test_first_active_update_task_is_the_only_registry_target(self, monkeypatch):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND).model_copy(
@@ -3340,6 +3399,91 @@ def test_unfixable_replan_clears_without_remaining_nonterminal_sca(monkeypatch):
     assert result["portfolio_replan_request"] is None
     assert result["portfolio_dirty"] is False
     assert result["next_routing_step"] != "portfolio"
+
+
+def test_pending_unfixable_replan_ignores_committed_workaround_child(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _keep_portfolio_current(monkeypatch)
+    group = _sca_group("g1")
+    parent = _make_task(
+        "task-1",
+        group.group_id,
+        status=TaskStatus.UNFIXABLE,
+    ).model_copy(
+        update={
+            "exhausted_update_path": True,
+            "portfolio_plan_id": "portfolio-current",
+            "strategy_stage": SCARemediationStage.PYPI_LATEST,
+        }
+    )
+    child = _make_task(
+        "task-2",
+        group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+    ).model_copy(
+        update={
+            "parent_task_id": parent.task_id,
+            "strategy_stage": SCARemediationStage.CODE_WORKAROUND,
+            "instruction": "Apply the committed code workaround.",
+        }
+    )
+    plan = _portfolio_stub()
+    plan.task_ids = [parent.task_id]
+    request = PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id=plan.portfolio_plan_id,
+    )
+    state = _base_state(
+        [group],
+        task_queue={parent.task_id: parent, child.task_id: child},
+        portfolio_plan=plan,
+        portfolio_replan_request=request,
+        portfolio_dirty=True,
+    )
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+
+    result = run_supervisor_node(state)
+
+    portfolio_tool.assert_not_called()
+    assert result["portfolio_replan_request"] is None
+    assert result["portfolio_dirty"] is False
+    assert result["next_routing_step"] == "workaround_subagent"
+    assert result["active_target_task_ids"] == [child.task_id]
+    attempt_id = result["task_queue"][child.task_id].current_attempt_id
+    assert attempt_id is not None
+    assert result["attempt_snapshots_by_id"][attempt_id].dispatch_node == "workaround_subagent"
+
+
+def test_nonterminal_sca_replan_excludes_only_committed_workaround_children():
+    group = _sca_group("g1")
+    sibling_group = _sca_group("g2")
+    parent = _make_task(
+        "task-1",
+        group.group_id,
+        status=TaskStatus.UNFIXABLE,
+    ).model_copy(update={"exhausted_update_path": True})
+    child = _make_task(
+        "task-2",
+        group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+    ).model_copy(update={"parent_task_id": parent.task_id})
+    sibling = _make_task("task-3", sibling_group.group_id)
+    plan = _portfolio_stub()
+    plan.task_ids = [parent.task_id, sibling.task_id]
+    task_queue = {
+        parent.task_id: parent,
+        child.task_id: child,
+        sibling.task_id: sibling,
+    }
+
+    remaining = _nonterminal_sca_task_ids(
+        task_queue,
+        {group.group_id: group, sibling_group.group_id: sibling_group},
+        plan,
+    )
+
+    assert remaining == [sibling.task_id]
 
 
 def test_early_stale_plan_route_preserves_typed_pending_request(monkeypatch):
