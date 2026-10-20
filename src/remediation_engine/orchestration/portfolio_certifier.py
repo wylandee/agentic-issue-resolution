@@ -2182,6 +2182,7 @@ def _certify_maven_assignment(
             batch_id for batch_id in sorted(batches_by_id) if batch_id not in set(ordered_batch_ids)
         )
         executable_count = 0
+        verified_occurrence_ids: set[str] = set()
         for batch_id in ordered_batch_ids:
             batch = batches_by_id[batch_id]
             if not batch.dispatchable:
@@ -2213,6 +2214,14 @@ def _certify_maven_assignment(
                 )
                 if not isinstance(result, str) or not result.startswith("SUCCESS:"):
                     raise _CertificationUnknown("authorized Maven POM transaction failed")
+            batch_task_ids = {mutation.task_id for mutation in batch.mutations}
+            batch_task_ids.update(
+                task_id for task_id in batch.task_ids if task_id in no_fix_task_ids
+            )
+            for task_id in batch_task_ids:
+                target = targets_by_task.get(task_id)
+                if target is not None and target.occurrence_id in assignment:
+                    verified_occurrence_ids.add(target.occurrence_id)
             resolver = _run_command(
                 sandbox,
                 f"cd {shlex.quote(absolute)} && mvn -B -DskipTests dependency:tree",
@@ -2224,7 +2233,7 @@ def _certify_maven_assignment(
                 raise _CertificationUnknown("Maven dependency-tree resolution failed")
             output = f"{resolver.stdout}\n{resolver.stderr}"
             for target in prepared.targets:
-                if target.occurrence_id not in assignment:
+                if target.occurrence_id not in verified_occurrence_ids:
                     continue
                 group_id, artifact_id = target.target_package_name.split(":", 1)
                 versions = _maven_dependency_tree_versions(output, group_id, artifact_id)
@@ -2252,6 +2261,8 @@ def _certify_maven_assignment(
                 }
             )
             prefix_digests[batch.batch_id] = graph_digest
+        if verified_occurrence_ids != set(assignment):
+            raise _CertificationUnknown("Maven plan did not resolve every assigned target")
         if executable_count == 0 or graph_digest is None:
             raise _CertificationUnknown("Maven plan contains no resolvable package batch")
 
