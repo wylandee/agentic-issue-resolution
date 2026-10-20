@@ -351,6 +351,7 @@ def _build_report_state(case: dict[str, Any]) -> dict[str, Any]:
         "diff": _fixture_diff(fixture),
         "changed_files": changed_files,
         "errors": fixture.get("errors", []),
+        "final_full_scan_result": fixture.get("final_full_scan_result"),
     }
 
 

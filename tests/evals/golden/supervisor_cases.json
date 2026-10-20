@@ -1909,5 +1909,571 @@
       "decision_code": null,
       "spawn_request_count": 0
     }
+  },
+  {
+    "case_id": "python-supervisor-version-bump-certifi",
+    "eval_type": "supervisor",
+    "golden_kind": "historical_analogue",
+    "provenance": "PyGoat certifi task selected 2024.7.4 and was QA-passed.",
+    "input": "The Python task has a committed certifi security floor at 2024.7.4 and a matching registry candidate.",
+    "context": [
+      "PyPI package: certifi",
+      "Manifest: requirements.txt",
+      "Committed fixed version: 2024.7.4"
+    ],
+    "expected_output": "Accept the committed PyPI certifi version proposal and authorize only 2024.7.4.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "The verified PyPI certifi candidate meets the committed security floor.",
+          "rationale": "Choose the lowest verified release that fixes the finding.",
+          "target_version": "2024.7.4"
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-direct-version-bump-clean",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-direct-version-bump-clean",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "certifi",
+          "target_dependency_type": "requirements",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-direct-version-bump-clean",
+          "issue_type": "sca",
+          "vulnerable_component": "certifi",
+          "file_path": "requirements.txt",
+          "file_paths": [
+            "requirements.txt"
+          ],
+          "cve_ids": [
+            "CVE-2026-0001"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "2022.12.7"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "certifi": "2022.12.7"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "6fdee8fe-d6a0-53b6-a96b-41fe54343c76",
+          "issues": [
+            {
+              "id": "6fdee8fe-d6a0-53b6-a96b-41fe54343c76",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0001",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "requirements.txt",
+              "line_range": null,
+              "package_name": "certifi",
+              "package_version": "2022.12.7",
+              "fixed_version": "2024.7.4",
+              "purl": null,
+              "ecosystem": "pypi",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "2024.7.4",
+            "instruction": "Upgrade certifi to 2024.7.4.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "certifi",
+            "dependency_type": "requirements",
+            "security_floor": "2024.7.4",
+            "versions": [
+              "2024.7.4"
+            ],
+            "canonical_version": "2024.7.4",
+            "peer_compatible": true
+          }
+        ],
+        "project_language": "python"
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted Python proposal accepted for certifi==2024.7.4.",
+      "actual_tools": [
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "The verified PyPI certifi candidate meets the committed security floor.",
+            "rationale": "Choose the lowest verified release that fixes the finding.",
+            "target_version": "2024.7.4"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "NEW_VERSION_BUMP",
+      "spawn_request_count": 0
+    },
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261016T075629Z_ba0b44c1-7a62-4523-b00e-7797df5e29c9.md",
+        "observation": "The update trajectory records certifi==2024.7.4 and task-scoped QA passed."
+      }
+    ]
+  },
+  {
+    "case_id": "python-supervisor-pyjwt-workaround-pivot",
+    "eval_type": "supervisor",
+    "golden_kind": "historical_scenario_projection",
+    "provenance": "PyGoat recorded a deterministic pivot to a Python workaround child after the PyJWT update path was exhausted; this tactical proposal is a policy-suite projection of that transition.",
+    "input": "The committed PyJWT Python update attempt failed QA with a remaining scanner identifier. Evaluate a bounded Python source workaround proposal.",
+    "context": [
+      "PyPI package: pyjwt",
+      "Manifest: requirements.txt",
+      "Python source hint: introduction/views.py",
+      "The historical workaround did not validate; the case tests only Supervisor authorization."
+    ],
+    "expected_output": "Accept a source-only PyJWT workaround proposal scoped to the recorded Python view and spawn one authorized workaround attempt.",
+    "expected_tools": [
+      {
+        "name": "CodeWorkaroundSupervisorAction",
+        "args": {
+          "selected_strategy": "code_workaround",
+          "diagnostic_basis": "The historical PyGoat workaround plan localized the JWT handling issue to introduction/views.py.",
+          "rationale": "Use the recorded source-level crit-header hypothesis after the manifest update path is exhausted.",
+          "workaround_hypothesis": "Reject tokens carrying unsupported critical JOSE header parameters before trusting decoded claims.",
+          "target_files_hint": [
+            "introduction/views.py"
+          ]
+        }
+      }
+    ],
+    "tool_correctness_applicable": true,
+    "expected_tool_correctness_pass": true,
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-workaround-pivot-breaking-change",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-workaround-pivot-breaking-change",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "pypi_latest",
+          "target_package_name": "pyjwt",
+          "target_dependency_type": "requirements",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": "2.13.0",
+          "exhausted_update_path": true,
+          "instruction": "",
+          "status": "needs_retry",
+          "retry_count": 1,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-workaround-pivot-breaking-change",
+          "issue_type": "sca",
+          "vulnerable_component": "pyjwt",
+          "file_path": "requirements.txt",
+          "file_paths": [
+            "requirements.txt"
+          ],
+          "cve_ids": [
+            "CVE-2026-32597"
+          ],
+          "ghsa_ids": [
+            "GHSA-752W-5FWX-JX9F"
+          ],
+          "versions": [
+            "2.4.0"
+          ],
+          "dependency_ancestry": [],
+          "dependency_versions": {
+            "pyjwt": "2.4.0"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "1ac3144d-a32d-5992-ba74-82ce0f7486c4",
+          "issues": [
+            {
+              "id": "1ac3144d-a32d-5992-ba74-82ce0f7486c4",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-32597",
+              "ghsa_id": "GHSA-752W-5FWX-JX9F",
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "requirements.txt",
+              "line_range": null,
+              "package_name": "pyjwt",
+              "package_version": "2.4.0",
+              "fixed_version": "2.12.0",
+              "purl": null,
+              "ecosystem": "pypi",
+              "message": "PyJWT prior to 2.12.0 accepts JWS tokens with unsupported critical JOSE header parameters.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "2.12.0",
+            "instruction": "Upgrade PyJWT to 2.12.0 or use an explicitly authorized source workaround for the crit-header finding.",
+            "strategy_used": "pypi_latest"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [],
+        "evaluation": {
+          "task_id": "task-supervisor-workaround-pivot-breaking-change",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "The PyJWT attempt did not clear the recorded critical-header finding; a bounded source workaround is being evaluated.",
+          "failure_evidence": {
+            "exact_diagnostics": [],
+            "failed_tests": [
+              "authorization middleware regression"
+            ],
+            "source_locations": [
+              "introduction/views.py"
+            ],
+            "affected_files": [],
+            "raw_excerpt": "",
+            "attempt_id": "",
+            "task_revision": 0
+          },
+          "deterministic_gates": null,
+          "semantic_security_review": null,
+          "test_attribution": null,
+          "contract_error": false,
+          "contract_error_reason": "",
+          "evidence_inconclusive": false,
+          "scan_evidence": null
+        },
+        "project_language": "python"
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted Python proposal accepted for the PyJWT view workaround.",
+      "actual_tools": [
+        {
+          "name": "CodeWorkaroundSupervisorAction",
+          "args": {
+            "selected_strategy": "code_workaround",
+            "diagnostic_basis": "The historical PyGoat workaround plan localized the JWT handling issue to introduction/views.py.",
+            "rationale": "Use the recorded source-level crit-header hypothesis after the manifest update path is exhausted.",
+            "workaround_hypothesis": "Reject tokens carrying unsupported critical JOSE header parameters before trusting decoded claims.",
+            "target_files_hint": [
+              "introduction/views.py"
+            ]
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "PIVOT_TO_WORKAROUND",
+      "spawn_request_count": 1
+    },
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T155736Z_2f772cbc-204b-44b7-a1b5-3f2a0f177a25.md",
+        "observation": "The PyGoat trace records a pivoted workaround child for PyJWT and a source hypothesis to check the crit header before trusting decoded claims; the attempt failed validation."
+      }
+    ]
+  },
+  {
+    "case_id": "python-supervisor-inconclusive-qa-suppressed",
+    "eval_type": "supervisor",
+    "golden_kind": "synthetic_policy_case",
+    "provenance": "Python adaptation of the existing inconclusive-QA suppression invariant.",
+    "input": "The Python task has incomplete targeted scan evidence and no verifiable target coverage.",
+    "context": [
+      "Project language: Python",
+      "QA scan coverage: incomplete",
+      "Do not propose or dispatch another remediation attempt."
+    ],
+    "expected_output": "Suppress the tactical model and preserve the current Python task state while QA remains inconclusive.",
+    "expected_tools": [],
+    "tool_correctness_applicable": false,
+    "expected_tool_correctness_pass": null,
+    "task_completion_applicable": false,
+    "expected_completion_pass": null,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-inconclusive-qa-suppressed",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-inconclusive-qa-suppressed",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "needs_retry",
+          "retry_count": 1,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-inconclusive-qa-suppressed",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0010"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "ccdce802-495b-5bfe-86c3-8cfb8d473814",
+          "issues": [
+            {
+              "id": "ccdce802-495b-5bfe-86c3-8cfb8d473814",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0010",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [],
+        "prior_attempts": [
+          {
+            "attempt_id": "4a7122f4-d5c7-583c-b17d-552b825ada26",
+            "task_id": "task-supervisor-inconclusive-qa-suppressed",
+            "state_revision": 1,
+            "task_revision": 0,
+            "attempt_number": 1,
+            "qa_policy": null,
+            "strategy_stage": "osv_minimum",
+            "no_fix_stage": null,
+            "selected_version": "6.0.0",
+            "allowed_target_versions": [
+              "6.0.0"
+            ],
+            "target_package_name": "express-jwt",
+            "target_dependency_type": "dependencies",
+            "allowed_dependency_types": [
+              "dependencies"
+            ],
+            "parent_minimum_version": null,
+            "instruction": "Update express-jwt to exact version 6.0.0.",
+            "instruction_digest": "0c9a124d13cae2a901a42b93a0259430544b47d1e453999754d44e48ed8486cf",
+            "dispatch_node": "update_subagent",
+            "plan_id": null,
+            "created_at": "2026-09-21T12:00:00Z",
+            "workaround_context": null
+          }
+        ],
+        "retry_diagnostics": {
+          "task_id": "task-supervisor-inconclusive-qa-suppressed",
+          "strategy_stage": "osv_minimum",
+          "committed_attempt_id": "4a7122f4-d5c7-583c-b17d-552b825ada26",
+          "security_floor": "6.0.0",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_minimum_version": null,
+          "registry_query_performed": false,
+          "attempted_versions": [
+            "6.0.0"
+          ],
+          "executed_versions": [
+            "6.0.0"
+          ],
+          "attempted_versions_by_target": {},
+          "candidate_versions_considered": [],
+          "attempted_dependency_types": [],
+          "candidate_dependency_types": [],
+          "selected_version": "6.0.0",
+          "effective_target_version": null,
+          "effective_dependency_type": null,
+          "latest_version_seen": null,
+          "used_overrides": false,
+          "package_abandoned": false,
+          "exhausted_update_path": false,
+          "failure_reason": "The prior attempted version did not complete the required QA gates.",
+          "reasoning_summary": "",
+          "instruction_digest": null
+        },
+        "evaluation": {
+          "task_id": "task-supervisor-inconclusive-qa-suppressed",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "QA attribution is inconclusive; rerun evidence collection without replanning.",
+          "failure_evidence": {
+            "exact_diagnostics": [],
+            "failed_tests": [
+              "authorization middleware suite"
+            ],
+            "source_locations": [],
+            "affected_files": [],
+            "raw_excerpt": "",
+            "attempt_id": "4a7122f4-d5c7-583c-b17d-552b825ada26",
+            "task_revision": 0
+          },
+          "deterministic_gates": null,
+          "semantic_security_review": null,
+          "test_attribution": {
+            "verdict": "inconclusive",
+            "responsible_group_ids": [
+              "supervisor:supervisor-inconclusive-qa-suppressed"
+            ],
+            "failed_tests": [
+              "authorization middleware suite"
+            ],
+            "reasoning": "The available test evidence cannot be attributed to this remediation task."
+          },
+          "contract_error": false,
+          "contract_error_reason": "",
+          "evidence_inconclusive": false,
+          "scan_evidence": null
+        },
+        "project_language": "python"
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "No tactical proposal was made because Python QA evidence was inconclusive.",
+      "actual_tools": []
+    },
+    "expected_replay": {
+      "model_invocations": 0,
+      "verification_accepted": null,
+      "decision_code": null,
+      "spawn_request_count": 0
+    }
   }
 ]

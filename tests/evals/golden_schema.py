@@ -145,7 +145,7 @@ def _validate_supervisor_expected_replay(case: Mapping[str, Any], label: str) ->
             f"{label}.expected_replay.decision_code must be a DecisionCode value or null"
         )
 
-    no_call_case = case.get("case_id") == "supervisor-inconclusive-qa-suppressed"
+    no_call_case = model_invocations == 0 and spawn_request_count == 0
     if no_call_case:
         if model_invocations != 0:
             violations.append(
@@ -162,7 +162,7 @@ def _validate_supervisor_expected_replay(case: Mapping[str, Any], label: str) ->
     elif verification_accepted is None or model_invocations == 0:
         violations.append(
             f"{label}.expected_replay null verification and zero calls are reserved for "
-            "the inconclusive no-call case"
+            "an inconclusive no-call case"
         )
     elif verification_accepted is True and decision_code is None:
         violations.append(f"{label}.expected_replay accepted verification requires a decision code")

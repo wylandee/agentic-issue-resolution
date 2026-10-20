@@ -124,7 +124,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":4,\"follow_up\":0,\"total_groups\":4,\"total_findings\":5},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\",\"CVE-2026-30001\",\"CVE-2026-30002\",\"CVE-2026-30003\"],\"successful_packages\":[\"@tootallnate/once\",\"base64url\",\"cookie\",\"nanoid\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\", \"CVE-2026-30001\", \"CVE-2026-30002\", \"CVE-2026-30003\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"@tootallnate/once\", \"base64url\", \"cookie\", \"nanoid\"], \"summary\": {\"fixed\": 4, \"follow_up\": 0, \"total_findings\": 5, \"total_groups\": 4}}",
     "expected_contract": {
       "summary": {
         "fixed": 4,
@@ -309,7 +309,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":2,\"total_groups\":3,\"total_findings\":3},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\",\"CVE-2020-15084\",\"GHSA-6G6M-M6H5-W9GF\",\"CVE-2026-30004\"],\"successful_packages\":[\"@tootallnate/once\"],\"follow_up_packages\":[\"express-jwt\",\"ws\"],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\", \"CVE-2020-15084\", \"GHSA-6G6M-M6H5-W9GF\", \"CVE-2026-30004\"], \"follow_up_packages\": [\"express-jwt\", \"ws\"], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"@tootallnate/once\"], \"summary\": {\"fixed\": 1, \"follow_up\": 2, \"total_findings\": 3, \"total_groups\": 3}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -478,7 +478,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":0,\"follow_up\":3,\"total_groups\":3,\"total_findings\":3},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\",\"CVE-2020-15084\",\"GHSA-6G6M-M6H5-W9GF\",\"CVE-2026-30005\",\"GHSA-6QX4-9M5V-2H7J\"],\"successful_packages\":[],\"follow_up_packages\":[\"@tootallnate/once\",\"express-jwt\",\"sanitize-html\"],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\", \"CVE-2020-15084\", \"GHSA-6G6M-M6H5-W9GF\", \"CVE-2026-30005\", \"GHSA-6QX4-9M5V-2H7J\"], \"follow_up_packages\": [\"@tootallnate/once\", \"express-jwt\", \"sanitize-html\"], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [], \"summary\": {\"fixed\": 0, \"follow_up\": 3, \"total_findings\": 3, \"total_groups\": 3}}",
     "expected_contract": {
       "summary": {
         "fixed": 0,
@@ -563,7 +563,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2026-30006\"],\"successful_packages\":[\"undici\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-30006\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"undici\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -653,7 +653,7 @@
         "src/guard.ts"
       ]
     },
-    "expected_output": "{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2020-15084\",\"GHSA-6G6M-M6H5-W9GF\"],\"successful_packages\":[\"express-jwt\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[\"src/guard.ts\"],\"forbidden_code_detail_diff_paths\":[\"package.json\"]}",
+    "expected_output": "{\"code_detail_diff_paths\": [\"src/guard.ts\"], \"finding_identifiers\": [\"CVE-2020-15084\", \"GHSA-6G6M-M6H5-W9GF\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\"], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"express-jwt\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -767,7 +767,7 @@
         "routes/b2bOrder.ts"
       ]
     },
-    "expected_output": "{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2021-23771\",\"GHSA-8G4M-CJM2-96WQ\"],\"successful_packages\":[\"notevil\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[\"routes/b2bOrder.ts\"],\"forbidden_code_detail_diff_paths\":[\"package.json\",\"package-lock.json\"]}",
+    "expected_output": "{\"code_detail_diff_paths\": [\"routes/b2bOrder.ts\"], \"finding_identifiers\": [\"CVE-2021-23771\", \"GHSA-8G4M-CJM2-96WQ\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\", \"package-lock.json\"], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"notevil\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -918,7 +918,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2026-30005\",\"GHSA-6QX4-9M5V-2H7J\"],\"successful_packages\":[\"sanitize-html\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[\"lib/insecurity.ts\"],\"forbidden_code_detail_diff_paths\":[\"package.json\",\"package-lock.json\"]}",
+    "expected_output": "{\"code_detail_diff_paths\": [\"lib/insecurity.ts\"], \"finding_identifiers\": [\"CVE-2026-30005\", \"GHSA-6QX4-9M5V-2H7J\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\", \"package-lock.json\"], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"sanitize-html\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -1049,7 +1049,7 @@
         "routes/b2bOrder.ts"
       ]
     },
-    "expected_output": "{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2021-23771\",\"GHSA-8G4M-CJM2-96WQ\"],\"successful_packages\":[\"notevil\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[\"routes/b2bOrder.ts\"],\"forbidden_code_detail_diff_paths\":[\"package.json\",\"package-lock.json\"]}",
+    "expected_output": "{\"code_detail_diff_paths\": [\"routes/b2bOrder.ts\"], \"finding_identifiers\": [\"CVE-2021-23771\", \"GHSA-8G4M-CJM2-96WQ\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\", \"package-lock.json\"], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"notevil\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -1165,7 +1165,7 @@
         "frontend/package.json"
       ]
     },
-    "expected_output": "{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":2,\"follow_up\":0,\"total_groups\":2,\"total_findings\":2},\"finding_identifiers\":[\"CVE-2026-30007\",\"CVE-2026-30008\"],\"successful_packages\":[\"lodash\",\"ws\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-30007\", \"CVE-2026-30008\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"lodash\", \"ws\"], \"summary\": {\"fixed\": 2, \"follow_up\": 0, \"total_findings\": 2, \"total_groups\": 2}}",
     "expected_contract": {
       "summary": {
         "fixed": 2,
@@ -1255,7 +1255,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\"],\"successful_packages\":[\"@tootallnate/once\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"@tootallnate/once\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -1288,5 +1288,454 @@
     ],
     "expected_tools": [],
     "offline_fixture": {}
+  },
+  {
+    "case_id": "python-report-certifi-success-with-warning",
+    "fixture_type": "historical",
+    "provenance": "Certifi task QA passed with requirements.txt changed; overall completed_with_errors reflects 19 unrelated identifiers in the incremental scan.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261016T075629Z_ba0b44c1-7a62-4523-b00e-7797df5e29c9.md",
+        "observation": "One certifi task passed QA; the run completed with errors after an incremental scan reported 19 new identifiers."
+      }
+    ],
+    "fixture": {
+      "status": "completed_with_errors",
+      "issues": [
+        "certifi",
+        "certifi"
+      ],
+      "groups": [
+        {
+          "id": "g-certifi",
+          "package": "certifi",
+          "version": "2022.12.7",
+          "severity": "high",
+          "finding_ids": [
+            "CVE-2023-37920",
+            "GHSA-XQR8-7JWR-RHP7",
+            "CVE-2024-39689",
+            "GHSA-248V-346W-9CWC"
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "t-certifi",
+          "group": "g-certifi",
+          "status": "qa_passed",
+          "strategy": "VERSION_BUMP",
+          "target_package_name": "certifi",
+          "target_dependency_type": "requirements",
+          "selected_version": "2024.7.4",
+          "qa": true
+        }
+      ],
+      "attempts": [
+        {
+          "id": "a-certifi",
+          "task": "t-certifi",
+          "status": "success",
+          "package": "certifi",
+          "selected_version": "2024.7.4",
+          "instruction": "Update certifi to 2024.7.4 in requirements.txt.",
+          "files": [
+            "requirements.txt"
+          ],
+          "qa": true,
+          "outcome": "Install, scoped scan, and tests passed."
+        }
+      ],
+      "package_changes": [
+        {
+          "file": "requirements.txt",
+          "name": "certifi",
+          "old": "2022.12.7",
+          "new": "2024.7.4",
+          "section": "requirements"
+        }
+      ],
+      "changed_files": [
+        "requirements.txt"
+      ],
+      "final_full_scan_result": {
+        "status": "completed",
+        "completed": true,
+        "coverage_scope": "incremental_dependency_inputs",
+        "coverage_complete": true,
+        "authoritative": false
+      },
+      "errors": [
+        "teardown_node: incremental scans detected 19 new identifier(s)"
+      ]
+    },
+    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2023-37920\", \"GHSA-XQR8-7JWR-RHP7\", \"CVE-2024-39689\", \"GHSA-248V-346W-9CWC\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"certifi\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 2, \"total_groups\": 1}}",
+    "expected_contract": {
+      "summary": {
+        "fixed": 1,
+        "follow_up": 0,
+        "total_groups": 1,
+        "total_findings": 2
+      },
+      "total_findings": 2,
+      "finding_identifiers": [
+        "CVE-2023-37920",
+        "GHSA-XQR8-7JWR-RHP7",
+        "CVE-2024-39689",
+        "GHSA-248V-346W-9CWC"
+      ],
+      "successful_packages": [
+        "certifi"
+      ],
+      "follow_up_packages": [],
+      "required_fragments": [
+        "No follow-up actions are required."
+      ],
+      "forbidden_fragments": []
+    },
+    "eval_type": "report",
+    "input": "Render an evidence-backed remediation report for python-report-certifi-success-with-warning.",
+    "context": [
+      "Certifi task QA passed with requirements.txt changed; overall completed_with_errors reflects 19 unrelated identifiers in the incremental scan.",
+      "The final incremental scan is non-authoritative and may report unrelated new identifiers."
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": {
+        "format": "remediation_report_v2",
+        "summary": {
+          "fixed": 1,
+          "follow_up": 0,
+          "total_groups": 1,
+          "total_findings": 2
+        },
+        "finding_identifiers": [
+          "CVE-2023-37920",
+          "GHSA-XQR8-7JWR-RHP7"
+        ],
+        "successful_packages": [
+          "certifi"
+        ],
+        "follow_up_packages": [],
+        "code_detail_diff_paths": [],
+        "forbidden_code_detail_diff_paths": []
+      },
+      "actual_tools": []
+    }
+  },
+  {
+    "case_id": "python-report-atomic-batch-success-with-warning",
+    "fixture_type": "historical",
+    "provenance": "The atomic requirements action passed QA for both tasks; the final incremental scan warning remains separately reportable.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T165913Z_9ede9474-e210-431f-bb8b-4def9e00cca8.md",
+        "observation": "Certifi and sqlparse tasks in the atomic batch passed QA; the run ended with an incremental-scan warning."
+      }
+    ],
+    "fixture": {
+      "status": "completed_with_errors",
+      "issues": [
+        "certifi",
+        "certifi",
+        "sqlparse"
+      ],
+      "groups": [
+        {
+          "id": "g-certifi",
+          "package": "certifi",
+          "version": "2022.12.7",
+          "severity": "high",
+          "finding_ids": [
+            "CVE-2023-37920",
+            "GHSA-XQR8-7JWR-RHP7",
+            "CVE-2024-39689",
+            "GHSA-248V-346W-9CWC"
+          ]
+        },
+        {
+          "id": "g-sqlparse",
+          "package": "sqlparse",
+          "version": "0.3.1",
+          "severity": "high",
+          "finding_ids": [
+            "CVE-2023-30608",
+            "GHSA-RRM6-WVJ7-CWH2"
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "t-certifi",
+          "group": "g-certifi",
+          "status": "qa_passed",
+          "strategy": "VERSION_BUMP",
+          "target_package_name": "certifi",
+          "target_dependency_type": "requirements",
+          "selected_version": "2024.7.4",
+          "qa": true
+        },
+        {
+          "id": "t-sqlparse",
+          "group": "g-sqlparse",
+          "status": "qa_passed",
+          "strategy": "VERSION_BUMP",
+          "target_package_name": "sqlparse",
+          "target_dependency_type": "requirements",
+          "selected_version": "0.4.4",
+          "qa": true
+        }
+      ],
+      "attempts": [
+        {
+          "id": "a-certifi",
+          "task": "t-certifi",
+          "status": "success",
+          "package": "certifi",
+          "selected_version": "2024.7.4",
+          "instruction": "Atomic Python batch update.",
+          "files": [
+            "requirements.txt"
+          ],
+          "qa": true,
+          "outcome": "Batch transaction passed."
+        },
+        {
+          "id": "a-sqlparse",
+          "task": "t-sqlparse",
+          "status": "success",
+          "package": "sqlparse",
+          "selected_version": "0.4.4",
+          "instruction": "Atomic Python batch update.",
+          "files": [
+            "requirements.txt"
+          ],
+          "qa": true,
+          "outcome": "Batch transaction passed."
+        }
+      ],
+      "package_changes": [
+        {
+          "file": "requirements.txt",
+          "name": "certifi",
+          "old": "2022.12.7",
+          "new": "2024.7.4",
+          "section": "requirements"
+        },
+        {
+          "file": "requirements.txt",
+          "name": "sqlparse",
+          "old": "0.3.1",
+          "new": "0.4.4",
+          "section": "requirements"
+        }
+      ],
+      "changed_files": [
+        "requirements.txt"
+      ],
+      "final_full_scan_result": {
+        "status": "completed",
+        "completed": true,
+        "coverage_scope": "incremental_dependency_inputs",
+        "coverage_complete": true,
+        "authoritative": false
+      },
+      "errors": [
+        "teardown_node: incremental scans detected 17 new identifier(s)"
+      ]
+    },
+    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2023-37920\", \"GHSA-XQR8-7JWR-RHP7\", \"CVE-2024-39689\", \"GHSA-248V-346W-9CWC\", \"CVE-2023-30608\", \"GHSA-RRM6-WVJ7-CWH2\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"certifi\", \"sqlparse\"], \"summary\": {\"fixed\": 2, \"follow_up\": 0, \"total_findings\": 3, \"total_groups\": 2}}",
+    "expected_contract": {
+      "summary": {
+        "fixed": 2,
+        "follow_up": 0,
+        "total_groups": 2,
+        "total_findings": 3
+      },
+      "total_findings": 3,
+      "finding_identifiers": [
+        "CVE-2023-37920",
+        "GHSA-XQR8-7JWR-RHP7",
+        "CVE-2024-39689",
+        "GHSA-248V-346W-9CWC",
+        "CVE-2023-30608",
+        "GHSA-RRM6-WVJ7-CWH2"
+      ],
+      "successful_packages": [
+        "certifi",
+        "sqlparse"
+      ],
+      "follow_up_packages": [],
+      "required_fragments": [
+        "No follow-up actions are required."
+      ],
+      "forbidden_fragments": []
+    },
+    "eval_type": "report",
+    "input": "Render an evidence-backed remediation report for python-report-atomic-batch-success-with-warning.",
+    "context": [
+      "The atomic requirements action passed QA for both tasks; the final incremental scan warning remains separately reportable.",
+      "The final incremental scan is non-authoritative and may report unrelated new identifiers."
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": {
+        "format": "remediation_report_v2",
+        "summary": {
+          "fixed": 2,
+          "follow_up": 0,
+          "total_groups": 2,
+          "total_findings": 2
+        },
+        "finding_identifiers": [
+          "CVE-2023-37920",
+          "CVE-2021-32839"
+        ],
+        "successful_packages": [
+          "certifi",
+          "sqlparse"
+        ],
+        "follow_up_packages": [],
+        "code_detail_diff_paths": [],
+        "forbidden_code_detail_diff_paths": []
+      },
+      "actual_tools": []
+    }
+  },
+  {
+    "case_id": "python-report-pyjwt-follow-up",
+    "fixture_type": "historical",
+    "provenance": "PyJWT update did not clear all target identifiers and the later workaround did not pass validation; final status was unfixable.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T155736Z_2f772cbc-204b-44b7-a1b5-3f2a0f177a25.md",
+        "observation": "The PyJWT report recorded five scanner findings; the update and code workaround attempts failed, so the package remained a follow-up."
+      }
+    ],
+    "fixture": {
+      "status": "completed_with_errors",
+      "issues": [
+        "pyjwt",
+        "pyjwt",
+        "pyjwt",
+        "pyjwt",
+        "pyjwt"
+      ],
+      "groups": [
+        {
+          "id": "g-pyjwt",
+          "package": "pyjwt",
+          "version": "2.4.0",
+          "severity": "high",
+          "finding_ids": [
+            "CVE-2025-45770",
+            "CVE-2026-32597",
+            "CVE-2026-48522",
+            "CVE-2026-48524",
+            "CVE-2026-48526",
+            "GHSA-752W-5FWX-JX9F",
+            "GHSA-993G-76C3-P5M4",
+            "GHSA-FHV5-28VV-H8M8",
+            "GHSA-XGMM-8J9V-C9WX"
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "t-pyjwt",
+          "group": "g-pyjwt",
+          "status": "unfixable",
+          "strategy": "VERSION_BUMP",
+          "strategy_stage": "pypi_latest",
+          "target_package_name": "pyjwt",
+          "target_dependency_type": "requirements",
+          "selected_version": "2.13.0",
+          "qa": false
+        }
+      ],
+      "attempts": [
+        {
+          "id": "a-pyjwt",
+          "task": "t-pyjwt",
+          "status": "failed",
+          "package": "pyjwt",
+          "selected_version": "2.13.0",
+          "instruction": "Update pyjwt to the approved version in requirements.txt.",
+          "files": [
+            "requirements.txt"
+          ],
+          "qa": false,
+          "outcome": "CVE-2025-45770 remained; subsequent workaround validation failed."
+        }
+      ],
+      "package_changes": [],
+      "changed_files": [],
+      "final_full_scan_result": {
+        "status": "none",
+        "completed": true,
+        "coverage_scope": "incremental_dependency_inputs",
+        "coverage_complete": true,
+        "authoritative": false
+      }
+    },
+    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2025-45770\", \"CVE-2026-32597\", \"CVE-2026-48522\", \"CVE-2026-48524\", \"CVE-2026-48526\", \"GHSA-752W-5FWX-JX9F\", \"GHSA-993G-76C3-P5M4\", \"GHSA-FHV5-28VV-H8M8\", \"GHSA-XGMM-8J9V-C9WX\"], \"follow_up_packages\": [\"pyjwt\"], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [], \"summary\": {\"fixed\": 0, \"follow_up\": 1, \"total_findings\": 5, \"total_groups\": 1}}",
+    "expected_contract": {
+      "summary": {
+        "fixed": 0,
+        "follow_up": 1,
+        "total_groups": 1,
+        "total_findings": 5
+      },
+      "total_findings": 5,
+      "finding_identifiers": [
+        "CVE-2025-45770",
+        "CVE-2026-32597",
+        "CVE-2026-48522",
+        "CVE-2026-48524",
+        "CVE-2026-48526",
+        "GHSA-752W-5FWX-JX9F",
+        "GHSA-993G-76C3-P5M4",
+        "GHSA-FHV5-28VV-H8M8",
+        "GHSA-XGMM-8J9V-C9WX"
+      ],
+      "successful_packages": [],
+      "follow_up_packages": [
+        "pyjwt"
+      ],
+      "required_fragments": [
+        "Incremental",
+        "follow-up"
+      ],
+      "forbidden_fragments": []
+    },
+    "eval_type": "report",
+    "input": "Render an evidence-backed remediation report for python-report-pyjwt-follow-up.",
+    "context": [
+      "PyJWT update did not clear all target identifiers and the later workaround did not pass validation; final status was unfixable.",
+      "The final incremental scan is non-authoritative and may report unrelated new identifiers."
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": {
+        "format": "remediation_report_v2",
+        "summary": {
+          "fixed": 0,
+          "follow_up": 1,
+          "total_groups": 1,
+          "total_findings": 2
+        },
+        "finding_identifiers": [
+          "CVE-2025-45770",
+          "CVE-2026-48526"
+        ],
+        "successful_packages": [],
+        "follow_up_packages": [
+          "pyjwt"
+        ],
+        "code_detail_diff_paths": [],
+        "forbidden_code_detail_diff_paths": []
+      },
+      "actual_tools": []
+    }
   }
 ]

@@ -28,9 +28,9 @@ def test_all_golden_datasets_load_and_validate() -> None:
         if name == "supervisor_cases":
             supervisor_cases = cases
 
-    assert counts["fix_planner_cases"] == 15
-    assert counts["supervisor_cases"] == 10
-    assert len({case["case_id"] for case in supervisor_cases}) == 10
+    assert counts["fix_planner_cases"] == 18
+    assert counts["supervisor_cases"] == 13
+    assert len({case["case_id"] for case in supervisor_cases}) == 13
 
 
 def test_live_replay_datasets_have_structured_replay_inputs() -> None:

@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from remediation_engine.contracts.schemas import AgentActionStatus
+from remediation_engine.language import ProjectLanguage
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,
@@ -24,6 +25,7 @@ from tests.evals.replay_adapters import replay_update_case
 from tests.evals.replay_harness import (
     ReplayCapture,
     ScriptedReplayModel,
+    _case_project_language,
     cached_replay,
     format_tool_trace,
 )
@@ -232,17 +234,32 @@ def test_update_subagent_offline_production_replay(
 
     case_id = str(case["case_id"])
     summary = capture.typed_result["action_summaries"][0]
-    if case_id == "update-retry-limit-surrender":
+    if case_id == "update-retry-limit-surrender" or case.get("action_status") == "SURRENDER":
         assert summary.status == AgentActionStatus.SURRENDER
-        assert "RETRY_LIMIT_REACHED" in (capture.actual_output + "\n" + "\n".join(capture.errors))
-        baseline = json.loads(str(case["replay"]["input"]["workspace_files"]["package.json"]))
-        final_manifest = json.loads(capture.final_files["package.json"])
-        assert final_manifest == baseline
+        if case_id == "update-retry-limit-surrender" or case.get("expected_failure_marker"):
+            marker = str(case.get("expected_failure_marker", "RETRY_LIMIT_REACHED"))
+            assert marker in (capture.actual_output + "\n" + "\n".join(capture.errors))
+        if _case_project_language(case) == ProjectLanguage.PYTHON:
+            manifest_path = str(case.get("manifest_path", "requirements.txt"))
+            assert (
+                capture.final_files[manifest_path]
+                == case["replay"]["input"]["workspace_files"][manifest_path]
+            )
+        else:
+            baseline = json.loads(str(case["replay"]["input"]["workspace_files"]["package.json"]))
+            final_manifest = json.loads(capture.final_files["package.json"])
+            assert final_manifest == baseline
         return
 
     assert summary.status == AgentActionStatus.SUCCESS
     assert capture.changed_files
-    manifest = json.loads(capture.final_files["package.json"])
-    dependency_section = str(case["dependency_type"])
     package_name = str(case["target_package_name"])
-    assert manifest[dependency_section][package_name] == case["selected_version"]
+    if _case_project_language(case) == ProjectLanguage.PYTHON:
+        manifest_path = str(case.get("manifest_path", "requirements.txt"))
+        requirements = capture.final_files[manifest_path].splitlines()
+        assert f"{package_name}=={case['selected_version']}" in requirements
+        assert "package.json" not in capture.final_files
+    else:
+        manifest = json.loads(capture.final_files["package.json"])
+        dependency_section = str(case["dependency_type"])
+        assert manifest[dependency_section][package_name] == case["selected_version"]

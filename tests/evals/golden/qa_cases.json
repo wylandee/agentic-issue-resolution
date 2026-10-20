@@ -4,7 +4,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md \u00a7494",
+    "provenance": "data/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md §494",
     "historical_evidence": [
       "debug UPDATE_VERSION used version_bump with install, scan, and tests passing; terminal output passed=true."
     ],
@@ -56,7 +56,7 @@
     "expected_output": "Complete: emit passed=true because install, scanner clearance, and tests all pass.",
     "input": "Review one version-bump QA group and emit one evidence-backed evaluation. A clean pass requires install, scanner clearance, and tests to pass.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md \u00a7494",
+      "Golden provenance:\ndata/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md §494",
       "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": true\n}"
     ],
@@ -145,7 +145,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "historical_gate_normalized_terminal",
     "evidence_status": "historical_legacy",
-    "provenance": "data/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md \u00a7157",
+    "provenance": "data/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md §157",
     "historical_evidence": [
       "npm install FAILED with EOVERRIDE: the ws@8.21.1 override conflicted with the direct dependency; old trace had no current terminal emit."
     ],
@@ -199,7 +199,7 @@
     "expected_output": "Complete: query install and emit passed=false with peer-conflict guidance.",
     "input": "Review one version-bump QA group and emit a failure evaluation when dependency installation fails. Use the install log to provide peer-conflict guidance.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md \u00a7157",
+      "Golden provenance:\ndata/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md §157",
       "Expected QA verdict:\n{\n  \"failure_category\": \"peer_conflict\",\n  \"passed\": false\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": false,\n  \"package_graph_state\": null,\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"not_run\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": null,\n  \"tests_passed\": null\n}"
     ],
@@ -303,7 +303,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md \u00a7\u00a7128, 162",
+    "provenance": "data/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md §§128, 162",
     "historical_evidence": [
       "fstream UPDATE_VERSION had install=true, scan=false, tests=true; remaining CVE-2019-13173 and GHSA-XF7W-R453-M56C produced a security_flag terminal evaluation."
     ],
@@ -362,7 +362,7 @@
     "expected_output": "Complete: query scan and emit a security_flag failure for the remaining target identifiers.",
     "input": "Review one version-bump QA group and emit a security failure when the scanner still reports target identifiers, even if install and tests pass.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md \u00a7\u00a7128, 162",
+      "Golden provenance:\ndata/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md §§128, 162",
       "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2019-13173\",\n    \"GHSA-XF7W-R453-M56C\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
@@ -471,7 +471,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427, 473",
+    "provenance": "data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md §§427, 473",
     "historical_evidence": [
       "express-jwt UPDATE_VERSION had install=true, scan=true, tests=false; TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35 was categorized as breaking_change."
     ],
@@ -525,7 +525,7 @@
     "expected_output": "Complete: query tests and emit a breaking_change failure tied to the express-jwt v8 import error.",
     "input": "Review one version-bump QA group and emit a failure evaluation when the updated package causes a test regression. Cite the exact API diagnostic.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427, 473",
+      "Golden provenance:\ndata/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md §§427, 473",
       "Expected QA verdict:\n{\n  \"failure_category\": \"breaking_change\",\n  \"passed\": false\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": false\n}"
     ],
@@ -629,7 +629,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "normalized_initial_semantic_pass",
     "evidence_status": "normalized",
-    "provenance": "Closest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md \u00a7508 plus synthetic case_5_initial_workaround_pass.",
+    "provenance": "Closest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md §508 plus synthetic case_5_initial_workaround_pass.",
     "historical_evidence": [
       "Historical mitigation_code_workaround evidence had install=true, scan=false, tests=true but no terminal emit; existing initial fixture used scanner not_run. This case normalizes scanner failure as nonblocking under initial_code_workaround."
     ],
@@ -685,7 +685,7 @@
     "expected_output": "Complete: use source/diff evidence and emit passed=true even though the initial-workaround scanner identifier remains nonblocking.",
     "input": "Review one initial code-workaround group. Remaining scanner identifiers are nonblocking, but source/diff evidence must prove the vulnerable path is blocked and tests must pass before emitting pass.",
     "context": [
-      "Golden provenance:\nClosest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md \u00a7508 plus synthetic case_5_initial_workaround_pass.",
+      "Golden provenance:\nClosest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md §508 plus synthetic case_5_initial_workaround_pass.",
       "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true,\n  \"semantic_security_review\": \"pass\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2020-15084\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
@@ -1573,7 +1573,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7\u00a7891, 918",
+    "provenance": "data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md §§891, 918",
     "historical_evidence": [
       "express-jwt CODE_WORKAROUND used migration_code_workaround with install, scan, and tests passing; terminal output passed=true with semantic review pass."
     ],
@@ -1627,7 +1627,7 @@
     "expected_output": "Complete: emit passed=true with semantic review pass because the migrated API, scanner, and tests are successful.",
     "input": "Review one migration code-workaround pivot after an update API break and emit pass only when the migrated API, scanner clearance, and tests are all successful.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7\u00a7891, 918",
+      "Golden provenance:\ndata/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md §§891, 918",
       "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true,\n  \"semantic_security_review\": \"pass\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": true\n}"
     ],
@@ -1899,7 +1899,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "normalized_pivot_test_failure",
     "evidence_status": "normalized",
-    "provenance": "Composite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7891.",
+    "provenance": "Composite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md §§427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md §891.",
     "historical_evidence": [
       "The update trace proves the express-jwt API test break and the pivot trace proves the subsequent migration path; no single exported trace contains this exact pivot plus terminal test-failure pair."
     ],
@@ -1952,7 +1952,7 @@
     "expected_output": "Complete: query tests and emit a breaking_change failure tied to the API integration error.",
     "input": "Review one migration code-workaround pivot and emit a breaking-change failure when the migrated API still causes required tests to fail.",
     "context": [
-      "Golden provenance:\nComposite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7891.",
+      "Golden provenance:\nComposite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md §§427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md §891.",
       "Expected QA verdict:\n{\n  \"failure_category\": \"breaking_change\",\n  \"passed\": false\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": false\n}"
     ],
@@ -2056,7 +2056,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "normalized_nofix_package_removal_pass",
     "evidence_status": "historical_worker_plus_synthetic_qa",
-    "provenance": "Worker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z \u00a723; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
+    "provenance": "Worker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z §23; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
     "historical_evidence": [
       "Worker removed notevil and its consumer and passed cumulative validation. The corresponding QA trace timed out during scanning, so this golden requires authoritative scan clearance rather than treating that trace as a QA pass."
     ],
@@ -2113,7 +2113,7 @@
     "expected_output": "Complete: confirm install, scan, package absence, and tests before emitting passed=true.",
     "input": "Review one no-fix package-removal group. Confirm install, scanner clearance, package absence from manifest and graph, and tests before emitting pass.",
     "context": [
-      "Golden provenance:\nWorker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z \u00a723; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
+      "Golden provenance:\nWorker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z §23; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
       "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"absent\",\n  \"package_manifest_state\": \"absent\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": true\n}"
     ],
@@ -2767,7 +2767,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "historical_typed_nofix_semantic_pass",
     "evidence_status": "historical_typed",
-    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md \u00a7\u00a759,99.",
+    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md §§59,99.",
     "historical_evidence": [
       "The no_fix_code_removal evaluation records install/tests passing, residual target identifiers as expected/nonblocking, and semantic review pass after removing notevil/node:vm usage from routes/b2bOrder.ts."
     ],
@@ -2826,7 +2826,7 @@
     "expected_output": "Complete: inspect source/diff and emit passed=true because the retained package is allowed and the vulnerable path is removed despite residual scanner identifiers.",
     "input": "Review one no-fix code-removal pivot after package removal was exhausted. Residual target identifiers are expected and nonblocking; emit pass only when source/diff evidence proves the vulnerable path was removed and tests pass.",
     "context": [
-      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md \u00a7\u00a759,99.",
+      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md §§59,99.",
       "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true,\n  \"semantic_security_review\": \"pass\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2021-23771\",\n    \"GHSA-8G4M-CJM2-96WQ\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
@@ -3147,7 +3147,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "historical_typed_nofix_semantic_failure",
     "evidence_status": "historical_typed",
-    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md \u00a7114.",
+    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md §114.",
     "historical_evidence": [
       "The no_fix_code_removal evaluation records install=true, scanner success with residual identifiers, tests=true, and semantic review fail because notevil remains imported and invoked."
     ],
@@ -3206,7 +3206,7 @@
     "expected_output": "Complete: inspect source/diff and emit a security_flag failure because the vulnerable path remains reachable.",
     "input": "Review one no-fix code-removal pivot. Residual target identifiers are nonblocking, but source/diff evidence must prove the vulnerable path is removed; emit a security failure when semantic review fails.",
     "context": [
-      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md \u00a7114.",
+      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md §114.",
       "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false,\n  \"semantic_security_review\": \"fail\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2021-23771\",\n    \"GHSA-8G4M-CJM2-96WQ\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
@@ -3363,7 +3363,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "historical_typed_nofix_test_failure",
     "evidence_status": "historical_typed",
-    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md \u00a7114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
+    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md §114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
     "historical_evidence": [
       "The no-fix stage-two evaluation records install=true, scanner success, and tests_passed=false; failed tests include /rest/chat and test/api/chat.test.ts, while semantic review was inconclusive."
     ],
@@ -3419,7 +3419,7 @@
     "expected_output": "Complete: query tests and emit a security_flag failure while preserving inconclusive semantic and test attribution.",
     "input": "Review one no-fix code-removal pivot and emit a failure when required unit tests fail. Preserve the historical evidence that semantic review and test attribution were inconclusive.",
     "context": [
-      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md \u00a7114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
+      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md §114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
       "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false,\n  \"semantic_security_review\": \"inconclusive\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": false\n}"
     ],
@@ -3583,7 +3583,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "maximum_subagent_tool_call_rounds",
     "evidence_status": "boundary_only",
-    "provenance": "data/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md \u00a7212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
+    "provenance": "data/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md §212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
     "historical_evidence": [
       "MAX_SUBAGENT_TOOL_CALL_ROUNDS is 24; the historical run contained 24 LLM rounds and 29 raw tool spans and ended without a final answer or terminal emit."
     ],
@@ -3635,7 +3635,7 @@
     "expected_output": "Incomplete: the execution bound was reached without a terminal emit_qa_evaluation call.",
     "input": "Complete the assigned QA evaluation for the vulnerability group. A bounded run that reaches 24 tool-call rounds without emit_qa_evaluation is incomplete and must not claim QA completion.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md \u00a7212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
+      "Golden provenance:\ndata/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md §212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
       "Expected QA verdict:\n{\n  \"completed\": false,\n  \"terminal_tool\": \"emit_qa_evaluation\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": null,\n  \"scanner_execution_status\": \"not_run\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": null,\n  \"tests_passed\": null\n}"
     ],
@@ -3686,5 +3686,840 @@
         }
       }
     }
+  },
+  {
+    "case_id": "python-qa-certifi-pass",
+    "eval_type": "qa_critic",
+    "golden_kind": "historical_replay",
+    "evidence_status": "complete",
+    "provenance": "Task task-1 reached qa_passed; install and tests passed; task-scoped scan evidence was complete and cleared CVE-2023-37920.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261016T075629Z_ba0b44c1-7a62-4523-b00e-7797df5e29c9.md",
+        "observation": "Task task-1 reached qa_passed; install and tests passed; task-scoped scan evidence was complete and cleared CVE-2023-37920."
+      }
+    ],
+    "completion_task": "Evaluate task-scoped Python QA for certifi; emit passed=true based on install, covered scan, and test evidence.",
+    "qa_policy": "version_bump",
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:certifi",
+      "vulnerable_component": "certifi",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "2022.12.7",
+      "fixed_version": "2024.7.4",
+      "cve_ids": [
+        "CVE-2023-37920"
+      ],
+      "ghsa_ids": []
+    },
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": true,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "python-qa-certifi-pass"
+      ],
+      "closure_package_names": [
+        "certifi"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
+    },
+    "execution_logs": {
+      "install_log": "pip dependency installation passed.",
+      "scan_summary": "Targeted Dependency-Check evidence is complete.",
+      "test_output": "pytest passed.",
+      "test_exit_code": 0,
+      "test_failure_count": 0
+    },
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "worker_action_summary": "Updated certifi to 2024.7.4.",
+    "expected_qa_verdict": {
+      "passed": true,
+      "failure_category": null
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete the QA audit and emit passed=true with failure_category=None.",
+    "input": "Check the Python remediation of certifi 2022.12.7 to 2024.7.4.",
+    "context": [
+      "Package: certifi",
+      "Scanner identifiers: ['CVE-2023-37920']",
+      "Target scan complete: True",
+      "Python tests passed: True"
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "python-qa-certifi-pass",
+          "passed": true,
+          "failure_category": null,
+          "retry_feedback": null,
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "python-qa-certifi-pass",
+        "passed": true,
+        "failure_category": null,
+        "retry_feedback": null
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "python-qa-certifi-pass",
+            "passed": true,
+            "failure_category": null,
+            "retry_feedback": null,
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "vulnerability_context": {
+          "group_id": "sca:requirements.txt:certifi",
+          "vulnerable_component": "certifi",
+          "file_path": "requirements.txt",
+          "ecosystem": "pypi",
+          "package_version": "2022.12.7",
+          "fixed_version": "2024.7.4",
+          "cve_ids": [
+            "CVE-2023-37920"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "python-qa-certifi-pass"
+          ],
+          "closure_package_names": [
+            "certifi"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
+        },
+        "execution_logs": {
+          "install_log": "pip passed.",
+          "scan_summary": "Dependency-Check passed.",
+          "test_output": "pytest passed.",
+          "test_exit_code": 0,
+          "test_failure_count": 0
+        },
+        "workspace_files": {
+          "requirements.txt": "certifi==2024.7.4\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_app():\n    assert True\n"
+        },
+        "allowed_target_versions": [
+          "2024.7.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "selected_version": "2024.7.4",
+    "dependency_type": "requirements",
+    "project_language": "python"
+  },
+  {
+    "case_id": "python-qa-batch-sqlparse-pass",
+    "eval_type": "qa_critic",
+    "golden_kind": "historical_replay",
+    "evidence_status": "complete",
+    "provenance": "The sqlparse task in the atomic certifi/sqlparse requirements batch reached qa_passed.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T165913Z_9ede9474-e210-431f-bb8b-4def9e00cca8.md",
+        "observation": "The PyGoat root input records sqlparse 0.3.1 with CVE-2023-30608 and GHSA-RRM6-WVJ7-CWH2; the atomic batch selected 0.4.4 and the task passed QA."
+      }
+    ],
+    "completion_task": "Evaluate task-scoped Python QA for sqlparse; emit passed=true based on install, covered scan, and test evidence.",
+    "qa_policy": "version_bump",
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:sqlparse",
+      "vulnerable_component": "sqlparse",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "0.3.1",
+      "fixed_version": "0.4.4",
+      "cve_ids": [
+        "CVE-2021-32839"
+      ],
+      "ghsa_ids": []
+    },
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": true,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "python-qa-batch-sqlparse-pass"
+      ],
+      "closure_package_names": [
+        "sqlparse"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
+    },
+    "execution_logs": {
+      "install_log": "pip dependency installation passed.",
+      "scan_summary": "Targeted Dependency-Check evidence is complete.",
+      "test_output": "pytest passed.",
+      "test_exit_code": 0,
+      "test_failure_count": 0
+    },
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "worker_action_summary": "Updated sqlparse to 0.4.4.",
+    "expected_qa_verdict": {
+      "passed": true,
+      "failure_category": null
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete the QA audit and emit passed=true with failure_category=None.",
+    "input": "Check the Python remediation of sqlparse 0.3.1 to 0.4.4.",
+    "context": [
+      "Package: sqlparse",
+      "Scanner identifiers: ['CVE-2021-32839']",
+      "Target scan complete: True",
+      "Python tests passed: True"
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "python-qa-batch-sqlparse-pass",
+          "passed": true,
+          "failure_category": null,
+          "retry_feedback": null,
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "python-qa-batch-sqlparse-pass",
+        "passed": true,
+        "failure_category": null,
+        "retry_feedback": null
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "python-qa-batch-sqlparse-pass",
+            "passed": true,
+            "failure_category": null,
+            "retry_feedback": null,
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "vulnerability_context": {
+          "group_id": "sca:requirements.txt:sqlparse",
+          "vulnerable_component": "sqlparse",
+          "file_path": "requirements.txt",
+          "ecosystem": "pypi",
+          "package_version": "0.3.1",
+          "fixed_version": "0.4.4",
+          "cve_ids": [
+            "CVE-2023-30608"
+          ],
+          "ghsa_ids": [
+            "GHSA-RRM6-WVJ7-CWH2"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "python-qa-batch-sqlparse-pass"
+          ],
+          "closure_package_names": [
+            "sqlparse"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
+        },
+        "execution_logs": {
+          "install_log": "pip passed.",
+          "scan_summary": "Dependency-Check passed.",
+          "test_output": "pytest passed.",
+          "test_exit_code": 0,
+          "test_failure_count": 0
+        },
+        "workspace_files": {
+          "requirements.txt": "sqlparse==0.4.4\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_app():\n    assert True\n"
+        },
+        "allowed_target_versions": [
+          "0.4.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "selected_version": "0.4.4",
+    "dependency_type": "requirements",
+    "project_language": "python"
+  },
+  {
+    "case_id": "python-qa-incomplete-target-coverage",
+    "eval_type": "qa_critic",
+    "golden_kind": "historical_replay",
+    "evidence_status": "incomplete",
+    "provenance": "Targeted ODC did not provide verifiable coverage for requirements.txt; QA returned inconclusive and did not consume a remediation retry.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261016T074329Z_2da20b0f-ee1b-4365-b63d-04000305773c.md",
+        "observation": "Targeted ODC did not provide verifiable coverage for requirements.txt; QA returned inconclusive and did not consume a remediation retry."
+      }
+    ],
+    "completion_task": "Evaluate task-scoped Python QA for certifi; emit passed=false based on install, covered scan, and test evidence.",
+    "qa_policy": "version_bump",
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:certifi",
+      "vulnerable_component": "certifi",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "2022.12.7",
+      "fixed_version": "2024.7.4",
+      "cve_ids": [
+        "CVE-2023-37920"
+      ],
+      "ghsa_ids": []
+    },
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "unparseable",
+      "target_scanner_cleared": null,
+      "target_remaining_identifiers": [
+        "CVE-2023-37920"
+      ],
+      "tests_passed": true,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": false,
+      "covered_task_ids": [
+        "python-qa-incomplete-target-coverage"
+      ],
+      "closure_package_names": [
+        "certifi"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": "targeted_report_unparseable"
+    },
+    "execution_logs": {
+      "install_log": "pip dependency installation passed.",
+      "scan_summary": "ODC did not cover the staged requirements.txt input.",
+      "test_output": "pytest passed.",
+      "test_exit_code": 0,
+      "test_failure_count": 0
+    },
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "worker_action_summary": "Updated certifi to 2024.7.4.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "security_flag"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete the QA audit and emit passed=false with failure_category=security_flag.",
+    "input": "Check the Python remediation of certifi 2022.12.7 to 2024.7.4.",
+    "context": [
+      "Package: certifi",
+      "Scanner identifiers: ['CVE-2023-37920']",
+      "Target scan complete: False",
+      "Python tests passed: True"
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "python-qa-incomplete-target-coverage",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "Targeted Python scan evidence is incomplete; do not claim clearance.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "python-qa-incomplete-target-coverage",
+        "passed": false,
+        "failure_category": "security_flag",
+        "retry_feedback": "Targeted Python scan evidence is incomplete; do not claim clearance."
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "python-qa-incomplete-target-coverage",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "Targeted Python scan evidence is incomplete; do not claim clearance.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "vulnerability_context": {
+          "group_id": "sca:requirements.txt:certifi",
+          "vulnerable_component": "certifi",
+          "file_path": "requirements.txt",
+          "ecosystem": "pypi",
+          "package_version": "2022.12.7",
+          "fixed_version": "2024.7.4",
+          "cve_ids": [
+            "CVE-2023-37920"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "unparseable",
+          "target_scanner_cleared": null,
+          "target_remaining_identifiers": [
+            "CVE-2023-37920"
+          ],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": false,
+          "covered_task_ids": [
+            "python-qa-incomplete-target-coverage"
+          ],
+          "closure_package_names": [
+            "certifi"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": "targeted_report_unparseable"
+        },
+        "execution_logs": {
+          "install_log": "pip passed.",
+          "scan_summary": "ODC coverage incomplete.",
+          "test_output": "pytest passed.",
+          "test_exit_code": 0,
+          "test_failure_count": 0
+        },
+        "workspace_files": {
+          "requirements.txt": "certifi==2024.7.4\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_app():\n    assert True\n"
+        },
+        "allowed_target_versions": [
+          "2024.7.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "selected_version": "2024.7.4",
+    "dependency_type": "requirements",
+    "project_language": "python"
+  },
+  {
+    "case_id": "python-qa-pyjwt-identifier-remains",
+    "eval_type": "qa_critic",
+    "golden_kind": "historical_replay",
+    "evidence_status": "complete",
+    "provenance": "The PyJWT QA attempt retained CVE-2025-45770 despite install and tests passing; the finding blocked remediation acceptance.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T155736Z_2f772cbc-204b-44b7-a1b5-3f2a0f177a25.md",
+        "observation": "The PyJWT QA attempt retained CVE-2025-45770 despite install and tests passing; the finding blocked remediation acceptance."
+      }
+    ],
+    "completion_task": "Evaluate task-scoped Python QA for pyjwt; emit passed=false based on install, covered scan, and test evidence.",
+    "qa_policy": "version_bump",
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:pyjwt",
+      "vulnerable_component": "pyjwt",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "2.4.0",
+      "fixed_version": "2.13.0",
+      "cve_ids": [
+        "CVE-2025-45770"
+      ],
+      "ghsa_ids": []
+    },
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": false,
+      "target_remaining_identifiers": [
+        "CVE-2025-45770"
+      ],
+      "tests_passed": true,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "python-qa-pyjwt-identifier-remains"
+      ],
+      "closure_package_names": [
+        "pyjwt"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
+    },
+    "execution_logs": {
+      "install_log": "pip dependency installation passed.",
+      "scan_summary": "Targeted Dependency-Check evidence is complete.",
+      "test_output": "pytest passed.",
+      "test_exit_code": 0,
+      "test_failure_count": 0
+    },
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "worker_action_summary": "Updated pyjwt to 2.13.0.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "security_flag"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete the QA audit and emit passed=false with failure_category=security_flag.",
+    "input": "Check the Python remediation of pyjwt 2.4.0 to 2.13.0.",
+    "context": [
+      "Package: pyjwt",
+      "Scanner identifiers: ['CVE-2025-45770']",
+      "Target scan complete: True",
+      "Python tests passed: True"
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "python-qa-pyjwt-identifier-remains",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "The assigned PyPI identifier remains after the update.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "python-qa-pyjwt-identifier-remains",
+        "passed": false,
+        "failure_category": "security_flag",
+        "retry_feedback": "The assigned PyPI identifier remains after the update."
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "python-qa-pyjwt-identifier-remains",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "The assigned PyPI identifier remains after the update.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "vulnerability_context": {
+          "group_id": "sca:requirements.txt:pyjwt",
+          "vulnerable_component": "pyjwt",
+          "file_path": "requirements.txt",
+          "ecosystem": "pypi",
+          "package_version": "2.4.0",
+          "fixed_version": "2.13.0",
+          "cve_ids": [
+            "CVE-2025-45770"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": false,
+          "target_remaining_identifiers": [
+            "CVE-2025-45770"
+          ],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "python-qa-pyjwt-identifier-remains"
+          ],
+          "closure_package_names": [
+            "pyjwt"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
+        },
+        "execution_logs": {
+          "install_log": "pip passed.",
+          "scan_summary": "Dependency-Check passed.",
+          "test_output": "pytest passed.",
+          "test_exit_code": 0,
+          "test_failure_count": 0
+        },
+        "workspace_files": {
+          "requirements.txt": "pyjwt==2.13.0\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_app():\n    assert True\n"
+        },
+        "allowed_target_versions": [
+          "2.13.0"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "selected_version": "2.13.0",
+    "dependency_type": "requirements",
+    "project_language": "python"
+  },
+  {
+    "case_id": "python-qa-tests-fail",
+    "eval_type": "qa_critic",
+    "golden_kind": "synthetic_policy_case",
+    "evidence_status": "complete",
+    "provenance": "Synthetic test failure case verifies the Python QA critic rejects a candidate with failed project tests.",
+    "historical_evidence": [
+      {
+        "source": "synthetic fixture",
+        "observation": "Synthetic test failure case verifies the Python QA critic rejects a candidate with failed project tests."
+      }
+    ],
+    "completion_task": "Evaluate task-scoped Python QA for certifi; emit passed=false based on install, covered scan, and test evidence.",
+    "qa_policy": "version_bump",
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:certifi",
+      "vulnerable_component": "certifi",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "2022.12.7",
+      "fixed_version": "2024.7.4",
+      "cve_ids": [
+        "CVE-2023-37920"
+      ],
+      "ghsa_ids": []
+    },
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": false,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "python-qa-tests-fail"
+      ],
+      "closure_package_names": [
+        "certifi"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
+    },
+    "execution_logs": {
+      "install_log": "pip dependency installation passed.",
+      "scan_summary": "Targeted Dependency-Check evidence is complete.",
+      "test_output": "pytest reported one failing test.",
+      "test_exit_code": 1,
+      "test_failure_count": 1
+    },
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "worker_action_summary": "Updated certifi to 2024.7.4.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "breaking_change"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete the QA audit and emit passed=false with failure_category=breaking_change.",
+    "input": "Check the Python remediation of certifi 2022.12.7 to 2024.7.4.",
+    "context": [
+      "Package: certifi",
+      "Scanner identifiers: ['CVE-2023-37920']",
+      "Target scan complete: True",
+      "Python tests passed: False"
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "python-qa-tests-fail",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "Python unit tests failed after the update.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "python-qa-tests-fail",
+        "passed": false,
+        "failure_category": "breaking_change",
+        "retry_feedback": "Python unit tests failed after the update."
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "python-qa-tests-fail",
+            "passed": false,
+            "failure_category": "breaking_change",
+            "retry_feedback": "Python unit tests failed after the update.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "vulnerability_context": {
+          "group_id": "sca:requirements.txt:certifi",
+          "vulnerable_component": "certifi",
+          "file_path": "requirements.txt",
+          "ecosystem": "pypi",
+          "package_version": "2022.12.7",
+          "fixed_version": "2024.7.4",
+          "cve_ids": [
+            "CVE-2023-37920"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": false,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "python-qa-tests-fail"
+          ],
+          "closure_package_names": [
+            "certifi"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
+        },
+        "execution_logs": {
+          "install_log": "pip passed.",
+          "scan_summary": "Dependency-Check passed.",
+          "test_output": "pytest failed.",
+          "test_exit_code": 1,
+          "test_failure_count": 1
+        },
+        "workspace_files": {
+          "requirements.txt": "certifi==2024.7.4\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_app():\n    assert True\n"
+        },
+        "allowed_target_versions": [
+          "2024.7.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "selected_version": "2024.7.4",
+    "dependency_type": "requirements",
+    "project_language": "python"
   }
 ]

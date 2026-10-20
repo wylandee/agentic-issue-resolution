@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from packaging.version import InvalidVersion, Version
 
 from remediation_engine.tools.fix_planner import SerperLLMResult
 from tests.evals.conftest import EvalSettings
@@ -133,7 +134,9 @@ def _case_package_name(case: dict[str, Any]) -> str | None:
     return None if package.casefold() in _PLACEHOLDER_PACKAGE_NAMES else package
 
 
-def validate_serper_schema(result_dict: dict[str, Any]) -> list[str]:
+def validate_serper_schema(
+    result_dict: dict[str, Any], *, project_language: str | None = None
+) -> list[str]:
     """Validate SerperLLMResult contract and strategy-specific field invariants."""
     violations: list[str] = []
     allowed_fields = {"strategy", "fixed_version", "workaround_snippets", "reasoning"}
@@ -158,6 +161,11 @@ def validate_serper_schema(result_dict: dict[str, Any]) -> list[str]:
     if strategy == "VERSION_BUMP":
         if not isinstance(fixed_ver, str) or not fixed_ver.strip():
             violations.append("VERSION_BUMP strategy requires non-empty fixed_version")
+        elif str(project_language or "").casefold() in {"python", "python3"}:
+            try:
+                Version(fixed_ver.strip())
+            except InvalidVersion:
+                violations.append(f"fixed_version '{fixed_ver}' is not valid PEP 440")
         elif not _SEMVER_RE.fullmatch(fixed_ver.strip()):
             violations.append(f"fixed_version '{fixed_ver}' is not valid semver")
         if snippets not in (None, []):
@@ -240,23 +248,38 @@ def validate_version_supported(
     candidate = str(fixed_version).strip()
     if not _SEMVER_RE.fullmatch(candidate):
         return False
+    return _version_has_package_security_evidence(candidate, source_content, package_name)
 
-    clean_version = candidate.lstrip("vV")
+
+def validate_python_version_supported(
+    fixed_version: str | None,
+    source_content: str,
+    package_name: str | None = None,
+) -> bool:
+    """Validate a PyPI version with PEP 440 and the same advisory evidence rule."""
+    if not fixed_version:
+        return True
+    try:
+        Version(str(fixed_version).strip())
+    except InvalidVersion:
+        return False
+    return _version_has_package_security_evidence(fixed_version, source_content, package_name)
+
+
+def _version_has_package_security_evidence(
+    fixed_version: str,
+    source_content: str,
+    package_name: str | None,
+) -> bool:
+    """Check that a version's nearby security claim refers to the target package."""
+    clean_version = str(fixed_version).strip().lstrip("vV")
     version_pattern = re.compile(
         rf"(?<![0-9A-Za-z-]){re.escape(clean_version)}(?![0-9A-Za-z-])",
         re.IGNORECASE,
     )
     package = package_name.strip().strip(chr(96)) if isinstance(package_name, str) else ""
     require_package = bool(package) and package.casefold() not in _PLACEHOLDER_PACKAGE_NAMES
-    security_markers = (
-        "fix",
-        "fixed",
-        "patched",
-        "upgrade",
-        "update",
-        "remediat",
-        "security",
-    )
+    security_markers = ("fix", "fixed", "patched", "upgrade", "update", "remediat", "security")
     package_pattern = re.compile(re.escape(package), re.IGNORECASE)
     competing_package_version = re.compile(
         r"(?<![A-Za-z0-9@])([A-Za-z0-9@][A-Za-z0-9_./@-]*-[A-Za-z0-9_./@-]*)"
@@ -291,16 +314,12 @@ def validate_version_supported(
             )
             if competing is not None:
                 continue
-            has_competing_backtick = False
-            for mentioned in backtick_package.finditer(region):
-                candidate = mentioned.group(1).strip()
-                if (
-                    candidate.casefold() != package.casefold()
-                    and re.search(r"[-/@]", candidate)
-                    and not candidate.upper().startswith(("CVE-", "GHSA-"))
-                ):
-                    has_competing_backtick = True
-                    break
+            has_competing_backtick = any(
+                candidate.group(1).strip().casefold() != package.casefold()
+                and re.search(r"[-/@]", candidate.group(1).strip())
+                and not candidate.group(1).strip().upper().startswith(("CVE-", "GHSA-"))
+                for candidate in backtick_package.finditer(region)
+            )
             if has_competing_backtick:
                 continue
         return True
@@ -310,13 +329,32 @@ def validate_version_supported(
 def validate_case_evidence(case: dict[str, Any], result: dict[str, Any]) -> list[str]:
     """Validate strategy-specific evidence against the relevant page set."""
     source = _case_source_content(case)
-    violations = validate_serper_schema(result)
-    if result.get("strategy") == "VERSION_BUMP" and not validate_version_supported(
-        result.get("fixed_version"),
-        source,
-        package_name=_case_package_name(case),
-    ):
-        violations.append("fixed_version is not semver-valid or security-supported by the pages")
+    replay = case.get("replay", {})
+    replay_input = replay.get("input", {}) if isinstance(replay, dict) else {}
+    project_language = (
+        replay_input.get("project_language", case.get("project_language"))
+        if isinstance(replay_input, dict)
+        else case.get("project_language")
+    )
+    violations = validate_serper_schema(result, project_language=str(project_language or ""))
+    if result.get("strategy") == "VERSION_BUMP":
+        replay_input = case.get("replay", {}).get("input", {})
+        project_language = (
+            replay_input.get("project_language", case.get("project_language"))
+            if isinstance(replay_input, dict)
+            else case.get("project_language")
+        )
+        validator = (
+            validate_python_version_supported
+            if str(project_language or "").casefold() in {"python", "python3"}
+            else validate_version_supported
+        )
+        if not validator(
+            result.get("fixed_version"),
+            source,
+            package_name=_case_package_name(case),
+        ):
+            violations.append("fixed_version is not valid or security-supported by the pages")
     if result.get("strategy") == "CODE_WORKAROUND":
         violations.extend(
             f"workaround snippet is not meaningfully supported: {snippet}"
@@ -358,7 +396,15 @@ class TestFixPlannerEval:
         expected_ver = case.get("expected_fixed_version")
 
         # 1. Deterministic schema & value assertions
-        schema_violations = validate_serper_schema(result)
+        replay_input = case.get("replay", {}).get("input", {})
+        project_language = (
+            replay_input.get("project_language", case.get("project_language"))
+            if isinstance(replay_input, dict)
+            else case.get("project_language")
+        )
+        schema_violations = validate_serper_schema(
+            result, project_language=str(project_language or "")
+        )
         assert not schema_violations, f"Case '{case_id}' failed schema: {schema_violations}"
 
         assert result.get("strategy") == expected_strat, (
@@ -493,10 +539,19 @@ class TestFixPlannerEval:
         snippets = result.get("workaround_snippets")
 
         # 1. Deterministic version substring check
-        version_in_source = validate_version_supported(
-            fixed_ver,
-            source_content,
-            package_name=_case_package_name(case),
+        replay_input = case.get("replay", {}).get("input", {})
+        project_language = (
+            replay_input.get("project_language", case.get("project_language"))
+            if isinstance(replay_input, dict)
+            else case.get("project_language")
+        )
+        version_validator = (
+            validate_python_version_supported
+            if str(project_language or "").casefold() in {"python", "python3"}
+            else validate_version_supported
+        )
+        version_in_source = version_validator(
+            fixed_ver, source_content, package_name=_case_package_name(case)
         )
         assert version_in_source, (
             f"Case '{case_id}' extracted version '{fixed_ver}' which is not in source page content!"
@@ -535,15 +590,20 @@ class TestFixPlannerEval:
 
 
 def test_fix_planner_dataset_has_realistic_structured_pages() -> None:
-    """The Phase 2 dataset has 15 page-backed cases with sufficient context."""
-    assert len(_FP_CASES) == 15
+    """Keep full web captures and compact, explicitly trajectory-backed evidence."""
+    assert len(_FP_CASES) == 18
     assert all(case.get("expected_tools") == [] for case in _FP_CASES)
     word_counts: list[int] = []
     for case in _FP_CASES:
         pages = case.get("pages")
         assert isinstance(pages, list) and pages
         assert all(set(page) >= {"url", "content"} for page in pages)
-        word_counts.extend(len(str(page["content"]).split()) for page in pages)
+        case_counts = [len(str(page["content"]).split()) for page in pages]
+        if case.get("trajectory_evidence_compact"):
+            assert case.get("historical_evidence")
+            assert min(case_counts) >= 30
+        else:
+            word_counts.extend(case_counts)
     assert min(word_counts) >= 500
     assert sum(count > 2_000 for count in word_counts) >= 3
     multi_package_cases = [
@@ -601,3 +661,13 @@ def test_fix_planner_evaluator_catches_hallucinated_version() -> None:
     )
     assert validate_version_supported("1.2.3", package_source, package_name="target-lib")
     assert not validate_version_supported("9.9.9", package_source, package_name="target-lib")
+
+    python_source = (
+        "target-lib security fix in version 2.0rc1. "
+        "The helper-lib version 9.9.9 security fix addresses another issue."
+    )
+    assert validate_python_version_supported("2.0rc1", python_source, package_name="target-lib")
+    assert not validate_python_version_supported("9.9.9", python_source, package_name="target-lib")
+    assert not validate_python_version_supported(
+        "not-a-version", python_source, package_name="target-lib"
+    )

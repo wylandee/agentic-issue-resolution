@@ -672,5 +672,188 @@
         ]
       }
     }
+  },
+  {
+    "case_id": "python-fix-planner-certifi",
+    "eval_type": "fix_planner",
+    "provenance": "PyGoat trajectory evidence for certifi CVE-2024-39689",
+    "source_page_content": "# PyPI security advisory for certifi\n\nThe installed certifi release is affected by the reported security issue. The security fix is available in certifi 2024.7.4. Upgrade to 2024.7.4 or later.",
+    "expected_strategy": "VERSION_BUMP",
+    "expected_fixed_version": "2024.7.4",
+    "expected_workaround_snippets": [],
+    "pages": [
+      {
+        "url": "trajectory://phase5_20261016T075629Z_ba0b44c1-7a62-4523-b00e-7797df5e29c9#certifi",
+        "content": "Historical PyGoat evidence: certifi was installed at 2022.12.7. The scan record identifies CVE-2024-39689 and GHSA-248V-346W-9CWC; the finding states that certifi releases before 2024.7.4 retain GLOBALTRUST root certificates. The recorded remediation set certifi==2024.7.4 in requirements.txt, and task-scoped QA passed. This is the exact historical candidate observed in the trajectory."
+      }
+    ],
+    "input": "Extract the Python remediation guidance for certifi from the supplied advisory page.",
+    "context": [
+      "Package: certifi",
+      "Project language: Python",
+      "Task-scoped QA verified certifi==2024.7.4 after the update. The trajectory does not itself establish that the fix planner extracted this version from a page; page wording below is a fixture built from the observed fixed-version evidence."
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": {
+        "strategy": "VERSION_BUMP",
+        "fixed_version": "2024.7.4",
+        "workaround_snippets": []
+      },
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "package_name": "certifi",
+        "vuln_id": "CVE-2024-39689",
+        "pages": [
+          {
+            "url": "https://example.invalid/python-fix-planner-certifi",
+            "content": "# PyPI security advisory for certifi\n\nThe installed certifi release is affected by the reported security issue. The security fix is available in certifi 2024.7.4. Upgrade to 2024.7.4 or later."
+          }
+        ],
+        "vulnerability_context": {
+          "cve_ids": [
+            "CVE-2023-37920",
+            "CVE-2024-39689"
+          ],
+          "ghsa_ids": [
+            "GHSA-XQR8-7JWR-RHP7",
+            "GHSA-248V-346W-9CWC"
+          ]
+        }
+      }
+    },
+    "expected_output": "{\"strategy\":\"VERSION_BUMP\",\"fixed_version\":\"2024.7.4\",\"workaround_snippets\":[]}",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261016T075629Z_ba0b44c1-7a62-4523-b00e-7797df5e29c9.md",
+        "observation": "Task-scoped QA verified certifi==2024.7.4 after the update. The trajectory does not itself establish that the fix planner extracted this version from a page; page wording below is a fixture built from the observed fixed-version evidence."
+      }
+    ],
+    "provenance_note": "Task-scoped QA verified certifi==2024.7.4 after the update. The trajectory does not itself establish that the fix planner extracted this version from a page; page wording below is a fixture built from the observed fixed-version evidence.",
+    "golden_kind": "historical_trajectory_replay",
+    "evaluation_note": "The recorded task changed certifi 2022.12.7 to 2024.7.4 and task-scoped QA passed. The fixture labels this as trajectory-derived candidate evidence, not a captured web fetch.",
+    "trajectory_evidence_compact": true
+  },
+  {
+    "case_id": "python-fix-planner-pyyaml-historical",
+    "eval_type": "fix_planner",
+    "provenance": "PyGoat PyYAML trajectory evidence",
+    "source_page_content": "# PyPI security advisory for pyyaml\n\nThe installed pyyaml release is affected by the reported security issue. The security fix is available in pyyaml 6.0rc1. Upgrade to 6.0rc1 or later.",
+    "expected_strategy": "VERSION_BUMP",
+    "expected_fixed_version": "6.0.3",
+    "expected_workaround_snippets": [],
+    "pages": [
+      {
+        "url": "trajectory://phase5_20261019T120726Z_cdef0f21-e8b5-44bd-a160-dbcd055766b6#pyyaml",
+        "content": "Historical PyGoat evidence: requirements.txt declared PyYAML 5.1. The scanner reported CVE-2019-20477, CVE-2020-14343, and CVE-2020-1747. The historical security remediation upgraded PyYAML to 6.0.3 in requirements.txt; task-scoped QA passed. This fixture preserves that observed target and does not claim that 6.0.3 was the first version to fix CVE-2020-14343."
+      }
+    ],
+    "input": "Extract the Python remediation guidance for pyyaml from the supplied advisory page.",
+    "context": [
+      "Package: pyyaml",
+      "Project language: Python",
+      "No historical trace supports this prerelease. The case checks PEP 440 acceptance and package-specific page evidence."
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": {
+        "strategy": "VERSION_BUMP",
+        "fixed_version": "6.0.3",
+        "workaround_snippets": []
+      },
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "package_name": "pyyaml",
+        "vuln_id": "CVE-2020-14343",
+        "pages": [
+          {
+            "url": "https://example.invalid/python-fix-planner-pyyaml-prerelease",
+            "content": "# PyPI security advisory for pyyaml\n\nThe installed pyyaml release is affected by the reported security issue. The security fix is available in pyyaml 6.0rc1. Upgrade to 6.0rc1 or later."
+          }
+        ],
+        "vulnerability_context": {
+          "cve_ids": [
+            "CVE-2019-20477",
+            "CVE-2020-14343",
+            "CVE-2020-1747"
+          ]
+        }
+      }
+    },
+    "expected_output": "{\"strategy\":\"VERSION_BUMP\",\"fixed_version\":\"6.0rc1\",\"workaround_snippets\":[]}",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T120726Z_cdef0f21-e8b5-44bd-a160-dbcd055766b6.md",
+        "observation": "The PyYAML task changed the 5.1 declaration to 6.0.3 and passed task-scoped QA; the root input records all three PyYAML CVEs."
+      }
+    ],
+    "provenance_note": "No historical trace supports this prerelease. The case checks PEP 440 acceptance and package-specific page evidence.",
+    "golden_kind": "historical_trajectory_replay",
+    "evaluation_note": "The selected 6.0.3 target and passing task QA come from the historical requirements update. CVE-2020-14343 itself has an earlier fixed release; this fixture tests extraction of the recorded safe target, not the first upstream fix.",
+    "trajectory_evidence_compact": true
+  },
+  {
+    "case_id": "python-fix-planner-workaround",
+    "eval_type": "fix_planner",
+    "provenance": "PyGoat PyJWT workaround attempt, not an accepted remediation",
+    "source_page_content": "# PyPI security advisory for pyjwt\n\nThe installed pyjwt release is affected by the reported security issue. As a mitigation, reject unsupported critical JOSE header parameters before trusting decoded claims.",
+    "expected_strategy": "CODE_WORKAROUND",
+    "expected_fixed_version": null,
+    "expected_workaround_snippets": [
+      "Reject tokens with unsupported critical JOSE header parameters before trusting decoded claims."
+    ],
+    "pages": [
+      {
+        "url": "trajectory://phase5_20261019T155736Z_2f772cbc-204b-44b7-a1b5-3f2a0f177a25#pyjwt-workaround-plan",
+        "content": "The PyGoat trace records the proposed hypothesis: the view directly trusts jwt.decode on an attacker-controlled cookie without compensating validation of the JWS header; adding a local pre-decode header check can reject tokens carrying crit entries that PyJWT may otherwise accept. The same trajectory records that the workaround failed validation and was not accepted as a remediation. Reject tokens with unsupported critical JOSE header parameters before trusting decoded claims."
+      }
+    ],
+    "input": "Extract the Python remediation guidance for pyjwt from the supplied advisory page.",
+    "context": [
+      "Package: pyjwt",
+      "Project language: Python",
+      "The historical PyJWT trace records a proposed local crit-header check; the workaround did not pass validation and was not accepted as a remediation."
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": {
+        "strategy": "CODE_WORKAROUND",
+        "fixed_version": null,
+        "workaround_snippets": [
+          "Reject tokens with unsupported critical JOSE header parameters before trusting decoded claims."
+        ]
+      },
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "package_name": "pyjwt",
+        "vuln_id": "CVE-2026-32597",
+        "pages": [
+          {
+            "url": "https://example.invalid/python-fix-planner-workaround",
+            "content": "# PyPI security advisory for pyjwt\n\nThe installed pyjwt release is affected by the reported security issue. As a mitigation, reject unsupported critical JOSE header parameters before trusting decoded claims."
+          }
+        ]
+      }
+    },
+    "expected_output": "{\"strategy\":\"CODE_WORKAROUND\",\"fixed_version\":null,\"workaround_snippets\":[\"Reject tokens with unsupported critical JOSE header parameters before trusting decoded claims.\"]}",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T155736Z_2f772cbc-204b-44b7-a1b5-3f2a0f177a25.md",
+        "observation": "The historical PyJWT trace records a proposed local crit-header check; the workaround did not pass validation and was not accepted as a remediation."
+      }
+    ],
+    "provenance_note": "The historical PyJWT trace records a proposed local crit-header check; the workaround did not pass validation and was not accepted as a remediation.",
+    "golden_kind": "historical_analogue",
+    "evaluation_note": "The trace records a proposed local crit-header check, followed by failed workaround validation. The fixture tests evidence extraction only and must not imply remediation success.",
+    "trajectory_evidence_compact": true
   }
 ]

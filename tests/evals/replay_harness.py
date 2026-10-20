@@ -33,6 +33,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.runtime.path_policy import normalize_workspace_path
 
 
@@ -727,6 +728,7 @@ def build_system_context(case: Mapping[str, Any]) -> SystemContext:
         if isinstance(raw_tags, Mapping)
         else {}
     )
+    project_language = _case_project_language(case)
     return SystemContext(
         repo_url=raw.get("repo_url"),
         base_ref=raw.get("base_ref"),
@@ -734,10 +736,38 @@ def build_system_context(case: Mapping[str, Any]) -> SystemContext:
         environment=environment,
         deployment_os=deployment_os,
         public_facing=raw.get("public_facing", public_facing),
-        primary_language=raw.get("primary_language", "javascript"),
+        primary_language=raw.get(
+            "primary_language",
+            "python" if project_language == ProjectLanguage.PYTHON else "javascript",
+        ),
         deployment_architecture=raw.get("deployment_architecture", "service"),
         data_sensitivity=raw.get("data_sensitivity", sensitivity),
         tags=tags,
+    )
+
+
+def _case_project_language(case: Mapping[str, Any]) -> ProjectLanguage:
+    """Resolve the execution language recorded on an evaluation case."""
+    replay = case.get("replay", {})
+    replay_input = replay.get("input", {}) if isinstance(replay, Mapping) else {}
+    raw_language = (
+        replay_input.get("project_language", case.get("project_language"))
+        if isinstance(replay_input, Mapping)
+        else case.get("project_language")
+    )
+    vulnerability = (
+        replay_input.get("vulnerability_context", {}) if isinstance(replay_input, Mapping) else {}
+    )
+    if not raw_language and isinstance(vulnerability, Mapping):
+        raw_language = vulnerability.get("project_language")
+    if not raw_language and isinstance(vulnerability, Mapping):
+        raw_language = (
+            "python" if str(vulnerability.get("ecosystem", "")).casefold() == "pypi" else None
+        )
+    return (
+        ProjectLanguage.PYTHON
+        if str(raw_language or "").casefold() in {"python", "python3"}
+        else ProjectLanguage.NODEJS
     )
 
 
@@ -816,6 +846,8 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
     except ValueError:
         severity = Severity.MEDIUM
     issue_id = f"{group_id}:issue"
+    project_language = _case_project_language(case)
+    ecosystem = "pypi" if project_language == ProjectLanguage.PYTHON else "npm"
     issue = VulnerabilityIssue(
         id=uuid5(NAMESPACE_URL, issue_id),
         finding_id=issue_id,
@@ -827,7 +859,7 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
         file_path=file_path,
         package_name=package,
         package_version=version or "0.0.0",
-        ecosystem="npm",
+        ecosystem=ecosystem,
         message=scenario,
     )
     epss_matches = [
@@ -890,6 +922,12 @@ def seed_replay_files(case: Mapping[str, Any]) -> dict[str, str]:
     files = raw.get("workspace_files", {}) if isinstance(raw, Mapping) else {}
     if isinstance(files, Mapping) and files:
         return {str(path): str(content) for path, content in files.items()}
+    if _case_project_language(case) == ProjectLanguage.PYTHON:
+        return {
+            "requirements.txt": "replay-package==1.0.0\n",
+            "src/replay.py": "def replay() -> bool:\n    return True\n",
+            "tests/test_replay.py": "def test_replay() -> None:\n    assert True\n",
+        }
     return {
         "package.json": json.dumps(
             {"name": "eval-replay", "version": "1.0.0", "dependencies": {}},

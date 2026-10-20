@@ -1051,5 +1051,410 @@
         ]
       }
     }
+  },
+  {
+    "case_id": "python-update-certifi",
+    "eval_type": "update_subagent",
+    "proposal": "python_requirement_pin",
+    "golden_kind": "historical_replay",
+    "provenance": "PyGoat PyPI trajectory",
+    "evaluation_note": "The certified update changed only requirements.txt; the task was QA-passed. The final incremental scan warning remains separate from task QA.",
+    "supervisor_instruction": "Update certifi from 2022.12.7 to the exact Supervisor-approved version 2024.7.4 in requirements.txt. Do not change other declarations.",
+    "target_package_name": "certifi",
+    "selected_version": "2024.7.4",
+    "dependency_type": "requirements",
+    "manifest_path": "requirements.txt",
+    "is_retry": false,
+    "repository_map": "requirements.txt contains the selected PyPI declaration.",
+    "expected_output": "The Python update worker sets certifi==2024.7.4 in requirements.txt and reports the committed change.",
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Apply the committed Python dependency update for certifi: 2022.12.7 to 2024.7.4.",
+    "context": [
+      "Package: certifi",
+      "Approved version: 2024.7.4",
+      "Ecosystem: PyPI"
+    ],
+    "expected_tools": [
+      {
+        "name": "modify_and_validate_python_dependency",
+        "args": {
+          "package_name": "certifi",
+          "target_version": "2024.7.4",
+          "dependency_type": "requirements",
+          "manifest_path": "requirements.txt"
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "APPLIED: certifi was updated to 2024.7.4 in requirements.txt.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_python_dependency",
+          "args": {
+            "package_name": "certifi",
+            "target_version": "2024.7.4",
+            "dependency_type": "requirements",
+            "manifest_path": "requirements.txt"
+          },
+          "output": "SUCCESS: Updated requirements.txt with certifi==2024.7.4; pip resolution passed."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "workspace_files": {
+          "requirements.txt": "certifi==2022.12.7\npytest==7.4.0\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_ready():\n    assert True\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "2024.7.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261016T075629Z_ba0b44c1-7a62-4523-b00e-7797df5e29c9.md",
+        "observation": "The certified update changed only requirements.txt; the task was QA-passed. The final incremental scan warning remains separate from task QA."
+      }
+    ]
+  },
+  {
+    "case_id": "python-update-pyyaml",
+    "eval_type": "update_subagent",
+    "proposal": "python_requirement_pin",
+    "golden_kind": "historical_replay",
+    "provenance": "PyGoat PyPI trajectory",
+    "evaluation_note": "The requirements declaration was upgraded from PyYAML 5.1 to 6.0.3 and task-scoped QA passed.",
+    "supervisor_instruction": "Update pyyaml from 5.1 to the exact Supervisor-approved version 6.0.3 in requirements.txt. Do not change other declarations.",
+    "target_package_name": "pyyaml",
+    "selected_version": "6.0.3",
+    "dependency_type": "requirements",
+    "manifest_path": "requirements.txt",
+    "is_retry": false,
+    "repository_map": "requirements.txt contains the selected PyPI declaration.",
+    "expected_output": "The Python update worker sets pyyaml==6.0.3 in requirements.txt and reports the committed change.",
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Apply the committed Python dependency update for pyyaml: 5.1 to 6.0.3.",
+    "context": [
+      "Package: pyyaml",
+      "Approved version: 6.0.3",
+      "Ecosystem: PyPI"
+    ],
+    "expected_tools": [
+      {
+        "name": "modify_and_validate_python_dependency",
+        "args": {
+          "package_name": "pyyaml",
+          "target_version": "6.0.3",
+          "dependency_type": "requirements",
+          "manifest_path": "requirements.txt"
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "APPLIED: pyyaml was updated to 6.0.3 in requirements.txt.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_python_dependency",
+          "args": {
+            "package_name": "pyyaml",
+            "target_version": "6.0.3",
+            "dependency_type": "requirements",
+            "manifest_path": "requirements.txt"
+          },
+          "output": "SUCCESS: Updated requirements.txt with pyyaml==6.0.3; pip resolution passed."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "workspace_files": {
+          "requirements.txt": "pyyaml==5.1\npytest==7.4.0\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_ready():\n    assert True\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "6.0.3"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T120726Z_cdef0f21-e8b5-44bd-a160-dbcd055766b6.md",
+        "observation": "The requirements declaration was upgraded from PyYAML 5.1 to 6.0.3 and task-scoped QA passed."
+      }
+    ]
+  },
+  {
+    "case_id": "python-update-atomic-certifi-sqlparse",
+    "eval_type": "update_subagent",
+    "proposal": "python_requirement_pin",
+    "golden_kind": "historical_replay",
+    "provenance": "PyGoat PyPI trajectory",
+    "evaluation_note": "Historical two-package batch changed certifi and sqlparse in one requirements.txt transaction; both tasks passed QA.",
+    "supervisor_instruction": "Update certifi from 2022.12.7 to the exact Supervisor-approved version 2024.7.4 in requirements.txt. Do not change other declarations.",
+    "target_package_name": "certifi",
+    "selected_version": "2024.7.4",
+    "dependency_type": "requirements",
+    "manifest_path": "requirements.txt",
+    "is_retry": false,
+    "repository_map": "requirements.txt contains the selected PyPI declaration.",
+    "expected_output": "The Python update worker sets certifi==2024.7.4 in requirements.txt and reports the committed change.",
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Apply the committed Python dependency update for certifi: 2022.12.7 to 2024.7.4.",
+    "context": [
+      "Package: certifi",
+      "Approved version: 2024.7.4",
+      "Ecosystem: PyPI"
+    ],
+    "expected_tools": [
+      {
+        "name": "modify_batch_python_dependencies",
+        "args": {}
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "APPLIED: certifi was updated to 2024.7.4 in requirements.txt.",
+      "actual_tools": [
+        {
+          "name": "modify_batch_python_dependencies",
+          "args": {},
+          "output": "SUCCESS: Applied the Supervisor-committed Python multi-package action for the recorded cluster; every declaration and resolver check passed."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "workspace_files": {
+          "requirements.txt": "certifi==2022.12.7\nsqlparse==0.3.1\npytest==7.4.0\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_ready():\n    assert True\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "2024.7.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ],
+        "batch_tasks": [
+          {
+            "task_id": "python-update-atomic-certifi-sqlparse-certifi",
+            "target_package_name": "certifi",
+            "selected_version": "2024.7.4",
+            "dependency_type": "requirements",
+            "manifest_path": "requirements.txt",
+            "input": "certifi 2022.12.7 to 2024.7.4",
+            "supervisor_instruction": "Update certifi to the exact authorized version 2024.7.4.",
+            "allowed_target_versions": [
+              "2024.7.4"
+            ],
+            "allowed_dependency_types": [
+              "requirements"
+            ]
+          },
+          {
+            "task_id": "python-update-atomic-certifi-sqlparse-sqlparse",
+            "target_package_name": "sqlparse",
+            "selected_version": "0.4.4",
+            "dependency_type": "requirements",
+            "manifest_path": "requirements.txt",
+            "input": "sqlparse 0.3.1 to 0.4.4",
+            "supervisor_instruction": "Update sqlparse to the exact authorized version 0.4.4.",
+            "allowed_target_versions": [
+              "0.4.4"
+            ],
+            "allowed_dependency_types": [
+              "requirements"
+            ]
+          }
+        ]
+      }
+    },
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T165913Z_9ede9474-e210-431f-bb8b-4def9e00cca8.md",
+        "observation": "Historical two-package batch changed certifi and sqlparse in one requirements.txt transaction; both tasks passed QA."
+      }
+    ]
+  },
+  {
+    "case_id": "python-update-reject-unauthorized-version",
+    "eval_type": "update_subagent",
+    "proposal": "python_requirement_pin",
+    "golden_kind": "synthetic_policy_case",
+    "provenance": "Synthetic authorization boundary",
+    "evaluation_note": "Synthetic replay proves the worker rejects a model-proposed version outside the committed candidate set, then applies the authorized version.",
+    "supervisor_instruction": "Update certifi from 2022.12.7 to the exact Supervisor-approved version 2024.7.4 in requirements.txt. Do not change other declarations.",
+    "target_package_name": "certifi",
+    "selected_version": "2024.7.4",
+    "dependency_type": "requirements",
+    "manifest_path": "requirements.txt",
+    "is_retry": false,
+    "repository_map": "requirements.txt contains the selected PyPI declaration.",
+    "expected_output": "The Python update worker sets certifi==2024.7.4 in requirements.txt and reports the committed change.",
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "input": "Apply the committed Python dependency update for certifi: 2022.12.7 to 2024.7.4.",
+    "context": [
+      "Package: certifi",
+      "Approved version: 2024.7.4",
+      "Ecosystem: PyPI"
+    ],
+    "expected_tools": [
+      {
+        "name": "modify_and_validate_python_dependency",
+        "args": {
+          "package_name": "certifi",
+          "target_version": "2024.7.4",
+          "dependency_type": "requirements",
+          "manifest_path": "requirements.txt"
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "APPLIED: certifi was updated to 2024.7.4 in requirements.txt.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_python_dependency",
+          "args": {
+            "package_name": "certifi",
+            "target_version": "2025.0.0",
+            "dependency_type": "requirements",
+            "manifest_path": "requirements.txt"
+          },
+          "output": "ERROR: Target version 2025.0.0 is not in the committed allowed version set."
+        },
+        {
+          "name": "modify_and_validate_python_dependency",
+          "args": {
+            "package_name": "certifi",
+            "target_version": "2024.7.4",
+            "dependency_type": "requirements",
+            "manifest_path": "requirements.txt"
+          },
+          "output": "SUCCESS: Updated requirements.txt with certifi==2024.7.4; pip resolution passed."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "workspace_files": {
+          "requirements.txt": "certifi==2022.12.7\npytest==7.4.0\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_ready():\n    assert True\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "2024.7.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "historical_evidence": [
+      {
+        "source": "Python worker authorization contract",
+        "observation": "Workers may execute only versions present in the committed attempt candidate set."
+      }
+    ]
+  },
+  {
+    "case_id": "python-update-pip-resolution-failure",
+    "eval_type": "update_subagent",
+    "proposal": "python_requirement_pin",
+    "golden_kind": "synthetic_policy_case",
+    "provenance": "Synthetic Python worker boundary case",
+    "evaluation_note": "The committed PyPI version is authorized, but pip resolution fails; the worker must preserve the original requirements pin and report surrender.",
+    "supervisor_instruction": "Update certifi from 2022.12.7 to the exact Supervisor-approved version 2024.7.4 in requirements.txt. Do not change other declarations.",
+    "target_package_name": "certifi",
+    "selected_version": "2024.7.4",
+    "dependency_type": "requirements",
+    "manifest_path": "requirements.txt",
+    "is_retry": false,
+    "repository_map": "requirements.txt contains the selected PyPI declaration.",
+    "expected_output": "The worker preserves requirements.txt and reports that the authorized dependency update failed pip resolution.",
+    "changed_files": [],
+    "action_status": "SURRENDER",
+    "expected_completion_pass": false,
+    "input": "Apply the committed Python dependency update for certifi: 2022.12.7 to 2024.7.4, but stop if pip resolution fails.",
+    "context": [
+      "Package: certifi",
+      "Approved version: 2024.7.4",
+      "Ecosystem: PyPI"
+    ],
+    "expected_tools": [
+      {
+        "name": "modify_and_validate_python_dependency",
+        "args": {
+          "package_name": "certifi",
+          "target_version": "2024.7.4",
+          "dependency_type": "requirements",
+          "manifest_path": "requirements.txt"
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "SURRENDER: pip resolution failed; requirements.txt was restored.",
+      "actual_tools": [
+        {
+          "name": "modify_and_validate_python_dependency",
+          "args": {
+            "package_name": "certifi",
+            "target_version": "2024.7.4",
+            "dependency_type": "requirements",
+            "manifest_path": "requirements.txt"
+          },
+          "output": "ERROR: MANIFEST_SYNC_FAILED: pip dry-run rejected the updated requirements set; transaction rolled back."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "workspace_files": {
+          "requirements.txt": "certifi==2022.12.7\npytest==7.4.0\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_ready():\n    assert True\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "2024.7.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "historical_evidence": []
   }
 ]
