@@ -338,6 +338,16 @@ def _supported(
         if (
             target.is_finding_backed
             and decision is not None
+            and strategy == "no_fix"
+            and decision_strategy == "no_fix"
+            and decision.selected_version is None
+        ):
+            # A committed no-fix task has no package mutation variable, but its
+            # mitigation worker still needs a dispatchable unresolved task.
+            return False, None, True
+        if (
+            target.is_finding_backed
+            and decision is not None
             and strategy in {"code_workaround", "workaround"}
             and decision_strategy in {"code_workaround", "workaround"}
             and bool(decision.selected_plan_issue_ids)

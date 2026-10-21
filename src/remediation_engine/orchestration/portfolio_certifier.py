@@ -748,7 +748,18 @@ def _certify_python_candidate(
             for coverage_id in batch.unresolved_coverage_ids
         ),
     }
-    if selected_batch_coverage["unresolved"] or selected_batch_coverage["workaround"]:
+    no_fix_occurrences = {
+        target.occurrence_id for target in prepared.targets if target.strategy == "no_fix"
+    }
+    authorized_no_fix_unresolved = {
+        finding.coverage_id
+        for finding in prepared.findings
+        if finding.target_occurrence_id in no_fix_occurrences
+    }
+    unexpected_unresolved = (
+        set(selected_batch_coverage["unresolved"]) - authorized_no_fix_unresolved
+    )
+    if unexpected_unresolved or selected_batch_coverage["workaround"]:
         raise _CertificationUnknown(
             "Python assignment left finding coverage unresolved or workaround-only"
         )

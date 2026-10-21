@@ -631,7 +631,8 @@ def prepare_python_portfolio_problem(
     updates enter the common portfolio. A Pipfile parent is dispatchable only
     when the lockfile, declaration, ancestry, and PyPI ``Requires-Dist`` proof
     agree. This adapter never invents npm lock records or trusts a worker hint
-    as a security floor.
+    as a security floor. Committed no-fix tasks are retained without a version
+    floor so their unresolved coverage can reach the mitigation worker.
     """
     from remediation_engine.orchestration.tools_manifest_python import (
         _declaration_is_editable,
@@ -825,25 +826,30 @@ def prepare_python_portfolio_problem(
         except ValueError:
             diagnostics.append(f"task {task.task_id!r} has no valid installed PEP 440 version")
             continue
-        fixed_versions = sorted(
-            {
-                floor
-                for issue in group.issues
-                if (issue.cve_id or issue.ghsa_id)
-                and (floor := _python_scanner_fixed_version(issue))
-            }
-        )
-        if not fixed_versions:
-            diagnostics.append(
-                f"task {task.task_id!r} has no scanner-backed fixed-version floor"
+        no_fix_mitigation = task.no_fix_stage is not None
+        floor: str | None = None
+        if not no_fix_mitigation:
+            fixed_versions = sorted(
+                {
+                    floor
+                    for issue in group.issues
+                    if (issue.cve_id or issue.ghsa_id)
+                    and (floor := _python_scanner_fixed_version(issue))
+                }
             )
-            continue
-        try:
-            normalized_floors = [_python_numeric_solver_version(value) for value in fixed_versions]
-            floor = max(normalized_floors, key=lambda value: value[1])[0]
-        except ValueError:
-            diagnostics.append(f"task {task.task_id!r} has an invalid PEP 440 security floor")
-            continue
+            if not fixed_versions:
+                diagnostics.append(
+                    f"task {task.task_id!r} has no scanner-backed fixed-version floor"
+                )
+                continue
+            try:
+                normalized_floors = [
+                    _python_numeric_solver_version(value) for value in fixed_versions
+                ]
+                floor = max(normalized_floors, key=lambda value: value[1])[0]
+            except ValueError:
+                diagnostics.append(f"task {task.task_id!r} has an invalid PEP 440 security floor")
+                continue
         parent_candidates: list[tuple[str, tuple[int, ...]]] = []
         parent_floor: str | None = None
         if parent_context is not None:
@@ -931,7 +937,7 @@ def prepare_python_portfolio_problem(
             lockfile_package_key=None,
             installed_version=installed_version,
             dependency_type=declaration_type,
-            strategy=task.strategy.value,
+            strategy=("no_fix" if no_fix_mitigation else task.strategy.value),
             is_synthetic=bool(task.is_synthetic or group.is_synthetic),
             is_finding_backed=bool(finding_ids),
             eligible_for_atomic_update=(
@@ -1051,9 +1057,8 @@ def prepare_python_portfolio_problem(
     )
     host_fingerprint = _digest(manifest_fingerprints)
     candidate_catalog_complete = bool(targets and findings) and all(
-        target.eligible_for_atomic_update
-        and target.occurrence_id in domains
-        and bool(domains[target.occurrence_id])
+        not target.eligible_for_atomic_update
+        or (target.occurrence_id in domains and bool(domains[target.occurrence_id]))
         for target in targets
     ) and not diagnostics
     catalog_digest = _digest(
