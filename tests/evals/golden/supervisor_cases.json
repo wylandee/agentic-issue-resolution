@@ -1909,5 +1909,1018 @@
       "decision_code": null,
       "spawn_request_count": 0
     }
+  },
+  {
+    "case_id": "supervisor-maven-direct-minimum",
+    "eval_type": "supervisor",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "historical_normalization",
+    "evidence_status": "historical_task_normalization",
+    "provenance": "Historical normalization from C:\\Users\\UserAdmin\\.codex\\worktrees\\93fc\\agentic-issue-resolution\\data\\trajectories\\phase5_20261020T035317Z_acc4a7ea-58ce-4140-becb-f26bc5764064.md Span 82; the direct Maven mutation selected 42.7.11.",
+    "historical_evidence": [
+      "Historical normalization from C:\\Users\\UserAdmin\\.codex\\worktrees\\93fc\\agentic-issue-resolution\\data\\trajectories\\phase5_20261020T035317Z_acc4a7ea-58ce-4140-becb-f26bc5764064.md Span 82; the direct Maven mutation selected 42.7.11."
+    ],
+    "vulnerability_context": {
+      "group_id": "supervisor-maven-direct-minimum:group",
+      "vulnerable_component": "org.postgresql:postgresql",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "42.2.5",
+      "fixed_version": "42.7.11",
+      "purl": "pkg:maven/org.postgresql/postgresql@42.2.5",
+      "is_reachable": null
+    },
+    "scenario": "Java Maven dependency org.postgresql:postgresql has a fixed-version floor of 42.7.11.",
+    "input": "Select an approved Maven version for org.postgresql:postgresql at or above security floor 42.7.11.",
+    "expected_output": "Choose the approved Maven release 42.7.11 for exact coordinate org.postgresql:postgresql; preserve the declaration type dependencies.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "The registry-verified Maven candidate 42.7.11 meets the committed security floor.",
+          "rationale": "Choose the lowest approved Maven release that meets the floor.",
+          "target_version": "42.7.11"
+        }
+      }
+    ],
+    "expected_tool_correctness_pass": true,
+    "tool_correctness_applicable": true,
+    "expected_completion_pass": true,
+    "task_completion_applicable": true,
+    "context": [
+      "Project language: java; package ecosystem: Maven; exact GAV: org.postgresql:postgresql.",
+      "Committed security floor: 42.7.11. Dependency declaration: dependencies.",
+      "Historical normalization from C:\\Users\\UserAdmin\\.codex\\worktrees\\93fc\\agentic-issue-resolution\\data\\trajectories\\phase5_20261020T035317Z_acc4a7ea-58ce-4140-becb-f26bc5764064.md Span 82; the direct Maven mutation selected 42.7.11."
+    ],
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "task": {
+          "task_id": "task-supervisor-maven-direct-minimum",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor-maven-direct-minimum:group",
+          "is_synthetic": false,
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "maven_latest",
+          "target_package_name": "org.postgresql:postgresql",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "selected_plan_issue_ids": [],
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0,
+          "allowed_target_versions": [],
+          "allowed_dependency_types": [],
+          "portfolio_plan_id": null,
+          "remediation_action": null
+        },
+        "group": {
+          "group_id": "supervisor-maven-direct-minimum:group",
+          "issue_type": "sca",
+          "vulnerable_component": "org.postgresql:postgresql",
+          "file_path": "pom.xml",
+          "file_paths": [
+            "pom.xml"
+          ],
+          "is_synthetic": false,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "42.2.5"
+          ],
+          "dependency_ancestry": [],
+          "dependency_versions": {
+            "org.postgresql:postgresql": "42.2.5"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "d2f618c8-0542-5860-8793-362a9ca1a039",
+          "issues": [
+            {
+              "id": "d2f618c8-0542-5860-8793-362a9ca1a039",
+              "finding_id": "supervisor-maven-direct-minimum:group:issue",
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2024-1597",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "MEDIUM",
+              "confidence": null,
+              "file_path": "pom.xml",
+              "line_range": null,
+              "package_name": "org.postgresql:postgresql",
+              "package_version": "42.2.5",
+              "fixed_version": "42.7.11",
+              "purl": "pkg:maven/org.postgresql/postgresql@42.2.5",
+              "ecosystem": "maven",
+              "message": "Java Maven dependency org.postgresql:postgresql has a fixed-version floor of 42.7.11.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-10-20T09:17:05.393909+00:00"
+            }
+          ],
+          "localized_issues": [
+            {
+              "issue": {
+                "id": "d2f618c8-0542-5860-8793-362a9ca1a039",
+                "finding_id": "supervisor-maven-direct-minimum:group:issue",
+                "source": "odc",
+                "issue_type": "sca",
+                "repo_url": null,
+                "base_ref": null,
+                "rule_id": null,
+                "cve_id": "CVE-2024-1597",
+                "ghsa_id": null,
+                "cwe": [],
+                "owasp": [],
+                "severity": "MEDIUM",
+                "confidence": null,
+                "file_path": "pom.xml",
+                "line_range": null,
+                "package_name": "org.postgresql:postgresql",
+                "package_version": "42.2.5",
+                "fixed_version": "42.7.11",
+                "purl": "pkg:maven/org.postgresql/postgresql@42.2.5",
+                "ecosystem": "maven",
+                "message": "Java Maven dependency org.postgresql:postgresql has a fixed-version floor of 42.7.11.",
+                "finding_url": null,
+                "dataflow_trace": null,
+                "validation_profile": null,
+                "raw_payload": null,
+                "ingested_at": "2026-10-20T09:17:05.393909+00:00"
+              },
+              "enclosing_symbol": null,
+              "enclosing_node_type": "unknown",
+              "sink_expression": null,
+              "imports": [],
+              "data_flow_hints": [],
+              "snippet": null,
+              "manifest_file": "pom.xml",
+              "is_direct_dependency": null,
+              "manifest_line": null,
+              "manifest_snippet": null,
+              "package_manager": "maven",
+              "version_property_name": null,
+              "version_property_file": null,
+              "dependency_ancestry": [],
+              "dependency_versions": {},
+              "declaration_type": "dependencies",
+              "parent_package_name": null,
+              "parent_package_version": null,
+              "parent_declaration_type": null,
+              "parent_manifest_line": null,
+              "parent_manifest_snippet": null,
+              "localization_confidence": 0.0,
+              "localized_at": "2026-10-20T09:17:05.394914Z"
+            }
+          ],
+          "fix_plan_candidates": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "42.7.11",
+            "workaround_snippets": null,
+            "instruction": "Upgrade org.postgresql:postgresql to 42.7.11.",
+            "strategy_used": "maven_registry"
+          },
+          "enrichment": {
+            "cve_id": "CVE-2024-1597",
+            "epss": 0.0,
+            "epss_percentile": 0.0,
+            "in_kev": false,
+            "kev_date_added": null,
+            "enriched_at": "2026-10-20T09:17:05.393909Z",
+            "enrichment_source": "eval_replay"
+          },
+          "is_reachable": null,
+          "grouped_at": "2026-10-20T09:17:05.394914Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "org.postgresql:postgresql",
+            "dependency_type": "dependencies",
+            "security_floor": "42.7.11",
+            "versions": [
+              "42.7.11"
+            ],
+            "canonical_version": "42.7.11",
+            "peer_compatible": true,
+            "approved_version_pool": [
+              "42.7.11"
+            ]
+          }
+        ]
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Historical observations anchor the Maven target and fixed version; the tactical action replay is independently scripted.",
+      "actual_tools": [
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "The registry-verified Maven candidate 42.7.11 meets the committed security floor.",
+            "rationale": "Choose the lowest approved Maven release that meets the floor.",
+            "target_version": "42.7.11"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "NEW_VERSION_BUMP",
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-maven-managed-minimum",
+    "eval_type": "supervisor",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "historical_normalization",
+    "evidence_status": "historical_task_normalization",
+    "provenance": "Historical normalization from C:\\Users\\UserAdmin\\.codex\\worktrees\\93fc\\agentic-issue-resolution\\data\\trajectories\\phase5_20261020T061021Z_c2b3de3e-bbb6-4d05-a68d-9db7f65027ce.md Span 80; managed Logback batch selected 1.2.13.",
+    "historical_evidence": [
+      "Historical normalization from C:\\Users\\UserAdmin\\.codex\\worktrees\\93fc\\agentic-issue-resolution\\data\\trajectories\\phase5_20261020T061021Z_c2b3de3e-bbb6-4d05-a68d-9db7f65027ce.md Span 80; managed Logback batch selected 1.2.13."
+    ],
+    "vulnerability_context": {
+      "group_id": "supervisor-maven-managed-minimum:group",
+      "vulnerable_component": "ch.qos.logback:logback-classic",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2021-42550"
+      ],
+      "package_version": "1.2.12",
+      "fixed_version": "1.2.13",
+      "purl": "pkg:maven/ch.qos.logback/logback-classic@1.2.12",
+      "is_reachable": null
+    },
+    "scenario": "Java Maven dependency ch.qos.logback:logback-classic has a fixed-version floor of 1.2.13.",
+    "input": "Select an approved Maven version for ch.qos.logback:logback-classic at or above security floor 1.2.13.",
+    "expected_output": "Choose the approved Maven release 1.2.13 for exact coordinate ch.qos.logback:logback-classic; preserve the declaration type dependencyManagement.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "The registry-verified Maven candidate 1.2.13 meets the committed security floor.",
+          "rationale": "Choose the lowest approved Maven release that meets the floor.",
+          "target_version": "1.2.13"
+        }
+      }
+    ],
+    "expected_tool_correctness_pass": true,
+    "tool_correctness_applicable": true,
+    "expected_completion_pass": true,
+    "task_completion_applicable": true,
+    "context": [
+      "Project language: java; package ecosystem: Maven; exact GAV: ch.qos.logback:logback-classic.",
+      "Committed security floor: 1.2.13. Dependency declaration: dependencyManagement.",
+      "Historical normalization from C:\\Users\\UserAdmin\\.codex\\worktrees\\93fc\\agentic-issue-resolution\\data\\trajectories\\phase5_20261020T061021Z_c2b3de3e-bbb6-4d05-a68d-9db7f65027ce.md Span 80; managed Logback batch selected 1.2.13."
+    ],
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "task": {
+          "task_id": "task-supervisor-maven-managed-minimum",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor-maven-managed-minimum:group",
+          "is_synthetic": false,
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "maven_latest",
+          "target_package_name": "ch.qos.logback:logback-classic",
+          "target_dependency_type": "dependencyManagement",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "selected_plan_issue_ids": [],
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0,
+          "allowed_target_versions": [],
+          "allowed_dependency_types": [],
+          "portfolio_plan_id": null,
+          "remediation_action": null
+        },
+        "group": {
+          "group_id": "supervisor-maven-managed-minimum:group",
+          "issue_type": "sca",
+          "vulnerable_component": "ch.qos.logback:logback-classic",
+          "file_path": "pom.xml",
+          "file_paths": [
+            "pom.xml"
+          ],
+          "is_synthetic": false,
+          "cve_ids": [
+            "CVE-2021-42550"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "1.2.12"
+          ],
+          "dependency_ancestry": [],
+          "dependency_versions": {
+            "ch.qos.logback:logback-classic": "1.2.12"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "5ec10dfb-b9cd-537c-860d-1b34d07f5ce3",
+          "issues": [
+            {
+              "id": "5ec10dfb-b9cd-537c-860d-1b34d07f5ce3",
+              "finding_id": "supervisor-maven-managed-minimum:group:issue",
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2021-42550",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "MEDIUM",
+              "confidence": null,
+              "file_path": "pom.xml",
+              "line_range": null,
+              "package_name": "ch.qos.logback:logback-classic",
+              "package_version": "1.2.12",
+              "fixed_version": "1.2.13",
+              "purl": "pkg:maven/ch.qos.logback/logback-classic@1.2.12",
+              "ecosystem": "maven",
+              "message": "Java Maven dependency ch.qos.logback:logback-classic has a fixed-version floor of 1.2.13.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-10-20T09:17:05.397915+00:00"
+            }
+          ],
+          "localized_issues": [
+            {
+              "issue": {
+                "id": "5ec10dfb-b9cd-537c-860d-1b34d07f5ce3",
+                "finding_id": "supervisor-maven-managed-minimum:group:issue",
+                "source": "odc",
+                "issue_type": "sca",
+                "repo_url": null,
+                "base_ref": null,
+                "rule_id": null,
+                "cve_id": "CVE-2021-42550",
+                "ghsa_id": null,
+                "cwe": [],
+                "owasp": [],
+                "severity": "MEDIUM",
+                "confidence": null,
+                "file_path": "pom.xml",
+                "line_range": null,
+                "package_name": "ch.qos.logback:logback-classic",
+                "package_version": "1.2.12",
+                "fixed_version": "1.2.13",
+                "purl": "pkg:maven/ch.qos.logback/logback-classic@1.2.12",
+                "ecosystem": "maven",
+                "message": "Java Maven dependency ch.qos.logback:logback-classic has a fixed-version floor of 1.2.13.",
+                "finding_url": null,
+                "dataflow_trace": null,
+                "validation_profile": null,
+                "raw_payload": null,
+                "ingested_at": "2026-10-20T09:17:05.397915+00:00"
+              },
+              "enclosing_symbol": null,
+              "enclosing_node_type": "unknown",
+              "sink_expression": null,
+              "imports": [],
+              "data_flow_hints": [],
+              "snippet": null,
+              "manifest_file": "pom.xml",
+              "is_direct_dependency": null,
+              "manifest_line": null,
+              "manifest_snippet": null,
+              "package_manager": "maven",
+              "version_property_name": null,
+              "version_property_file": null,
+              "dependency_ancestry": [],
+              "dependency_versions": {},
+              "declaration_type": "dependencyManagement",
+              "parent_package_name": null,
+              "parent_package_version": null,
+              "parent_declaration_type": null,
+              "parent_manifest_line": null,
+              "parent_manifest_snippet": null,
+              "localization_confidence": 0.0,
+              "localized_at": "2026-10-20T09:17:05.397915Z"
+            }
+          ],
+          "fix_plan_candidates": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "1.2.13",
+            "workaround_snippets": null,
+            "instruction": "Upgrade ch.qos.logback:logback-classic to 1.2.13.",
+            "strategy_used": "maven_registry"
+          },
+          "enrichment": {
+            "cve_id": "CVE-2021-42550",
+            "epss": 0.0,
+            "epss_percentile": 0.0,
+            "in_kev": false,
+            "kev_date_added": null,
+            "enriched_at": "2026-10-20T09:17:05.397915Z",
+            "enrichment_source": "eval_replay"
+          },
+          "is_reachable": null,
+          "grouped_at": "2026-10-20T09:17:05.397915Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "ch.qos.logback:logback-classic",
+            "dependency_type": "dependencyManagement",
+            "security_floor": "1.2.13",
+            "versions": [
+              "1.2.13"
+            ],
+            "canonical_version": "1.2.13",
+            "peer_compatible": true,
+            "approved_version_pool": [
+              "1.2.13"
+            ]
+          }
+        ]
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Historical observations anchor the Maven target and fixed version; the tactical action replay is independently scripted.",
+      "actual_tools": [
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "The registry-verified Maven candidate 1.2.13 meets the committed security floor.",
+            "rationale": "Choose the lowest approved Maven release that meets the floor.",
+            "target_version": "1.2.13"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "NEW_VERSION_BUMP",
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-maven-qualified-version",
+    "eval_type": "supervisor",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "synthetic_guardrail_variant",
+    "evidence_status": "synthetic",
+    "provenance": "Synthetic native Maven version-ordering case: floor 1.9, approved stable 1.10.Final; release candidates must not replace the exact approved token.",
+    "historical_evidence": [
+      "Synthetic native Maven version-ordering case: floor 1.9, approved stable 1.10.Final; release candidates must not replace the exact approved token."
+    ],
+    "vulnerability_context": {
+      "group_id": "supervisor-maven-qualified-version:group",
+      "vulnerable_component": "org.example:qualified-version",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "42.2.5",
+      "fixed_version": "1.9",
+      "purl": "pkg:maven/org.example/qualified-version@42.2.5",
+      "is_reachable": null
+    },
+    "scenario": "Java Maven dependency org.example:qualified-version has a fixed-version floor of 1.9.",
+    "input": "Select an approved Maven version for org.example:qualified-version at or above security floor 1.9.",
+    "expected_output": "Choose the approved Maven release 1.10.Final for exact coordinate org.example:qualified-version; preserve the declaration type dependencies.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "The registry-verified Maven candidate 1.10.Final meets the committed security floor.",
+          "rationale": "Choose the lowest approved Maven release that meets the floor.",
+          "target_version": "1.10.Final"
+        }
+      }
+    ],
+    "expected_tool_correctness_pass": true,
+    "tool_correctness_applicable": true,
+    "expected_completion_pass": true,
+    "task_completion_applicable": true,
+    "context": [
+      "Project language: java; package ecosystem: Maven; exact GAV: org.example:qualified-version.",
+      "Committed security floor: 1.9. Dependency declaration: dependencies.",
+      "Synthetic native Maven version-ordering case: floor 1.9, approved stable 1.10.Final; release candidates must not replace the exact approved token."
+    ],
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "task": {
+          "task_id": "task-supervisor-maven-qualified-version",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor-maven-qualified-version:group",
+          "is_synthetic": false,
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "maven_latest",
+          "target_package_name": "org.example:qualified-version",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "selected_plan_issue_ids": [],
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0,
+          "allowed_target_versions": [],
+          "allowed_dependency_types": [],
+          "portfolio_plan_id": null,
+          "remediation_action": null
+        },
+        "group": {
+          "group_id": "supervisor-maven-qualified-version:group",
+          "issue_type": "sca",
+          "vulnerable_component": "org.example:qualified-version",
+          "file_path": "pom.xml",
+          "file_paths": [
+            "pom.xml"
+          ],
+          "is_synthetic": false,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "42.2.5"
+          ],
+          "dependency_ancestry": [],
+          "dependency_versions": {
+            "org.example:qualified-version": "42.2.5"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "64de1d6f-2eb0-5cb9-a3c7-ec707c471506",
+          "issues": [
+            {
+              "id": "64de1d6f-2eb0-5cb9-a3c7-ec707c471506",
+              "finding_id": "supervisor-maven-qualified-version:group:issue",
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2024-1597",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "MEDIUM",
+              "confidence": null,
+              "file_path": "pom.xml",
+              "line_range": null,
+              "package_name": "org.example:qualified-version",
+              "package_version": "42.2.5",
+              "fixed_version": "1.9",
+              "purl": "pkg:maven/org.example/qualified-version@42.2.5",
+              "ecosystem": "maven",
+              "message": "Java Maven dependency org.example:qualified-version has a fixed-version floor of 1.9.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-10-20T09:17:05.397915+00:00"
+            }
+          ],
+          "localized_issues": [
+            {
+              "issue": {
+                "id": "64de1d6f-2eb0-5cb9-a3c7-ec707c471506",
+                "finding_id": "supervisor-maven-qualified-version:group:issue",
+                "source": "odc",
+                "issue_type": "sca",
+                "repo_url": null,
+                "base_ref": null,
+                "rule_id": null,
+                "cve_id": "CVE-2024-1597",
+                "ghsa_id": null,
+                "cwe": [],
+                "owasp": [],
+                "severity": "MEDIUM",
+                "confidence": null,
+                "file_path": "pom.xml",
+                "line_range": null,
+                "package_name": "org.example:qualified-version",
+                "package_version": "42.2.5",
+                "fixed_version": "1.9",
+                "purl": "pkg:maven/org.example/qualified-version@42.2.5",
+                "ecosystem": "maven",
+                "message": "Java Maven dependency org.example:qualified-version has a fixed-version floor of 1.9.",
+                "finding_url": null,
+                "dataflow_trace": null,
+                "validation_profile": null,
+                "raw_payload": null,
+                "ingested_at": "2026-10-20T09:17:05.397915+00:00"
+              },
+              "enclosing_symbol": null,
+              "enclosing_node_type": "unknown",
+              "sink_expression": null,
+              "imports": [],
+              "data_flow_hints": [],
+              "snippet": null,
+              "manifest_file": "pom.xml",
+              "is_direct_dependency": null,
+              "manifest_line": null,
+              "manifest_snippet": null,
+              "package_manager": "maven",
+              "version_property_name": null,
+              "version_property_file": null,
+              "dependency_ancestry": [],
+              "dependency_versions": {},
+              "declaration_type": "dependencies",
+              "parent_package_name": null,
+              "parent_package_version": null,
+              "parent_declaration_type": null,
+              "parent_manifest_line": null,
+              "parent_manifest_snippet": null,
+              "localization_confidence": 0.0,
+              "localized_at": "2026-10-20T09:17:05.397915Z"
+            }
+          ],
+          "fix_plan_candidates": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "1.9",
+            "workaround_snippets": null,
+            "instruction": "Upgrade org.example:qualified-version to 1.9.",
+            "strategy_used": "maven_registry"
+          },
+          "enrichment": {
+            "cve_id": "CVE-2024-1597",
+            "epss": 0.0,
+            "epss_percentile": 0.0,
+            "in_kev": false,
+            "kev_date_added": null,
+            "enriched_at": "2026-10-20T09:17:05.397915Z",
+            "enrichment_source": "eval_replay"
+          },
+          "is_reachable": null,
+          "grouped_at": "2026-10-20T09:17:05.397915Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "org.example:qualified-version",
+            "dependency_type": "dependencies",
+            "security_floor": "1.9",
+            "versions": [
+              "1.9",
+              "1.10.Final",
+              "1.10.0-rc1"
+            ],
+            "canonical_version": "1.10.Final",
+            "peer_compatible": true,
+            "approved_version_pool": [
+              "1.9",
+              "1.10.Final",
+              "1.10.0-rc1"
+            ]
+          }
+        ]
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Historical observations anchor the Maven target and fixed version; the tactical action replay is independently scripted.",
+      "actual_tools": [
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "The registry-verified Maven candidate 1.10.Final meets the committed security floor.",
+            "rationale": "Choose the lowest approved Maven release that meets the floor.",
+            "target_version": "1.10.Final"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "NEW_VERSION_BUMP",
+      "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-maven-reject-unapproved",
+    "eval_type": "supervisor",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "synthetic_guardrail_variant",
+    "evidence_status": "synthetic",
+    "provenance": "Synthetic repair-loop guardrail based on the historical PostgreSQL Maven target; an out-of-pool proposal must be rejected before the approved choice is committed.",
+    "historical_evidence": [
+      "Synthetic repair-loop guardrail based on the historical PostgreSQL Maven target; an out-of-pool proposal must be rejected before the approved choice is committed."
+    ],
+    "vulnerability_context": {
+      "group_id": "supervisor-maven-reject-unapproved:group",
+      "vulnerable_component": "org.postgresql:postgresql",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "42.2.5",
+      "fixed_version": "42.7.11",
+      "purl": "pkg:maven/org.postgresql/postgresql@42.2.5",
+      "is_reachable": null
+    },
+    "scenario": "Java Maven dependency org.postgresql:postgresql has a fixed-version floor of 42.7.11.",
+    "input": "Select an approved Maven version for org.postgresql:postgresql at or above security floor 42.7.11.",
+    "expected_output": "Choose the approved Maven release 42.7.11 for exact coordinate org.postgresql:postgresql; preserve the declaration type dependencies.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "The registry-verified Maven candidate 42.7.11 meets the committed security floor.",
+          "rationale": "Choose the lowest approved Maven release that meets the floor.",
+          "target_version": "42.7.11"
+        }
+      }
+    ],
+    "expected_tool_correctness_pass": true,
+    "tool_correctness_applicable": true,
+    "expected_completion_pass": true,
+    "task_completion_applicable": true,
+    "context": [
+      "Project language: java; package ecosystem: Maven; exact GAV: org.postgresql:postgresql.",
+      "Committed security floor: 42.7.11. Dependency declaration: dependencies.",
+      "Synthetic repair-loop guardrail based on the historical PostgreSQL Maven target; an out-of-pool proposal must be rejected before the approved choice is committed."
+    ],
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "task": {
+          "task_id": "task-supervisor-maven-reject-unapproved",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor-maven-reject-unapproved:group",
+          "is_synthetic": false,
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "maven_latest",
+          "target_package_name": "org.postgresql:postgresql",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "selected_plan_issue_ids": [],
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0,
+          "allowed_target_versions": [],
+          "allowed_dependency_types": [],
+          "portfolio_plan_id": null,
+          "remediation_action": null
+        },
+        "group": {
+          "group_id": "supervisor-maven-reject-unapproved:group",
+          "issue_type": "sca",
+          "vulnerable_component": "org.postgresql:postgresql",
+          "file_path": "pom.xml",
+          "file_paths": [
+            "pom.xml"
+          ],
+          "is_synthetic": false,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "42.2.5"
+          ],
+          "dependency_ancestry": [],
+          "dependency_versions": {
+            "org.postgresql:postgresql": "42.2.5"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "aa4cc22c-a819-5d92-a133-5acfabd38ff4",
+          "issues": [
+            {
+              "id": "aa4cc22c-a819-5d92-a133-5acfabd38ff4",
+              "finding_id": "supervisor-maven-reject-unapproved:group:issue",
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2024-1597",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "MEDIUM",
+              "confidence": null,
+              "file_path": "pom.xml",
+              "line_range": null,
+              "package_name": "org.postgresql:postgresql",
+              "package_version": "42.2.5",
+              "fixed_version": "42.7.11",
+              "purl": "pkg:maven/org.postgresql/postgresql@42.2.5",
+              "ecosystem": "maven",
+              "message": "Java Maven dependency org.postgresql:postgresql has a fixed-version floor of 42.7.11.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-10-20T09:17:05.397915+00:00"
+            }
+          ],
+          "localized_issues": [
+            {
+              "issue": {
+                "id": "aa4cc22c-a819-5d92-a133-5acfabd38ff4",
+                "finding_id": "supervisor-maven-reject-unapproved:group:issue",
+                "source": "odc",
+                "issue_type": "sca",
+                "repo_url": null,
+                "base_ref": null,
+                "rule_id": null,
+                "cve_id": "CVE-2024-1597",
+                "ghsa_id": null,
+                "cwe": [],
+                "owasp": [],
+                "severity": "MEDIUM",
+                "confidence": null,
+                "file_path": "pom.xml",
+                "line_range": null,
+                "package_name": "org.postgresql:postgresql",
+                "package_version": "42.2.5",
+                "fixed_version": "42.7.11",
+                "purl": "pkg:maven/org.postgresql/postgresql@42.2.5",
+                "ecosystem": "maven",
+                "message": "Java Maven dependency org.postgresql:postgresql has a fixed-version floor of 42.7.11.",
+                "finding_url": null,
+                "dataflow_trace": null,
+                "validation_profile": null,
+                "raw_payload": null,
+                "ingested_at": "2026-10-20T09:17:05.397915+00:00"
+              },
+              "enclosing_symbol": null,
+              "enclosing_node_type": "unknown",
+              "sink_expression": null,
+              "imports": [],
+              "data_flow_hints": [],
+              "snippet": null,
+              "manifest_file": "pom.xml",
+              "is_direct_dependency": null,
+              "manifest_line": null,
+              "manifest_snippet": null,
+              "package_manager": "maven",
+              "version_property_name": null,
+              "version_property_file": null,
+              "dependency_ancestry": [],
+              "dependency_versions": {},
+              "declaration_type": "dependencies",
+              "parent_package_name": null,
+              "parent_package_version": null,
+              "parent_declaration_type": null,
+              "parent_manifest_line": null,
+              "parent_manifest_snippet": null,
+              "localization_confidence": 0.0,
+              "localized_at": "2026-10-20T09:17:05.397915Z"
+            }
+          ],
+          "fix_plan_candidates": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "42.7.11",
+            "workaround_snippets": null,
+            "instruction": "Upgrade org.postgresql:postgresql to 42.7.11.",
+            "strategy_used": "maven_registry"
+          },
+          "enrichment": {
+            "cve_id": "CVE-2024-1597",
+            "epss": 0.0,
+            "epss_percentile": 0.0,
+            "in_kev": false,
+            "kev_date_added": null,
+            "enriched_at": "2026-10-20T09:17:05.397915Z",
+            "enrichment_source": "eval_replay"
+          },
+          "is_reachable": null,
+          "grouped_at": "2026-10-20T09:17:05.397915Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "org.postgresql:postgresql",
+            "dependency_type": "dependencies",
+            "security_floor": "42.7.11",
+            "versions": [
+              "42.7.11"
+            ],
+            "canonical_version": "42.7.11",
+            "peer_compatible": true,
+            "approved_version_pool": [
+              "42.7.11"
+            ]
+          }
+        ]
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Historical observations anchor the Maven target and fixed version; the tactical action replay is independently scripted.",
+      "actual_tools": [
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "The registry-verified Maven candidate 42.7.11 meets the committed security floor.",
+            "rationale": "Choose the lowest approved Maven release that meets the floor.",
+            "target_version": "99.99.99"
+          }
+        },
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "The registry-verified Maven candidate 42.7.11 meets the committed security floor.",
+            "rationale": "Choose the lowest approved Maven release that meets the floor.",
+            "target_version": "42.7.11"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 2,
+      "verification_accepted": true,
+      "decision_code": "NEW_VERSION_BUMP",
+      "spawn_request_count": 0
+    }
   }
 ]

@@ -33,6 +33,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.runtime.path_policy import normalize_workspace_path
 
 
@@ -681,6 +682,12 @@ def build_system_context(case: Mapping[str, Any]) -> SystemContext:
     replay = case.get("replay", {}) if isinstance(case.get("replay"), Mapping) else {}
     raw = replay.get("input", {}).get("system_context", {}) if isinstance(replay, Mapping) else {}
     raw = raw if isinstance(raw, Mapping) else {}
+    replay_input = replay.get("input", {}) if isinstance(replay, Mapping) else {}
+    language = (
+        str(replay_input.get("project_language", ProjectLanguage.NODEJS.value))
+        if isinstance(replay_input, Mapping)
+        else ProjectLanguage.NODEJS.value
+    )
     scenario = str(case.get("scenario", case.get("input", "")))
     scenario_lower = scenario.lower()
     completion = str(case.get("completion_task", ""))
@@ -734,7 +741,10 @@ def build_system_context(case: Mapping[str, Any]) -> SystemContext:
         environment=environment,
         deployment_os=deployment_os,
         public_facing=raw.get("public_facing", public_facing),
-        primary_language=raw.get("primary_language", "javascript"),
+        primary_language=raw.get(
+            "primary_language",
+            "java" if language == ProjectLanguage.JAVA.value else "javascript",
+        ),
         deployment_architecture=raw.get("deployment_architecture", "service"),
         data_sensitivity=raw.get("data_sensitivity", sensitivity),
         tags=tags,
@@ -756,6 +766,12 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
         return VulnerabilityGroup.model_validate(raw_group)
 
     scenario = str(case.get("scenario", case.get("input", "")))
+    language = (
+        str(replay_input.get("project_language", ProjectLanguage.NODEJS.value))
+        if isinstance(replay_input, Mapping)
+        else ProjectLanguage.NODEJS.value
+    )
+    is_java = language == ProjectLanguage.JAVA.value
     vulnerability = case.get("vulnerability_context", {})
     vulnerability = vulnerability if isinstance(vulnerability, Mapping) else {}
     group_id = str(vulnerability.get("group_id") or case.get("case_id") or "replay-group")
@@ -801,11 +817,13 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
     issue_source = IssueSource.SEMGREP if issue_type == IssueType.SAST else IssueSource.ODC
     version = _first_match(
         rf"{re.escape(package)}@(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)", scenario
+    ) or (
+        str(vulnerability.get("package_version")) if vulnerability.get("package_version") else None
     )
     file_path = str(
         vulnerability.get("file_path")
         or _first_match(r"(test(?:/|\\)[^\s,]+|lib(?:/|\\)[^\s,]+\.\w+)", scenario)
-        or "package.json"
+        or ("pom.xml" if is_java else "package.json")
     ).rstrip(".,")
     severity_name = (
         _first_match(r"original\s+(?:scanner\s+)?severity\s*(?:is|=)?\s*([A-Z]+)", scenario)
@@ -826,8 +844,14 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
         severity=severity,
         file_path=file_path,
         package_name=package,
-        package_version=version or "0.0.0",
-        ecosystem="npm",
+        package_version=str(vulnerability.get("package_version") or version or "0.0.0"),
+        fixed_version=(
+            str(vulnerability["fixed_version"])
+            if vulnerability.get("fixed_version") is not None
+            else None
+        ),
+        purl=str(vulnerability["purl"]) if vulnerability.get("purl") else None,
+        ecosystem="maven" if is_java else "npm",
         message=scenario,
     )
     epss_matches = [
@@ -847,15 +871,21 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
         if (cves or in_kev or epss > 0.0)
         else None
     )
-    reachable = not bool(
-        re.search(r"\bis_reachable\s*=\s*false\b|\bunreachable\b", scenario.lower())
-    )
+    reachable = vulnerability.get("is_reachable")
+    if reachable is None and not is_java:
+        reachable = not bool(
+            re.search(r"\bis_reachable\s*=\s*false\b|\bunreachable\b", scenario.lower())
+        )
     return VulnerabilityGroup(
         group_id=group_id,
         issue_type=issue_type,
         vulnerable_component=package,
         file_path=file_path,
-        file_paths=[file_path],
+        file_paths=(
+            [str(path) for path in vulnerability.get("file_paths", [])]
+            if isinstance(vulnerability.get("file_paths"), list)
+            else [file_path]
+        ),
         cve_ids=cves,
         ghsa_ids=ghsas,
         versions=[version] if version else ["0.0.0"],
@@ -890,6 +920,29 @@ def seed_replay_files(case: Mapping[str, Any]) -> dict[str, str]:
     files = raw.get("workspace_files", {}) if isinstance(raw, Mapping) else {}
     if isinstance(files, Mapping) and files:
         return {str(path): str(content) for path, content in files.items()}
+    language = (
+        str(raw.get("project_language", ProjectLanguage.NODEJS.value))
+        if isinstance(raw, Mapping)
+        else ProjectLanguage.NODEJS.value
+    )
+    if language == ProjectLanguage.JAVA.value:
+        return {
+            "pom.xml": (
+                '<project xmlns="http://maven.apache.org/POM/4.0.0" '
+                'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+                'xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 '
+                'https://maven.apache.org/xsd/maven-4.0.0.xsd">\n'
+                "  <modelVersion>4.0.0</modelVersion>\n"
+                "  <groupId>eval.replay</groupId>\n  <artifactId>eval-replay</artifactId>\n"
+                "  <version>1.0.0</version>\n  <dependencies/>\n</project>\n"
+            ),
+            "src/main/java/eval/Replay.java": (
+                "package eval;\npublic final class Replay { public boolean run() { return true; } }\n"
+            ),
+            "src/test/java/eval/ReplayTest.java": (
+                "package eval;\npublic final class ReplayTest { public void passes() {} }\n"
+            ),
+        }
     return {
         "package.json": json.dumps(
             {"name": "eval-replay", "version": "1.0.0", "dependencies": {}},

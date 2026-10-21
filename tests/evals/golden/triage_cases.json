@@ -463,5 +463,134 @@
         "system_context": {}
       }
     }
+  },
+  {
+    "case_id": "triage-maven-actionable",
+    "eval_type": "triage",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "historical_context_normalization",
+    "evidence_status": "historical_context",
+    "provenance": "data/trajectories/phase5_20261020T035317Z_acc4a7ea-58ce-4140-becb-f26bc5764064.md; PostgreSQL update observed at Span 82.",
+    "historical_evidence": [
+      "The trace reports direct org.postgresql:postgresql 42.2.5 → 42.7.11 in pom.xml. This supports the Maven identity and target version; it does not establish a triage model verdict."
+    ],
+    "vulnerability_context": {
+      "group_id": "triage-maven-actionable:group",
+      "vulnerable_component": "org.postgresql:postgresql",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "42.7.10",
+      "fixed_version": "42.7.11",
+      "purl": "pkg:maven/org.postgresql/postgresql@42.7.10"
+    },
+    "scenario": "Production Java service with high data sensitivity has direct org.postgresql:postgresql@42.2.5 in pom.xml. Dependency-Check reports CVE-2024-1597, original scanner severity HIGH, and a fixed version of 42.7.11. The trace records the update; no Java reachability result is available.",
+    "completion_task": "Keep the Maven finding valid, preserve the HIGH risk context, and do not claim unreachable code when Java reachability was not analyzed.",
+    "expected_output": "The direct PostgreSQL Maven finding remains valid and HIGH priority; unavailable Java reachability evidence does not make it unreachable.",
+    "expected_completion_pass": true,
+    "triage_metadata": {
+      "expected_valid": true,
+      "expected_priority": "HIGH",
+      "expected_unreachable": false
+    },
+    "input": "Triage the documented Java dependency finding without inventing reachability evidence.",
+    "context": [
+      "Project language: Java. Package manager: Maven. Exact identity: org.postgresql:postgresql.",
+      "Historical source supports the direct dependency and selected update, not a historical triage verdict."
+    ],
+    "target_package_name": "org.postgresql:postgresql",
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "system_context": {
+          "primary_language": "java",
+          "environment": "production",
+          "public_facing": true,
+          "data_sensitivity": "high"
+        },
+        "vulnerability_context": {
+          "group_id": "triage-maven-actionable:group",
+          "vulnerable_component": "org.postgresql:postgresql",
+          "file_path": "pom.xml",
+          "file_paths": null,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "package_version": "42.2.5",
+          "fixed_version": "42.7.11",
+          "purl": "pkg:maven/org.postgresql/postgresql@42.2.5",
+          "is_reachable": null
+        }
+      }
+    },
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Historical trace evidence records the PostgreSQL Maven update; this fixture does not claim a historical triage verdict.",
+      "actual_tools": []
+    }
+  },
+  {
+    "case_id": "triage-maven-unknown-reachability",
+    "eval_type": "triage",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "synthetic_guardrail_variant",
+    "evidence_status": "synthetic",
+    "provenance": "Synthetic Java reachability-unknown variant of the historical PostgreSQL finding.",
+    "historical_evidence": [
+      "Synthetic guardrail variant: Java reachability analysis is unavailable; the source trace only anchors the Maven coordinate and remediation context."
+    ],
+    "vulnerability_context": {
+      "group_id": "triage-maven-unknown-reachability:group",
+      "vulnerable_component": "org.postgresql:postgresql",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "42.7.10",
+      "fixed_version": "42.7.11",
+      "purl": "pkg:maven/org.postgresql/postgresql@42.7.10"
+    },
+    "scenario": "A Java service has a direct org.postgresql:postgresql@42.7.10 dependency in pom.xml. CVE-2024-1597 is a valid HIGH finding with fixed version 42.7.11. Java reachability analysis is unavailable.",
+    "completion_task": "Preserve validity and HIGH priority. Do not claim that the code is unreachable when reachability analysis is unavailable.",
+    "expected_output": "Keep the Maven finding valid and HIGH priority, without asserting unreachable code.",
+    "input": "Assess this Java Maven finding with unavailable reachability evidence.",
+    "context": [
+      "Synthetic guardrail case. An unknown reachability result is not evidence of unreachability."
+    ],
+    "target_package_name": "org.postgresql:postgresql",
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "system_context": {
+          "primary_language": "java",
+          "environment": "production",
+          "public_facing": true,
+          "data_sensitivity": "high"
+        },
+        "vulnerability_context": {
+          "group_id": "triage-maven-unknown-reachability:group",
+          "vulnerable_component": "org.postgresql:postgresql",
+          "file_path": "pom.xml",
+          "file_paths": null,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "package_version": "42.7.10",
+          "fixed_version": "42.7.11",
+          "purl": "pkg:maven/org.postgresql/postgresql@42.7.10",
+          "is_reachable": null
+        }
+      }
+    },
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Synthetic case: no historical model output is claimed.",
+      "actual_tools": []
+    }
   }
 ]

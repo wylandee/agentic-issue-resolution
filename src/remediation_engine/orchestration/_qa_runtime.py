@@ -4280,6 +4280,7 @@ def _scan_evidence_by_task(
     }
     result: dict[str, ODCScanEvidence] = {}
     for task_id in sorted(task_ids):
+        target = targets_by_task.get(task_id)
         scoped_closures_by_task = (
             getattr(batch, "task_scoped_closures_by_task", None) if batch is not None else None
         )
@@ -4312,9 +4313,28 @@ def _scan_evidence_by_task(
                 in {"package-lock.json", "npm-shrinkwrap.json"}
                 for source_input_path in project_input_paths
             )
+            project_is_maven = any(
+                Path(source_input_path).name.casefold() == "pom.xml"
+                for source_input_path in project_input_paths
+            )
             restrict_to_task_closure = has_task_closure_scope and project_is_npm_lockfile
+            restrict_to_maven_target = (
+                target is not None
+                and target.package_manager == "maven"
+                and bool(target.target_package)
+                and project_is_maven
+            )
             covered_input_paths.update(project_input_paths)
             for occurrence in artifact_manifest.occurrences_by_project.get(project_path, ()):
+                if restrict_to_maven_target and (
+                    occurrence.ecosystem.casefold() != "maven"
+                    or occurrence.package_name != target.target_package
+                    or (
+                        target.expected_version is not None
+                        and occurrence.version != target.expected_version
+                    )
+                ):
+                    continue
                 occurrence_key = _package_occurrence_key(
                     occurrence.source_input_path,
                     occurrence.lockfile_key,

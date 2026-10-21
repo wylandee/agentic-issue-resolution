@@ -10,7 +10,7 @@ import re
 import subprocess
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -784,7 +784,7 @@ class EvalSettings:
 
     judge_model: str
     is_live: bool
-    openai_api_key: str
+    openai_api_key: str = field(repr=False)
     trajectory_dir: Path
     golden_dir: Path
 

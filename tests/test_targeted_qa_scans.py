@@ -2419,6 +2419,102 @@ def test_manifest_task_projection_preserves_new_ghsa_with_existing_cve() -> None
     assert task_evidence["task-2"].found_identifiers == []
 
 
+def test_shared_maven_pom_projection_uses_exact_gav_for_task_verdicts() -> None:
+    issue_for_other_group = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-10001",
+        package_name="org.beta:common",
+        package_version="2.0.0",
+    )
+    issue_for_beta = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        cve_id="CVE-2026-10002",
+        package_name="org.beta:common",
+        package_version="2.0.0",
+    )
+    alpha_occurrence = PackageScanOccurrence(
+        source_input_path="pom.xml",
+        package_name="org.alpha:common",
+        version="1.0.0",
+        ecosystem="maven",
+        lockfile_key="org.alpha:common:jar:compile",
+    )
+    beta_occurrence = PackageScanOccurrence(
+        source_input_path="pom.xml",
+        package_name="org.beta:common",
+        version="2.0.0",
+        ecosystem="maven",
+        lockfile_key="org.beta:common:jar:compile",
+        found_identifiers=["CVE-2026-10001", "CVE-2026-10002"],
+        found_issues=[issue_for_other_group, issue_for_beta],
+    )
+    manifest = _TargetedArtifactManifest(
+        scan_subdir=".odc-targeted",
+        expected_package_occurrences=(
+            ("org.alpha:common", "1.0.0"),
+            ("org.beta:common", "2.0.0"),
+        ),
+        occurrences_by_project={".odc-targeted/000": (alpha_occurrence, beta_occurrence)},
+        task_ids_by_project={".odc-targeted/000": ("task-alpha", "task-beta")},
+        input_paths_by_project={".odc-targeted/000": ("pom.xml",)},
+    )
+    cumulative_evidence = ODCScanEvidence(
+        requested_scope=ScanScope.TARGETED,
+        effective_scope=ScanScope.TARGETED,
+        covered_task_ids=["task-alpha", "task-beta"],
+        found_identifiers=["CVE-2026-10001", "CVE-2026-10002"],
+        new_identifiers=["CVE-2026-10001", "CVE-2026-10002"],
+        found_issues=[issue_for_other_group, issue_for_beta],
+        complete=True,
+    )
+    targets = [
+        QAScanTarget(
+            task_id="task-alpha",
+            group_id="group-alpha",
+            target_package="org.alpha:common",
+            expected_version="1.0.0",
+            manifest_paths=("pom.xml",),
+            dependency_ancestry=(),
+            target_identifiers=frozenset({"CVE-2026-10001"}),
+            package_manager="maven",
+        ),
+        QAScanTarget(
+            task_id="task-beta",
+            group_id="group-beta",
+            target_package="org.beta:common",
+            expected_version="2.0.0",
+            manifest_paths=("pom.xml",),
+            dependency_ancestry=(),
+            target_identifiers=frozenset({"CVE-2026-10002"}),
+            package_manager="maven",
+        ),
+    ]
+
+    task_evidence = _scan_evidence_by_task(
+        cumulative_evidence,
+        targets=targets,
+        baseline_identifiers=set(),
+        batch=None,
+        artifact_manifest=manifest,
+    )
+
+    assert cumulative_evidence.found_identifiers == [
+        "CVE-2026-10001",
+        "CVE-2026-10002",
+    ]
+    assert task_evidence["task-alpha"].closure_package_names == ["org.alpha:common"]
+    assert task_evidence["task-alpha"].found_identifiers == []
+    assert task_evidence["task-alpha"].remaining_target_identifiers == []
+    assert task_evidence["task-alpha"].found_issues == []
+    assert task_evidence["task-beta"].closure_package_names == ["org.beta:common"]
+    assert task_evidence["task-beta"].remaining_target_identifiers == ["CVE-2026-10002"]
+    assert task_evidence["task-beta"].found_issues == [issue_for_other_group, issue_for_beta]
+
+
 def test_shared_lockfile_report_projects_only_task_owned_occurrences() -> None:
     issue_a = VulnerabilityIssue(
         source=IssueSource.ODC,

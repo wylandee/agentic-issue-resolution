@@ -91,6 +91,8 @@ def case_metadata(
     }
     for key in (
         "golden_kind",
+        "language",
+        "ecosystem",
         "provenance",
         "provenance_status",
         "evidence_status",

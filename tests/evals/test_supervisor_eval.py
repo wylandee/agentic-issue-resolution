@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -291,6 +292,14 @@ def _assert_accepted_instruction(case: dict[str, Any], capture: ReplayCapture) -
     group = case["replay"]["input"]["group"]
     target_package = group["vulnerable_component"]
     assert verification.target_package_name == target_package
+    if case.get("language") == "java":
+        assert f"AUTHORIZED TARGET: exact Maven GAV {target_package}" in instruction
+        assert "query a registry" in instruction
+        assert "edit another GAV" in instruction
+        if "target_version" in action_args:
+            assert verification.selected_version == action_args["target_version"]
+            assert action_args["target_version"] in instruction
+        return
     assert f"AUTHORIZED TARGET: {target_package}" in instruction
     assert "PROHIBITED OPERATIONS" in instruction
 
@@ -487,9 +496,28 @@ def test_supervisor_offline_production_replay(
 
 
 def test_supervisor_eval_case_labels_and_expected_action_contract() -> None:
-    """Keep the ten stable cases and their live metric applicability explicit."""
-    assert len(_SUPERVISOR_CASES) == 10
-    assert len(set(_SUPERVISOR_CASE_IDS)) == 10
+    """Preserve existing npm cases and require the Java tactical slice."""
+    existing_npm_ids = {
+        "supervisor-direct-version-bump-clean",
+        "supervisor-transitive-package-override",
+        "supervisor-workaround-pivot-breaking-change",
+        "supervisor-portfolio-escalation-peer-conflict",
+        "supervisor-version-advance-after-test-fail",
+        "supervisor-error-unverified-version",
+        "supervisor-error-unsafe-workaround-path",
+        "supervisor-error-disallowed-strategy",
+        "supervisor-repair-loop-recovery",
+        "supervisor-inconclusive-qa-suppressed",
+    }
+    required_java_ids = {
+        "supervisor-maven-direct-minimum",
+        "supervisor-maven-managed-minimum",
+        "supervisor-maven-qualified-version",
+        "supervisor-maven-reject-unapproved",
+    }
+    assert existing_npm_ids <= set(_SUPERVISOR_CASE_IDS)
+    assert required_java_ids <= set(_SUPERVISOR_CASE_IDS)
+    assert len(set(_SUPERVISOR_CASE_IDS)) == len(_SUPERVISOR_CASE_IDS)
     no_call_cases = [case for case in _SUPERVISOR_CASES if not case["tool_correctness_applicable"]]
     assert [case["case_id"] for case in no_call_cases] == ["supervisor-inconclusive-qa-suppressed"]
     for case in _SUPERVISOR_CASES:
@@ -504,6 +532,41 @@ def test_supervisor_eval_case_labels_and_expected_action_contract() -> None:
             assert case["expected_tool_correctness_pass"] is None
             assert case["task_completion_applicable"] is False
             assert case["expected_completion_pass"] is None
+
+
+def test_java_inconclusive_qa_does_not_consume_a_remediation_retry(
+    eval_settings: EvalSettings,
+) -> None:
+    """An incomplete Maven QA result suppresses tactical work for a QA-only rerun."""
+    case = copy.deepcopy(
+        next(
+            item
+            for item in _SUPERVISOR_CASES
+            if item["case_id"] == "supervisor-maven-direct-minimum"
+        )
+    )
+    task = case["replay"]["input"]["task"]
+    case["replay"]["input"]["evaluation"] = {
+        "task_id": task["task_id"],
+        "passed": False,
+        "failure_category": "security_flag",
+        "retry_feedback": "Maven scan coverage is incomplete; rerun QA against this attempt.",
+        "evidence_inconclusive": True,
+    }
+    model = ScriptedReplayModel.from_tool_trace([])
+
+    capture = replay_supervisor_case(case, eval_settings, llm=model)
+
+    typed = capture.typed_result
+    assert typed["verification"] is None
+    assert typed["decision"] is None
+    assert typed["task_before"]["retry_count"] == 0
+    assert typed["task_after"]["retry_count"] == 0
+    assert typed["task_before"] == typed["task_after"]
+    assert typed["model_invocations"] == 0
+    assert typed["registry_resolution_calls"] == 0
+    assert typed["staged_resolutions"] == []
+    assert model.bound_tool_names == []
 
 
 def test_supervisor_test_case_builder_records_explicit_provenance() -> None:

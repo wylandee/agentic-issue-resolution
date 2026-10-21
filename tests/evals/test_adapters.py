@@ -361,6 +361,8 @@ def test_eval_settings_fixture(eval_settings: EvalSettings) -> None:
     assert isinstance(eval_settings.is_live, bool)
     assert isinstance(eval_settings.trajectory_dir, Path)
     assert isinstance(eval_settings.golden_dir, Path)
+    if eval_settings.openai_api_key:
+        assert eval_settings.openai_api_key not in repr(eval_settings)
 
 
 def test_eval_settings_env_resolution(monkeypatch: pytest.MonkeyPatch) -> None:

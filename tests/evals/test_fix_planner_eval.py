@@ -103,6 +103,20 @@ def _case_result(case: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _faithfulness_projection(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep faithfulness scoring on extracted source-backed evidence.
+
+    Deterministic checks validate strategy and schema separately. Null
+    extraction fields mean no value was extracted; they do not claim that the
+    source proves the value is absent, so they are omitted from the judge input.
+    """
+    return {
+        field: result[field]
+        for field in ("fixed_version", "workaround_snippets")
+        if result.get(field) not in (None, [])
+    }
+
+
 def _case_prompt_inputs(case: dict[str, Any]) -> tuple[str, str, list[dict[str, str]]]:
     """Return the package, identifier, and structured pages for production framing."""
     replay_input = case.get("replay", {}).get("input", {})
@@ -519,7 +533,7 @@ class TestFixPlannerEval:
             test_case = LLMTestCase(
                 name=f"{case_id} [Extraction Faithfulness]",
                 input=prompt,
-                actual_output=json.dumps(result, indent=2),
+                actual_output=json.dumps(_faithfulness_projection(result), indent=2),
                 context=[source_content],
                 retrieval_context=[source_content],
             )
@@ -563,6 +577,19 @@ def test_fix_planner_case_evidence_is_deterministic() -> None:
         result = _case_result(case)
         violations = validate_case_evidence(case, result)
         assert not violations, f"Case {case['case_id']} failed evidence checks: {violations}"
+
+
+def test_fix_planner_faithfulness_projection_omits_null_and_unscored_fields() -> None:
+    """Faithfulness judges only extracted versions and actionable snippets."""
+    projected = _faithfulness_projection(
+        {
+            "strategy": "VERSION_BUMP",
+            "fixed_version": "1.2.3",
+            "workaround_snippets": None,
+            "reasoning": "The advisory identifies a patched release.",
+        }
+    )
+    assert projected == {"fixed_version": "1.2.3"}
 
 
 # ---------------------------------------------------------------------------

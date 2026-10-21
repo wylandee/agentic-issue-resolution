@@ -21,8 +21,11 @@ from remediation_engine.contracts.schemas import (
     FixPlan,
     FixPlanStatus,
     LocalizedIssue,
+    MavenTargetOperation,
+    MultiPackageAction,
     NoFixMitigationStage,
     ODCScanEvidence,
+    QADependencyEvidence,
     QAEvaluation,
     QAPolicy,
     RemediationTask,
@@ -40,6 +43,7 @@ from remediation_engine.contracts.schemas import (
     WorkaroundReplayPlan,
     WorkerAttemptResult,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.state import (
     initial_update_subagent_state,
     initial_workaround_subagent_state,
@@ -70,6 +74,15 @@ def _replay_input(case: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(replay, Mapping) and isinstance(replay.get("input"), Mapping):
         return dict(replay["input"])
     return {}
+
+
+def _project_language(case: Mapping[str, Any]) -> ProjectLanguage:
+    """Resolve a replay language while preserving the historical Node default."""
+    value = _replay_input(case).get("project_language", ProjectLanguage.NODEJS.value)
+    try:
+        return ProjectLanguage(str(value))
+    except ValueError as exc:
+        raise ValueError(f"Unsupported replay project_language: {value!r}") from exc
 
 
 def _recorder_token_fields(recorder: TrajectoryRecorder) -> dict[str, Any]:
@@ -136,7 +149,9 @@ def _group_for_case(case: Mapping[str, Any], *, component: str) -> Vulnerability
         or case.get("target_package_name")
         or "replay-package"
     )
-    file_path = str(raw_context.get("file_path") or case.get("manifest_path") or "package.json")
+    language = _project_language(case)
+    default_manifest = "pom.xml" if language == ProjectLanguage.JAVA else "package.json"
+    file_path = str(raw_context.get("file_path") or case.get("manifest_path") or default_manifest)
     case_for_group = dict(case)
     case_for_group["vulnerability_context"] = {
         **dict(raw_context),
@@ -150,17 +165,36 @@ def _group_for_case(case: Mapping[str, Any], *, component: str) -> Vulnerability
     # package-state guardrail.  Worker groups also benefit from the same
     # manifest context when their result is serialized.
     issue = group.issues[0] if group.issues else None
-    if issue is not None and (component == "qa" or "no-fix" in str(case.get("case_id", ""))):
-        manifest_file = "package.json"
+    if issue is not None and (
+        language == ProjectLanguage.JAVA
+        or component == "qa"
+        or "no-fix" in str(case.get("case_id", ""))
+    ):
+        manifest_file = file_path
+        package_manager = "maven" if language == ProjectLanguage.JAVA else "npm"
         localized = LocalizedIssue(
             issue=issue,
             manifest_file=manifest_file,
-            package_manager="npm",
+            package_manager=package_manager,
             declaration_type=str(case.get("dependency_type") or "dependencies"),
+            version_property_name=(
+                str(raw_context["version_property_name"])
+                if raw_context.get("version_property_name")
+                else None
+            ),
+            version_property_file=(
+                str(raw_context["version_property_file"])
+                if raw_context.get("version_property_file")
+                else None
+            ),
         )
         group = group.model_copy(
             update={
-                "file_paths": [manifest_file],
+                "file_paths": (
+                    [str(path) for path in raw_context.get("file_paths", [])]
+                    if isinstance(raw_context.get("file_paths"), list)
+                    else [manifest_file]
+                ),
                 "localized_issues": [localized],
             }
         )
@@ -235,6 +269,8 @@ def _build_task(
     stage = (
         SCARemediationStage.CODE_WORKAROUND
         if component == "workaround"
+        else SCARemediationStage.MAVEN_LATEST
+        if _project_language(case) == ProjectLanguage.JAVA
         else SCARemediationStage.NPM_LATEST
     )
     status = (
@@ -285,6 +321,29 @@ def _build_snapshot(
     if task.target_dependency_type and task.target_dependency_type not in dependency_types:
         dependency_types.append(task.target_dependency_type)
     digest = hashlib.sha256(task.instruction.strip().encode("utf-8")).hexdigest()
+    is_maven = _project_language(case) == ProjectLanguage.JAVA
+    manifest_path = str(case.get("manifest_path") or "pom.xml") if is_maven else None
+    raw_paths = replay.get("target_manifest_paths")
+    target_paths = (
+        [str(path) for path in raw_paths]
+        if isinstance(raw_paths, list)
+        else [manifest_path]
+        if manifest_path
+        else []
+    )
+    operation = None
+    if is_maven:
+        operation = MavenTargetOperation(
+            str(
+                replay.get("maven_target_operation")
+                or (
+                    MavenTargetOperation.ENSURE_DEPENDENCY_MANAGEMENT.value
+                    if task.target_dependency_type == "dependencyManagement"
+                    and bool(replay.get("ensure_dependency_management"))
+                    else MavenTargetOperation.UPDATE_DECLARATION.value
+                )
+            )
+        )
     return TaskAttemptSnapshot(
         attempt_id=task.current_attempt_id or f"attempt-{task.task_id}",
         task_id=task.task_id,
@@ -299,6 +358,9 @@ def _build_snapshot(
         target_package_name=task.target_package_name,
         target_dependency_type=task.target_dependency_type,
         allowed_dependency_types=dependency_types,
+        manifest_path=manifest_path,
+        target_manifest_paths=target_paths,
+        maven_target_operation=operation,
         parent_minimum_version=task.parent_minimum_version,
         instruction=task.instruction,
         instruction_digest=digest,
@@ -313,6 +375,8 @@ def _build_snapshot(
 def _worker_files(case: Mapping[str, Any]) -> dict[str, str]:
     """Seed worker files and ensure the target package is declared."""
     files = seed_replay_files(case)
+    if _project_language(case) == ProjectLanguage.JAVA:
+        return files
     package_json_path = "package.json"
     try:
         package_json = json.loads(files[package_json_path])
@@ -574,6 +638,9 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str
                 return parsed
         return ()
 
+    is_maven = _project_language(case) == ProjectLanguage.JAVA
+    install_label = "mvn -B -q -DskipTests clean package" if is_maven else "npm install"
+    test_label = "mvn test" if is_maven else "npm test"
     install_summary = str(logs.get("install_log", "replay install result"))
     results.install = (bool(execution.get("install_passed")), install_summary)
     results.install_exit_code = optional_int(
@@ -592,12 +659,12 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str
     )
     results.install_raw_stdout = optional_stream("install", "stdout")
     results.install_raw_stderr = optional_stream("install", "stderr")
-    install_records = fixture_records("install", "npm install")
+    install_records = fixture_records("install", install_label)
     if not install_records:
         install_records = (
             qa._QALogRecord(
                 phase="install",
-                label="npm install",
+                label=install_label,
                 exit_code=results.install_exit_code,
                 stdout=results.install_raw_stdout or install_summary,
                 stderr=results.install_raw_stderr or "",
@@ -707,8 +774,6 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str
                 return [str(item) for item in value if str(item).strip()]
 
             covered_task_ids = typed_strings("covered_task_ids", [task_id])
-            if covered_task_ids != [task_id]:
-                raise ValueError("Replay QA scan evidence must cover exactly its assigned task.")
             results.scan_evidence = ODCScanEvidence(
                 requested_scope=requested_scope,
                 effective_scope=effective_scope,
@@ -750,12 +815,12 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str
     results.test_raw_stderr = optional_stream("test", "stderr")
     if results.test_raw_stderr is None:
         results.test_raw_stderr = optional_stream("tests", "stderr")
-    test_records = fixture_records("tests", "npm test") or fixture_records("test", "npm test")
+    test_records = fixture_records("tests", test_label) or fixture_records("test", test_label)
     if not test_records:
         test_records = (
             qa._QALogRecord(
                 phase="tests",
-                label="npm test",
+                label=test_label,
                 exit_code=results.test_exit_code,
                 stdout=results.test_raw_stdout or test_summary,
                 stderr=results.test_raw_stderr or "",
@@ -784,12 +849,21 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str
             ),
             diagnostics=tuple(str(value) for value in diagnostics if value),
         )
+    raw_dependency_evidence = execution.get("dependency_evidence")
+    if isinstance(raw_dependency_evidence, Mapping):
+        results.package_state_by_task[task_id] = qa._QAPackageState(
+            manifest_state=str(execution.get("package_manifest_state", "present")),
+            graph_state=str(execution.get("package_graph_state", "present")),
+            dependency_evidence=QADependencyEvidence.model_validate(dict(raw_dependency_evidence)),
+        )
     return results
 
 
 def _qa_files(case: Mapping[str, Any]) -> dict[str, str]:
     """Seed QA workspace files and ensure candidate changed files exist."""
     files = seed_replay_files(case)
+    if _project_language(case) == ProjectLanguage.JAVA:
+        return files
     cid = str(case.get("case_id", ""))
     changed = list(case.get("changed_files", []) or [])
 
@@ -848,7 +922,7 @@ def replay_qa_case(
         "execution_context", case.get("execution_context", {})
     )
     execution = replay_execution if isinstance(replay_execution, Mapping) else {}
-    if isinstance(execution, Mapping):
+    if isinstance(execution, Mapping) and _project_language(case) == ProjectLanguage.NODEJS:
         manifest_state = execution.get("package_manifest_state")
         package = str(group.vulnerable_component or "")
         if manifest_state == "absent" and "package.json" in files:
@@ -880,7 +954,8 @@ def replay_qa_case(
         else "absent"
     )
     if (
-        task.qa_policy == QAPolicy.VERSION_BUMP
+        _project_language(case) == ProjectLanguage.NODEJS
+        and task.qa_policy == QAPolicy.VERSION_BUMP
         and expected_graph == "present"
         and "package-lock.json" in files
     ):
@@ -913,7 +988,25 @@ def replay_qa_case(
             "duration_seconds": 0.0,
         }
 
-    sandbox = ReplaySandbox(files, command_responses={"npm ls": npm_ls_response})
+    command_responses = build_command_responses(case)
+    command_responses.setdefault("npm ls", npm_ls_response)
+    if _project_language(case) == ProjectLanguage.JAVA:
+        command_responses.setdefault(
+            "mvn -B -DoutputType=text org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree",
+            {
+                "exit_code": 0,
+                "stdout": str(
+                    execution.get(
+                        "maven_dependency_tree",
+                        "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n"
+                        "[INFO] \\- org.postgresql:postgresql:jar:42.7.11:compile\n",
+                    )
+                ),
+                "stderr": "",
+                "duration_seconds": 0.0,
+            },
+        )
+    sandbox = ReplaySandbox(files, command_responses=command_responses)
     results = _qa_results(case, group, task.task_id)
     worker_summary = None
     raw_worker_summary = case.get("worker_action_summary")
@@ -952,6 +1045,7 @@ def replay_qa_case(
                 instruction_digest=snapshot.instruction_digest,
             )
         },
+        "project_language": _project_language(case),
     }
     loop_outputs: list[Any] = []
     final_files: dict[str, str] = {}
@@ -1030,9 +1124,19 @@ def replay_qa_case(
 
 
 def _update_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
-    """Build deterministic npm transaction responses for update replays."""
+    """Build deterministic npm or Maven transaction responses for update replays."""
     responses = build_command_responses(case)
     case_id = str(case.get("case_id", ""))
+    if _project_language(case) == ProjectLanguage.JAVA:
+        if not any("dependency:resolve" in str(key) for key in responses):
+            failed = case_id == "update-maven-sync-rollback"
+            responses["dependency:resolve"] = {
+                "exit_code": 1 if failed else 0,
+                "stdout": "",
+                "stderr": "Could not resolve Maven dependencies in replay." if failed else "",
+                "duration_seconds": 0.0,
+            }
+        return responses
     counter = {"sync": 0}
 
     def sync_response(command: str) -> dict[str, Any]:
@@ -1134,9 +1238,32 @@ def replay_update_case(
     del eval_settings
     import remediation_engine.orchestration.update_subagent as update
 
-    group = _group_for_case(case, component="update")
-    task = _build_task(case, group, "update")
-    snapshot = _build_snapshot(case, task, dispatch_node="update_subagent")
+    replay = _replay_input(case)
+    raw_tasks = replay.get("tasks")
+    raw_groups = replay.get("groups")
+    if raw_tasks is not None or raw_groups is not None:
+        if not isinstance(raw_tasks, list) or not isinstance(raw_groups, list):
+            raise TypeError("Batch replay requires serialized tasks and groups lists.")
+        tasks = [RemediationTask.model_validate(item) for item in raw_tasks]
+        groups = [VulnerabilityGroup.model_validate(item) for item in raw_groups]
+        raw_snapshots = replay.get("attempt_snapshots")
+        if not isinstance(raw_snapshots, list):
+            raise TypeError("Batch replay requires serialized attempt_snapshots list.")
+        snapshots = [TaskAttemptSnapshot.model_validate(item) for item in raw_snapshots]
+        raw_action = replay.get("multi_package_action")
+        if not isinstance(raw_action, Mapping):
+            raise TypeError("Batch replay requires serialized multi_package_action object.")
+        multi_package_action = MultiPackageAction.model_validate(dict(raw_action))
+        task = tasks[0]
+        snapshot = next(item for item in snapshots if item.task_id == task.task_id)
+    else:
+        group = _group_for_case(case, component="update")
+        task = _build_task(case, group, "update")
+        snapshot = _build_snapshot(case, task, dispatch_node="update_subagent")
+        tasks = []
+        groups = []
+        snapshots = []
+        multi_package_action = None
     files = _worker_files(case)
     sandbox = ReplaySandbox(files, command_responses=_update_command_routes(case))
     loop_outputs: list[Any] = []
@@ -1148,14 +1275,24 @@ def replay_update_case(
         state = initial_update_subagent_state(
             str(repo_root),
             f"replay-{case.get('case_id', 'update')}",
-            [task],
-            [group],
+            tasks or [task],
+            groups or [group],
             constraints_ledger=[],
             feedback_by_task={},
             previous_action_summaries_by_task={},
             retry_diagnostics_by_task={},
-            target_attempt_snapshots={task.task_id: snapshot},
+            target_attempt_snapshots=(
+                {item.task_id: item for item in snapshots}
+                if snapshots
+                else {task.task_id: snapshot}
+            ),
+            active_cluster_id=multi_package_action.cluster_id if multi_package_action else None,
+            dispatch_batch_id=(
+                multi_package_action.dispatch_batch_id if multi_package_action else None
+            ),
+            multi_package_action=multi_package_action,
             messages=_prior_messages_from_case(case) if llm is None else [],
+            project_language=_project_language(case),
         )
         with ExitStack() as stack:
             stack.enter_context(use_trajectory_recorder(recorder))
@@ -1451,6 +1588,7 @@ def replay_supervisor_case(
         raw_versions = raw_candidate["versions"]
         canonical_version = raw_candidate["canonical_version"]
         peer_compatible = raw_candidate["peer_compatible"]
+        approved_version_pool = raw_candidate.get("approved_version_pool", [])
         if not isinstance(target_package_name, str) or not target_package_name:
             raise TypeError(
                 f"replay.input.candidate_sets[{index}].target_package_name must be a string"
@@ -1475,6 +1613,13 @@ def replay_supervisor_case(
             raise TypeError(
                 f"replay.input.candidate_sets[{index}].peer_compatible must be a boolean"
             )
+        if not isinstance(approved_version_pool, list) or not all(
+            isinstance(version, str) for version in approved_version_pool
+        ):
+            raise TypeError(
+                f"replay.input.candidate_sets[{index}].approved_version_pool "
+                "must be a list of strings"
+            )
         if security_floor != group.fix_plan.fixed_version:
             raise ValueError(
                 f"Candidate set {index} security floor does not match the group fix-plan floor."
@@ -1488,6 +1633,7 @@ def replay_supervisor_case(
                 versions=tuple(raw_versions),
                 canonical_version=canonical_version,
                 peer_compatible=peer_compatible,
+                approved_version_pool=tuple(approved_version_pool),
             )
         )
 
@@ -1636,6 +1782,7 @@ def replay_supervisor_case(
             worker_results_by_attempt=worker_results_by_attempt,
             attempt_snapshots_by_id=attempt_snapshots_by_id,
             target_task_id=task.task_id,
+            project_language=_project_language(case),
             consistency_events=consistency_events,
             errors=errors,
             staged_resolutions=staged_resolutions,

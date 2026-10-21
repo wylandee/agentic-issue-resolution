@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from remediation_engine.contracts.schemas import DecisionCode, ScanFallbackReason, ScanScope
+from remediation_engine.language import ProjectLanguage
 
 REQUIRED_CASE_FIELDS = ("case_id", "input", "context", "expected_output", "expected_tools")
 LIVE_REPLAY_EVAL_TYPES = frozenset(
@@ -241,6 +242,14 @@ def validate_golden_case(
                 violations.append(f"{tool_label}.output must be a string when present")
 
     eval_type = case.get("eval_type")
+    if "language" in case and case.get("language") not in {
+        language.value for language in ProjectLanguage
+    }:
+        violations.append(f"{label}.language must be a ProjectLanguage value")
+    if "ecosystem" in case and (
+        not isinstance(case.get("ecosystem"), str) or not case.get("ecosystem", "").strip()
+    ):
+        violations.append(f"{label}.ecosystem must be a non-empty string")
     if eval_type in {"triage", "report", "fix_planner"} and expected_tools not in ([], None):
         violations.append(f"{label} {eval_type} cases must define expected_tools as []")
     if eval_type in LIVE_REPLAY_EVAL_TYPES:
@@ -251,6 +260,12 @@ def validate_golden_case(
             violations.append(f"{label}.replay.input must be an object")
         else:
             replay_input = replay["input"]
+            if "project_language" in replay_input and replay_input["project_language"] not in {
+                language.value for language in ProjectLanguage
+            }:
+                violations.append(
+                    f"{label}.replay.input.project_language must be a ProjectLanguage value"
+                )
             required_replay_fields = {
                 "triage": ("system_context",),
                 "qa_critic": (

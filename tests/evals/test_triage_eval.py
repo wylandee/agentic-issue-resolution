@@ -31,6 +31,7 @@ from tests.evals.replay_harness import (
     build_system_context,
     build_vulnerability_group,
     cached_replay,
+    seed_replay_files,
 )
 
 try:
@@ -262,3 +263,45 @@ class TestTriageEval:
         assert result.triage_method == "llm"
         assert result.recommended_issue_id == group.representative_issue_id
         assert "CISA KEV" in result.priority_reasoning
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    ["triage-maven-actionable", "triage-maven-unknown-reachability"],
+)
+def test_java_triage_production_replays_preserve_unknown_reachability(
+    case_id: str,
+    eval_settings: EvalSettings,
+) -> None:
+    """Replay Java findings through the structured production triage boundary."""
+    case = next(item for item in _TRIAGE_CASES if item["case_id"] == case_id)
+    group = build_vulnerability_group(case)
+    result = TriageResult(
+        chain_of_thought="The Maven finding is valid; the fixture contains no reachability proof.",
+        group_id=group.group_id,
+        is_valid=True,
+        original_severity=Severity.HIGH,
+        revised_priority=Severity.HIGH,
+        is_unreachable_code=False,
+        priority_reasoning="The Java dependency finding is high risk and remains actionable.",
+        validity_confidence_score=0.9,
+        priority_confidence_score=0.9,
+        recommended_issue_id=group.representative_issue_id,
+        triage_method="llm",
+    )
+    model = ScriptedReplayModel.from_structured_result(result)
+
+    capture = replay_triage_case(case, eval_settings, llm=model)
+
+    assert model.structured_invocation_count == 1
+    assert capture.typed_result.is_valid is True
+    assert capture.typed_result.is_unreachable_code is False
+    assert group.issues[0].ecosystem == "maven"
+    assert group.issues[0].package_name == "org.postgresql:postgresql"
+    assert group.file_path == "pom.xml"
+    assert group.is_reachable is None
+    assert build_system_context(case).primary_language == "java"
+    java_files = seed_replay_files({"replay": {"input": {"project_language": "java"}}})
+    assert "pom.xml" in java_files
+    assert "package.json" not in java_files
+    assert build_system_context({"replay": {"input": {}}}).primary_language == "javascript"

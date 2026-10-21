@@ -29,8 +29,25 @@ def test_all_golden_datasets_load_and_validate() -> None:
             supervisor_cases = cases
 
     assert counts["fix_planner_cases"] == 15
-    assert counts["supervisor_cases"] == 10
-    assert len({case["case_id"] for case in supervisor_cases}) == 10
+    supervisor_ids = {case["case_id"] for case in supervisor_cases}
+    assert {
+        "supervisor-direct-version-bump-clean",
+        "supervisor-transitive-package-override",
+        "supervisor-workaround-pivot-breaking-change",
+        "supervisor-portfolio-escalation-peer-conflict",
+        "supervisor-version-advance-after-test-fail",
+        "supervisor-error-unverified-version",
+        "supervisor-error-unsafe-workaround-path",
+        "supervisor-error-disallowed-strategy",
+        "supervisor-repair-loop-recovery",
+        "supervisor-inconclusive-qa-suppressed",
+    } <= supervisor_ids
+    assert {
+        "supervisor-maven-direct-minimum",
+        "supervisor-maven-managed-minimum",
+        "supervisor-maven-qualified-version",
+        "supervisor-maven-reject-unapproved",
+    } <= supervisor_ids
 
 
 def test_live_replay_datasets_have_structured_replay_inputs() -> None:

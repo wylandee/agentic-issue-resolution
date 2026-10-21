@@ -4,7 +4,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md \u00a7494",
+    "provenance": "data/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md §494",
     "historical_evidence": [
       "debug UPDATE_VERSION used version_bump with install, scan, and tests passing; terminal output passed=true."
     ],
@@ -56,7 +56,7 @@
     "expected_output": "Complete: emit passed=true because install, scanner clearance, and tests all pass.",
     "input": "Review one version-bump QA group and emit one evidence-backed evaluation. A clean pass requires install, scanner clearance, and tests to pass.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md \u00a7494",
+      "Golden provenance:\ndata/trajectories/phase5_20260825T065848Z_f450504b-6248-4305-8b06-340a73171c96.md §494",
       "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": true\n}"
     ],
@@ -145,7 +145,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "historical_gate_normalized_terminal",
     "evidence_status": "historical_legacy",
-    "provenance": "data/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md \u00a7157",
+    "provenance": "data/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md §157",
     "historical_evidence": [
       "npm install FAILED with EOVERRIDE: the ws@8.21.1 override conflicted with the direct dependency; old trace had no current terminal emit."
     ],
@@ -199,7 +199,7 @@
     "expected_output": "Complete: query install and emit passed=false with peer-conflict guidance.",
     "input": "Review one version-bump QA group and emit a failure evaluation when dependency installation fails. Use the install log to provide peer-conflict guidance.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md \u00a7157",
+      "Golden provenance:\ndata/trajectories/phase5_20260721T064116Z_aa632865-4cce-4bec-86ba-8c6dfb526f67.md §157",
       "Expected QA verdict:\n{\n  \"failure_category\": \"peer_conflict\",\n  \"passed\": false\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": false,\n  \"package_graph_state\": null,\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"not_run\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": null,\n  \"tests_passed\": null\n}"
     ],
@@ -303,7 +303,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md \u00a7\u00a7128, 162",
+    "provenance": "data/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md §§128, 162",
     "historical_evidence": [
       "fstream UPDATE_VERSION had install=true, scan=false, tests=true; remaining CVE-2019-13173 and GHSA-XF7W-R453-M56C produced a security_flag terminal evaluation."
     ],
@@ -362,7 +362,7 @@
     "expected_output": "Complete: query scan and emit a security_flag failure for the remaining target identifiers.",
     "input": "Review one version-bump QA group and emit a security failure when the scanner still reports target identifiers, even if install and tests pass.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md \u00a7\u00a7128, 162",
+      "Golden provenance:\ndata/trajectories/phase5_20260825T072934Z_05fc216d-7f55-4287-9540-52059ce3ef0a.md §§128, 162",
       "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2019-13173\",\n    \"GHSA-XF7W-R453-M56C\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
@@ -471,7 +471,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427, 473",
+    "provenance": "data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md §§427, 473",
     "historical_evidence": [
       "express-jwt UPDATE_VERSION had install=true, scan=true, tests=false; TypeError import_express_jwt.default is not a function at lib/insecurity.ts:54:35 was categorized as breaking_change."
     ],
@@ -525,7 +525,7 @@
     "expected_output": "Complete: query tests and emit a breaking_change failure tied to the express-jwt v8 import error.",
     "input": "Review one version-bump QA group and emit a failure evaluation when the updated package causes a test regression. Cite the exact API diagnostic.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427, 473",
+      "Golden provenance:\ndata/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md §§427, 473",
       "Expected QA verdict:\n{\n  \"failure_category\": \"breaking_change\",\n  \"passed\": false\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": false\n}"
     ],
@@ -629,7 +629,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "normalized_initial_semantic_pass",
     "evidence_status": "normalized",
-    "provenance": "Closest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md \u00a7508 plus synthetic case_5_initial_workaround_pass.",
+    "provenance": "Closest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md §508 plus synthetic case_5_initial_workaround_pass.",
     "historical_evidence": [
       "Historical mitigation_code_workaround evidence had install=true, scan=false, tests=true but no terminal emit; existing initial fixture used scanner not_run. This case normalizes scanner failure as nonblocking under initial_code_workaround."
     ],
@@ -685,7 +685,7 @@
     "expected_output": "Complete: use source/diff evidence and emit passed=true even though the initial-workaround scanner identifier remains nonblocking.",
     "input": "Review one initial code-workaround group. Remaining scanner identifiers are nonblocking, but source/diff evidence must prove the vulnerable path is blocked and tests must pass before emitting pass.",
     "context": [
-      "Golden provenance:\nClosest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md \u00a7508 plus synthetic case_5_initial_workaround_pass.",
+      "Golden provenance:\nClosest historical trace data/trajectories/phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92.md §508 plus synthetic case_5_initial_workaround_pass.",
       "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true,\n  \"semantic_security_review\": \"pass\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2020-15084\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
@@ -1573,7 +1573,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "direct_historical_modern",
     "evidence_status": "direct_modern",
-    "provenance": "data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7\u00a7891, 918",
+    "provenance": "data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md §§891, 918",
     "historical_evidence": [
       "express-jwt CODE_WORKAROUND used migration_code_workaround with install, scan, and tests passing; terminal output passed=true with semantic review pass."
     ],
@@ -1627,7 +1627,7 @@
     "expected_output": "Complete: emit passed=true with semantic review pass because the migrated API, scanner, and tests are successful.",
     "input": "Review one migration code-workaround pivot after an update API break and emit pass only when the migrated API, scanner clearance, and tests are all successful.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7\u00a7891, 918",
+      "Golden provenance:\ndata/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md §§891, 918",
       "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true,\n  \"semantic_security_review\": \"pass\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": true\n}"
     ],
@@ -1899,7 +1899,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "normalized_pivot_test_failure",
     "evidence_status": "normalized",
-    "provenance": "Composite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7891.",
+    "provenance": "Composite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md §§427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md §891.",
     "historical_evidence": [
       "The update trace proves the express-jwt API test break and the pivot trace proves the subsequent migration path; no single exported trace contains this exact pivot plus terminal test-failure pair."
     ],
@@ -1952,7 +1952,7 @@
     "expected_output": "Complete: query tests and emit a breaking_change failure tied to the API integration error.",
     "input": "Review one migration code-workaround pivot and emit a breaking-change failure when the migrated API still causes required tests to fail.",
     "context": [
-      "Golden provenance:\nComposite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md \u00a7\u00a7427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md \u00a7891.",
+      "Golden provenance:\nComposite evidence from express-jwt update failure data/trajectories/phase5_20260819T045004Z_b0cd51b5-0005-4248-930d-165aac643a21.md §§427,473 and migration pivot data/trajectories/phase5_20260819T042010Z_132dbbd5-6b76-4fcd-8820-382108a0713e.md §891.",
       "Expected QA verdict:\n{\n  \"failure_category\": \"breaking_change\",\n  \"passed\": false\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": false\n}"
     ],
@@ -2056,7 +2056,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "normalized_nofix_package_removal_pass",
     "evidence_status": "historical_worker_plus_synthetic_qa",
-    "provenance": "Worker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z \u00a723; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
+    "provenance": "Worker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z §23; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
     "historical_evidence": [
       "Worker removed notevil and its consumer and passed cumulative validation. The corresponding QA trace timed out during scanning, so this golden requires authoritative scan clearance rather than treating that trace as a QA pass."
     ],
@@ -2113,7 +2113,7 @@
     "expected_output": "Complete: confirm install, scan, package absence, and tests before emitting passed=true.",
     "input": "Review one no-fix package-removal group. Confirm install, scanner clearance, package absence from manifest and graph, and tests before emitting pass.",
     "context": [
-      "Golden provenance:\nWorker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z \u00a723; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
+      "Golden provenance:\nWorker golden tests/evals/golden/workaround_subagent_cases.json case workaround-no-fix-package-removal, historical run phase5_20260819T030725Z §23; QA outcome normalized from synthetic case_8_no_fix_package_removal_pass.",
       "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"absent\",\n  \"package_manifest_state\": \"absent\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": true\n}"
     ],
@@ -2767,7 +2767,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "historical_typed_nofix_semantic_pass",
     "evidence_status": "historical_typed",
-    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md \u00a7\u00a759,99.",
+    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md §§59,99.",
     "historical_evidence": [
       "The no_fix_code_removal evaluation records install/tests passing, residual target identifiers as expected/nonblocking, and semantic review pass after removing notevil/node:vm usage from routes/b2bOrder.ts."
     ],
@@ -2826,7 +2826,7 @@
     "expected_output": "Complete: inspect source/diff and emit passed=true because the retained package is allowed and the vulnerable path is removed despite residual scanner identifiers.",
     "input": "Review one no-fix code-removal pivot after package removal was exhausted. Residual target identifiers are expected and nonblocking; emit pass only when source/diff evidence proves the vulnerable path was removed and tests pass.",
     "context": [
-      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md \u00a7\u00a759,99.",
+      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T081243Z.json, linked QA trajectory data/trajectories/phase5_20260811T081812Z_4e04f8ff-d8b9-48dc-924c-b1295de20c95.md §§59,99.",
       "Expected QA verdict:\n{\n  \"failure_category\": null,\n  \"passed\": true,\n  \"semantic_security_review\": \"pass\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2021-23771\",\n    \"GHSA-8G4M-CJM2-96WQ\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
@@ -3147,7 +3147,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "historical_typed_nofix_semantic_failure",
     "evidence_status": "historical_typed",
-    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md \u00a7114.",
+    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md §114.",
     "historical_evidence": [
       "The no_fix_code_removal evaluation records install=true, scanner success with residual identifiers, tests=true, and semantic review fail because notevil remains imported and invoked."
     ],
@@ -3206,7 +3206,7 @@
     "expected_output": "Complete: inspect source/diff and emit a security_flag failure because the vulnerable path remains reachable.",
     "input": "Review one no-fix code-removal pivot. Residual target identifiers are nonblocking, but source/diff evidence must prove the vulnerable path is removed; emit a security failure when semantic review fails.",
     "context": [
-      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md \u00a7114.",
+      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T061348Z.json, linked QA trajectory data/trajectories/phase5_20260811T062014Z_76d5f696-efab-4637-8876-0cdc09d6dd52.md §114.",
       "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false,\n  \"semantic_security_review\": \"fail\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [\n    \"CVE-2021-23771\",\n    \"GHSA-8G4M-CJM2-96WQ\"\n  ],\n  \"target_scanner_cleared\": false,\n  \"tests_passed\": true\n}"
     ],
@@ -3363,7 +3363,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "historical_typed_nofix_test_failure",
     "evidence_status": "historical_typed",
-    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md \u00a7114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
+    "provenance": "Typed artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md §114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
     "historical_evidence": [
       "The no-fix stage-two evaluation records install=true, scanner success, and tests_passed=false; failed tests include /rest/chat and test/api/chat.test.ts, while semantic review was inconclusive."
     ],
@@ -3419,7 +3419,7 @@
     "expected_output": "Complete: query tests and emit a security_flag failure while preserving inconclusive semantic and test attribution.",
     "input": "Review one no-fix code-removal pivot and emit a failure when required unit tests fail. Preserve the historical evidence that semantic review and test attribution were inconclusive.",
     "context": [
-      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md \u00a7114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
+      "Golden provenance:\nTyped artifact data/trajectories/notevil_workaround_nofix_stage2_20260811T033558Z.json, linked QA trajectory data/trajectories/phase5_20260811T034728Z_b024acd8-cf06-4157-9a42-c8f86a5fa0cc.md §114; pivot context is phase5_20260811T030632Z_7c61637f-9b44-453f-9131-f5f962f67115.md.",
       "Expected QA verdict:\n{\n  \"failure_category\": \"security_flag\",\n  \"passed\": false,\n  \"semantic_security_review\": \"inconclusive\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": true,\n  \"package_graph_state\": \"present\",\n  \"package_manifest_state\": \"present\",\n  \"scanner_execution_status\": \"success\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": true,\n  \"tests_passed\": false\n}"
     ],
@@ -3583,7 +3583,7 @@
     "eval_type": "qa_critic",
     "golden_kind": "maximum_subagent_tool_call_rounds",
     "evidence_status": "boundary_only",
-    "provenance": "data/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md \u00a7212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
+    "provenance": "data/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md §212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
     "historical_evidence": [
       "MAX_SUBAGENT_TOOL_CALL_ROUNDS is 24; the historical run contained 24 LLM rounds and 29 raw tool spans and ended without a final answer or terminal emit."
     ],
@@ -3635,7 +3635,7 @@
     "expected_output": "Incomplete: the execution bound was reached without a terminal emit_qa_evaluation call.",
     "input": "Complete the assigned QA evaluation for the vulnerability group. A bounded run that reaches 24 tool-call rounds without emit_qa_evaluation is incomplete and must not claim QA completion.",
     "context": [
-      "Golden provenance:\ndata/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md \u00a7212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
+      "Golden provenance:\ndata/trajectories/phase5_20260805T025205Z_49f32aca-5c7a-498b-ad11-5ec5872c4e52.md §212 and tests/evals/golden/workaround_subagent_cases.json case workaround-surrender-after-max-tool-round-limit.",
       "Expected QA verdict:\n{\n  \"completed\": false,\n  \"terminal_tool\": \"emit_qa_evaluation\"\n}",
       "Deterministic execution context:\n{\n  \"install_passed\": null,\n  \"scanner_execution_status\": \"not_run\",\n  \"target_remaining_identifiers\": [],\n  \"target_scanner_cleared\": null,\n  \"tests_passed\": null\n}"
     ],
@@ -3684,6 +3684,1235 @@
           "src/eval.ts": "export function evaluate() { return true; }\n",
           "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
         }
+      }
+    }
+  },
+  {
+    "case_id": "qa_maven_target_pass",
+    "eval_type": "qa_critic",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "historical_qa_normalization",
+    "evidence_status": "historical_qa_observation",
+    "provenance": "Historical trace C:\\Users\\UserAdmin\\.codex\\worktrees\\93fc\\agentic-issue-resolution\\data\\trajectories\\phase5_20261020T035317Z_acc4a7ea-58ce-4140-becb-f26bc5764064.md; PostgreSQL and jsoup task QA outcomes follow the mutations. The overall run must be interpreted separately.",
+    "historical_evidence": [
+      "Historical trace C:\\Users\\UserAdmin\\.codex\\worktrees\\93fc\\agentic-issue-resolution\\data\\trajectories\\phase5_20261020T035317Z_acc4a7ea-58ce-4140-becb-f26bc5764064.md; PostgreSQL and jsoup task QA outcomes follow the mutations. The overall run must be interpreted separately."
+    ],
+    "vulnerability_context": {
+      "group_id": "qa_maven_target_pass:group",
+      "vulnerable_component": "org.postgresql:postgresql",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "42.7.11",
+      "fixed_version": "42.7.11",
+      "purl": "pkg:maven/org.postgresql/postgresql@42.7.11"
+    },
+    "completion_task": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
+    "qa_policy": "version_bump",
+    "target_package_name": "org.postgresql:postgresql",
+    "selected_version": "42.7.11",
+    "dependency_type": "dependencies",
+    "manifest_path": "pom.xml",
+    "attempt_id": "attempt-qa_maven_target_pass",
+    "task_revision": 1,
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": true,
+      "test_exit_code": 0,
+      "test_failure_count": 0,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_maven_target_pass"
+      ],
+      "closure_package_names": [
+        "org.postgresql:postgresql"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null,
+      "found_identifiers": [
+        "CVE-2030-0001"
+      ],
+      "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- org.postgresql:postgresql:jar:42.7.11:compile\n",
+      "dependency_evidence": {
+        "status": "verified",
+        "target_package": "org.postgresql:postgresql",
+        "expected_version": "42.7.11",
+        "manifest_paths": [
+          "pom.xml"
+        ],
+        "lockfile_paths": [],
+        "declarations": {
+          "pom.xml": "42.7.11"
+        },
+        "resolved_versions": [
+          "42.7.11"
+        ],
+        "lockfile_versions": [],
+        "evidence_refs": [
+          "pom.xml"
+        ],
+        "diagnostics": []
+      }
+    },
+    "execution_logs": {
+      "install_log": "mvn clean package succeeded.",
+      "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+      "test_output": "mvn test passed."
+    },
+    "changed_files": [
+      "pom.xml"
+    ],
+    "worker_action_summary": "Committed Maven task for org.postgresql:postgresql executed at 42.7.11.",
+    "expected_qa_verdict": {
+      "passed": true,
+      "failure_category": null
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "tool_correctness_applicable": true,
+    "expected_output": "Emit passed=true because the committed target, scanner, and tests pass.",
+    "input": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
+    "context": [
+      "Project language: Java; Maven GAV: org.postgresql:postgresql; committed version: 42.7.11.",
+      "Task-scoped ODC evidence is separate from cumulative repository findings."
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "qa_maven_target_pass",
+          "passed": true,
+          "failure_category": null,
+          "retry_feedback": null,
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "Historical observations are stored separately from this scripted Java QA replay.",
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "qa_maven_target_pass",
+            "passed": true,
+            "failure_category": null,
+            "retry_feedback": null,
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "vulnerability_context": {
+          "group_id": "qa_maven_target_pass:group",
+          "vulnerable_component": "org.postgresql:postgresql",
+          "file_path": "pom.xml",
+          "file_paths": null,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "package_version": "42.7.11",
+          "fixed_version": "42.7.11",
+          "purl": "pkg:maven/org.postgresql/postgresql@42.7.11"
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": true,
+          "test_exit_code": 0,
+          "test_failure_count": 0,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_maven_target_pass"
+          ],
+          "closure_package_names": [
+            "org.postgresql:postgresql"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null,
+          "found_identifiers": [
+            "CVE-2030-0001"
+          ],
+          "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- org.postgresql:postgresql:jar:42.7.11:compile\n",
+          "dependency_evidence": {
+            "status": "verified",
+            "target_package": "org.postgresql:postgresql",
+            "expected_version": "42.7.11",
+            "manifest_paths": [
+              "pom.xml"
+            ],
+            "lockfile_paths": [],
+            "declarations": {
+              "pom.xml": "42.7.11"
+            },
+            "resolved_versions": [
+              "42.7.11"
+            ],
+            "lockfile_versions": [],
+            "evidence_refs": [
+              "pom.xml"
+            ],
+            "diagnostics": []
+          }
+        },
+        "execution_logs": {
+          "install_log": "mvn clean package succeeded.",
+          "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+          "test_output": "mvn test passed."
+        },
+        "workspace_files": {
+          "pom.xml": "<project xmlns=\"http://maven.apache.org/POM/4.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>eval.replay</groupId>\n  <artifactId>eval-replay</artifactId>\n  <version>1.0.0</version>\n  <dependencies>\n    <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><version>42.7.11</version></dependency>\n  </dependencies>\n</project>\n"
+        },
+        "allowed_target_versions": [
+          "42.7.11"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
+  },
+  {
+    "case_id": "qa_maven_compile_failure",
+    "eval_type": "qa_critic",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "synthetic_compile_failure",
+    "evidence_status": "synthetic",
+    "provenance": "Synthetic self-contained Maven QA replay; historical status is not implied.",
+    "historical_evidence": [],
+    "vulnerability_context": {
+      "group_id": "qa_maven_compile_failure:group",
+      "vulnerable_component": "org.postgresql:postgresql",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "42.7.11",
+      "fixed_version": "42.7.11",
+      "purl": "pkg:maven/org.postgresql/postgresql@42.7.11"
+    },
+    "completion_task": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
+    "qa_policy": "version_bump",
+    "target_package_name": "org.postgresql:postgresql",
+    "selected_version": "42.7.11",
+    "dependency_type": "dependencies",
+    "manifest_path": "pom.xml",
+    "attempt_id": "attempt-qa_maven_compile_failure",
+    "task_revision": 1,
+    "execution_context": {
+      "install_passed": false,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": false,
+      "test_exit_code": null,
+      "test_failure_count": null,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_maven_compile_failure"
+      ],
+      "closure_package_names": [
+        "org.postgresql:postgresql"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null,
+      "found_identifiers": [
+        "CVE-2030-0001"
+      ],
+      "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- org.postgresql:postgresql:jar:42.7.11:compile\n",
+      "dependency_evidence": {
+        "status": "verified",
+        "target_package": "org.postgresql:postgresql",
+        "expected_version": "42.7.11",
+        "manifest_paths": [
+          "pom.xml"
+        ],
+        "lockfile_paths": [],
+        "declarations": {
+          "pom.xml": "42.7.11"
+        },
+        "resolved_versions": [
+          "42.7.11"
+        ],
+        "lockfile_versions": [],
+        "evidence_refs": [
+          "pom.xml"
+        ],
+        "diagnostics": []
+      }
+    },
+    "execution_logs": {
+      "install_log": "mvn compile failed: [ERROR] cannot find symbol\n[ERROR] symbol: method missingApi()\n[ERROR] location: class eval.Service",
+      "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+      "test_output": "Maven tests were not run because the compile gate failed."
+    },
+    "changed_files": [
+      "pom.xml"
+    ],
+    "worker_action_summary": "Committed Maven task for org.postgresql:postgresql executed at 42.7.11.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "security_flag"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "tool_correctness_applicable": true,
+    "expected_output": "Emit passed=false with security_flag because the Maven evidence fails the required gate.",
+    "input": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
+    "context": [
+      "Project language: Java; Maven GAV: org.postgresql:postgresql; committed version: 42.7.11.",
+      "Task-scoped ODC evidence is separate from cumulative repository findings."
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Historical observations are stored separately from this scripted Java QA replay.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "vulnerability_context": {
+          "group_id": "qa_maven_compile_failure:group",
+          "vulnerable_component": "org.postgresql:postgresql",
+          "file_path": "pom.xml",
+          "file_paths": null,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "package_version": "42.7.11",
+          "fixed_version": "42.7.11",
+          "purl": "pkg:maven/org.postgresql/postgresql@42.7.11"
+        },
+        "execution_context": {
+          "install_passed": false,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": false,
+          "test_exit_code": null,
+          "test_failure_count": null,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_maven_compile_failure"
+          ],
+          "closure_package_names": [
+            "org.postgresql:postgresql"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null,
+          "found_identifiers": [
+            "CVE-2030-0001"
+          ],
+          "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- org.postgresql:postgresql:jar:42.7.11:compile\n",
+          "dependency_evidence": {
+            "status": "verified",
+            "target_package": "org.postgresql:postgresql",
+            "expected_version": "42.7.11",
+            "manifest_paths": [
+              "pom.xml"
+            ],
+            "lockfile_paths": [],
+            "declarations": {
+              "pom.xml": "42.7.11"
+            },
+            "resolved_versions": [
+              "42.7.11"
+            ],
+            "lockfile_versions": [],
+            "evidence_refs": [
+              "pom.xml"
+            ],
+            "diagnostics": []
+          }
+        },
+        "execution_logs": {
+          "install_log": "mvn compile failed: [ERROR] cannot find symbol\n[ERROR] symbol: method missingApi()\n[ERROR] location: class eval.Service",
+          "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+          "test_output": "Maven tests were not run because the compile gate failed."
+        },
+        "workspace_files": {
+          "pom.xml": "<project xmlns=\"http://maven.apache.org/POM/4.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>eval.replay</groupId>\n  <artifactId>eval-replay</artifactId>\n  <version>1.0.0</version>\n  <dependencies>\n    <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><version>42.7.11</version></dependency>\n  </dependencies>\n</project>\n"
+        },
+        "allowed_target_versions": [
+          "42.7.11"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
+  },
+  {
+    "case_id": "qa_maven_test_regression",
+    "eval_type": "qa_critic",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "synthetic_surefire_regression",
+    "evidence_status": "synthetic",
+    "provenance": "Synthetic self-contained Maven QA replay; historical status is not implied.",
+    "historical_evidence": [],
+    "vulnerability_context": {
+      "group_id": "qa_maven_test_regression:group",
+      "vulnerable_component": "org.postgresql:postgresql",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "42.7.11",
+      "fixed_version": "42.7.11",
+      "purl": "pkg:maven/org.postgresql/postgresql@42.7.11"
+    },
+    "completion_task": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
+    "qa_policy": "version_bump",
+    "target_package_name": "org.postgresql:postgresql",
+    "selected_version": "42.7.11",
+    "dependency_type": "dependencies",
+    "manifest_path": "pom.xml",
+    "attempt_id": "attempt-qa_maven_test_regression",
+    "task_revision": 1,
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": false,
+      "test_exit_code": 1,
+      "test_failure_count": 1,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_maven_test_regression"
+      ],
+      "closure_package_names": [
+        "org.postgresql:postgresql"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null,
+      "found_identifiers": [
+        "CVE-2030-0001"
+      ],
+      "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- org.postgresql:postgresql:jar:42.7.11:compile\n",
+      "dependency_evidence": {
+        "status": "verified",
+        "target_package": "org.postgresql:postgresql",
+        "expected_version": "42.7.11",
+        "manifest_paths": [
+          "pom.xml"
+        ],
+        "lockfile_paths": [],
+        "declarations": {
+          "pom.xml": "42.7.11"
+        },
+        "resolved_versions": [
+          "42.7.11"
+        ],
+        "lockfile_versions": [],
+        "evidence_refs": [
+          "pom.xml"
+        ],
+        "diagnostics": []
+      }
+    },
+    "execution_logs": {
+      "install_log": "mvn clean package succeeded.",
+      "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+      "test_output": "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\norg.example.ServiceTest.testCompatibility expected <200> but was <500>."
+    },
+    "changed_files": [
+      "pom.xml"
+    ],
+    "worker_action_summary": "Committed Maven task for org.postgresql:postgresql executed at 42.7.11.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "breaking_change"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "tool_correctness_applicable": true,
+    "expected_output": "Emit passed=false with breaking_change because the Maven evidence fails the required gate.",
+    "input": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
+    "context": [
+      "Project language: Java; Maven GAV: org.postgresql:postgresql; committed version: 42.7.11.",
+      "Task-scoped ODC evidence is separate from cumulative repository findings."
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "tests"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "qa_maven_test_regression",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "Maven tests failed in ServiceTest.testCompatibility after a successful build and clean target scan.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "Historical observations are stored separately from this scripted Java QA replay.",
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "tests"
+          },
+          "output": "Maven test output confirms Surefire regression."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "qa_maven_test_regression",
+            "passed": false,
+            "failure_category": "breaking_change",
+            "retry_feedback": "Maven tests failed in ServiceTest.testCompatibility after a successful build and clean target scan.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "vulnerability_context": {
+          "group_id": "qa_maven_test_regression:group",
+          "vulnerable_component": "org.postgresql:postgresql",
+          "file_path": "pom.xml",
+          "file_paths": null,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "package_version": "42.7.11",
+          "fixed_version": "42.7.11",
+          "purl": "pkg:maven/org.postgresql/postgresql@42.7.11"
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": false,
+          "test_exit_code": 1,
+          "test_failure_count": 1,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_maven_test_regression"
+          ],
+          "closure_package_names": [
+            "org.postgresql:postgresql"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null,
+          "found_identifiers": [
+            "CVE-2030-0001"
+          ],
+          "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- org.postgresql:postgresql:jar:42.7.11:compile\n",
+          "dependency_evidence": {
+            "status": "verified",
+            "target_package": "org.postgresql:postgresql",
+            "expected_version": "42.7.11",
+            "manifest_paths": [
+              "pom.xml"
+            ],
+            "lockfile_paths": [],
+            "declarations": {
+              "pom.xml": "42.7.11"
+            },
+            "resolved_versions": [
+              "42.7.11"
+            ],
+            "lockfile_versions": [],
+            "evidence_refs": [
+              "pom.xml"
+            ],
+            "diagnostics": []
+          }
+        },
+        "execution_logs": {
+          "install_log": "mvn clean package succeeded.",
+          "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+          "test_output": "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\norg.example.ServiceTest.testCompatibility expected <200> but was <500>."
+        },
+        "workspace_files": {
+          "pom.xml": "<project xmlns=\"http://maven.apache.org/POM/4.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>eval.replay</groupId>\n  <artifactId>eval-replay</artifactId>\n  <version>1.0.0</version>\n  <dependencies>\n    <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><version>42.7.11</version></dependency>\n  </dependencies>\n</project>\n"
+        },
+        "allowed_target_versions": [
+          "42.7.11"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
+  },
+  {
+    "case_id": "qa_maven_target_remaining",
+    "eval_type": "qa_critic",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "historical_qa_rejection",
+    "evidence_status": "historical_qa_observation",
+    "provenance": "Historical D-drive trace D:\\agentic-issue-resolution\\data\\trajectories\\phase5_20261008T071822Z_d91b4065-fe6e-4cfa-9149-6ec4a6b86e14.md Span 49: target CVE-2021-42550 and CVE-2023-6378 remain despite Maven tests passing. Historical evidence is a QA rejection, not a remediation pass.",
+    "historical_evidence": [
+      "Historical D-drive trace D:\\agentic-issue-resolution\\data\\trajectories\\phase5_20261008T071822Z_d91b4065-fe6e-4cfa-9149-6ec4a6b86e14.md Span 49: target CVE-2021-42550 and CVE-2023-6378 remain despite Maven tests passing. Historical evidence is a QA rejection, not a remediation pass."
+    ],
+    "vulnerability_context": {
+      "group_id": "qa_maven_target_remaining:group",
+      "vulnerable_component": "ch.qos.logback:logback-classic",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "1.2.13",
+      "fixed_version": "1.2.13",
+      "purl": "pkg:maven/ch.qos.logback/logback-classic@1.2.13"
+    },
+    "completion_task": "Review Maven QA for ch.qos.logback:logback-classic at committed version 1.2.13; separate task-owned evidence from cumulative findings.",
+    "qa_policy": "version_bump",
+    "target_package_name": "ch.qos.logback:logback-classic",
+    "selected_version": "1.2.13",
+    "dependency_type": "dependencies",
+    "manifest_path": "pom.xml",
+    "attempt_id": "attempt-qa_maven_target_remaining",
+    "task_revision": 1,
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": false,
+      "target_remaining_identifiers": [
+        "CVE-2021-42550",
+        "CVE-2023-6378"
+      ],
+      "tests_passed": true,
+      "test_exit_code": 0,
+      "test_failure_count": 0,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_maven_target_remaining"
+      ],
+      "closure_package_names": [
+        "ch.qos.logback:logback-classic"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null,
+      "found_identifiers": [
+        "CVE-2030-0001"
+      ],
+      "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- ch.qos.logback:logback-classic:jar:1.2.13:compile\n",
+      "dependency_evidence": {
+        "status": "verified",
+        "target_package": "ch.qos.logback:logback-classic",
+        "expected_version": "1.2.13",
+        "manifest_paths": [
+          "pom.xml"
+        ],
+        "lockfile_paths": [],
+        "declarations": {
+          "pom.xml": "1.2.13"
+        },
+        "resolved_versions": [
+          "1.2.13"
+        ],
+        "lockfile_versions": [],
+        "evidence_refs": [
+          "pom.xml"
+        ],
+        "diagnostics": []
+      }
+    },
+    "execution_logs": {
+      "install_log": "mvn clean package succeeded.",
+      "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+      "test_output": "mvn test passed."
+    },
+    "changed_files": [
+      "pom.xml"
+    ],
+    "worker_action_summary": "Committed Maven task for ch.qos.logback:logback-classic executed at 1.2.13.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "security_flag"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "tool_correctness_applicable": true,
+    "expected_output": "Emit passed=false with security_flag because the Maven evidence fails the required gate.",
+    "input": "Review Maven QA for ch.qos.logback:logback-classic at committed version 1.2.13; separate task-owned evidence from cumulative findings.",
+    "context": [
+      "Project language: Java; Maven GAV: ch.qos.logback:logback-classic; committed version: 1.2.13.",
+      "Task-scoped ODC evidence is separate from cumulative repository findings."
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "scan"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "qa_maven_target_remaining",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "The targeted Maven scan still reports the committed target identifiers; clear them before retrying.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "Historical observations are stored separately from this scripted Java QA replay.",
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "scan"
+          },
+          "output": "Maven build or scanner evidence confirms the target gate failed."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "qa_maven_target_remaining",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "The targeted Maven scan still reports the committed target identifiers; clear them before retrying.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "vulnerability_context": {
+          "group_id": "qa_maven_target_remaining:group",
+          "vulnerable_component": "ch.qos.logback:logback-classic",
+          "file_path": "pom.xml",
+          "file_paths": null,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "package_version": "1.2.13",
+          "fixed_version": "1.2.13",
+          "purl": "pkg:maven/ch.qos.logback/logback-classic@1.2.13"
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": false,
+          "target_remaining_identifiers": [
+            "CVE-2021-42550",
+            "CVE-2023-6378"
+          ],
+          "tests_passed": true,
+          "test_exit_code": 0,
+          "test_failure_count": 0,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_maven_target_remaining"
+          ],
+          "closure_package_names": [
+            "ch.qos.logback:logback-classic"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null,
+          "found_identifiers": [
+            "CVE-2030-0001"
+          ],
+          "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- ch.qos.logback:logback-classic:jar:1.2.13:compile\n",
+          "dependency_evidence": {
+            "status": "verified",
+            "target_package": "ch.qos.logback:logback-classic",
+            "expected_version": "1.2.13",
+            "manifest_paths": [
+              "pom.xml"
+            ],
+            "lockfile_paths": [],
+            "declarations": {
+              "pom.xml": "1.2.13"
+            },
+            "resolved_versions": [
+              "1.2.13"
+            ],
+            "lockfile_versions": [],
+            "evidence_refs": [
+              "pom.xml"
+            ],
+            "diagnostics": []
+          }
+        },
+        "execution_logs": {
+          "install_log": "mvn clean package succeeded.",
+          "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+          "test_output": "mvn test passed."
+        },
+        "workspace_files": {
+          "pom.xml": "<project xmlns=\"http://maven.apache.org/POM/4.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>eval.replay</groupId>\n  <artifactId>eval-replay</artifactId>\n  <version>1.0.0</version>\n  <dependencies>\n    <dependency><groupId>ch.qos.logback</groupId><artifactId>logback-classic</artifactId><version>1.2.13</version></dependency>\n  </dependencies>\n</project>\n"
+        },
+        "allowed_target_versions": [
+          "1.2.13"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
+  },
+  {
+    "case_id": "qa_maven_incomplete_coverage",
+    "eval_type": "qa_critic",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "synthetic_incomplete_coverage",
+    "evidence_status": "synthetic",
+    "provenance": "Synthetic self-contained Maven QA replay; historical status is not implied.",
+    "historical_evidence": [],
+    "vulnerability_context": {
+      "group_id": "qa_maven_incomplete_coverage:group",
+      "vulnerable_component": "org.postgresql:postgresql",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "42.7.11",
+      "fixed_version": "42.7.11",
+      "purl": "pkg:maven/org.postgresql/postgresql@42.7.11"
+    },
+    "completion_task": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
+    "qa_policy": "version_bump",
+    "target_package_name": "org.postgresql:postgresql",
+    "selected_version": "42.7.11",
+    "dependency_type": "dependencies",
+    "manifest_path": "pom.xml",
+    "attempt_id": "attempt-qa_maven_incomplete_coverage",
+    "task_revision": 1,
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": true,
+      "test_exit_code": 0,
+      "test_failure_count": 0,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": false,
+      "covered_task_ids": [],
+      "closure_package_names": [
+        "org.postgresql:postgresql"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null,
+      "found_identifiers": [
+        "CVE-2030-0001"
+      ],
+      "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- org.postgresql:postgresql:jar:42.7.11:compile\n",
+      "dependency_evidence": {
+        "status": "verified",
+        "target_package": "org.postgresql:postgresql",
+        "expected_version": "42.7.11",
+        "manifest_paths": [
+          "pom.xml"
+        ],
+        "lockfile_paths": [],
+        "declarations": {
+          "pom.xml": "42.7.11"
+        },
+        "resolved_versions": [
+          "42.7.11"
+        ],
+        "lockfile_versions": [],
+        "evidence_refs": [
+          "pom.xml"
+        ],
+        "diagnostics": []
+      }
+    },
+    "execution_logs": {
+      "install_log": "mvn clean package succeeded.",
+      "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+      "test_output": "mvn test passed."
+    },
+    "changed_files": [
+      "pom.xml"
+    ],
+    "worker_action_summary": "Committed Maven task for org.postgresql:postgresql executed at 42.7.11.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "security_flag"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "tool_correctness_applicable": true,
+    "expected_output": "Emit passed=false with security_flag because the Maven evidence fails the required gate.",
+    "input": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
+    "context": [
+      "Project language: Java; Maven GAV: org.postgresql:postgresql; committed version: 42.7.11.",
+      "Task-scoped ODC evidence is separate from cumulative repository findings."
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Historical observations are stored separately from this scripted Java QA replay.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "vulnerability_context": {
+          "group_id": "qa_maven_incomplete_coverage:group",
+          "vulnerable_component": "org.postgresql:postgresql",
+          "file_path": "pom.xml",
+          "file_paths": null,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "package_version": "42.7.11",
+          "fixed_version": "42.7.11",
+          "purl": "pkg:maven/org.postgresql/postgresql@42.7.11"
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": true,
+          "test_exit_code": 0,
+          "test_failure_count": 0,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": false,
+          "covered_task_ids": [],
+          "closure_package_names": [
+            "org.postgresql:postgresql"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null,
+          "found_identifiers": [
+            "CVE-2030-0001"
+          ],
+          "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- org.postgresql:postgresql:jar:42.7.11:compile\n",
+          "dependency_evidence": {
+            "status": "verified",
+            "target_package": "org.postgresql:postgresql",
+            "expected_version": "42.7.11",
+            "manifest_paths": [
+              "pom.xml"
+            ],
+            "lockfile_paths": [],
+            "declarations": {
+              "pom.xml": "42.7.11"
+            },
+            "resolved_versions": [
+              "42.7.11"
+            ],
+            "lockfile_versions": [],
+            "evidence_refs": [
+              "pom.xml"
+            ],
+            "diagnostics": []
+          }
+        },
+        "execution_logs": {
+          "install_log": "mvn clean package succeeded.",
+          "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+          "test_output": "mvn test passed."
+        },
+        "workspace_files": {
+          "pom.xml": "<project xmlns=\"http://maven.apache.org/POM/4.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>eval.replay</groupId>\n  <artifactId>eval-replay</artifactId>\n  <version>1.0.0</version>\n  <dependencies>\n    <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><version>42.7.11</version></dependency>\n  </dependencies>\n</project>\n"
+        },
+        "allowed_target_versions": [
+          "42.7.11"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
+      }
+    }
+  },
+  {
+    "case_id": "qa_maven_executed_version_mismatch",
+    "eval_type": "qa_critic",
+    "language": "java",
+    "ecosystem": "maven",
+    "golden_kind": "synthetic_executed_version_mismatch",
+    "evidence_status": "synthetic",
+    "provenance": "Synthetic self-contained Maven QA replay; historical status is not implied.",
+    "historical_evidence": [],
+    "vulnerability_context": {
+      "group_id": "qa_maven_executed_version_mismatch:group",
+      "vulnerable_component": "org.postgresql:postgresql",
+      "file_path": "pom.xml",
+      "file_paths": null,
+      "cve_ids": [
+        "CVE-2024-1597"
+      ],
+      "package_version": "42.7.11",
+      "fixed_version": "42.7.11",
+      "purl": "pkg:maven/org.postgresql/postgresql@42.7.11"
+    },
+    "completion_task": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
+    "qa_policy": "version_bump",
+    "target_package_name": "org.postgresql:postgresql",
+    "selected_version": "42.7.11",
+    "dependency_type": "dependencies",
+    "manifest_path": "pom.xml",
+    "attempt_id": "attempt-qa_maven_executed_version_mismatch",
+    "task_revision": 1,
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": true,
+      "test_exit_code": 0,
+      "test_failure_count": 0,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "qa_maven_executed_version_mismatch"
+      ],
+      "closure_package_names": [
+        "org.postgresql:postgresql"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null,
+      "found_identifiers": [
+        "CVE-2030-0001"
+      ],
+      "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- org.postgresql:postgresql:jar:42.7.10:compile\n",
+      "dependency_evidence": {
+        "status": "mismatch",
+        "target_package": "org.postgresql:postgresql",
+        "expected_version": "42.7.11",
+        "manifest_paths": [
+          "pom.xml"
+        ],
+        "lockfile_paths": [],
+        "declarations": {
+          "pom.xml": "42.7.11"
+        },
+        "resolved_versions": [
+          "42.7.10"
+        ],
+        "lockfile_versions": [],
+        "evidence_refs": [
+          "pom.xml"
+        ],
+        "diagnostics": [
+          "Resolved Maven version 42.7.10 does not match committed version 42.7.11."
+        ]
+      }
+    },
+    "execution_logs": {
+      "install_log": "mvn clean package succeeded.",
+      "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+      "test_output": "mvn test passed."
+    },
+    "changed_files": [
+      "pom.xml"
+    ],
+    "worker_action_summary": "Committed Maven task for org.postgresql:postgresql executed at 42.7.11.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "security_flag"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "tool_correctness_applicable": true,
+    "expected_output": "Emit passed=false with security_flag because the Maven evidence fails the required gate.",
+    "input": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
+    "context": [
+      "Project language: Java; Maven GAV: org.postgresql:postgresql; committed version: 42.7.11.",
+      "Task-scoped ODC evidence is separate from cumulative repository findings."
+    ],
+    "expected_tools": [
+      {
+        "name": "query_qa_logs",
+        "args": {
+          "log_type": "scan"
+        }
+      },
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "qa_maven_executed_version_mismatch",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "The targeted Maven scan still reports the committed target identifiers; clear them before retrying.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "Historical observations are stored separately from this scripted Java QA replay.",
+      "actual_tools": [
+        {
+          "name": "query_qa_logs",
+          "args": {
+            "log_type": "scan"
+          },
+          "output": "Maven build or scanner evidence confirms the target gate failed."
+        },
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "qa_maven_executed_version_mismatch",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "The targeted Maven scan still reports the committed target identifiers; clear them before retrying.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "java",
+        "vulnerability_context": {
+          "group_id": "qa_maven_executed_version_mismatch:group",
+          "vulnerable_component": "org.postgresql:postgresql",
+          "file_path": "pom.xml",
+          "file_paths": null,
+          "cve_ids": [
+            "CVE-2024-1597"
+          ],
+          "package_version": "42.7.11",
+          "fixed_version": "42.7.11",
+          "purl": "pkg:maven/org.postgresql/postgresql@42.7.11"
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": true,
+          "test_exit_code": 0,
+          "test_failure_count": 0,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "qa_maven_executed_version_mismatch"
+          ],
+          "closure_package_names": [
+            "org.postgresql:postgresql"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null,
+          "found_identifiers": [
+            "CVE-2030-0001"
+          ],
+          "maven_dependency_tree": "[INFO] --- maven-dependency-plugin:3.6.1:tree (default-cli) @ eval-replay ---\n[INFO] \\- org.postgresql:postgresql:jar:42.7.10:compile\n",
+          "dependency_evidence": {
+            "status": "mismatch",
+            "target_package": "org.postgresql:postgresql",
+            "expected_version": "42.7.11",
+            "manifest_paths": [
+              "pom.xml"
+            ],
+            "lockfile_paths": [],
+            "declarations": {
+              "pom.xml": "42.7.11"
+            },
+            "resolved_versions": [
+              "42.7.10"
+            ],
+            "lockfile_versions": [],
+            "evidence_refs": [
+              "pom.xml"
+            ],
+            "diagnostics": [
+              "Resolved Maven version 42.7.10 does not match committed version 42.7.11."
+            ]
+          }
+        },
+        "execution_logs": {
+          "install_log": "mvn clean package succeeded.",
+          "scan_summary": "Dependency-Check completed; task-scoped Maven target evidence recorded.",
+          "test_output": "mvn test passed."
+        },
+        "workspace_files": {
+          "pom.xml": "<project xmlns=\"http://maven.apache.org/POM/4.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>eval.replay</groupId>\n  <artifactId>eval-replay</artifactId>\n  <version>1.0.0</version>\n  <dependencies>\n    <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><version>42.7.11</version></dependency>\n  </dependencies>\n</project>\n"
+        },
+        "allowed_target_versions": [
+          "42.7.11"
+        ],
+        "allowed_dependency_types": [
+          "dependencies"
+        ]
       }
     }
   }

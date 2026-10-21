@@ -227,9 +227,93 @@ def build_qa_test_case(
             f"Expected QA output:\n{json.dumps(case.get('expected_qa_verdict', {}), indent=2)}",
         ),
         tools_called=tools_called,
-        expected_tools=expected or None,
+        expected_tools=expected,
         token_cost=capture.token_cost if capture is not None else None,
         additional_metadata=metadata,
+    )
+
+
+def _build_qa_audit_completion_case(
+    case: dict[str, Any],
+    test_case: LLMTestCase,
+    typed_result: Any,
+) -> LLMTestCase:
+    """Frame Task Completion around completing the audit, including rejection.
+
+    DeepEval's TaskCompletionMetric extracts the goal from ``input`` and does
+    not consult ``expected_output``. Keep a remediation failure from being
+    mistaken for an incomplete evaluation task.
+    """
+    if not bool(case.get("expected_task_completion_pass", True)):
+        return test_case
+    input_text = (
+        f"Complete the QA audit for task {case.get('case_id')}. Evaluate the supplied "
+        "execution evidence and return one final QA verdict. The task is to finish "
+        "the audit, not to make the candidate remediation pass. Completion includes "
+        "either passed=true when all required gates pass or passed=false with an "
+        "appropriate failure category when evidence requires rejection. A correct "
+        "rejection is a completed audit."
+    )
+    actual_output = test_case.actual_output
+    if typed_result is not None:
+        if isinstance(typed_result, Mapping):
+            category = typed_result.get("failure_category")
+            verdict = {
+                "passed": typed_result.get("passed"),
+                "failure_category": getattr(category, "value", category),
+            }
+        else:
+            category = getattr(typed_result, "failure_category", None)
+            verdict = {
+                "passed": getattr(typed_result, "passed", None),
+                "failure_category": getattr(category, "value", category),
+            }
+        actual_output = f"Final typed QA evaluation emitted: {json.dumps(verdict, sort_keys=True)}"
+    return LLMTestCase(
+        name=f"{case['case_id']} [QA Audit Completion]",
+        input=input_text,
+        actual_output=actual_output,
+        tools_called=[],
+    )
+
+
+def _qa_task_completion_metric_applicable(case: dict[str, Any]) -> bool:
+    """Use deterministic verdict matching for expected QA rejections.
+
+    DeepEval's TaskCompletionMetric scores a negative QA verdict as a failed
+    task even when the auditor completed its assignment correctly. The live
+    typed-verdict assertion is the authoritative completion check for these
+    rejection cases; retain Task Completion for successful audits and bounded
+    runs whose contract explicitly expects an incomplete evaluation.
+    """
+    if not bool(case.get("expected_task_completion_pass", True)):
+        return True
+    expected = case.get("expected_qa_verdict")
+    return not (isinstance(expected, Mapping) and expected.get("passed") is False)
+
+
+def _assert_live_qa_verdict_matches_golden(
+    case: dict[str, Any],
+    capture: ReplayCapture,
+) -> None:
+    """Require the live replay's typed QA verdict to match its independent contract."""
+    expected = case.get("expected_qa_verdict")
+    if not isinstance(expected, Mapping) or "passed" not in expected:
+        return
+    observed = capture.typed_result
+    assert observed is not None, f"Case {case['case_id']!r} emitted no typed QA verdict."
+    if isinstance(observed, Mapping):
+        actual_passed = observed.get("passed")
+        actual_category = observed.get("failure_category")
+    else:
+        actual_passed = getattr(observed, "passed", None)
+        actual_category = getattr(observed, "failure_category", None)
+    expected_passed = expected.get("passed")
+    expected_category = expected.get("failure_category")
+    assert actual_passed == expected_passed and actual_category == expected_category, (
+        f"Case {case['case_id']!r} emitted QA verdict "
+        f"passed={actual_passed!r}, failure_category={actual_category!r}; "
+        f"expected passed={expected_passed!r}, failure_category={expected_category!r}."
     )
 
 
@@ -298,10 +382,15 @@ class TestQACriticEval:
             replay_source="production_live",
             capture=capture,
         )
-        if (
-            bool(case.get("tool_correctness_applicable", True))
-            and DeepEvalToolCorrectnessMetric is not None
-        ):
+        _assert_live_qa_verdict_matches_golden(case, capture)
+        tool_contract_applicable = bool(case.get("tool_correctness_applicable", True))
+        expected_qa_tools = expected_tools(case, component="QA")
+        if tool_contract_applicable and not expected_qa_tools:
+            assert not capture.actual_tools, (
+                f"Case {case['case_id']!r} expected no QA tool calls, but observed "
+                f"{[event.get('name') for event in capture.actual_tools]!r}."
+            )
+        elif tool_contract_applicable and DeepEvalToolCorrectnessMetric is not None:
             tool_metric = DeepEvalToolCorrectnessMetric(
                 threshold=0.50,
                 evaluation_params=[],
@@ -318,7 +407,10 @@ class TestQACriticEval:
                 )
             else:
                 tool_metric.measure(test_case)
-        if DeepEvalTaskCompletionMetric is not None:
+        if (
+            DeepEvalTaskCompletionMetric is not None
+            and _qa_task_completion_metric_applicable(case)
+        ):
             task_metric = DeepEvalTaskCompletionMetric(
                 threshold=0.70,
                 model=eval_settings.judge_model,
@@ -326,11 +418,64 @@ class TestQACriticEval:
             )
             _measure_expected(
                 task_metric,
-                test_case,
+                _build_qa_audit_completion_case(case, test_case, capture.typed_result),
                 expected_pass=bool(case.get("expected_task_completion_pass", True)),
                 case_id=str(case["case_id"]),
                 label="QA task completion",
             )
+
+
+def test_qa_test_case_preserves_empty_expected_tool_contract() -> None:
+    """Represent a no-tool QA case as an empty list rather than missing data."""
+    case = next(case for case in _QA_CASES if case["case_id"] == "qa_maven_compile_failure")
+    test_case = build_qa_test_case(
+        case,
+        "Replay result",
+        [],
+        replay_source="offline_fixture",
+    )
+    assert test_case.expected_tools == []
+
+
+def test_qa_completion_projection_uses_typed_verdict_not_tool_trace() -> None:
+    """Task Completion sees the typed audit result without remediation noise."""
+    case = {"case_id": "qa_passed_candidate", "expected_task_completion_pass": True}
+    test_case = LLMTestCase(
+        name="QA test",
+        input="A remediation must pass QA.",
+        actual_output="Long tool trace: remediation rejected.",
+        tools_called=[ToolCall(name="emit_qa_evaluation", input_parameters={})],
+    )
+    projected = _build_qa_audit_completion_case(
+        case,
+        test_case,
+        {"passed": True, "failure_category": None},
+    )
+    assert "A correct rejection is a completed audit." in projected.input
+    assert '"passed": true' in projected.actual_output
+    assert projected.tools_called == []
+
+
+def test_qa_false_verdict_uses_typed_contract_for_completion() -> None:
+    """Only explicit incomplete runs should use negative Task Completion scoring."""
+    assert not _qa_task_completion_metric_applicable(
+        {
+            "expected_task_completion_pass": True,
+            "expected_qa_verdict": {"passed": False, "failure_category": "security_flag"},
+        }
+    )
+    assert _qa_task_completion_metric_applicable(
+        {
+            "expected_task_completion_pass": False,
+            "expected_qa_verdict": {"completed": False},
+        }
+    )
+    assert _qa_task_completion_metric_applicable(
+        {
+            "expected_task_completion_pass": True,
+            "expected_qa_verdict": {"passed": True, "failure_category": None},
+        }
+    )
 
 
 @pytest.mark.parametrize("case", _QA_CASES or [{}], ids=_QA_CASE_IDS or ["no_cases"])
@@ -395,6 +540,22 @@ def test_qa_critic_offline_production_replay(
     assert capture.attempt_result.task_id == case_id
     assert capture.attempt_result.attempt_id == capture.attempt_id
     assert capture.attempt_result.task_revision == capture.task_revision
+    assert capture.attempt_result.qa_policy_source == "attempt_snapshot"
+    if case_id == "qa_maven_incomplete_coverage":
+        assert capture.typed_result.passed is False
+        assert capture.typed_result.evidence_inconclusive is True
+        assert capture.typed_result.failure_category.value == "security_flag"
+        assert not any(event["name"] == "emit_qa_evaluation" for event in capture.actual_tools)
+        assert capture.typed_result.scan_evidence is None or not (
+            capture.typed_result.scan_evidence.covered_task_ids
+        )
+        return
+    if case_id == "qa_maven_compile_failure":
+        assert capture.typed_result.passed is False
+        assert capture.typed_result.failure_category.value == "security_flag"
+        assert "cannot find symbol" in json.dumps(capture.typed_result.model_dump(mode="json"))
+        assert "mvn test passed" not in json.dumps(capture.typed_result.model_dump(mode="json"))
+        return
     scan_evidence = capture.typed_result.scan_evidence
     if scan_evidence is not None:
         assert scan_evidence.covered_task_ids == [case_id]
@@ -445,3 +606,13 @@ def test_qa_critic_offline_production_replay(
     actual_category = getattr(actual_category, "value", actual_category)
     expected_category = expected.get("failure_category")
     assert actual_category == expected_category
+    if case_id == "qa_maven_executed_version_mismatch":
+        assert gates.dependency_evidence is not None
+        assert gates.dependency_evidence.status.value == "mismatch"
+        assert gates.dependency_evidence.resolved_versions == ["42.7.10"]
+    if case_id == "qa_maven_target_remaining":
+        assert gates.tests_passed is True
+        assert gates.target_remaining_identifiers == [
+            "CVE-2021-42550",
+            "CVE-2023-6378",
+        ]
