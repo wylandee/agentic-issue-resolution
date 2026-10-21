@@ -1,23 +1,66 @@
 flowchart TD
-    Start([START]) --> Initial[initial_triage]
-    Initial -->|actionable| Builder[workspace_builder]
-    Initial -->|no work or failure| Teardown[teardown]
-    Builder -->|ready| SetupScan[workspace_setup_scan]
-    Builder -->|setup failure| Teardown
-    SetupScan --> Supervisor[Supervisor<br/>plans and certifies inside this node]
+    Start(["START"]):::boundary --> Triage
 
-    Supervisor -->|committed update| Update[update_subagent]
-    Supervisor -->|committed workaround| Workaround[workaround_subagent]
-    Supervisor -->|validate attempt| QA[qa_critic]
-    Supervisor -->|post-QA reconcile| Triage[triage]
-    Supervisor -->|optional full scan| FullScan[final_full_scan]
-    Supervisor -->|finished| Teardown
+    subgraph BulkPhase ["Phase 1: Bulk Triage (Processes All Tasks)"]
+        direction TB
+        ODCSemgrep["ODC/Semgrep"]:::gate
+        Triage["Triage Agent"]:::triage
+        TriageDB[("🗄️ Triage DB")]:::db
+        WebTriage["🌐 Internet"]:::external
 
-    Update --> Supervisor
-    Workaround --> Supervisor
-    QA --> Supervisor
-    Triage -->|reconciled| Supervisor
-    Triage -->|no work or failure| Teardown
-    FullScan --> Supervisor
-    Teardown --> Report[report]
-    Report --> End([END])
+        ODCSemgrep -->|"parse scanner report"| TriageDB
+        Triage <--> TriageDB
+        Triage -.->|"Advisory Feeds"| WebTriage
+    end
+
+    Triage -->|"Triage Done (All Tasks Queued)"| Supervisor
+    Triage -.->|"No Actionable Work"| Report["Report Agent"]:::report
+
+    subgraph BatchLoop ["Phase 2: Iterative Execution (1 Batch of Tasks at a Time)"]
+        direction TB
+        Supervisor["SUPERVISOR"]:::supervisor
+        SupDB[("🗄️ State & Task DB")]:::db
+        Solver["🧮 Solver"]:::gate
+        WebSolver["🌐 Internet"]:::external
+
+        Supervisor <--> SupDB
+        Supervisor <--> Solver
+        Solver -.->|"Registry APIs"| WebSolver
+
+        Supervisor -.->|"Update Task (1 Batch)"| Update["Update Agent"]:::worker
+        Update -->|"Update Result"| Supervisor
+        Update --- UpdateTools["🔧 Update and Validate Tools"]:::tool
+
+        Supervisor -.->|"Code Workaround Task (1 Batch)"| Workaround["Code Workaround Agent"]:::worker
+        Workaround -->|"Workaround Result"| Supervisor
+
+        Workaround --- WT_Inv["🔍 Investigative Tools"]:::tool
+        WT_Inv --> WT_Plan["📋 Plan Tools"]:::tool
+        WT_Plan --> WT_Exec["⚡ Execute Tools"]:::tool
+        WT_Exec --> WT_Val["✅ Validate Tools"]:::tool
+        WT_Inv -.->|"Web Search"| WebWorkaround["🌐 Internet"]:::external
+
+        Supervisor -.->|"Validate Attempt (1 Batch)"| QA["QA Agent"]:::qa
+        QA -->|"Attempt Evaluation"| Supervisor
+        QA --- QA_Inspect["🔎 Inspection Tools"]:::tool
+        QA --- QA_Install["📦 Install"]:::gate
+        QA --- QA_Scanner["🛡️ Scanner"]:::gate
+        QA --- QA_Test["🧪 Unit Test"]:::gate
+    end
+
+    Supervisor -.->|"Post-QA Re-Triage"| Triage
+    Supervisor -->|"All Tasks Terminal"| Report
+    Report --> End(["END"]):::boundary
+
+    classDef boundary fill:#1f2937,stroke:#111827,stroke-width:2px,color:#ffffff;
+    classDef supervisor fill:#ede9fe,stroke:#8b5cf6,stroke-width:2.5px,color:#5b21b6;
+    classDef worker fill:#dbeafe,stroke:#3b82f6,stroke-width:2px,color:#1e40af;
+    classDef qa fill:#fee2e2,stroke:#ef4444,stroke-width:2px,color:#991b1b;
+    classDef triage fill:#fef3c7,stroke:#f59e0b,stroke-width:2px,color:#92400e;
+    classDef report fill:#d1fae5,stroke:#10b981,stroke-width:2px,color:#065f46;
+    classDef db fill:#f3f4f6,stroke:#4b5563,stroke-width:2px,color:#1f2937;
+    classDef tool fill:#e0f2fe,stroke:#0284c7,stroke-width:1.5px,stroke-dasharray: 4 2,color:#0369a1;
+    classDef gate fill:#f1f5f9,stroke:#64748b,stroke-width:2px,color:#334155;
+    classDef external fill:#fae8ff,stroke:#c026d3,stroke-width:1.5px,color:#86198f;
+    style BulkPhase fill:#fffbeb,stroke:#f59e0b,stroke-width:1.5px,stroke-dasharray: 6 4,color:#92400e
+    style BatchLoop fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,stroke-dasharray: 6 4,color:#5b21b6
