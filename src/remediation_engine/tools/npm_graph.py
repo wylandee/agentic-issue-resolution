@@ -16,6 +16,7 @@ import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -51,6 +52,18 @@ _NODE_MODULES = "node_modules/"
 def _normalize_npm_operator_whitespace(value: str) -> str:
     """Normalize npm-legal spaces between range operators and versions."""
     return _NPM_OPERATOR_SPACE_RE.sub(r"\1", value.strip())
+
+
+@lru_cache(maxsize=2_048)
+def _cached_npm_spec(requested: str) -> NpmSpec:
+    """Parse and retain a bounded set of normalized npm ranges."""
+    return NpmSpec(requested)
+
+
+@lru_cache(maxsize=4_096)
+def _cached_npm_version(candidate: str) -> Version:
+    """Parse and retain a bounded set of normalized npm versions."""
+    return Version.coerce(candidate)
 
 
 def _freeze(value: Any) -> Any:
@@ -173,7 +186,7 @@ def check_npm_range(version_range: str | None, version: str | None) -> NpmRangeC
     if not candidate:
         return NpmRangeCheck(None, "npm version is empty")
     try:
-        return NpmRangeCheck(NpmSpec(requested).match(Version.coerce(candidate)))
+        return NpmRangeCheck(_cached_npm_spec(requested).match(_cached_npm_version(candidate)))
     except (TypeError, ValueError) as exc:
         return NpmRangeCheck(None, f"invalid npm range/version {requested!r}/{candidate!r}: {exc}")
 
