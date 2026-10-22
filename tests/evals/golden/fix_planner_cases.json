@@ -741,7 +741,7 @@
     "case_id": "python-fix-planner-pyyaml-historical",
     "eval_type": "fix_planner",
     "provenance": "PyGoat PyYAML trajectory evidence",
-    "source_page_content": "# PyPI security advisory for pyyaml\n\nThe installed pyyaml release is affected by the reported security issue. The security fix is available in pyyaml 6.0rc1. Upgrade to 6.0rc1 or later.",
+    "source_page_content": "# PyPI remediation evidence for pyyaml\n\nThe observed PyYAML task updated version 5.1 to 6.0.3 for the reported findings, and task-scoped QA passed. Use 6.0.3 as the recorded safe target; this does not claim it was the first upstream fixed release.",
     "expected_strategy": "VERSION_BUMP",
     "expected_fixed_version": "6.0.3",
     "expected_workaround_snippets": [],
@@ -751,11 +751,11 @@
         "content": "Historical PyGoat evidence: requirements.txt declared PyYAML 5.1. The scanner reported CVE-2019-20477, CVE-2020-14343, and CVE-2020-1747. The historical security remediation upgraded PyYAML to 6.0.3 in requirements.txt; task-scoped QA passed. This fixture preserves that observed target and does not claim that 6.0.3 was the first version to fix CVE-2020-14343."
       }
     ],
-    "input": "Extract the Python remediation guidance for pyyaml from the supplied advisory page.",
+    "input": "Extract the recorded Python remediation guidance for PyYAML from the supplied source material.",
     "context": [
       "Package: pyyaml",
       "Project language: Python",
-      "No historical trace supports this prerelease. The case checks PEP 440 acceptance and package-specific page evidence."
+      "The historical trace supports 6.0.3 as the target; this case does not ask the extractor to identify the earliest upstream fixed release."
     ],
     "expected_tools": [],
     "offline_fixture": {
@@ -773,8 +773,8 @@
         "vuln_id": "CVE-2020-14343",
         "pages": [
           {
-            "url": "https://example.invalid/python-fix-planner-pyyaml-prerelease",
-            "content": "# PyPI security advisory for pyyaml\n\nThe installed pyyaml release is affected by the reported security issue. The security fix is available in pyyaml 6.0rc1. Upgrade to 6.0rc1 or later."
+            "url": "https://example.invalid/python-fix-planner-pyyaml-historical",
+            "content": "# PyPI remediation evidence for pyyaml\n\nThe observed PyYAML task updated version 5.1 to 6.0.3 for the reported findings, and task-scoped QA passed. Use 6.0.3 as the recorded safe target; this does not claim it was the first upstream fixed release."
           }
         ],
         "vulnerability_context": {
@@ -786,23 +786,23 @@
         }
       }
     },
-    "expected_output": "{\"strategy\":\"VERSION_BUMP\",\"fixed_version\":\"6.0rc1\",\"workaround_snippets\":[]}",
+    "expected_output": "{\"strategy\":\"VERSION_BUMP\",\"fixed_version\":\"6.0.3\",\"workaround_snippets\":[]}",
     "historical_evidence": [
       {
         "trajectory": "data/trajectories/phase5_20261019T120726Z_cdef0f21-e8b5-44bd-a160-dbcd055766b6.md",
         "observation": "The PyYAML task changed the 5.1 declaration to 6.0.3 and passed task-scoped QA; the root input records all three PyYAML CVEs."
       }
     ],
-    "provenance_note": "No historical trace supports this prerelease. The case checks PEP 440 acceptance and package-specific page evidence.",
+    "provenance_note": "The PyGoat trajectory supports 6.0.3 as the target; the case does not claim it was the earliest upstream fix.",
     "golden_kind": "historical_trajectory_replay",
-    "evaluation_note": "The selected 6.0.3 target and passing task QA come from the historical requirements update. CVE-2020-14343 itself has an earlier fixed release; this fixture tests extraction of the recorded safe target, not the first upstream fix.",
+    "evaluation_note": "The 6.0.3 target and task-scoped QA are historical; the case checks PEP 440 parsing and package-specific evidence, not the first fixed release.",
     "trajectory_evidence_compact": true
   },
   {
     "case_id": "python-fix-planner-workaround",
     "eval_type": "fix_planner",
     "provenance": "PyGoat PyJWT workaround attempt, not an accepted remediation",
-    "source_page_content": "# PyPI security advisory for pyjwt\n\nThe installed pyjwt release is affected by the reported security issue. As a mitigation, reject unsupported critical JOSE header parameters before trusting decoded claims.",
+    "source_page_content": "# PyPI security advisory for pyjwt\n\nThe installed PyJWT release is affected by the reported security issue. As a mitigation, reject tokens with unsupported critical JOSE header parameters before trusting decoded claims.",
     "expected_strategy": "CODE_WORKAROUND",
     "expected_fixed_version": null,
     "expected_workaround_snippets": [
@@ -810,8 +810,8 @@
     ],
     "pages": [
       {
-        "url": "trajectory://phase5_20261019T155736Z_2f772cbc-204b-44b7-a1b5-3f2a0f177a25#pyjwt-workaround-plan",
-        "content": "The PyGoat trace records the proposed hypothesis: the view directly trusts jwt.decode on an attacker-controlled cookie without compensating validation of the JWS header; adding a local pre-decode header check can reject tokens carrying crit entries that PyJWT may otherwise accept. The same trajectory records that the workaround failed validation and was not accepted as a remediation. Reject tokens with unsupported critical JOSE header parameters before trusting decoded claims."
+        "url": "https://example.invalid/python-fix-planner-workaround",
+        "content": "# PyPI security advisory for pyjwt\n\nThe installed PyJWT release is affected by the reported security issue. As a mitigation, reject tokens with unsupported critical JOSE header parameters before trusting decoded claims."
       }
     ],
     "input": "Extract the Python remediation guidance for pyjwt from the supplied advisory page.",
@@ -839,7 +839,7 @@
         "pages": [
           {
             "url": "https://example.invalid/python-fix-planner-workaround",
-            "content": "# PyPI security advisory for pyjwt\n\nThe installed pyjwt release is affected by the reported security issue. As a mitigation, reject unsupported critical JOSE header parameters before trusting decoded claims."
+            "content": "# PyPI security advisory for pyjwt\n\nThe installed PyJWT release is affected by the reported security issue. As a mitigation, reject tokens with unsupported critical JOSE header parameters before trusting decoded claims."
           }
         ]
       }

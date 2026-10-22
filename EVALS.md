@@ -85,14 +85,14 @@ These tests are deterministic and do not invoke a model judge.
 
 ### Report (`test_report_eval.py`)
 
-The 13 cases render deterministic Markdown from typed remediation evidence and validate counts, package/task identity, changed-file and diff evidence, successful versus follow-up sections, and forbidden unsupported claims. In live mode, the same rendered report is evaluated with exactly these four DeepEval metrics:
+The 13 cases render deterministic Markdown from typed remediation evidence and validate counts, package/task identity and transitions, failed-attempt versions/outcomes, changed-file and diff evidence, successful versus follow-up sections, and forbidden unsupported claims. In live mode, the same rendered report is scored with exactly these four DeepEval metrics; their scores and reasons are diagnostic, while deterministic contract assertions remain the pass/fail gate:
 
 - `HallucinationMetric`, threshold `0.30`;
 - `FaithfulnessMetric`, threshold `0.85`;
 - `SummarizationMetric`, threshold `0.80`;
 - `GEval` named `Report Constraint Adherence`, threshold `0.70`.
 
-Offline mode does not substitute a cached judge: it runs the deterministic report contract only.
+Offline mode runs the deterministic report contract only; live mode adds persisted, non-gating metric diagnostics.
 
 ### Triage (`test_triage_eval.py`)
 
@@ -118,7 +118,7 @@ The 18 page-backed cases cover `VERSION_BUMP`, `CODE_WORKAROUND`, and `NO_FIX` e
 - `GEval` `Workaround Extraction Quality`, threshold `0.70`, for workaround cases;
 - `FaithfulnessMetric`, threshold `0.85`, for non-`NO_FIX` results.
 
-The pages are fixtures; live judging does not fetch advisory pages.
+Live mode runs the production structured extraction boundary against the page fixtures without fetching advisory pages. Judges see only the contract fields (strategy, fixed version, and workaround snippets), not free-form reasoning. The historical PyJWT workaround is judged for extraction fidelity only; it does not imply the proposal was accepted or validated.
 
 ### Update worker (`test_update_subagent_eval.py`)
 
@@ -136,7 +136,7 @@ The 19 cases cover clean edits, pivots, validation recovery, no-fix removal, gua
 - `ToolCorrectnessMetric`, threshold `0.50`, with case-specific expected calls and ordering;
 - `TaskCompletionMetric`, threshold `0.70`.
 
-Optional research and inspection branches are represented by each case's trace; they are not mandatory for every case.
+Historical failure-injection cases with intentionally invalid calls may mark tool correctness inapplicable; deterministic replay asserts those known failure paths. Validation-failure cases may also mark TaskCompletion inapplicable because their expected failure is asserted deterministically. Optional research and inspection branches are represented by each case's trace; they are not mandatory for every case.
 
 ### QA critic (`test_qa_critic_eval.py`)
 

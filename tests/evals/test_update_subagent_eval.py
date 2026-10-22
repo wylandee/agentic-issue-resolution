@@ -119,22 +119,26 @@ def build_update_test_case(
 
 def _measure_expected(
     metric: Any,
-    test_case: LLMTestCase,
+    test_case: Any,
     *,
     expected_pass: bool,
     case_id: str,
     label: str,
 ) -> None:
-    """Measure an expected-positive or expected-negative metric."""
-    if expected_pass:
-        if assert_test is not None:
-            assert_test(test_case, [metric], run_async=False)
-        else:
-            metric.measure(test_case)
-            assert metric.is_successful(), f"Case {case_id!r} failed {label}."
-    else:
+    """Measure and register an expected-positive or expected-negative metric."""
+    if assert_test is None:
         metric.measure(test_case)
-        assert not metric.is_successful(), f"Case {case_id!r} unexpectedly passed {label}."
+    else:
+        try:
+            assert_test(test_case, [metric], run_async=False)
+        except AssertionError:
+            if expected_pass or metric.is_successful() or getattr(metric, "error", None):
+                raise
+
+    actual_pass = bool(metric.is_successful())
+    assert actual_pass is expected_pass, (
+        f"Case {case_id!r} expected {label} to {'pass' if expected_pass else 'fail'}."
+    )
 
 
 def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
