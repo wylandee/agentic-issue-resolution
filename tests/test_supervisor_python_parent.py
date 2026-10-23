@@ -110,9 +110,7 @@ def _candidate(version: str) -> RegistryCandidate:
 
 
 @pytest.mark.parametrize("direct", [True, False], ids=["direct", "no-parent-proof"])
-def test_unproven_pipfile_target_never_dispatches_to_registry(
-    tmp_path: Path, direct: bool
-) -> None:
+def test_unproven_pipfile_target_never_dispatches_to_registry(tmp_path: Path, direct: bool) -> None:
     _pipfile_fixture(
         tmp_path,
         declarations={"vulnerable-child": "==1.0.0"},
@@ -298,9 +296,7 @@ def test_committed_python_portfolio_accepts_language_specific_target_identity(
         solver_plan=SimpleNamespace(
             selected_plan=SimpleNamespace(
                 task_decisions=[decision],
-                selected_candidate_versions={
-                    "python:requirements.txt:certifi": "2024.7.4"
-                },
+                selected_candidate_versions={"python:requirements.txt:certifi": "2024.7.4"},
                 batches=[],
             )
         ),
@@ -328,9 +324,7 @@ def test_committed_python_portfolio_accepts_language_specific_target_identity(
             solver_plan=SimpleNamespace(
                 selected_plan=SimpleNamespace(
                     task_decisions=[invalid_decision],
-                    selected_candidate_versions={
-                        "python:requirements.txt:certifi": "2024.7.4"
-                    },
+                    selected_candidate_versions={"python:requirements.txt:certifi": "2024.7.4"},
                     batches=[],
                 )
             ),

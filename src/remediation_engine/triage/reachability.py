@@ -171,9 +171,7 @@ def analyze_reachability(
             ):
                 group.is_reachable = None
                 maven_groups.add(id(group))
-        if all(
-            group.issue_type != IssueType.SCA or id(group) in maven_groups for group in groups
-        ):
+        if all(group.issue_type != IssueType.SCA or id(group) in maven_groups for group in groups):
             return
 
     npm_groups: list[VulnerabilityGroup] = []

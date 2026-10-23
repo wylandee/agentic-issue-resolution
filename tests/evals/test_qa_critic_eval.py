@@ -407,10 +407,7 @@ class TestQACriticEval:
                 )
             else:
                 tool_metric.measure(test_case)
-        if (
-            DeepEvalTaskCompletionMetric is not None
-            and _qa_task_completion_metric_applicable(case)
-        ):
+        if DeepEvalTaskCompletionMetric is not None and _qa_task_completion_metric_applicable(case):
             task_metric = DeepEvalTaskCompletionMetric(
                 threshold=0.70,
                 model=eval_settings.judge_model,

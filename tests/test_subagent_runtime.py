@@ -1135,6 +1135,7 @@ def test_only_maven_no_fix_removal_is_serialized() -> None:
     ]
     assert node_removal.invoke.call_count == 2
 
+
 def test_python_manifest_success_projects_manifest_and_regenerated_lockfile() -> None:
     event = ToolEvent(
         name="modify_and_validate_python_dependency",

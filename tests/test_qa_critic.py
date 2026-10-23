@@ -179,6 +179,7 @@ class TestRunQACriticNode:
             archive_excluded_dirs=frozenset({"target"}),
         )
         assert result["status"] == "qa_completed"
+
     def test_python_project_language_reaches_global_execution(self):
         group = _make_group()
         state = _make_minimal_state(groups=[group])

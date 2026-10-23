@@ -1091,11 +1091,7 @@ def registry_candidates_for_context(
             else f"Security floor verification failed: {floor_error}."
         )
     ecosystem = (
-        "maven"
-        if maven_mode
-        else "pypi"
-        if _task_uses_pypi(context.task, context.group)
-        else "npm"
+        "maven" if maven_mode else "pypi" if _task_uses_pypi(context.task, context.group) else "npm"
     )
     approved_pool = _approved_candidate_pool(
         context,
@@ -1159,16 +1155,20 @@ def _eligible_candidate_versions(
 ) -> tuple[str, ...]:
     """Return strategic stable candidates using ecosystem-specific ordering."""
     candidate_list = list(candidates)
-    resolved_ecosystem = str(
-        ecosystem
-        or (
-            "maven"
-            if project_language == ProjectLanguage.JAVA and maven_mode
-            else "pypi"
-            if project_language == ProjectLanguage.PYTHON
-            else "npm"
+    resolved_ecosystem = (
+        str(
+            ecosystem
+            or (
+                "maven"
+                if project_language == ProjectLanguage.JAVA and maven_mode
+                else "pypi"
+                if project_language == ProjectLanguage.PYTHON
+                else "npm"
+            )
         )
-    ).strip().casefold()
+        .strip()
+        .casefold()
+    )
     if resolved_ecosystem == "maven":
         eligible_maven: list[MavenRegistryCandidate] = []
         attempted = {str(value).strip() for value in attempted_versions}
@@ -1379,29 +1379,31 @@ def _candidate_set(
     ecosystem: str | None = None,
 ) -> TacticalCandidateSet:
     """Build one normalized strategy-specific candidate whitelist."""
-    resolved_ecosystem = str(
-        ecosystem
-        or (
-            "maven"
-            if project_language == ProjectLanguage.JAVA and maven_mode
-            else "pypi"
-            if project_language == ProjectLanguage.PYTHON
-            else "npm"
+    resolved_ecosystem = (
+        str(
+            ecosystem
+            or (
+                "maven"
+                if project_language == ProjectLanguage.JAVA and maven_mode
+                else "pypi"
+                if project_language == ProjectLanguage.PYTHON
+                else "npm"
+            )
         )
-    ).strip().casefold()
+        .strip()
+        .casefold()
+    )
     approved_pool: tuple[str, ...] = ()
     if resolved_ecosystem == "maven":
         ordered = tuple(
             version
             for version in _stable_maven_versions(versions)
-            if is_stable_maven_version(floor)
-            and compare_maven_versions(version, floor) >= 0
+            if is_stable_maven_version(floor) and compare_maven_versions(version, floor) >= 0
         )
         approved_pool = tuple(
             version
             for version in _stable_maven_versions(approved_version_pool)
-            if is_stable_maven_version(floor)
-            and compare_maven_versions(version, floor) >= 0
+            if is_stable_maven_version(floor) and compare_maven_versions(version, floor) >= 0
         )
     else:
         ordered = _stable_registry_versions(versions, resolved_ecosystem)
@@ -1456,11 +1458,7 @@ def _normalise_context_candidate_sets(
                     project_language=project_language,
                     maven_mode=maven_mode,
                     ecosystem=(
-                        "maven"
-                        if maven_mode
-                        else "pypi"
-                        if _task_uses_pypi(task, group)
-                        else "npm"
+                        "maven" if maven_mode else "pypi" if _task_uses_pypi(task, group) else "npm"
                     ),
                 )
             )
@@ -1602,8 +1600,7 @@ def _current_candidate_versions(
         ecosystem=ecosystem,
     )
     approved = {
-        _normalise_candidate_version(version, maven_mode=maven_mode)
-        for version in approved_pool
+        _normalise_candidate_version(version, maven_mode=maven_mode) for version in approved_pool
     }
     attempted = {
         _normalise_candidate_version(version, maven_mode=maven_mode)
@@ -1730,7 +1727,7 @@ def registry_candidate_sets_for_context(
         except Exception as exc:  # noqa: BLE001
             return (), f"Registry verification unavailable: {exc}"
 
-    provider = registry_provider or _supervisor_fetch_registry_candidates
+    provider = registry_provider
     ecosystem = "pypi" if _task_uses_pypi(context.task, context.group) else "npm"
     targets: list[tuple[TacticalStrategy, str | None, str | None]] = []
     if context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
@@ -1806,12 +1803,25 @@ def registry_candidate_sets_for_context(
                 else:
                     versions = report_versions
             else:
-                candidates = provider(
-                    package_name,
-                    floor,
-                    _candidate_query_attempts(approved_pool, context.attempted_versions),
-                    ecosystem,
+                attempted_candidates = _candidate_query_attempts(
+                    approved_pool,
+                    context.attempted_versions,
                 )
+                if provider is None:
+                    candidates = _supervisor_fetch_registry_candidates(
+                        package_name,
+                        floor,
+                        attempted_candidates,
+                        project_language=context.project_language,
+                        ecosystem=ecosystem,
+                    )
+                else:
+                    candidates = provider(
+                        package_name,
+                        floor,
+                        attempted_candidates,
+                        ecosystem,
+                    )
                 versions = _current_candidate_versions(
                     candidates,
                     approved_pool=approved_pool,

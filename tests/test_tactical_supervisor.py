@@ -725,6 +725,43 @@ def test_parent_minimum_is_not_used_as_a_security_floor() -> None:
     assert candidate_sets[0].versions == ("1.2.3",)
 
 
+def test_default_registry_fetcher_receives_ecosystem_as_keyword() -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    def fetch_candidates(
+        package_name: str,
+        security_floor: str,
+        attempted_versions: set[str],
+        *,
+        project_language,
+        maven_mode: bool = False,
+        ecosystem: str | None = None,
+    ) -> list[RegistryCandidate]:
+        calls.append((package_name, security_floor, ecosystem or ""))
+        return [
+            RegistryCandidate(
+                version="1.2.3",
+                semver_key=(1, 2, 3),
+                security_floor_met=True,
+                is_stable=True,
+                same_major=True,
+                already_attempted=False,
+            )
+        ]
+
+    with patch(
+        "remediation_engine.orchestration.tactical_supervisor._supervisor_fetch_registry_candidates",
+        side_effect=fetch_candidates,
+    ):
+        candidate_sets, error = registry_candidate_sets_for_context(
+            build_tactical_context(_task(), _group())
+        )
+
+    assert error is None
+    assert calls == [("test-pkg", "1.2.3", "npm")]
+    assert candidate_sets[0].versions == ("1.2.3",)
+
+
 def test_transitive_inventory_keeps_child_override_when_parent_has_no_compatible_version():
     group = _group().model_copy(
         update={

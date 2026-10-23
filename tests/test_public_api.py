@@ -26,11 +26,16 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
+from remediation_engine.orchestration.graph import triage_node
 from remediation_engine.orchestration.runtime_context import (
     get_bound_runtime_settings,
     get_runtime_settings,
 )
-from remediation_engine.orchestration.state import normalize_group_paths
+from remediation_engine.orchestration.state import (
+    initial_orchestrator_state,
+    normalize_group_paths,
+)
 from remediation_engine.settings import AppSettings
 
 
@@ -362,12 +367,6 @@ def test_cli_exposes_ingest_triage_and_run_commands() -> None:
         )
         assert args.command == command
 
-# Stage-2 behavior retained during the architecture merge.
-from remediation_engine.language import ProjectLanguage
-
-from remediation_engine.orchestration.graph import triage_node
-
-from remediation_engine.orchestration.state import initial_orchestrator_state
 
 def test_run_remediation_preserves_context_when_filling_language(tmp_path: Path) -> None:
     """A missing language is filled without replacing caller context."""
@@ -398,6 +397,7 @@ def test_run_remediation_preserves_context_when_filling_language(tmp_path: Path)
     assert context.primary_language is None
     assert orchestrator.call_args.kwargs["project_language"] is ProjectLanguage.PYTHON
 
+
 def test_triage_issues_preserves_context_when_filling_language(tmp_path: Path) -> None:
     """Triage derives execution language without discarding caller metadata."""
     (tmp_path / "Pipfile").touch()
@@ -411,6 +411,7 @@ def test_triage_issues_preserves_context_when_filling_language(tmp_path: Path) -
     assert received.environment == "staging"
     assert received.tags == {"owner": "security"}
     assert context.primary_language is None
+
 
 def test_context_free_raw_issue_triage_keeps_graph_skip(tmp_path: Path) -> None:
     """Raw findings without a system context still skip graph triage."""

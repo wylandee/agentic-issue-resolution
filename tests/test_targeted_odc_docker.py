@@ -10,13 +10,18 @@ from uuid import uuid4
 
 import pytest
 
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration._qa_runtime import _write_targeted_artifacts
 from remediation_engine.orchestration.qa_odc import (
     _parse_report_package_occurrences,
     _run_targeted_odc,
 )
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox, get_docker_client
-from remediation_engine.tools.lockfile_closure import resolve_dependency_closure
+from remediation_engine.tools.lockfile_closure import (
+    build_sliced_lockfile_artifacts,
+    resolve_dependency_closure,
+)
+from remediation_engine.tools.odc_parser import parse_python_packages
 
 
 @pytest.mark.docker
@@ -188,12 +193,6 @@ def test_trace_esbuild_target_scans_after_batch_staging() -> None:
         finally:
             client.close()
 
-# Stage-2 behavior retained during the architecture merge.
-from remediation_engine.language import ProjectLanguage
-
-from remediation_engine.tools.lockfile_closure import build_sliced_lockfile_artifacts
-
-from remediation_engine.tools.odc_parser import parse_python_packages
 
 @pytest.mark.docker
 @pytest.mark.skipif(
@@ -229,6 +228,7 @@ def test_generated_targeted_lockfile_produces_parseable_odc_report() -> None:
             client.volumes.get(volume_name).remove(force=True)
         finally:
             client.close()
+
 
 @pytest.mark.docker
 @pytest.mark.skipif(

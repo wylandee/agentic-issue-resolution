@@ -682,7 +682,6 @@ def build_system_context(case: Mapping[str, Any]) -> SystemContext:
     replay = case.get("replay", {}) if isinstance(case.get("replay"), Mapping) else {}
     raw = replay.get("input", {}).get("system_context", {}) if isinstance(replay, Mapping) else {}
     raw = raw if isinstance(raw, Mapping) else {}
-    replay_input = replay.get("input", {}) if isinstance(replay, Mapping) else {}
     scenario = str(case.get("scenario", case.get("input", "")))
     scenario_lower = scenario.lower()
     completion = str(case.get("completion_task", ""))

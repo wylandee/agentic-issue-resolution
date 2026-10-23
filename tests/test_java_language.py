@@ -67,7 +67,7 @@ def test_language_configs_preserve_node_contract_and_register_maven_contract() -
     assert java.excluded_dirs == frozenset({"target"})
 
 
-def test_detection_is_root_only_and_prioritizes_root_pom(tmp_path: Path) -> None:
+def test_detection_is_root_only_and_preserves_node_precedence(tmp_path: Path) -> None:
     nested = tmp_path / "module"
     nested.mkdir()
     (nested / "pom.xml").write_text("<project />", encoding="utf-8")
@@ -77,6 +77,9 @@ def test_detection_is_root_only_and_prioritizes_root_pom(tmp_path: Path) -> None
     assert detect_project_language(tmp_path) is ProjectLanguage.NODEJS
 
     (tmp_path / "pom.xml").write_text("<project />", encoding="utf-8")
+    assert detect_project_language(tmp_path) is ProjectLanguage.NODEJS
+
+    (tmp_path / "package.json").unlink()
     assert detect_project_language(tmp_path) is ProjectLanguage.JAVA
 
 
@@ -95,10 +98,12 @@ def test_explicit_java_language_is_resolved(tmp_path: Path) -> None:
     assert resolve_project_language(tmp_path, "java") is ProjectLanguage.JAVA
 
 
-@pytest.mark.parametrize("language", ["python", "kotlin", "", "maven"])
-def test_unregistered_explicit_language_fails_closed(tmp_path: Path, language: str) -> None:
-    with pytest.raises(ValueError, match="Unsupported project language"):
-        resolve_project_language(tmp_path, language)
+@pytest.mark.parametrize("language", ["kotlin", "", "maven"])
+def test_unknown_explicit_language_falls_back_to_root_detection(
+    tmp_path: Path, language: str
+) -> None:
+    (tmp_path / "pom.xml").write_text("<project />", encoding="utf-8")
+    assert resolve_project_language(tmp_path, language) is ProjectLanguage.JAVA
 
 
 def test_run_api_detects_language_when_context_is_missing(tmp_path: Path) -> None:
@@ -143,22 +148,18 @@ def test_api_preserves_explicit_context_fields_while_resolving_missing_language(
     assert supplied.primary_language is None
 
 
-def test_api_keeps_explicit_java_context_and_rejects_unknown_language(tmp_path: Path) -> None:
-    java_context = SystemContext(primary_language="java", environment="dev")
-    request = RemediationRequest(repo_root=tmp_path, system_context=java_context)
-    with patch(
-        "remediation_engine.api.run_orchestrator",
-        return_value={"status": "completed", "errors": []},
-    ) as orchestrator:
-        run_remediation(request, settings=Mock())
-    assert orchestrator.call_args.kwargs["system_context"].primary_language == "java"
-
-    invalid = RemediationRequest(
-        repo_root=tmp_path,
-        system_context=SystemContext(primary_language="python"),
-    )
-    with pytest.raises(ValueError, match="Unsupported project language"):
-        run_remediation(invalid, settings=Mock())
+def test_api_keeps_explicit_java_and_python_contexts(tmp_path: Path) -> None:
+    for language in ("java", "python"):
+        request = RemediationRequest(
+            repo_root=tmp_path,
+            system_context=SystemContext(primary_language=language, environment="dev"),
+        )
+        with patch(
+            "remediation_engine.api.run_orchestrator",
+            return_value={"status": "completed", "errors": []},
+        ) as orchestrator:
+            run_remediation(request, settings=Mock())
+        assert orchestrator.call_args.kwargs["system_context"].primary_language == language
 
 
 def test_triage_api_detects_from_repo_and_defaults_to_node_without_repo(tmp_path: Path) -> None:
@@ -182,8 +183,9 @@ def test_cli_language_option_is_limited_to_triage_and_run() -> None:
     assert parser.parse_args(["triage", "issues.jsonl"]).language == "auto"
     assert parser.parse_args(["run", "issues.jsonl", "--repo", "."]).language == "auto"
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(["triage", "issues.jsonl", "--language", "python"])
+    assert (
+        parser.parse_args(["triage", "issues.jsonl", "--language", "python"]).language == "python"
+    )
     with pytest.raises(SystemExit):
         parser.parse_args(["ingest", "issues.jsonl", "--language", "java"])
 

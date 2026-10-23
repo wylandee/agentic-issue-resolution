@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import CommandResult
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.trajectory_exporter import (
     TrajectoryRecorder,
     use_trajectory_recorder,
@@ -185,13 +186,9 @@ class TestWorkspaceBuilderNode:
         assert "npm ERR! install failed" in result["errors"][0]
         sandbox.__exit__.assert_called_once()
 
-# Stage-2 behavior retained during the architecture merge.
-from remediation_engine.language import LANGUAGE_CONFIGS
-
-from remediation_engine.language import ProjectLanguage
 
 class TestWorkspaceBuilderNodeStage2Parity:
-    def test_incompatible_python_requirement_fails_before_setup_but_keeps_volume(self, tmp_path):
+    def test_incompatible_python_requirement_fails_before_volume_creation(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text(
             '[project]\nname = "future-only"\nrequires-python = ">=3.12"\n',
             encoding="utf-8",
@@ -214,8 +211,9 @@ class TestWorkspaceBuilderNodeStage2Parity:
             )
 
         assert result["status"] == "workspace_build_failed"
-        assert result["workspace_volume"] == f"agent_workspace_{_VOLUME_HEX[:8]}"
+        assert result["workspace_volume"] is None
         assert "incompatible with Python 3.11" in result["errors"][0]
+        client.volumes.create.assert_not_called()
         sandbox_type.assert_not_called()
 
     def test_pipfile_without_lock_runs_pipenv_install(self, tmp_path):
@@ -248,7 +246,7 @@ class TestWorkspaceBuilderNodeStage2Parity:
         assert not any(command.endswith("pipenv sync --dev") for command in commands)
         assert result["status"] == "workspace_ready"
 
-    def test_poetry_only_project_fails_boundedly_and_retains_volume_for_teardown(self, tmp_path):
+    def test_poetry_only_project_fails_before_volume_creation(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text(
             '[tool.poetry.dependencies]\npython = "^3.11"\nrequests = "^2.31"\n',
             encoding="utf-8",
@@ -271,8 +269,9 @@ class TestWorkspaceBuilderNodeStage2Parity:
             )
 
         assert result["status"] == "workspace_build_failed"
-        assert result["workspace_volume"] == f"agent_workspace_{_VOLUME_HEX[:8]}"
+        assert result["workspace_volume"] is None
         assert "Poetry-managed Python dependencies are unsupported" in result["errors"][0]
+        client.volumes.create.assert_not_called()
         sandbox_type.assert_not_called()
 
     def test_python_pipfile_is_authoritative_and_uses_persistent_volume_environments(
@@ -302,12 +301,14 @@ class TestWorkspaceBuilderNodeStage2Parity:
             result = run_workspace_builder_node(
                 {"repo_root": str(tmp_path), "project_language": ProjectLanguage.PYTHON}
             )
-
         volume_name = f"agent_workspace_{_VOLUME_HEX[:8]}"
+
         sandbox_type.assert_called_once_with(
-            str(tmp_path),
+            tmp_path,
             image=LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image,
             workspace_volume=volume_name,
+            maven_repository_volume=None,
+            archive_excluded_dirs=LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].excluded_dirs,
         )
         assert [call.args[0] for call in sandbox.run.call_args_list] == [
             "rm -rf .venv .remedy-pipenv",
@@ -322,7 +323,8 @@ class TestWorkspaceBuilderNodeStage2Parity:
                 "then .venv/bin/python -m pip install pytest; fi"
             ),
         ]
-        assert result == {"workspace_volume": volume_name, "status": "workspace_ready"}
+        assert result["workspace_volume"] == volume_name
+        assert result["status"] == "workspace_ready"
 
     def test_python_requirements_and_static_pep621_metadata_install_inside_volume(self, tmp_path):
         (tmp_path / "requirements.txt").write_text("requests==2.31.0\n", encoding="utf-8")
@@ -457,7 +459,7 @@ class TestWorkspaceBuilderNodeStage2Parity:
         ]
         assert result["status"] == "workspace_ready"
 
-    def test_uv_only_dependencies_fail_boundedly_and_retain_volume(self, tmp_path):
+    def test_uv_only_dependencies_fail_before_volume_creation(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text(
             '[tool.uv]\ndev-dependencies = ["pytest"]\n',
             encoding="utf-8",
@@ -480,6 +482,7 @@ class TestWorkspaceBuilderNodeStage2Parity:
             )
 
         assert result["status"] == "workspace_build_failed"
-        assert result["workspace_volume"] == f"agent_workspace_{_VOLUME_HEX[:8]}"
+        assert result["workspace_volume"] is None
         assert "uv-managed Python dependencies are unsupported" in result["errors"][0]
+        client.volumes.create.assert_not_called()
         sandbox_type.assert_not_called()

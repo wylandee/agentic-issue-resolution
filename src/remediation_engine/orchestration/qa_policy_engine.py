@@ -430,6 +430,42 @@ def _disabled_package_state_failure(
     return any(term in feedback for term in package_state_terms)
 
 
+def _known_pastebin_test_failure(evaluation: QAEvaluation) -> bool:
+    """Recognize only the Juice Shop's external PasteBin test outage.
+
+    Args:
+        evaluation: Structured QA failure with test attribution evidence.
+
+    Returns:
+        True when every failed test and source location belongs to the known
+        PasteBin-backed Internet Resources test. Other failures remain blocking.
+    """
+    evidence = evaluation.failure_evidence
+    if (
+        evaluation.failure_category != FailureCategory.BREAKING_CHANGE
+        or evidence is None
+        or not evidence.failed_tests
+        or not evidence.affected_files
+        or not evidence.source_locations
+    ):
+        return False
+    references = (*evidence.failed_tests, *evidence.exact_diagnostics)
+    if not any("pastebin.com" in value.casefold() for value in references):
+        return False
+    if any(
+        "pastebin" not in test_name.casefold()
+        and test_name.strip().casefold() != "required internet resource"
+        for test_name in evidence.failed_tests
+    ):
+        return False
+    expected_path = "test/api/internet-resources.test.ts"
+    paths = (*evidence.affected_files, *evidence.source_locations)
+    return all(
+        path.replace("\\", "/").casefold().split(":", 1)[0].endswith(expected_path)
+        for path in paths
+    )
+
+
 def _version_bump_llm_failure_is_relevant(
     evaluation: QAEvaluation,
     gates: QADeterministicGates,
@@ -612,9 +648,14 @@ def _apply_policy_decision(
                 policy == QAPolicy.VERSION_BUMP
                 and gates.tests_passed is False
                 and not current.contract_error
-                and attribution is not None
-                and attribution.verdict == TestAttributionVerdict.EXONERATED
-                and _valid_test_attribution(current, group.group_id, known_group_ids)
+                and (
+                    _known_pastebin_test_failure(current)
+                    or (
+                        attribution is not None
+                        and attribution.verdict == TestAttributionVerdict.EXONERATED
+                        and _valid_test_attribution(current, group.group_id, known_group_ids)
+                    )
+                )
             )
             tests_satisfied = (
                 gates.tests_passed is True
@@ -666,8 +707,13 @@ def _apply_policy_decision(
             policy == QAPolicy.VERSION_BUMP
             and gates.tests_passed is False
             and current.failure_category == FailureCategory.BREAKING_CHANGE
-            and current.test_attribution is not None
-            and _valid_test_attribution(current, group.group_id, known_group_ids)
+            and (
+                _known_pastebin_test_failure(current)
+                or (
+                    current.test_attribution is not None
+                    and _valid_test_attribution(current, group.group_id, known_group_ids)
+                )
+            )
         )
         dependency_evidence_inconclusive = (
             _QA_PACKAGE_STATE_CHECKS_ENABLED
@@ -770,7 +816,7 @@ def _apply_policy_decision(
             )
         elif policy == QAPolicy.VERSION_BUMP and gates.tests_passed is not True:
             attribution = current.test_attribution
-            valid_exoneration = bool(
+            valid_exoneration = _known_pastebin_test_failure(current) or bool(
                 attribution
                 and attribution.verdict == TestAttributionVerdict.EXONERATED
                 and attribution.responsible_group_ids

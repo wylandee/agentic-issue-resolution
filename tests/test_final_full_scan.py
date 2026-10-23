@@ -3,9 +3,9 @@
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import ScannerExecutionStatus
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.final_full_scan import run_final_full_scan_node
 from remediation_engine.orchestration.qa_types import _SecurityScanResult
-from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 
 
 def test_final_full_scan_projects_authoritative_findings():
@@ -173,9 +173,7 @@ def test_final_full_scan_docker_error_returns_typed_failure():
 
 
 def test_final_full_scan_skips_docker_when_workspace_is_unavailable():
-    with patch(
-        "remediation_engine.orchestration.final_full_scan.DockerSandbox"
-    ) as sandbox_factory:
+    with patch("remediation_engine.orchestration.final_full_scan.DockerSandbox") as sandbox_factory:
         output = run_final_full_scan_node({"workspace_volume": None})
 
     sandbox_factory.assert_not_called()

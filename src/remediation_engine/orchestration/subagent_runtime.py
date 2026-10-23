@@ -44,9 +44,7 @@ _PYTHON_MANIFEST_TRANSACTION_TOOL_NAMES = frozenset(
 _SERIAL_MANIFEST_TOOL_NAMES = _UPDATE_MANIFEST_TOOL_NAMES | frozenset(
     {"remove_no_fix_python_dependency"}
 )
-_WORKAROUND_VALIDATION_TOOL_NAMES = frozenset(
-    {"validate_workaround", "validate_python_workaround"}
-)
+_WORKAROUND_VALIDATION_TOOL_NAMES = frozenset({"validate_workaround", "validate_python_workaround"})
 _TARGETED_TEST_TOOL_NAMES = frozenset({"run_targeted_test", "run_targeted_python_test"})
 
 
@@ -172,9 +170,7 @@ def _infer_changed_files(tool_event: ToolEvent) -> list[str]:
         # Deferred and failed transactions did not leave a committed file change.
         manifest_path = tool_event.args.get(
             "manifest_path",
-            "pom.xml"
-            if tool_event.name == _MAVEN_UPDATE_MANIFEST_TOOL_NAME
-            else "package.json",
+            "pom.xml" if tool_event.name == _MAVEN_UPDATE_MANIFEST_TOOL_NAME else "package.json",
         )
         if isinstance(manifest_path, str) and manifest_path.strip():
             return [manifest_path.replace("\\", "/")]

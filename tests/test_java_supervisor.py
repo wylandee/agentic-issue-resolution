@@ -223,8 +223,9 @@ def test_java_retry_stage_and_candidate_whitelist_use_maven_stability() -> None:
 
 
 def test_maven_retry_plan_validation_preserves_native_version_identity_and_pivot_stage() -> None:
+    group = _maven_group(direct=True, declaration_type="dependencies")
     task = build_initial_remediation_task(
-        _maven_group(direct=True, declaration_type="dependencies"),
+        group,
         "task-plan-validation",
         project_language=ProjectLanguage.JAVA,
     )
@@ -238,7 +239,17 @@ def test_maven_retry_plan_validation_preserves_native_version_identity_and_pivot
         candidate_versions_considered=["v1.0"],
         exact_instruction="Apply the authorized Maven version update.",
     )
-    assert _planner_plan_violations({task.task_id: retry}, {task.task_id: task}, {}) == []
+    group_by_id = {group.group_id: group}
+    assert (
+        _planner_plan_violations(
+            {task.task_id: retry},
+            {task.task_id: task},
+            {},
+            group_by_id,
+            project_language=ProjectLanguage.JAVA,
+        )
+        == []
+    )
 
     pivot = SupervisorRetryPlan(
         task_id=task.task_id,
@@ -249,7 +260,16 @@ def test_maven_retry_plan_validation_preserves_native_version_identity_and_pivot
         action="pivot_workaround",
         exact_instruction="Use the committed workaround path.",
     )
-    assert _planner_plan_violations({task.task_id: pivot}, {task.task_id: task}, {}) == []
+    assert (
+        _planner_plan_violations(
+            {task.task_id: pivot},
+            {task.task_id: task},
+            {},
+            group_by_id,
+            project_language=ProjectLanguage.JAVA,
+        )
+        == []
+    )
 
 
 def _maven_candidate(version: str, role: str) -> MavenRegistryCandidate:

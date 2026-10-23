@@ -66,8 +66,8 @@ from remediation_engine.orchestration.portfolio_solver import (
     _PreparedPortfolioProblem,
     _PreparedPythonPortfolioProblem,
     _project_prepared_portfolio_plan,
-    maven_repository_fingerprint,
     build_python_portfolio_plan,
+    maven_repository_fingerprint,
     prepare_python_portfolio_problem,
 )
 from remediation_engine.orchestration.qa_test_parsing import (

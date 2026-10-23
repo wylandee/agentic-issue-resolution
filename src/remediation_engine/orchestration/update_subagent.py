@@ -431,9 +431,8 @@ def _validate_committed_multi_package_action(
         valid_manifest_paths = {path.replace("\\", "/").lstrip("/") for path in manifest_paths}
         if mutation.package_name != expected_package:
             errors.append(f"Update Subagent: package mismatch for task {task.task_id}.")
-        if (
-            mutation.ecosystem != expected_ecosystem
-            or mutation.ecosystem != _group_ecosystem(group)
+        if mutation.ecosystem != expected_ecosystem or mutation.ecosystem != _group_ecosystem(
+            group
         ):
             errors.append(f"Update Subagent: ecosystem mismatch for task {task.task_id}.")
         if mutation.manifest_path not in valid_manifest_paths:
@@ -693,6 +692,7 @@ committed action. Do not call the singleton dependency tool, search the registry
 or perform retry planning. After the tool returns, report its result and return
 control to the Supervisor. A failed or rolled-back action must be surrendered for
 a new Supervisor-committed attempt."""
+
 
 _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS = """You are a Python
 dependency-manifest cluster execution worker.
@@ -1178,7 +1178,8 @@ def _attempted_versions_for_current_run(
             "maven"
             if event_name in {_MAVEN_UPDATE_MANIFEST_TOOL_NAME, _BATCH_MAVEN_DEPENDENCIES_TOOL_NAME}
             else "pypi"
-            if event_name in {_PYTHON_UPDATE_MANIFEST_TOOL_NAME, _BATCH_PYTHON_DEPENDENCIES_TOOL_NAME}
+            if event_name
+            in {_PYTHON_UPDATE_MANIFEST_TOOL_NAME, _BATCH_PYTHON_DEPENDENCIES_TOOL_NAME}
             else "npm"
         )
         target = _event_target_version(event, ecosystem)
@@ -1206,7 +1207,8 @@ def _executed_versions_for_current_run(
             "maven"
             if event_name in {_MAVEN_UPDATE_MANIFEST_TOOL_NAME, _BATCH_MAVEN_DEPENDENCIES_TOOL_NAME}
             else "pypi"
-            if event_name in {_PYTHON_UPDATE_MANIFEST_TOOL_NAME, _BATCH_PYTHON_DEPENDENCIES_TOOL_NAME}
+            if event_name
+            in {_PYTHON_UPDATE_MANIFEST_TOOL_NAME, _BATCH_PYTHON_DEPENDENCIES_TOOL_NAME}
             else "npm"
         )
         target = _event_target_version(event, ecosystem)
@@ -1255,7 +1257,8 @@ def _effective_targets_for_current_run(
             "maven"
             if event_name in {_MAVEN_UPDATE_MANIFEST_TOOL_NAME, _BATCH_MAVEN_DEPENDENCIES_TOOL_NAME}
             else "pypi"
-            if event_name in {_PYTHON_UPDATE_MANIFEST_TOOL_NAME, _BATCH_PYTHON_DEPENDENCIES_TOOL_NAME}
+            if event_name
+            in {_PYTHON_UPDATE_MANIFEST_TOOL_NAME, _BATCH_PYTHON_DEPENDENCIES_TOOL_NAME}
             else "npm"
         )
         version = _event_target_version(event, ecosystem) or None

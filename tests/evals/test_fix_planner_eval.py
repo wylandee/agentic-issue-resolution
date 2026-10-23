@@ -121,11 +121,11 @@ def _faithfulness_projection(result: dict[str, Any]) -> dict[str, Any]:
         if result.get(field) not in (None, [])
     }
 
+
 def _judge_extraction_output(result: dict[str, Any]) -> dict[str, Any]:
     """Keep non-contract reasoning text out of structured extraction judgments."""
     return {
-        field: result.get(field)
-        for field in ("strategy", "fixed_version", "workaround_snippets")
+        field: result.get(field) for field in ("strategy", "fixed_version", "workaround_snippets")
     }
 
 
@@ -732,6 +732,8 @@ def test_fix_planner_faithfulness_projection_omits_null_and_unscored_fields() ->
         }
     )
     assert projected == {"fixed_version": "1.2.3"}
+
+
 def test_pyyaml_golden_expected_version_matches_its_page_evidence() -> None:
     """The historical PyYAML page, output, and target must describe one version."""
     case = next(

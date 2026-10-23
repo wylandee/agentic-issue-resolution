@@ -293,7 +293,9 @@ def _candidate_meets_finding_floor(candidate: str, floor: str | None) -> bool:
             return False
     floor_key = _version_key(floor)
     candidate_key = _version_key(candidate)
-    return floor_key is not None and candidate_key is not None and candidate_key[:3] >= floor_key[:3]
+    return (
+        floor_key is not None and candidate_key is not None and candidate_key[:3] >= floor_key[:3]
+    )
 
 
 def _boundary(left: SolverTarget, right: SolverTarget) -> bool:

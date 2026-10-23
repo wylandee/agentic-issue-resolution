@@ -1309,7 +1309,8 @@ def replay_update_case(
         if not isinstance(raw_snapshots, list):
             raise TypeError("Batch replay requires serialized attempt_snapshots list.")
         snapshots = {
-            item.task_id: item for item in (TaskAttemptSnapshot.model_validate(raw) for raw in raw_snapshots)
+            item.task_id: item
+            for item in (TaskAttemptSnapshot.model_validate(raw) for raw in raw_snapshots)
         }
         raw_action = replay.get("multi_package_action")
         if not isinstance(raw_action, Mapping):
@@ -1327,7 +1328,9 @@ def replay_update_case(
         batch_cases = replay.get("batch_tasks")
         if isinstance(batch_cases, list) and len(batch_cases) > 1:
             if project_language != ProjectLanguage.PYTHON:
-                raise ValueError("Generated replay batches are currently supported only for Python cases.")
+                raise ValueError(
+                    "Generated replay batches are currently supported only for Python cases."
+                )
             tasks, groups, snapshots = [], [], {}
             cluster_id = f"cluster-{case['case_id']}"
             dispatch_batch_id = f"batch-{case['case_id']}"

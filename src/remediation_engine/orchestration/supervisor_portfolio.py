@@ -14,6 +14,7 @@ from remediation_engine.contracts.solver_models import (
     PackageResolutionStatus,
     PortfolioReplanRequest,
 )
+from remediation_engine.language import resolve_project_language
 from remediation_engine.orchestration.portfolio_orchestrator import (
     apply_portfolio_plan,
     build_certified_portfolio_plan,
@@ -22,7 +23,6 @@ from remediation_engine.orchestration.portfolio_orchestrator import (
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.task_utils import TERMINAL_TASK_STATUSES
-from remediation_engine.language import resolve_project_language
 
 log = logging.getLogger(__name__)
 

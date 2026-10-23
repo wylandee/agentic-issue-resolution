@@ -9,7 +9,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from langchain_core.messages import AIMessage
 
 from remediation_engine.contracts.schemas import (
@@ -40,14 +39,19 @@ from remediation_engine.orchestration.state import (
     initial_workaround_subagent_state,
 )
 from remediation_engine.orchestration.update_subagent import (
+    _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _UPDATE_WORKER_STATIC_INSTRUCTIONS,
+    _build_multi_package_update_prompt,
     _build_update_prompt,
+    _build_update_system_prompt,
     _changed_files_by_task,
     run_update_subagent_node,
 )
 from remediation_engine.orchestration.workaround_subagent import (
+    _WORKAROUND_STATIC_INSTRUCTIONS,
     _build_workaround_prompt,
+    _build_workaround_system_prompt,
     run_workaround_subagent_node,
 )
 
@@ -1472,20 +1476,6 @@ class TestUpdateSubagentWrapper:
             res = post_qa_triage_node(state)
         assert res["status"] == "triage_skipped"
 
-# Stage-2 behavior retained during the architecture merge.
-from remediation_engine.language import ProjectLanguage
-
-from remediation_engine.orchestration.update_subagent import _build_update_system_prompt
-
-from remediation_engine.orchestration.workaround_subagent import _WORKAROUND_STATIC_INSTRUCTIONS
-
-from remediation_engine.orchestration.workaround_subagent import _build_workaround_system_prompt
-
-from remediation_engine.orchestration.update_subagent import (
-    _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS,
-    _build_multi_package_update_prompt,
-)
-
 
 class TestUpdateWorkerPromptLanguageParity:
     @pytest.mark.parametrize(
@@ -1585,12 +1575,14 @@ class TestUpdateWorkerPromptLanguageParity:
         normalized_static = " ".join(static_prompt.split())
         normalized_dynamic = " ".join(dynamic_prompt.split())
         assert "major-version migration" in normalized_static
-        assert "source and test migration to the committed package API is authorized and required" in (
-            normalized_static
+        assert (
+            "source and test migration to the committed package API is authorized and required"
+            in (normalized_static)
         )
         assert "Do not reselect or change any package name or version" in normalized_static
         assert f"Invoke {expected_tool} exactly once" in normalized_dynamic
         assert wrong_tool not in normalized_static + normalized_dynamic
+
 
 class TestUpdateSubagentWrapperStage2Parity:
     def test_language_matched_worker_prompts_limit_python_authority(self):

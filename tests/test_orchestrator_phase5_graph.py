@@ -43,6 +43,7 @@ from remediation_engine.contracts.schemas import (
     WorkerExecutionDiagnostics,
 )
 from remediation_engine.contracts.solver_models import PortfolioReplanRequest
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration import (
     build_orchestrator_graph,
     orchestrator_engine,
@@ -4381,12 +4382,11 @@ def test_socket_stack_fixture_rejects_mutation_id_mismatch_before_snapshot(
     apply_action.assert_not_called()
     sandbox.create_workspace_snapshot.assert_not_called()
 
-# Stage-2 behavior retained during the architecture merge.
-from remediation_engine.language import ProjectLanguage
 
 class TestPhase5RoutingStage2Parity:
     def test_route_after_workspace_builder_routes_to_supervisor(self):
         assert route_after_workspace_builder({"status": "workspace_ready"}) == "supervisor"
+
 
 class TestPhase5RunOrchestratorStage2Parity:
     def test_keyboard_interrupt_preserves_partial_state_and_writes_follow_up_report(
@@ -4455,6 +4455,7 @@ class TestPhase5RunOrchestratorStage2Parity:
         assert "task-1" in trajectory_text
         assert "orchestrator interrupted by KeyboardInterrupt" in trajectory_text
         assert "inconclusive" in trajectory_text
+
 
 class TestPhase5GraphIntegrationStage2Parity:
     def test_update_wrapper_preserves_exact_task_instruction_python_stage2(self, tmp_path):

@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
 from packaging.version import InvalidVersion, Version
 
 from remediation_engine.contracts.decision_codes import (
@@ -98,8 +99,8 @@ from remediation_engine.orchestration.issue_identity import stable_issue_fingerp
 from remediation_engine.orchestration.portfolio_solver import (
     _python_pipfile_manifest_path,
     _python_requirements_manifest_path,
-    python_manifest_repository_fingerprint,
     maven_repository_fingerprint,
+    python_manifest_repository_fingerprint,
 )
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.scan_identity import package_scan_occurrence_key
@@ -839,17 +840,21 @@ def _ordered_update_candidates(
         if maven_mode is not None
         else bool(re.fullmatch(r"[^:\s]+:[^:\s]+", task.target_package_name or ""))
     )
-    normalized_ecosystem = str(
-        ecosystem
-        or (
-            "maven"
-            if maven_mode
-            else "pypi"
-            if project_language == ProjectLanguage.PYTHON
-            or stage in {SCARemediationStage.PYPI_SAME_MAJOR, SCARemediationStage.PYPI_LATEST}
-            else "npm"
+    normalized_ecosystem = (
+        str(
+            ecosystem
+            or (
+                "maven"
+                if maven_mode
+                else "pypi"
+                if project_language == ProjectLanguage.PYTHON
+                or stage in {SCARemediationStage.PYPI_SAME_MAJOR, SCARemediationStage.PYPI_LATEST}
+                else "npm"
+            )
         )
-    ).strip().casefold()
+        .strip()
+        .casefold()
+    )
     python_ecosystem = normalized_ecosystem == "pypi"
 
     def package_key(value: str | None) -> str:
@@ -866,7 +871,10 @@ def _ordered_update_candidates(
             floor = diagnostics.security_floor if diagnostics is not None else None
             if floor:
                 try:
-                    if not is_stable_maven_version(floor) or compare_maven_versions(version, floor) < 0:
+                    if (
+                        not is_stable_maven_version(floor)
+                        or compare_maven_versions(version, floor) < 0
+                    ):
                         return None
                 except ValueError:
                     return None
@@ -2476,7 +2484,13 @@ def _build_multi_package_action(
                 & set(maven_paths)
             )
             manifest_path = localized_manifest_paths[0] if localized_manifest_paths else ""
-            if not package_name or not target_version or not manifest_path or not maven_paths or operation is None:
+            if (
+                not package_name
+                or not target_version
+                or not manifest_path
+                or not maven_paths
+                or operation is None
+            ):
                 return None
             ecosystem = "maven"
             mutation_values = {
@@ -3541,9 +3555,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
     unfixable_replan_cleared = bool(
         isinstance(pending_request_at_entry, PortfolioReplanRequest)
         and pending_request_at_entry.reason == "UNFIXABLE_REPLAN"
-        and not _nonterminal_sca_task_ids(
-            task_queue, group_by_id, state.get("portfolio_plan")
-        )
+        and not _nonterminal_sca_task_ids(task_queue, group_by_id, state.get("portfolio_plan"))
     )
     active_target_task_ids = _recover_active_target_task_ids(
         state.get("active_target_task_ids") or [],
@@ -4782,6 +4794,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         retry_diagnostics_by_task,
         retry_plans_by_task,
         group_by_id,
+        project_language=project_language,
     )
     if stale_pivot_parent_ids:
         errors.append(
@@ -4916,6 +4929,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             task_queue,
             parsed_diagnostics,
             group_by_id,
+            project_language=project_language,
         )
         if planner_violations:
             errors.extend(
@@ -4928,12 +4942,14 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 task_queue,
                 group_by_id,
                 violations=planner_violations,
+                project_language=project_language,
             )
             repair_violations = _planner_plan_violations(
                 parsed_plans,
                 task_queue,
                 parsed_diagnostics,
                 group_by_id,
+                project_language=project_language,
             )
             if repair_violations:
                 errors.extend(
@@ -4946,6 +4962,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             task_queue,
             parsed_diagnostics,
             group_by_id,
+            project_language=project_language,
         ):
             _commit_retry_plans(
                 task_queue,
@@ -5653,6 +5670,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     retry_diagnostics_by_task=retry_diagnostics_by_task,
                     retry_plans_by_task=retry_plans_by_task,
                     group_by_id=group_by_id,
+                    project_language=project_language,
                 )
                 decision = _deterministic_routing(
                     task_queue,
@@ -5845,6 +5863,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             retry_diagnostics_by_task=retry_diagnostics_by_task,
             retry_plans_by_task=retry_plans_by_task,
             group_by_id=group_by_id,
+            project_language=project_language,
         )
 
     resolved_target_task_ids: list[str] = []
@@ -6008,6 +6027,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                         {task_id: task},
                         recovered_diagnostics,
                         {task.parent_group_id: group},
+                        project_language=project_language,
                     ):
                         retry_diagnostics_by_task.update(recovered_diagnostics)
                         _commit_retry_plans(

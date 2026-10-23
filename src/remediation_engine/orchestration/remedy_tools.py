@@ -41,6 +41,7 @@ from .tools_manifest import (
     _make_modify_and_validate_npm_dependency_tool,
     _make_modify_batch_npm_dependencies_tool,
     _make_remove_no_fix_dependency_tool,
+    _normalize_python_manifest_targets,
     _package_checkpoint_paths,
     _PackageCheckpoint,
     apply_multi_package_action,
@@ -50,25 +51,22 @@ from .tools_manifest_java import (
     _make_modify_and_validate_maven_dependency_tool,
     _make_modify_batch_maven_dependencies_tool,
 )
+from .tools_manifest_python import (
+    _make_modify_and_validate_python_dependency_tool,
+    _make_modify_batch_python_dependencies_tool,
+    _make_remove_no_fix_python_dependency_tool,
+    _normalize_python_package_manifest_targets,
+)
 from .tools_validation import (
     _make_record_plan_tool,
     _make_record_targeted_test_substitution_tool,
-    _make_run_targeted_test_tool,
     _make_run_targeted_python_test_tool,
+    _make_run_targeted_test_tool,
     _make_validate_code_syntax_tool,
     _make_validate_python_syntax_tool,
     _make_validate_python_workaround_tool,
     _make_validate_workaround_tool,
 )
-from remediation_engine.language import ProjectLanguage
-
-from .tools_manifest_python import (
-    _make_modify_batch_python_dependencies_tool,
-    _make_modify_and_validate_python_dependency_tool,
-    _make_remove_no_fix_python_dependency_tool,
-    _normalize_python_package_manifest_targets,
-)
-from .tools_manifest import _normalize_python_manifest_targets
 from .tools_web import (
     _make_read_web_page_tool,
     _make_search_web_tool,
@@ -108,10 +106,7 @@ def build_update_toolbelt(
         ProjectLanguage.JAVA: "maven",
         ProjectLanguage.PYTHON: "pypi",
     }[project_language]
-    if (
-        package_ecosystem is not None
-        and package_ecosystem.strip().casefold() != expected_ecosystem
-    ):
+    if package_ecosystem is not None and package_ecosystem.strip().casefold() != expected_ecosystem:
         raise ValueError("Unsupported project-language/package-ecosystem pairing.")
 
     if project_language == ProjectLanguage.PYTHON:
@@ -226,10 +221,7 @@ def build_multi_package_update_toolbelt(
             )
         ]
     expected_ecosystem = "pypi" if project_language == ProjectLanguage.PYTHON else "npm"
-    if any(
-        getattr(mutation, "ecosystem", "npm") != expected_ecosystem
-        for mutation in mutations
-    ):
+    if any(getattr(mutation, "ecosystem", "npm") != expected_ecosystem for mutation in mutations):
         raise ValueError(
             f"{project_language.value} batch toolbelt requires a non-empty "
             f"{expected_ecosystem} action."
@@ -244,13 +236,15 @@ def build_multi_package_update_toolbelt(
                 package_checkpoints=package_checkpoints,
             )
         ]
-    return [_make_modify_batch_npm_dependencies_tool(
-        sandbox,
-        action,
-        touched_files,
-        execution_state=execution_state,
-        package_checkpoints=package_checkpoints,
-    )]
+    return [
+        _make_modify_batch_npm_dependencies_tool(
+            sandbox,
+            action,
+            touched_files,
+            execution_state=execution_state,
+            package_checkpoints=package_checkpoints,
+        )
+    ]
 
 
 def build_workaround_toolbelt(
@@ -423,7 +417,8 @@ def build_workaround_toolbelt(
         effective_no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value
         and no_fix_package_name
         and normalized_no_fix_manifests
-        and language in {
+        and language
+        in {
             ProjectLanguage.NODEJS,
             ProjectLanguage.JAVA,
             ProjectLanguage.PYTHON,

@@ -1542,11 +1542,12 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                     )
                     for path in normalized_candidates:
                         name = Path(path).name.casefold()
-                        if no_fix_package_manager == "pipenv" and name == "pipfile":
-                            no_fix_manifest_paths.append(path)
-                        elif no_fix_package_manager == "pip" and (
-                            (name.startswith("requirements") and name.endswith(".txt"))
-                            or name in {"pyproject.toml", "setup.cfg", "setup.py"}
+                        if (no_fix_package_manager == "pipenv" and name == "pipfile") or (
+                            no_fix_package_manager == "pip"
+                            and (
+                                (name.startswith("requirements") and name.endswith(".txt"))
+                                or name in {"pyproject.toml", "setup.cfg", "setup.py"}
+                            )
                         ):
                             no_fix_manifest_paths.append(path)
                 else:

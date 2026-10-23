@@ -1585,9 +1585,7 @@ def _build_qa_scan_targets(
                 target_package=target_package,
                 expected_version=expected_version,
                 manifest_paths=(
-                    _manifest_paths_for_group(group)
-                    if _group_is_python(group)
-                    else manifest_paths
+                    _manifest_paths_for_group(group) if _group_is_python(group) else manifest_paths
                 ),
                 dependency_ancestry=ancestry,
                 target_identifiers=frozenset(group_target_identifiers(group)),
@@ -1872,6 +1870,8 @@ def _maven_target_manifest_paths(group: VulnerabilityGroup) -> tuple[str, ...]:
         if Path(path).name.casefold() == "pom.xml":
             manifests.add(path)
     return tuple(sorted(manifests))
+
+
 def _python_package_name(name: str) -> str:
     """Normalize a Python distribution name according to PEP 503."""
     return normalize_python_package_name(str(name or "").strip())
@@ -3885,7 +3885,7 @@ def _python_targeted_closure_from_inspect(
 
     package_specs = tuple(
         sorted(
-            ((records[name]["name"], records[name]["version"]) for name in resolved),
+            ((name, records[name]["version"]) for name in resolved),
             key=lambda item: item[0].casefold(),
         )
     )
@@ -4598,6 +4598,7 @@ def _write_targeted_artifacts(
                     source_input_path=source_paths[0],
                     package_name=name,
                     version=version,
+                    ecosystem="pypi",
                 )
                 for name, version in closure.package_specs
             )
@@ -5019,7 +5020,9 @@ def _attribute_reported_occurrences(
                 ecosystem = str(_scan_result_value(reported, "ecosystem", "")).casefold()
                 expected_ecosystem = artifact_manifest.ecosystem_by_project.get(
                     project_path,
-                    "npm",
+                    "maven"
+                    if project_path in artifact_manifest.maven_artifacts_by_project
+                    else "npm",
                 )
                 if ecosystem != expected_ecosystem:
                     mapping_complete = False
@@ -5358,20 +5361,21 @@ def _scan_evidence_by_task(
         scope_to_npm_target = task_target is not None and (
             bool(task_closures) or project_is_shared or project_is_npm
         )
-        if scope_to_npm_target and not has_task_closure_scope:
-            # Shared npm projects are filtered to this task's exact dependency root.
-            target_closures = tuple(
-                closure
-                for closure in task_closures
-                if _closure_matches_task_target(closure, task_target)
-            )
-            if not target_closures and target_skipped:
-                target_closures = tuple(
+        if scope_to_npm_target:
+            if target_skipped:
+                task_closures = tuple(
                     closure
                     for closure in task_closures
                     if "" in (getattr(closure, "root_keys", ()) or ())
                 )
-            task_closures = target_closures
+            else:
+                # Keep scan-wide changed closures out of unrelated task verdicts.
+                task_closures = tuple(
+                    closure
+                    for closure in task_closures
+                    if _closure_matches_task_target(closure, task_target)
+                )
+            has_task_closure_scope = True
         task_occurrence_keys = {
             _package_occurrence_key(
                 closure.source_lockfile,

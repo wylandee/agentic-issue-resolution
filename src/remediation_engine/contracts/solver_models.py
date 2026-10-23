@@ -508,9 +508,7 @@ class SolverPythonRuntimeFingerprint(_SolverModel):
     platform: str = Field(..., min_length=1)
     architecture: str = Field(..., min_length=1)
 
-    @field_validator(
-        "python_version", "pip_version", "platform", "architecture", mode="before"
-    )
+    @field_validator("python_version", "pip_version", "platform", "architecture", mode="before")
     @classmethod
     def _text(cls, value: Any, info: Any) -> str:
         return _required_text(value, info.field_name)

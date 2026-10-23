@@ -360,9 +360,7 @@ def test_update_subagent_offline_production_replay(
 
 def test_maven_target_recovery_separates_live_and_offline_tool_contracts() -> None:
     """Keep adversarial guardrail calls in the scripted trace, not live expectations."""
-    case = next(
-        case for case in _UPDATE_CASES if case["case_id"] == "update-maven-target-recovery"
-    )
+    case = next(case for case in _UPDATE_CASES if case["case_id"] == "update-maven-target-recovery")
     expected_live_tools = expected_tools(case, component="update")
     scripted_tools = case["offline_fixture"]["actual_tools"]
 

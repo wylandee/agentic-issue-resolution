@@ -21,6 +21,7 @@ from remediation_engine.contracts.schemas import (
     UpdateRetryDiagnostics,
     VulnerabilityGroup,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.supervisor_planner import (
     _build_high_level_retry_instruction,
     instruction_digest,
@@ -96,6 +97,7 @@ def _terminalize_pivot_parents(
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
     retry_plans_by_task: dict[str, SupervisorRetryPlan] | None = None,
     group_by_id: dict[str, VulnerabilityGroup] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> None:
     """Mark pivoted parent tasks terminal so they cannot be re-routed to update work."""
     for parent_id in parent_ids:
@@ -126,7 +128,11 @@ def _terminalize_pivot_parents(
             component = group.vulnerable_component if group else parent_task.parent_group_id
             updates.update(
                 {
-                    "strategy_stage": _latest_sca_stage(parent_task, group),
+                    "strategy_stage": _latest_sca_stage(
+                        parent_task,
+                        group,
+                        project_language,
+                    ),
                     "selected_version": None,
                     "exhausted_update_path": True,
                     "instruction": (
@@ -175,6 +181,7 @@ def _reconcile_terminal_pivot_parents(
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
     retry_plans_by_task: dict[str, SupervisorRetryPlan],
     group_by_id: dict[str, VulnerabilityGroup],
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> list[str]:
     """Terminalize non-terminal update parents whose workaround child is terminal.
 
@@ -222,6 +229,7 @@ def _reconcile_terminal_pivot_parents(
         retry_diagnostics_by_task=retry_diagnostics_by_task,
         retry_plans_by_task=retry_plans_by_task,
         group_by_id=group_by_id,
+        project_language=project_language,
     )
     return parent_ids
 

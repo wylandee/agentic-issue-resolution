@@ -33,9 +33,7 @@ log = logging.getLogger(__name__)
 
 def _resolve_cli_language(repo_root: Path | None, option: str) -> ProjectLanguage:
     """Resolve the CLI's auto or explicit language selection."""
-    return resolve_project_language(
-        repo_root or Path.cwd(), None if option == "auto" else option
-    )
+    return resolve_project_language(repo_root or Path.cwd(), None if option == "auto" else option)
 
 
 def _system_context(language: ProjectLanguage) -> SystemContext:
@@ -381,9 +379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_root=args.repo,
             issues=issues,
             valid_groups=[],
-            system_context=_system_context(
-                _resolve_cli_language(args.repo, args.language)
-            ),
+            system_context=_system_context(_resolve_cli_language(args.repo, args.language)),
         )
         result = run_remediation(request, settings=settings)
         if args.patch_out:

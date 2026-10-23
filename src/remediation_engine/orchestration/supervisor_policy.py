@@ -60,16 +60,20 @@ def _normalise_security_floor(
     if value is None:
         return None, None
     raw = str(value).strip()
-    normalized_ecosystem = str(
-        ecosystem
-        or (
-            "maven"
-            if project_language == ProjectLanguage.JAVA and maven_mode
-            else "pypi"
-            if project_language == ProjectLanguage.PYTHON
-            else "npm"
+    normalized_ecosystem = (
+        str(
+            ecosystem
+            or (
+                "maven"
+                if project_language == ProjectLanguage.JAVA and maven_mode
+                else "pypi"
+                if project_language == ProjectLanguage.PYTHON
+                else "npm"
+            )
         )
-    ).strip().casefold()
+        .strip()
+        .casefold()
+    )
     if normalized_ecosystem == "maven":
         if not is_stable_maven_version(raw):
             return None, None
@@ -116,8 +120,11 @@ def _task_uses_pypi(
 def _latest_sca_stage(
     task: RemediationTask | None,
     group: VulnerabilityGroup | None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> SCARemediationStage:
-    """Return the latest bounded update stage for a task's package ecosystem."""
+    """Return the latest bounded update stage for one package ecosystem."""
+    if is_maven_group(group, project_language):
+        return SCARemediationStage.MAVEN_LATEST
     if _task_uses_pypi(task, group):
         return SCARemediationStage.PYPI_LATEST
     return SCARemediationStage.NPM_LATEST
@@ -344,16 +351,20 @@ def _next_sca_stage(
     ecosystem: str | None = None,
 ) -> SCARemediationStage:
     """Advance one ordered SCA stage without changing the Node ladder."""
-    resolved_ecosystem = str(
-        ecosystem
-        or (
-            "maven"
-            if project_language == ProjectLanguage.JAVA and maven_mode
-            else "pypi"
-            if project_language == ProjectLanguage.PYTHON
-            else "npm"
+    resolved_ecosystem = (
+        str(
+            ecosystem
+            or (
+                "maven"
+                if project_language == ProjectLanguage.JAVA and maven_mode
+                else "pypi"
+                if project_language == ProjectLanguage.PYTHON
+                else "npm"
+            )
         )
-    ).strip().casefold()
+        .strip()
+        .casefold()
+    )
     if resolved_ecosystem == "maven":
         if stage == SCARemediationStage.OSV_MINIMUM:
             return SCARemediationStage.MAVEN_LATEST

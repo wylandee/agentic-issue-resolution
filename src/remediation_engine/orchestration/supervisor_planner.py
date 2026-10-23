@@ -91,16 +91,20 @@ def _supervisor_fetch_registry_candidates(
     Returns:
         Candidates returned by the selected registry adapter.
     """
-    normalized_ecosystem = str(
-        ecosystem
-        or (
-            "maven"
-            if project_language == ProjectLanguage.JAVA and maven_mode
-            else "pypi"
-            if project_language == ProjectLanguage.PYTHON
-            else "npm"
+    normalized_ecosystem = (
+        str(
+            ecosystem
+            or (
+                "maven"
+                if project_language == ProjectLanguage.JAVA and maven_mode
+                else "pypi"
+                if project_language == ProjectLanguage.PYTHON
+                else "npm"
+            )
         )
-    ).strip().casefold()
+        .strip()
+        .casefold()
+    )
     if normalized_ecosystem not in {"npm", "maven", "pypi"}:
         raise ValueError(f"Unsupported registry ecosystem: {normalized_ecosystem}")
     inputs = {
@@ -125,6 +129,7 @@ def _supervisor_fetch_registry_candidates(
                 attempted_versions,
             )
         return fetch_registry_candidates(package_name, security_floor, attempted_versions)
+
     return invoke_with_trajectory(
         "supervisor.fetch_registry_candidates",
         fetch,
@@ -381,6 +386,7 @@ def _planner_plan_violations(
     task_queue: dict[str, RemediationTask],
     diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
     group_by_id: dict[str, VulnerabilityGroup] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> list[str]:
     """Validate retry-plan semantics before a plan can mutate routing state.
 
@@ -397,10 +403,17 @@ def _planner_plan_violations(
             violations.append(f"task {task_id}: planner returned an unknown task")
             continue
         group = (group_by_id or {}).get(task.parent_group_id)
-        python_task = _task_uses_pypi(task, group)
-        latest_stage = _latest_sca_stage(task, group)
+        maven_task = is_maven_group(group, project_language)
+        python_task = not maven_task and _task_uses_pypi(task, group)
+        latest_stage = _latest_sca_stage(task, group, project_language)
         allowed_stages = (
             {
+                SCARemediationStage.OSV_MINIMUM,
+                SCARemediationStage.MAVEN_LATEST,
+                SCARemediationStage.CODE_WORKAROUND,
+            }
+            if maven_task
+            else {
                 SCARemediationStage.OSV_MINIMUM,
                 SCARemediationStage.PYPI_SAME_MAJOR,
                 SCARemediationStage.PYPI_LATEST,
@@ -416,9 +429,9 @@ def _planner_plan_violations(
             }
         )
         if plan.strategy_stage not in allowed_stages:
+            ecosystem = "maven" if maven_task else "pypi" if python_task else "npm"
             violations.append(
-                f"task {task_id}: stage {plan.strategy_stage.value} is not valid for "
-                f"{'pypi' if python_task else 'npm'}"
+                f"task {task_id}: stage {plan.strategy_stage.value} is not valid for {ecosystem}"
             )
         if task.status in _TERMINAL_STATUSES:
             violations.append(f"task {task_id}: planner returned a plan for terminal task")
@@ -475,9 +488,7 @@ def _planner_plan_violations(
                 f"from committed stage {task.strategy_stage.value}"
             )
         required_pivot_stage = (
-            SCARemediationStage.MAVEN_LATEST
-            if plan.version_scheme == "maven"
-            else latest_stage
+            SCARemediationStage.MAVEN_LATEST if plan.version_scheme == "maven" else latest_stage
         )
         if plan.action == "pivot_workaround" and plan.strategy_stage != required_pivot_stage:
             violations.append(
@@ -518,14 +529,23 @@ def _repair_invalid_planner_plans(
         if invalid_task_ids and task_id not in invalid_task_ids:
             repaired_plans[task_id] = plan
             continue
+        task = task_queue[task_id]
         diagnostics = repaired_diagnostics.get(task_id)
         attempted = {
             version.strip().lstrip("vV").lower()
             for version in (diagnostics.attempted_versions if diagnostics else [])
             if version
         }
-        group = group_by_id.get(task_queue[task_id].parent_group_id)
-        if is_maven_group(group, project_language) and group is not None:
+        group = group_by_id.get(task.parent_group_id)
+        maven_task = is_maven_group(group, project_language)
+        python_task = not maven_task and _task_uses_pypi(task, group)
+        if python_task:
+            attempted.update(
+                version.strip().lstrip("vV").lower()
+                for version in plan.attempted_versions
+                if version
+            )
+        if maven_task and group is not None:
             if diagnostics is None:
                 diagnostics = UpdateRetryDiagnostics(task_id=task_id)
             target_package = group.vulnerable_component or task_queue[task_id].target_package_name
@@ -539,7 +559,14 @@ def _repair_invalid_planner_plans(
                     diagnostics.candidate_versions_considered or plan.candidate_versions_considered
                 )
             )
-            attempted_maven = set(diagnostics.attempted_versions)
+            attempted_maven = {
+                str(version).strip()
+                for version in (
+                    *(diagnostics.attempted_versions if diagnostics is not None else ()),
+                    *plan.attempted_versions,
+                )
+                if str(version).strip()
+            }
             stage = plan.strategy_stage
             selected = None
             if (
@@ -637,10 +664,9 @@ def _repair_invalid_planner_plans(
             continue
 
         candidate = None
-        task = task_queue[task_id]
         group = group_by_id.get(task.parent_group_id)
-        latest_stage = _latest_sca_stage(task, group)
-        python_task = _task_uses_pypi(task, group)
+        latest_stage = _latest_sca_stage(task, group, project_language)
+        python_task = not maven_task and _task_uses_pypi(task, group)
         valid_stages = (
             {
                 SCARemediationStage.OSV_MINIMUM,

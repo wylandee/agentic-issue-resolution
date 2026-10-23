@@ -229,6 +229,7 @@ def test_reachability_rejects_external_root_manifest_symlink(tmp_path):
 
     assert group.is_reachable is None
 
+
 # Stage-2 behavior retained during the architecture merge.
 def test_analyze_reachability_leaves_pypi_findings_unknown(monkeypatch, tmp_path):
     (tmp_path / "package.json").write_text(

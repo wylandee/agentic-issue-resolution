@@ -344,13 +344,10 @@ def _extract_fixed_from_osv_vuln(
                     fallback.append(str(fixed))
 
     package_ecosystems = {
-        str((affected.get("package") or {}).get("ecosystem") or ecosystem or "")
-        .strip()
-        .casefold()
+        str((affected.get("package") or {}).get("ecosystem") or ecosystem or "").strip().casefold()
         for affected in vuln.get("affected") or []
         if not (affected.get("package") or {}).get("name")
-        or str((affected.get("package") or {}).get("name")).casefold()
-        == package_name.casefold()
+        or str((affected.get("package") or {}).get("name")).casefold() == package_name.casefold()
     }
     version_ecosystem = (
         "maven"
@@ -605,9 +602,10 @@ def _query_osv_fixed_version(
                     "pypi"
                     if str(getattr(issue, "ecosystem", None) or "").strip().casefold()
                     in {"pypi", "python", "pip"}
-                    or str(getattr(issue, "purl", "") or "").strip().casefold().startswith(
-                        "pkg:pypi/"
-                    )
+                    or str(getattr(issue, "purl", "") or "")
+                    .strip()
+                    .casefold()
+                    .startswith("pkg:pypi/")
                     else "npm"
                 )
             ),

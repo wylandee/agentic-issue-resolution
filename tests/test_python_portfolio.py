@@ -177,12 +177,14 @@ def test_shared_python_version_key_preserves_pep440_numeric_order_and_equivalenc
     assert _python_numeric_solver_version("1.10")[1] > _python_numeric_solver_version("1.9.2")[1]
     assert _python_numeric_solver_version("1.0")[1] == _python_numeric_solver_version("1.0.0")[1]
     assert _python_numeric_solver_version("1.0")[0] == "1.0.0"
-    assert _python_numeric_solver_version("1.8.0")[1] < _python_numeric_solver_version(
-        "1.8.0.post1"
-    )[1]
-    assert _python_numeric_solver_version("1.8.0.post1")[1] < _python_numeric_solver_version(
-        "1.8.1"
-    )[1]
+    assert (
+        _python_numeric_solver_version("1.8.0")[1]
+        < _python_numeric_solver_version("1.8.0.post1")[1]
+    )
+    assert (
+        _python_numeric_solver_version("1.8.0.post1")[1]
+        < _python_numeric_solver_version("1.8.1")[1]
+    )
 
 
 def _pipfile_parent_group():
@@ -238,10 +240,7 @@ def test_pipfile_parent_uses_shared_solver_and_pep440_candidate_gates(tmp_path: 
 
     def registry(package: str, floor: str, attempted: set[str]):
         registry_calls.append((package, floor, set(attempted)))
-        return [
-            _pypi_candidate(version)
-            for version in ("1.2.0", "1.8.0.post1", "2.0.0")
-        ]
+        return [_pypi_candidate(version) for version in ("1.2.0", "1.8.0.post1", "2.0.0")]
 
     def requires_dist(package: str, version: str):
         assert package == "direct-parent"
@@ -262,7 +261,10 @@ def test_pipfile_parent_uses_shared_solver_and_pep440_candidate_gates(tmp_path: 
     )
 
     assert prepared.candidate_catalog_complete
-    assert prepared.parent_contexts[prepared.targets[0].occurrence_id]["parent_minimum_version"] == "1.8.0.post1"
+    assert (
+        prepared.parent_contexts[prepared.targets[0].occurrence_id]["parent_minimum_version"]
+        == "1.8.0.post1"
+    )
     assert prepared.targets[0].target_package_name == "direct-parent"
     assert prepared.targets[0].lockfile_package_key is None
     assert prepared.findings[0].vulnerable_package == "certifi"
@@ -272,10 +274,11 @@ def test_pipfile_parent_uses_shared_solver_and_pep440_candidate_gates(tmp_path: 
     assert solver.status == SolverStatus.OPTIMAL
     assert solver.selected_plan is not None
     selected = solver.selected_plan.selected_candidate_versions[prepared.targets[0].occurrence_id]
-    assert _python_numeric_solver_version(selected)[1] >= _python_numeric_solver_version("1.8.0.post1")[1]
-    assert registry_calls == [
-        ("direct-parent", "1.0.0", {"1.0.0", "1.2.0"})
-    ]
+    assert (
+        _python_numeric_solver_version(selected)[1]
+        >= _python_numeric_solver_version("1.8.0.post1")[1]
+    )
+    assert registry_calls == [("direct-parent", "1.0.0", {"1.0.0", "1.2.0"})]
 
 
 @pytest.mark.parametrize("declaration", ["==1.2.0", ">=2.0,<3.0"])
@@ -448,8 +451,8 @@ class _PythonCertifierSandbox:
         if command.startswith("python --version"):
             return self._result(
                 stdout=(
-                    'Python 3.11.10\n'
-                    'pip 24.2 from /usr/local/lib/python3.11/site-packages/pip (python 3.11)\n'
+                    "Python 3.11.10\n"
+                    "pip 24.2 from /usr/local/lib/python3.11/site-packages/pip (python 3.11)\n"
                     '{"platform":"linux","architecture":"x86_64"}\n'
                 )
             )
@@ -489,7 +492,9 @@ class _PythonCertifierSandbox:
                         records.append(
                             {"metadata": {"name": match.group(1), "version": match.group(2)}}
                         )
-            if any(record["metadata"]["version"] in self.pip_build_fail_versions for record in records):
+            if any(
+                record["metadata"]["version"] in self.pip_build_fail_versions for record in records
+            ):
                 return self._result(
                     1,
                     stderr=(
@@ -576,7 +581,9 @@ def test_python_uses_common_supervisor_certificate_with_typed_pip_evidence(
     assert committed_queue[task.task_id].allowed_target_versions == ["2022.12.7"]
     assert committed_queue[task.task_id].portfolio_plan_id == plan.portfolio_plan_id
     assert committed_queue[task.task_id].task_revision == task.task_revision + 1
-    pip_command = next(command for command in sandbox.commands if "pip install --dry-run" in command)
+    pip_command = next(
+        command for command in sandbox.commands if "pip install --dry-run" in command
+    )
     pip_arguments = shlex.split(pip_command)
     assert "-r" in pip_arguments
     requirements_argument = pip_arguments[pip_arguments.index("-r") + 1]
@@ -630,12 +637,8 @@ def test_python_certifier_retries_after_candidate_build_failure(tmp_path: Path) 
 def test_python_certifier_resolves_same_environment_requirements_files_together(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / "requirements-base.txt").write_text(
-        "certifi==2022.6.15\n", encoding="utf-8"
-    )
-    (tmp_path / "requirements-dev.txt").write_text(
-        "urllib3==1.25.11\n", encoding="utf-8"
-    )
+    (tmp_path / "requirements-base.txt").write_text("certifi==2022.6.15\n", encoding="utf-8")
+    (tmp_path / "requirements-dev.txt").write_text("urllib3==1.25.11\n", encoding="utf-8")
     groups = [
         _python_group("requirements-base.txt"),
         _python_group(
@@ -683,9 +686,7 @@ def test_python_certifier_resolves_same_environment_requirements_files_together(
     assert len(pip_commands) == 1
     arguments = shlex.split(pip_commands[0])
     requirements_arguments = [
-        arguments[index + 1]
-        for index, argument in enumerate(arguments[:-1])
-        if argument == "-r"
+        arguments[index + 1] for index, argument in enumerate(arguments[:-1]) if argument == "-r"
     ]
     assert len(requirements_arguments) == 2
     assert {Path(path).name for path in requirements_arguments} == {
@@ -701,9 +702,7 @@ def test_pipfile_parent_is_certified_and_committed_through_common_plan(tmp_path:
     task = build_initial_remediation_task(group, "task-pipfile")
     pipfile = (tmp_path / "Pipfile").read_text(encoding="utf-8")
     lockfile = (tmp_path / "Pipfile.lock").read_text(encoding="utf-8")
-    sandbox = _PythonCertifierSandbox(
-        files={"Pipfile": pipfile, "Pipfile.lock": lockfile}
-    )
+    sandbox = _PythonCertifierSandbox(files={"Pipfile": pipfile, "Pipfile.lock": lockfile})
 
     def registry(package: str, floor: str, attempted: set[str]):
         assert (package, floor, attempted) == ("direct-parent", "1.0.0", {"1.0.0"})
@@ -740,9 +739,7 @@ def test_pipfile_parent_is_certified_and_committed_through_common_plan(tmp_path:
     assert not any("npm" in command for command in sandbox.commands)
     assert _portfolio_certificate_violations(plan, {task.task_id: task}) == []
 
-    _groups, committed, diagnostics = apply_portfolio_plan(
-        plan, [group], {task.task_id: task}
-    )
+    _groups, committed, diagnostics = apply_portfolio_plan(plan, [group], {task.task_id: task})
     committed_task = committed[task.task_id]
     assert diagnostics == []
     assert committed_task.target_package_name == "direct-parent"

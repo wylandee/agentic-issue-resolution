@@ -493,7 +493,9 @@ def _floor_for_target(
                     from packaging.version import Version
 
                     parsed = Version(fixed)
-                    valid = parsed.epoch == 0 and not parsed.is_prerelease and not parsed.is_devrelease
+                    valid = (
+                        parsed.epoch == 0 and not parsed.is_prerelease and not parsed.is_devrelease
+                    )
                 except Exception:  # noqa: BLE001 - malformed PEP 440 floor is not proof
                     valid = False
         if not valid:
@@ -516,7 +518,7 @@ def _floor_for_target(
         try:
             from packaging.version import Version
 
-            return str(max((Version(item) for item in floors)))
+            return str(max(Version(item) for item in floors))
         except Exception:  # noqa: BLE001 - validation above already failed closed
             return None
     return max(floors, key=lambda item: _version_key(item) or ())

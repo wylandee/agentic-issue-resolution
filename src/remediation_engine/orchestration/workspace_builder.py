@@ -396,6 +396,7 @@ def _install_python_workspace(sandbox: DockerSandbox, commands: tuple[str, ...])
             f"{command[:180]}.\nstdout tail:\n{stdout_tail}\nstderr tail:\n{stderr_tail}"
         )
 
+
 def run_workspace_builder_node(state: OrchestratorState) -> dict[str, Any]:
     """Copy the source repository and install dependencies for its language.
 

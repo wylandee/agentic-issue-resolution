@@ -38,6 +38,7 @@ from remediation_engine.orchestration._qa_runtime import (
     _NonNpmInputProject,
     _package_lock_inventory,
     _package_occurrence_key,
+    _python_targeted_closure_from_inspect,
     _resolve_targeted_packages,
     _scan_evidence_by_task,
     _scan_state_projection,
@@ -729,6 +730,39 @@ def test_supported_target_runs_targeted_scan_and_attaches_evidence() -> None:
     sandbox.write_files.assert_called_once()
     sandbox.write_file.assert_not_called()
     sandbox.run.assert_called_once_with("rm -rf -- .odc-targeted", timeout=30)
+
+
+def test_python_targeted_closure_canonicalizes_distribution_names() -> None:
+    report = {
+        "version": "1",
+        "environment": {"python_version": "3.11", "sys_platform": "linux"},
+        "installed": [
+            {
+                "metadata": {
+                    "name": "mypy_extensions",
+                    "version": "1.1.0",
+                    "requires_dist": [],
+                    "provides_extra": [],
+                }
+            }
+        ],
+    }
+    target = QAScanTarget(
+        task_id="python-task",
+        group_id="python-group",
+        target_package="mypy_extensions",
+        expected_version="1.1.0",
+        manifest_paths=("requirements.txt",),
+        dependency_ancestry=(),
+        target_identifiers=frozenset(),
+    )
+
+    closure, reason, detail = _python_targeted_closure_from_inspect(report, target)
+
+    assert reason is None
+    assert detail is None
+    assert closure is not None
+    assert closure.package_specs == (("mypy-extensions", "1.1.0"),)
 
 
 def test_python_target_runs_pip_inspect_closure_and_pypi_targeted_scan() -> None:
@@ -2192,6 +2226,8 @@ def test_maven_artifact_copy_failure_fails_targeted_staging_closed() -> None:
 
     with pytest.raises(RuntimeError, match="Maven dependency artifact staging failed"):
         _write_targeted_artifacts(sandbox, {}, (project,))
+
+
 def test_report_coverage_accepts_odc_package_suffix_but_keeps_missing_paths() -> None:
     manifest = SimpleNamespace(
         occurrences_by_project={".odc-targeted/001": ()},
@@ -3442,6 +3478,8 @@ def test_maven_workspace_setup_scan_fails_closed_on_odc_gav_mismatch(tmp_path):
     assert evidence.complete is False
     assert evidence.fallback_reason == ScanFallbackReason.TARGET_PACKAGE_NOT_REPORTED
     assert result["errors"]
+
+
 def _python_target(
     package: str = "demo-root",
     version: str = "2.0.0",

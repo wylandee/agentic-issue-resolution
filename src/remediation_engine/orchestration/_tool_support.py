@@ -371,9 +371,7 @@ def _is_test_file_path(
         or filename.endswith(("test.java", "tests.java", "testcase.java"))
     )
     is_named_test = bool(
-        ".test." in filename
-        or ".spec." in filename
-        or filename.endswith((".test", ".spec"))
+        ".test." in filename or ".spec." in filename or filename.endswith((".test", ".spec"))
     )
     if language == ProjectLanguage.PYTHON:
         is_named_test = (
@@ -423,8 +421,7 @@ def _select_targeted_test_file(
             continue
         if (
             candidate in candidate_paths
-            or Path(candidate).suffix.lower()
-            not in (source_suffixes or _test_suffixes(language))
+            or Path(candidate).suffix.lower() not in (source_suffixes or _test_suffixes(language))
             or not _is_test_file_path(candidate, language=language)
             or sandbox.read_file(candidate) is None
         ):
@@ -458,10 +455,9 @@ def _select_targeted_test_file(
 
         requested_content = sandbox.read_file(normalized_requested)
         requested_suffix = Path(normalized_requested).suffix.lower()
-        requested_is_source_module = (
-            requested_suffix in (source_suffixes or _source_suffixes(language))
-            and not _is_test_file_path(normalized_requested, language=language)
-        )
+        requested_is_source_module = requested_suffix in (
+            source_suffixes or _source_suffixes(language)
+        ) and not _is_test_file_path(normalized_requested, language=language)
         requested_is_directory_hint = not requested_suffix or normalized_requested.endswith("/")
         requested_is_missing = requested_content is None
 
@@ -507,8 +503,7 @@ def _runtime_smoke_path_error(
     if Path(rel_path).suffix.lower() not in suffixes:
         accepted = ", ".join(sorted(suffixes))
         return None, (
-            f"Runtime smoke target '{rel_path}' must use a supported source suffix: "
-            f"{accepted}."
+            f"Runtime smoke target '{rel_path}' must use a supported source suffix: {accepted}."
         )
     if _is_test_file_path(rel_path, language=language):
         return None, (

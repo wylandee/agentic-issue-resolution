@@ -220,9 +220,7 @@ def _extract_ghsa_id(vulnerability: dict[str, Any]) -> str | None:
     return None
 
 
-def extract_odc_fixed_version_floor(
-    vulnerability: dict[str, Any], package_name: str
-) -> str | None:
+def extract_odc_fixed_version_floor(vulnerability: dict[str, Any], package_name: str) -> str | None:
     """Return one unambiguous ODC exclusive upper bound for a package.
 
     Args:
@@ -331,9 +329,7 @@ def parse_vulnerabilities(
             cve_id = _extract_cve_id(vuln)
             ghsa_id = _extract_ghsa_id(vuln)
             vuln_id = (vuln.get("name") or "").strip()
-            fixed_version = extract_odc_fixed_version_floor(
-                vuln, package_name or file_name or ""
-            )
+            fixed_version = extract_odc_fixed_version_floor(vuln, package_name or file_name or "")
 
             issue = VulnerabilityIssue(
                 source=IssueSource.ODC,

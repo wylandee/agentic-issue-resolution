@@ -22,6 +22,7 @@ from remediation_engine.contracts.schemas import (
     QAAttemptResult,
     QADependencyEvidence,
     QAEvaluation,
+    QAFailureEvidence,
     QAPolicy,
     QASemanticSecurityReview,
     QATestAttribution,
@@ -1144,6 +1145,68 @@ def test_version_bump_may_exonerate_unrelated_test_failure() -> None:
         evaluations["task-1"].deterministic_gates is not None
         and evaluations["task-1"].deterministic_gates.target_package_absent is True
     )
+
+
+def test_version_bump_exonerates_only_the_known_pastebin_test_failure() -> None:
+    group = _group("g1")
+    evaluation = QAEvaluation(
+        task_id="task-1",
+        passed=False,
+        failure_category=FailureCategory.BREAKING_CHANGE,
+        retry_feedback="The PasteBin Internet resource was unavailable.",
+        failure_evidence=QAFailureEvidence(
+            exact_diagnostics=["expected 200, received 503 from https://pastebin.com/example"],
+            failed_tests=[
+                "for default configuration (https://pastebin.com/example)",
+                'PasteBin paste for "Leaked Unsafe Product" challenge available',
+                "Required Internet resource",
+            ],
+            source_locations=[
+                "test/api/internet-resources.test.ts:2:1060",
+                "test/api/internet-resources.test.ts:14:14",
+            ],
+            affected_files=["test/api/internet-resources.test.ts"],
+        ),
+    )
+
+    result = _evaluate(
+        group,
+        QAPolicy.VERSION_BUMP,
+        _results(tests=(False, "The external PasteBin test failed.")),
+        evaluation,
+    )
+
+    assert result.passed is True
+
+
+def test_version_bump_does_not_exonerate_other_tests_with_pastebin_failure() -> None:
+    evaluation = QAEvaluation(
+        task_id="task-1",
+        passed=False,
+        failure_category=FailureCategory.BREAKING_CHANGE,
+        retry_feedback="PasteBin and an application test failed.",
+        failure_evidence=QAFailureEvidence(
+            exact_diagnostics=["expected 200, received 503 from https://pastebin.com/example"],
+            failed_tests=[
+                "PasteBin paste for a security challenge was unavailable",
+                "application behavior changed",
+            ],
+            source_locations=[
+                "test/api/internet-resources.test.ts:2:1060",
+                "test/api/auth.test.ts:55:10",
+            ],
+            affected_files=["test/api/internet-resources.test.ts", "test/api/auth.test.ts"],
+        ),
+    )
+
+    result = _evaluate(
+        _group("g1"),
+        QAPolicy.VERSION_BUMP,
+        _results(tests=(False, "PasteBin and an application test failed.")),
+        evaluation,
+    )
+
+    assert result.passed is False
 
 
 def test_hard_test_policy_ignores_llm_exoneration() -> None:

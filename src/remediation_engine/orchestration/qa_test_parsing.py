@@ -207,6 +207,7 @@ def _python_install_command(sandbox: DockerSandbox) -> str:
     Returns:
         A Pipenv or pip command that installs dependencies in the workspace venv.
     """
+
     def read(path: str) -> str | None:
         try:
             content = sandbox.read_file(path)
@@ -1552,13 +1553,14 @@ def _run_unit_tests(
 
     Args:
         sandbox: Active QA sandbox containing the remediation workspace.
-        project_language: Project language selecting npm, Maven, or pytest.
+        project_language: Project language selecting npm, Maven, pytest, or Django tests.
 
     Returns:
         Structured command outcome with bounded summary and raw output streams.
     """
     if project_language in {ProjectLanguage.JAVA, ProjectLanguage.PYTHON}:
         command = LANGUAGE_CONFIGS[project_language].test_command
+        test_label = "mvn test" if project_language == ProjectLanguage.JAVA else "pytest"
         timeout = (
             _MAVEN_TEST_TIMEOUT_SECONDS
             if project_language == ProjectLanguage.JAVA
@@ -1580,11 +1582,35 @@ def _run_unit_tests(
             stdout = _exception_stream(exc, "stdout")
             stderr = _exception_stream(exc, "stderr")
 
+        if project_language == ProjectLanguage.PYTHON and exit_code == 5:
+            try:
+                manage_script = sandbox.read_file("manage.py")
+            except Exception:  # noqa: BLE001 - discovery fallback must not mask pytest evidence
+                manage_script = None
+            if isinstance(manage_script, str) and manage_script.strip():
+                command = ".venv/bin/python manage.py test"
+                test_label = "manage.py test"
+                error = None
+                try:
+                    result = sandbox.run(command, timeout=timeout)
+                    exit_code = int(getattr(result, "exit_code", 1))
+                    stdout = _subprocess_text(getattr(result, "stdout", ""))
+                    stderr = _subprocess_text(getattr(result, "stderr", ""))
+                except Exception as exc:  # noqa: BLE001 - retain deterministic QA evidence
+                    error = exc
+                    raw_exit_code = getattr(exc, "exit_code", getattr(exc, "returncode", None))
+                    try:
+                        exit_code = int(raw_exit_code) if raw_exit_code is not None else None
+                    except (TypeError, ValueError):
+                        exit_code = None
+                    stdout = _exception_stream(exc, "stdout")
+                    stderr = _exception_stream(exc, "stderr")
+
         if exit_code == 0:
             summary = (
                 "mvn test passed."
                 if project_language == ProjectLanguage.JAVA
-                else "pytest passed."
+                else f"{test_label} passed."
             )
             failure_count = 0
         else:
@@ -1620,11 +1646,7 @@ def _run_unit_tests(
             log_records=(
                 _QALogRecord(
                     phase="tests",
-                    label=(
-                        "mvn test"
-                        if project_language == ProjectLanguage.JAVA
-                        else "pytest"
-                    ),
+                    label=test_label,
                     exit_code=exit_code,
                     stdout=stdout,
                     stderr=stderr,

@@ -19,15 +19,23 @@ from remediation_engine.contracts.schemas import (
     TacticalStrategy,
 )
 from remediation_engine.language import ProjectLanguage
+from remediation_engine.orchestration._tool_support import (
+    _is_test_file_path,
+    _runtime_smoke_bootstrap_reason,
+    _runtime_smoke_path_error,
+)
 from remediation_engine.orchestration.remedy_tools import (
     _make_deterministic_replace_ast_symbol_tool,
+    _make_deterministic_search_replace_tool,
     _make_read_repository_map_tool,
     _make_run_targeted_test_tool,
     _make_validate_code_syntax_tool,
+    _make_validate_workaround_tool,
     build_multi_package_update_toolbelt,
     build_update_toolbelt,
     build_workaround_toolbelt,
 )
+from remediation_engine.orchestration.tools_manifest import _is_prohibited_target
 
 
 def _update_tool_map(
@@ -1813,24 +1821,6 @@ def test_failed_package_checkpoint_restore_retains_anchor_and_unresolved_paths()
     assert touched_files == {"package-lock.json", "other.js", "prior.js"}
     sandbox.write_file.assert_called_once_with("package.json", '{"dependencies":{}}')
 
-# Stage-2 behavior retained during the architecture merge.
-import pytest
-
-from remediation_engine.contracts.schemas import NoFixMitigationStage
-
-from remediation_engine.language import ProjectLanguage
-
-from remediation_engine.orchestration._tool_support import _is_test_file_path
-
-from remediation_engine.orchestration._tool_support import _runtime_smoke_bootstrap_reason
-
-from remediation_engine.orchestration._tool_support import _runtime_smoke_path_error
-
-from remediation_engine.orchestration.remedy_tools import _make_deterministic_search_replace_tool
-
-from remediation_engine.orchestration.remedy_tools import _make_validate_workaround_tool
-
-from remediation_engine.orchestration.tools_manifest import _is_prohibited_target
 
 class TestToolbeltFactoriesStage2Parity:
     def test_mismatched_update_toolbelt_pairing_fails_before_factories(self):
@@ -2235,6 +2225,7 @@ class TestToolbeltFactoriesStage2Parity:
 
         assert set(node_tools) == {"modify_and_validate_npm_dependency"}
         assert [tool.name for tool in python_tools] == ["modify_and_validate_python_dependency"]
+
 
 class TestPythonWorkaroundSupportStage2Parity:
     def test_python_ast_replacement_requires_prior_file_inspection(self):

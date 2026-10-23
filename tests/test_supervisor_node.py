@@ -6090,6 +6090,7 @@ def test_later_clean_task_scan_clears_prior_incremental_vulnerability():
     assert later_metrics[1] == []
     assert later_metrics[3] == []
 
+
 # Stage-2 behavior retained during the architecture merge.
 class TestSupervisorDecisionSchemaStage2Parity:
     def test_update_subagent_rejects_more_than_ten_targets(self):
@@ -6100,6 +6101,7 @@ class TestSupervisorDecisionSchemaStage2Parity:
                 instructions="test",
                 decision_reason="test",
             )
+
 
 class TestRunSupervisorNodeToQAStage2Parity:
     def test_all_optimistically_fixed_tasks_route_to_qa_one_at_a_time(self):
@@ -6117,6 +6119,7 @@ class TestRunSupervisorNodeToQAStage2Parity:
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "qa_critic"
         assert result["active_target_task_ids"] == ["task-1"]
+
 
 class TestRunSupervisorNodeQAUpdatesStage2Parity:
     @pytest.mark.parametrize(
@@ -6217,6 +6220,7 @@ class TestRunSupervisorNodeQAUpdatesStage2Parity:
         assert second["next_routing_step"] != "qa_critic"
         assert any("recheck limit reached" in error for error in second["errors"])
 
+
 class TestBugFixesStage2Parity:
     @patch("langchain_openai.ChatOpenAI")
     def test_replayed_pivot_with_terminal_child_routes_to_final_scan(self, mock_chat):
@@ -6267,6 +6271,7 @@ class TestBugFixesStage2Parity:
             error.startswith("supervisor: routing fell back to teardown")
             for error in result.get("errors", [])
         )
+
 
 def test_pypi_dispatch_uses_canonical_attempts_and_immutable_snapshot_pool():
     task = _make_task("task-pypi", "pypi-group").model_copy(

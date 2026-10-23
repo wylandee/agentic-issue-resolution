@@ -651,7 +651,12 @@ def _run_global_execution(
                             continue
                         expected_ecosystem = artifact_manifest.ecosystem_by_project.get(
                             project_path,
-                            "npm",
+                            "maven"
+                            if project_path in maven_project_paths
+                            or project_language == ProjectLanguage.JAVA
+                            else "pypi"
+                            if project_language == ProjectLanguage.PYTHON
+                            else "npm",
                         )
                         reported_ecosystem = str(
                             _scan_result_value(occurrence, "ecosystem", "")

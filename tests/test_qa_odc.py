@@ -25,11 +25,13 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration._qa_runtime import (
     _build_qa_scan_targets,
     _collect_baseline_identifiers,
     _collect_target_identifiers,
     _scan_state_projection,
+    _workspace_remediation_fingerprint,
 )
 from remediation_engine.orchestration.qa_critic import run_workspace_setup_scan_node
 from remediation_engine.orchestration.qa_odc import (
@@ -40,14 +42,17 @@ from remediation_engine.orchestration.qa_odc import (
     _ODC_TIMEOUT_SECONDS,
     _maven_embedded_pom_owner_path,
     _maven_repository_layout_coordinate,
+    _odc_command,
     _parse_report_dependency_paths,
     _parse_report_identifiers,
     _parse_report_package_occurrences,
+    _parse_report_python_packages,
     _read_report_from_workspace,
     _run_incremental_security_scan,
     _run_odc,
     _run_security_scan,
     _run_targeted_odc,
+    _run_targeted_security_scan,
 )
 from remediation_engine.orchestration.qa_test_parsing import (
     _NPM_INSTALL_TIMEOUT_SECONDS,
@@ -1370,16 +1375,6 @@ class TestTestFailureExtraction:
         assert "line 119" in summary
         assert "stderr tail:" in summary
 
-# Stage-2 behavior retained during the architecture merge.
-from remediation_engine.language import ProjectLanguage
-
-from remediation_engine.orchestration._qa_runtime import _workspace_remediation_fingerprint
-
-from remediation_engine.orchestration.qa_odc import _odc_command
-
-from remediation_engine.orchestration.qa_odc import _parse_report_python_packages
-
-from remediation_engine.orchestration.qa_odc import _run_targeted_security_scan
 
 class TestRunOdcStage2Parity:
     def test_node_command_keeps_configured_odc_arguments_without_python_mode(self):
@@ -1450,6 +1445,31 @@ class TestRunOdcStage2Parity:
         assert tests.ok is True
         assert sandbox.run.call_args_list[1].args[0] == ".venv/bin/python -m pytest"
 
+    def test_django_project_falls_back_when_pytest_collects_no_tests(self):
+        sandbox = _make_sandbox(
+            run_side_effects=[
+                CommandResult(exit_code=5, stdout="no tests ran", stderr="", duration_seconds=0.1),
+                CommandResult(
+                    exit_code=0,
+                    stdout="Ran 2 tests",
+                    stderr="",
+                    duration_seconds=0.1,
+                ),
+            ]
+        )
+        sandbox.read_file.side_effect = lambda path: "manage.py" if path == "manage.py" else None
+
+        outcome = _run_unit_tests(sandbox, ProjectLanguage.PYTHON)
+
+        assert outcome.ok is True
+        assert outcome.summary == "manage.py test passed."
+        assert [call.args[0] for call in sandbox.run.call_args_list] == [
+            ".venv/bin/python -m pytest",
+            ".venv/bin/python manage.py test",
+        ]
+        assert outcome.log_records[0].label == "manage.py test"
+
+
 def test_workspace_remediation_fingerprint_changes_with_material_file_change(tmp_path) -> None:
     """The fingerprint reflects content changes, not only candidate file names."""
     (tmp_path / "package.json").write_text('{"version":"1.0.0"}', encoding="utf-8")
@@ -1462,6 +1482,7 @@ def test_workspace_remediation_fingerprint_changes_with_material_file_change(tmp
     changed = _workspace_remediation_fingerprint(str(tmp_path), sandbox, ["package.json"])
 
     assert changed != unchanged
+
 
 def test_python_package_inventory_includes_nonvulnerable_dependencies():
     report = json.dumps(
@@ -1480,6 +1501,7 @@ def test_python_package_inventory_includes_nonvulnerable_dependencies():
     )
 
     assert _parse_report_python_packages(report) == {("certifi", "2024.7.4")}
+
 
 def test_targeted_python_scan_reports_clean_package_inventory():
     sandbox = MagicMock()
@@ -1528,6 +1550,7 @@ def test_targeted_python_scan_reports_clean_package_inventory():
     assert result.execution_status.value == "success"
     assert result.scanned_packages == {("certifi", "2024.7.4")}
     assert targeted_odc.call_args.args[2] == ProjectLanguage.PYTHON
+
 
 def test_targeted_scan_accepts_parseable_report_with_nonzero_exit() -> None:
     report = json.dumps(

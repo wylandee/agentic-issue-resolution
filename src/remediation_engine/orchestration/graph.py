@@ -52,6 +52,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration._qa_runtime import group_target_identifiers
 from remediation_engine.orchestration.final_full_scan import run_final_full_scan_node
 from remediation_engine.orchestration.graph_wrappers import (
@@ -124,7 +125,6 @@ from remediation_engine.orchestration.update_subagent import run_update_subagent
 from remediation_engine.orchestration.workaround_subagent import run_workaround_subagent_node
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
-from remediation_engine.language import ProjectLanguage
 from remediation_engine.settings import AppSettings
 from remediation_engine.triage.pipeline import run_triage_pipeline
 

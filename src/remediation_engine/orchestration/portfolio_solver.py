@@ -363,7 +363,15 @@ def _resolve_python_pipfile_parent_context(
                 if requirement.marker is not None or requirement.extras or not unconditional:
                     unproven_child_edge = True
                     continue
-                proven.append((parent_name, parent_version, child_version, category, "default" if category == "packages" else "develop"))
+                proven.append(
+                    (
+                        parent_name,
+                        parent_version,
+                        child_version,
+                        category,
+                        "default" if category == "packages" else "develop",
+                    )
+                )
     except (InvalidRequirement, InvalidVersion, TypeError, ValueError):
         return None
     except Exception:  # noqa: BLE001 - missing PyPI metadata is not ancestry proof
@@ -681,6 +689,7 @@ def prepare_python_portfolio_problem(
         _matching_declarations,
     )
     from remediation_engine.tools.package_identity import normalize_python_package_name
+
     if registry_fetcher is not None and parent_requires_dist_fetcher is None:
         from remediation_engine.tools.pypi_registry_tools import get_pypi_release_requires_dist
 
@@ -725,8 +734,7 @@ def prepare_python_portfolio_problem(
             or group.dependency_ancestry
         )
         non_python_evidence = any(
-            issue.ecosystem
-            and issue.ecosystem.casefold() not in {"pypi", "pip", "python"}
+            issue.ecosystem and issue.ecosystem.casefold() not in {"pypi", "pip", "python"}
             for issue in group.issues
         )
         if not package_name or non_python_evidence:
@@ -857,10 +865,18 @@ def prepare_python_portfolio_problem(
             specifier = next(iter(requirement.specifier))
             if specifier.operator in {"==", "==="} and "*" not in specifier.version:
                 installed_version = specifier.version
-        installed_version = installed_version or next(
-            (str(issue.package_version).strip() for issue in group.issues if issue.package_version),
-            None,
-        ) or next((str(value).strip() for value in group.versions if value), None)
+        installed_version = (
+            installed_version
+            or next(
+                (
+                    str(issue.package_version).strip()
+                    for issue in group.issues
+                    if issue.package_version
+                ),
+                None,
+            )
+            or next((str(value).strip() for value in group.versions if value), None)
+        )
         try:
             if not installed_version:
                 raise ValueError("missing installed version evidence")
@@ -897,9 +913,7 @@ def prepare_python_portfolio_problem(
         if parent_context is not None:
             try:
                 retry_diagnostics = (retry_diagnostics_by_task or {}).get(task.task_id)
-                attempted_by_target = getattr(
-                    retry_diagnostics, "attempted_versions_by_target", {}
-                )
+                attempted_by_target = getattr(retry_diagnostics, "attempted_versions_by_target", {})
                 attempted_for_parent: list[str] = []
                 if isinstance(attempted_by_target, Mapping):
                     attempted_for_parent = [
@@ -919,13 +933,9 @@ def prepare_python_portfolio_problem(
                 }
                 attempted.add(installed_version)
                 attempted_keys = {
-                    key
-                    for value in attempted
-                    for _, key in [_python_numeric_solver_version(value)]
+                    key for value in attempted for _, key in [_python_numeric_solver_version(value)]
                 }
-                for candidate in registry_fetcher(
-                    target_name, installed_version, attempted
-                ):
+                for candidate in registry_fetcher(target_name, installed_version, attempted):
                     version, key = _python_numeric_solver_version(str(candidate.version))
                     if key in attempted_keys:
                         continue
@@ -1006,9 +1016,7 @@ def prepare_python_portfolio_problem(
         )
         vulnerable_occurrence_id = occurrence_id
         if parent_context is not None:
-            vulnerable_occurrence_id = (
-                f"python-lock:{parent_context['lock_path']}:{parent_context['lock_category']}:{package_name}"
-            )
+            vulnerable_occurrence_id = f"python-lock:{parent_context['lock_path']}:{parent_context['lock_category']}:{package_name}"
             occurrences.append(
                 SolverPackageOccurrence(
                     occurrence_id=vulnerable_occurrence_id,
@@ -1098,11 +1106,15 @@ def prepare_python_portfolio_problem(
         diagnostics=sorted(set(diagnostics)),
     )
     host_fingerprint = _digest(manifest_fingerprints)
-    candidate_catalog_complete = bool(targets and findings) and all(
-        not target.eligible_for_atomic_update
-        or (target.occurrence_id in domains and bool(domains[target.occurrence_id]))
-        for target in targets
-    ) and not diagnostics
+    candidate_catalog_complete = (
+        bool(targets and findings)
+        and all(
+            not target.eligible_for_atomic_update
+            or (target.occurrence_id in domains and bool(domains[target.occurrence_id]))
+            for target in targets
+        )
+        and not diagnostics
+    )
     catalog_digest = _digest(
         {
             "ecosystem": "pypi",
@@ -3498,9 +3510,9 @@ def _expected_target_identity(
     if not package_name:
         raise ValueError(f"task {task.task_id!r} has no target package identity")
     if not _manifest_path(group, Path(".")):
-        python_manifest = _python_requirements_manifest_path(group) or _python_pipfile_manifest_path(
+        python_manifest = _python_requirements_manifest_path(
             group
-        )
+        ) or _python_pipfile_manifest_path(group)
         python_evidence = any(
             str(issue.ecosystem or "").strip().casefold() in {"pypi", "pip", "python"}
             for issue in group.issues
