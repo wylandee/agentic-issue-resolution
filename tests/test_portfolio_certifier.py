@@ -328,7 +328,7 @@ class _FakeSandboxFactory:
         self.state = state
         self.instances: list[_FakeSandbox] = []
 
-    def __call__(self, *, repo_root=None, workspace_volume=None) -> _FakeSandbox:
+    def __call__(self, *, repo_root=None, workspace_volume=None, image=None) -> _FakeSandbox:
         assert repo_root is None
         assert workspace_volume
         sandbox = _FakeSandbox(self.state)
@@ -474,6 +474,53 @@ def _run_fake_certifier(
         sandbox_factory=factory,
     )
     return plan, state, factory
+
+
+def test_child_override_keeps_child_floor_when_group_has_parent_context(tmp_path: Path) -> None:
+    root, _files, groups, task_queue = _certifier_fixture(tmp_path)
+    group = groups[0].model_copy(update={"parent_package_name": "express-jwt"})
+    task = task_queue["task-jsonwebtoken"].model_copy(
+        update={
+            "parent_package_name": "express-jwt",
+            "target_package_name": "jsonwebtoken",
+            "target_dependency_type": "overrides",
+            "allowed_dependency_types": ["overrides"],
+            "allowed_target_versions": ["9.0.0"],
+            "selected_version": "9.0.0",
+        }
+    )
+    settings = AppSettings(solver_timeout_seconds=5, solver_max_candidates_per_target=16)
+    prepared = _prepare_portfolio_problem(
+        root,
+        [group],
+        {task.task_id: task},
+        settings=settings,
+        registry_fetcher=lambda package_name: {
+            "name": package_name,
+            "versions": {"8.5.1": {}, "9.0.0": {}, "9.0.2": {}},
+        },
+    )
+
+    target = next(item for item in prepared.targets if item.task_id == task.task_id)
+    finding = next(
+        item for item in prepared.findings if item.target_occurrence_id == target.occurrence_id
+    )
+    assert target.target_package_name == "jsonwebtoken"
+    assert finding.fixed_version == "9.0.0"
+    assert finding.direct_parent_name is None
+    assert finding.direct_parent_minimum_version is None
+
+    solver_plan = solve_portfolio(
+        prepared.subgraph,
+        prepared.candidate_domains,
+        settings=settings,
+        candidate_catalog_complete=prepared.candidate_catalog_complete,
+        candidate_catalog_digest=prepared.candidate_catalog_digest,
+    )
+
+    assert solver_plan.selected_plan is not None
+    selected_version = solver_plan.selected_plan.selected_candidate_versions[target.occurrence_id]
+    assert selected_version in {"9.0.0", "9.0.2"}
 
 
 def _certified_prior_plan(

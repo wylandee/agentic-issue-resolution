@@ -113,14 +113,22 @@ class TestTarArchiveHelper:
         assert "index.js" in names
         assert "package.json" in names
 
-    def test_archive_ignores_git_and_node_modules(self, tmp_path):
-        (tmp_path / ".git").mkdir()
-        (tmp_path / ".git" / "config").write_text("[core]", encoding="utf-8")
-        (tmp_path / "node_modules").mkdir()
-        (tmp_path / "node_modules" / "leftpad.js").write_text(
-            "module.exports = {}", encoding="utf-8"
-        )
+    def test_archive_ignores_host_environments_and_generated_python_files(self, tmp_path):
+        """Host virtual environments and Python caches never enter the volume archive."""
+        for dirname in (
+            ".git",
+            "node_modules",
+            ".venv",
+            "venv",
+            ".remedy-pipenv",
+            "__pycache__",
+        ):
+            directory = tmp_path / dirname
+            directory.mkdir()
+            (directory / "payload").write_text("host environment", encoding="utf-8")
+        (tmp_path / "module.pyc").write_bytes(b"bytecode")
         (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "module.pyc").write_bytes(b"bytecode")
         (tmp_path / "src" / "index.js").write_text("console.log('ok')", encoding="utf-8")
 
         archive = _make_tar_archive(tmp_path)
@@ -128,8 +136,13 @@ class TestTarArchiveHelper:
             names = tf.getnames()
 
         assert "src/index.js" in names
-        assert not any(name.startswith(".git") for name in names)
-        assert not any(name.startswith("node_modules") for name in names)
+        assert not any(
+            name.startswith(
+                (".git", "node_modules", ".venv", "venv", ".remedy-pipenv", "__pycache__")
+            )
+            for name in names
+        )
+        assert not any(name.endswith(".pyc") for name in names)
 
     def test_java_archive_keeps_mvn_and_build_files_but_excludes_target(self, tmp_path):
         (tmp_path / ".mvn" / "wrapper").mkdir(parents=True)
@@ -169,6 +182,7 @@ class TestSandboxLifecycle:
         args, _kwargs = container.put_archive.call_args
         assert args[0] == "/workspace"
         client.images.get.assert_called_once_with("node:22")
+        assert client.containers.run.call_args.args[0] == "node:22"
 
     def test_start_with_workspace_volume_mounts_named_volume(self, tmp_path):
         docker_mod, docker_errors, client, container = _docker_modules()

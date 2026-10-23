@@ -4,13 +4,13 @@ The evaluation suites live under `tests/evals/`. They combine deterministic cont
 
 | Dataset | Cases | Consumer |
 | --- | ---: | --- |
-| `tests/evals/golden/report_cases.json` | 10 | `test_report_eval.py` |
-| `tests/evals/golden/triage_cases.json` | 15 | `test_triage_eval.py` |
-| `tests/evals/golden/fix_planner_cases.json` | 15 | `test_fix_planner_eval.py` |
-| `tests/evals/golden/update_subagent_cases.json` | 11 | `test_update_subagent_eval.py` |
-| `tests/evals/golden/workaround_subagent_cases.json` | 16 | `test_workaround_subagent_eval.py` |
-| `tests/evals/golden/qa_cases.json` | 20 | `test_qa_critic_eval.py` |
-| `tests/evals/golden/supervisor_cases.json` | 10 | `test_supervisor_eval.py` |
+| `tests/evals/golden/report_cases.json` | 13 | `test_report_eval.py` |
+| `tests/evals/golden/triage_cases.json` | 18 | `test_triage_eval.py` |
+| `tests/evals/golden/fix_planner_cases.json` | 18 | `test_fix_planner_eval.py` |
+| `tests/evals/golden/update_subagent_cases.json` | 16 | `test_update_subagent_eval.py` |
+| `tests/evals/golden/workaround_subagent_cases.json` | 19 | `test_workaround_subagent_eval.py` |
+| `tests/evals/golden/qa_cases.json` | 25 | `test_qa_critic_eval.py` |
+| `tests/evals/golden/supervisor_cases.json` | 13 | `test_supervisor_eval.py` |
 
 Every dataset is validated by `tests/evals/golden_schema.py`. Agent replay cases contain a typed `replay.input` and an `offline_fixture`; provenance fields identify the source trajectory or explain why a case is synthetic. Historical evidence is input context, not an unmarked live result.
 
@@ -55,6 +55,22 @@ python -m pip install -e '.[dev,eval]'
 
 Golden cases keep independently authored expectations separate from observations. `expected_tools` is the canonical expected trace. Observed calls are stored in `offline_fixture.actual_tools` or in a live `ReplayCapture.actual_tools`. The adapters preserve tool names, argument objects, output text, and order; each suite decides whether order and exact arguments are required. This prevents a historical call sequence from becoming the expected result by accident.
 
+## Python coverage
+
+The seven datasets include 25 Python cases selected by `python` in their case IDs. Historical evidence comes from PyGoat trajectories: certifi and PyYAML updates, a certifi/sqlparse atomic batch, incomplete ODC coverage, and a PyJWT update/workaround path that did not clear all findings. The PyYAML 5.1 to 6.0.3 trajectory exercises the PEP 440 validation path; synthetic QA test-failure and successful-workaround scenarios remain explicit policy cases. The historical PyJWT workaround remains failed; the separate synthetic success case does not claim historical success.
+
+| Historical trajectory | Evidence used by the Python cases |
+| --- | --- |
+| `phase5_20261016T075629Z_ba0b44c1-7a62-4523-b00e-7797df5e29c9.md` | certifi 2022.12.7 was updated to 2024.7.4 and passed task-scoped QA; the overall run still reported 19 new incremental-scan identifiers. |
+| `phase5_20261019T120726Z_cdef0f21-e8b5-44bd-a160-dbcd055766b6.md` | PyYAML 5.1 was updated to 6.0.3 for three reported CVEs and passed task-scoped QA. |
+| `phase5_20261019T165913Z_9ede9474-e210-431f-bb8b-4def9e00cca8.md` | certifi and sqlparse were updated in one atomic requirements transaction; both tasks passed QA, while the run retained an incremental-scan warning. |
+| `phase5_20261016T074329Z_2da20b0f-ee1b-4365-b63d-04000305773c.md` | Targeted ODC did not provide verifiable `requirements.txt` coverage; QA returned inconclusive without consuming a remediation retry. |
+| `phase5_20261019T155736Z_2f772cbc-204b-44b7-a1b5-3f2a0f177a25.md` | The PyJWT update left CVE-2025-45770 open. The proposed workaround was not accepted: its runtime import failed and another validation attempt used `introduction/tests.py` as a test target. |
+
+Each historical case links its source trajectory under `historical_evidence`. Cases that exercise policy without an observed production attempt are labeled `synthetic_policy_case`; the PyJWT tactical workaround proposal is labeled as a historical scenario projection, and its failed validation is preserved.
+
+Python replay cases set `replay.input.project_language` to `python`, use PyPI findings and `requirements.txt`, and preserve task-scoped QA evidence. The in-memory replay boundary handles pip and Python validation commands; it does not add Python metadata to existing Node.js cases. The evidence map and each golden's `historical_evidence` distinguish task-level QA success from an overall run that still reports incremental scan findings.
+
 Report cases expand compact evidence into task queue, attempt, QA, patch, and diff state, then call the production `generate_report()` renderer. Supervisor decisions and report rendering are deterministic; they are checked as typed/state contracts rather than judged as LLM behavior.
 
 ## Suites and implemented metric scope
@@ -69,22 +85,22 @@ These tests are deterministic and do not invoke a model judge.
 
 ### Report (`test_report_eval.py`)
 
-The ten cases render deterministic Markdown from typed remediation evidence and validate counts, package/task identity, changed-file and diff evidence, successful versus follow-up sections, and forbidden unsupported claims. In live mode, the same rendered report is evaluated with exactly these four DeepEval metrics:
+The 13 cases render deterministic Markdown from typed remediation evidence and validate counts, package/task identity and transitions, failed-attempt versions/outcomes, changed-file and diff evidence, successful versus follow-up sections, and forbidden unsupported claims. In live mode, the same rendered report is scored with exactly these four DeepEval metrics; their scores and reasons are diagnostic, while deterministic contract assertions remain the pass/fail gate:
 
 - `HallucinationMetric`, threshold `0.30`;
 - `FaithfulnessMetric`, threshold `0.85`;
 - `SummarizationMetric`, threshold `0.80`;
 - `GEval` named `Report Constraint Adherence`, threshold `0.70`.
 
-Offline mode does not substitute a cached judge: it runs the deterministic report contract only.
+Offline mode runs the deterministic report contract only; live mode adds persisted, non-gating metric diagnostics.
 
 ### Triage (`test_triage_eval.py`)
 
-The 15 cases cover actionable/false-positive/deferred decisions, priority and reachability handling, missing advisory data, and deterministic guardrail recovery. Offline tests exercise the real triage path with deterministic inputs, including timeout fallback and protection against a hallucinated selected issue. Live mode runs the production triage replay and one DeepEval `TaskCompletionMetric` at threshold `0.70`. Triage has no expected tool trace.
+The 18 cases cover actionable/false-positive/deferred decisions, priority and reachability handling, missing advisory data, ecosystem identity, and deterministic guardrail recovery. Python additions use PyGoat certifi and PyYAML evidence. Offline tests exercise the real triage path with deterministic inputs, including timeout fallback and protection against a hallucinated selected issue. Live mode runs the production triage replay and one DeepEval `TaskCompletionMetric` at threshold `0.70`. Triage has no expected tool trace.
 
 ### Tactical Supervisor (`test_supervisor_eval.py`)
 
-The ten cases exercise bounded single-task model proposals and Python-side
+The 13 cases exercise bounded single-task model proposals and Python-side
 verification, including retry/repair behavior, candidate authorization,
 peer-conflict referral, workaround pivots, and inconclusive QA. Offline replay
 tests call the production tactical boundary with scripted model/tool output and
@@ -96,17 +112,17 @@ authorities.
 
 ### Fix Planner (`test_fix_planner_eval.py`)
 
-The 15 page-backed cases cover `VERSION_BUMP`, `CODE_WORKAROUND`, and `NO_FIX` extraction, semver and source evidence, multi-page content, and workaround snippets. Offline checks validate the typed result and that versions/snippets occur in the supplied page content. Live mode adds:
+The 18 page-backed cases cover `VERSION_BUMP`, `CODE_WORKAROUND`, and `NO_FIX` extraction, semver and PEP 440 version evidence, multi-page content, and workaround snippets. Offline checks validate the typed result and that versions/snippets occur in the supplied page content. Live mode adds:
 
 - `GEval` `Fix Extraction Accuracy`, threshold `0.70`;
 - `GEval` `Workaround Extraction Quality`, threshold `0.70`, for workaround cases;
 - `FaithfulnessMetric`, threshold `0.85`, for non-`NO_FIX` results.
 
-The pages are fixtures; live judging does not fetch advisory pages.
+Live mode runs the production structured extraction boundary against the page fixtures without fetching advisory pages. Judges see only the contract fields (strategy, fixed version, and workaround snippets), not free-form reasoning. The historical PyJWT workaround is judged for extraction fidelity only; it does not imply the proposal was accepted or validated.
 
 ### Update worker (`test_update_subagent_eval.py`)
 
-The 11 cases cover direct and transitive updates, dependency sections, invalid inputs, manifest-sync recovery, retries, fallback, and bounded surrender. Offline tests run the real worker loop against a scripted model and recording sandbox, then assert the typed attempt/result, changed files, final workspace, and ordered tool trace. Live mode replays the production worker and evaluates:
+The 16 cases cover direct and transitive updates, dependency sections, invalid inputs, manifest-sync recovery, retries, atomic batches, Python requirements updates, and bounded surrender. Offline tests run the real worker loop against a scripted model and recording sandbox, then assert the typed attempt/result, changed files, final workspace, and ordered tool trace. Live mode replays the production worker and evaluates:
 
 - `ToolCorrectnessMetric`, threshold `1.0`, exact input parameters and ordering;
 - `TaskCompletionMetric`, threshold `0.70`, against the Supervisor instruction.
@@ -115,16 +131,16 @@ Expected-negative cases intentionally retain an observed bad call while omitting
 
 ### Workaround worker (`test_workaround_subagent_eval.py`)
 
-The 16 cases cover clean edits, pivots, validation recovery, no-fix removal, guardrail retries, infrastructure substitution, and bounded surrender. Offline tests execute the worker and lifecycle against the deterministic workspace boundary and verify typed attempt provenance, final files, and tool calls. Live mode evaluates:
+The 19 cases cover clean edits, pivots, validation recovery, no-fix removal, guardrail retries, infrastructure substitution, bounded surrender, and Python validation. Offline tests execute the worker and lifecycle against the deterministic workspace boundary and verify typed attempt provenance, final files, and tool calls. Live mode evaluates:
 
 - `ToolCorrectnessMetric`, threshold `0.50`, with case-specific expected calls and ordering;
 - `TaskCompletionMetric`, threshold `0.70`.
 
-Optional research and inspection branches are represented by each case's trace; they are not mandatory for every case.
+Historical failure-injection cases with intentionally invalid calls may mark tool correctness inapplicable; deterministic replay asserts those known failure paths. Validation-failure cases may also mark TaskCompletion inapplicable because their expected failure is asserted deterministically. Optional research and inspection branches are represented by each case's trace; they are not mandatory for every case.
 
 ### QA critic (`test_qa_critic_eval.py`)
 
-The 20 cases cover update and workaround decisions, pivots, package-removal decisions, install/scanner/test gates, semantic review, and the bounded tool-call surrender path. Offline tests run the real QA node against deterministic execution logs and workspace files, verify typed deterministic gates and failure evidence, and require task-keyed QA output. Live mode evaluates:
+The 25 cases cover update and workaround decisions, pivots, package-removal decisions, install/scanner/test gates, semantic review, task-scoped Python scan evidence, and the bounded tool-call surrender path. Offline tests run the real QA node against deterministic execution logs and workspace files, verify typed deterministic gates and failure evidence, and require task-keyed QA output. Live mode evaluates:
 
 - `ToolCorrectnessMetric`, threshold `0.50`, when the case marks tool correctness applicable;
 - `TaskCompletionMetric`, threshold `0.70`, for the evidence-backed QA decision.

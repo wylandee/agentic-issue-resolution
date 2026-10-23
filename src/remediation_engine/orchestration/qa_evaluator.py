@@ -26,6 +26,7 @@ from remediation_engine.contracts.schemas import (
     TestAttributionVerdict,
     VulnerabilityGroup,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.context_manager import ContextManager
 from remediation_engine.orchestration.runtime_context import (
     get_runtime_settings,
@@ -129,7 +130,7 @@ def _qa_log_records_for_phase(
         return (
             _QALogRecord(
                 phase=log_type,
-                label="npm install",
+                label="dependency installation",
                 exit_code=results.install_exit_code,
                 stdout=results.install_raw_stdout or results.install[1],
                 stderr=results.install_raw_stderr or "",
@@ -164,7 +165,7 @@ def _qa_log_records_for_phase(
         return (
             _QALogRecord(
                 phase=log_type,
-                label="npm test",
+                label="unit tests",
                 exit_code=results.test_exit_code,
                 stdout=results.test_raw_stdout or results.tests[1],
                 stderr=results.test_raw_stderr or "",
@@ -557,6 +558,21 @@ not fill those fields.
 """
 
 
+def _build_qa_evaluator_system_prompt(
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str:
+    """Build read-only evaluator instructions for the detected project language."""
+    if not isinstance(project_language, ProjectLanguage):
+        project_language = ProjectLanguage(project_language)
+    if project_language == ProjectLanguage.PYTHON:
+        return (
+            _QA_EVALUATOR_STATIC_PREAMBLE
+            + "\n\nCanonical project language: python (Python). "
+            + "Interpret pytest failures as Python unit-test evidence."
+        )
+    return _QA_EVALUATOR_STATIC_PREAMBLE
+
+
 def _qa_status(
     result: Any,
     *,
@@ -795,6 +811,7 @@ def _build_individual_investigator_prompt(
     qa_policy: QAPolicy | None = None,
     singleton_scope: bool = False,
     task_scan_evidence: ODCScanEvidence | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> str:
     """Build the lean static-plus-dynamic prompt for one QA evaluator.
 
@@ -813,7 +830,7 @@ def _build_individual_investigator_prompt(
         The complete evaluator prompt.
     """
     return (
-        _QA_EVALUATOR_STATIC_PREAMBLE
+        _build_qa_evaluator_system_prompt(project_language)
         + "\n\n"
         + _build_qa_dynamic_context(
             group=group,
@@ -855,6 +872,7 @@ def _run_individual_investigations(
     results: _QAExecutionResults,
     task_policies: dict[str, QAPolicy | None],
     singleton_scope: bool = False,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> dict[str, GroupInvestigation]:
     """Run one bounded structured evaluator independently for each task.
 
@@ -934,7 +952,7 @@ def _run_individual_investigations(
             **openai_api_key_kwargs(settings),
         )
         initial_messages = [
-            SystemMessage(content=_QA_EVALUATOR_STATIC_PREAMBLE),
+            SystemMessage(content=_build_qa_evaluator_system_prompt(project_language)),
             HumanMessage(
                 content=(
                     f"{dynamic_context}\n\n"

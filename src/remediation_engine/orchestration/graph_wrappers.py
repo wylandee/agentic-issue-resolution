@@ -1506,6 +1506,7 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
         active_cluster_id=state.get("active_cluster_id"),
         dispatch_batch_id=state.get("active_dispatch_batch_id"),
         multi_package_action=state.get("active_multi_package_action"),
+        project_language=state.get("project_language", ProjectLanguage.NODEJS),
     )
 
     workspace_snapshot_id, snapshot_errors = _create_workspace_attempt_snapshot(
@@ -1671,6 +1672,7 @@ def run_workaround_subagent_from_orchestrator(
         project_language=state.get("project_language", ProjectLanguage.NODEJS),
         maven_cache_volume=state.get("maven_cache_volume"),
         current_replay_plan=current_replay_plan,
+        project_language=state.get("project_language", ProjectLanguage.NODEJS),
     )
 
     workspace_snapshot_id, snapshot_errors = _create_workspace_attempt_snapshot(

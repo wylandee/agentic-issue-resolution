@@ -124,6 +124,7 @@ from remediation_engine.orchestration.update_subagent import run_update_subagent
 from remediation_engine.orchestration.workaround_subagent import run_workaround_subagent_node
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.settings import AppSettings
 from remediation_engine.triage.pipeline import run_triage_pipeline
 
@@ -831,6 +832,7 @@ def run_orchestrator(
     system_context: SystemContext | None = None,
     settings: AppSettings | None = None,
     target_packages: list[str] | None = None,
+    project_language: ProjectLanguage | str | None = None,
 ) -> OrchestratorState:
     """Run the Phase 5 graph and return its final state.
 
@@ -843,6 +845,9 @@ def run_orchestrator(
             finalization; environment settings are used when omitted.
         target_packages: Optional development-only package allowlist. An empty
             value preserves full-repository portfolio discovery.
+        project_language: Optional explicit execution-language alias. When
+            omitted, root manifests and the supplied system context determine
+            the profile.
 
     Returns:
         The final graph state, including trajectory and report metadata when
@@ -863,6 +868,7 @@ def run_orchestrator(
         issues=issues,
         system_context=system_context,
         target_packages=normalized_target_packages,
+        project_language=project_language,
     )
     initial_state["post_qa_triage_enabled"] = not settings.remedy_disable_post_qa_triage
     initial_state["final_full_scan_enabled"] = settings.remedy_final_full_scan_enabled

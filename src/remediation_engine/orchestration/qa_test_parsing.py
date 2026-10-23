@@ -198,27 +198,70 @@ def _store_test_outcome(results: _QAExecutionResults, outcome: _QATestExecutionO
     _append_qa_log_records(results, "tests", outcome.log_records)
 
 
+def _python_install_command(sandbox: DockerSandbox) -> str:
+    """Build a deterministic install command for the persistent project venv.
+
+    Args:
+        sandbox: Active QA sandbox used to inspect project manifests.
+
+    Returns:
+        A Pipenv or pip command that installs dependencies in the workspace venv.
+    """
+    def read(path: str) -> str | None:
+        try:
+            content = sandbox.read_file(path)
+        except Exception:  # noqa: BLE001 - install still reports unavailable metadata
+            return None
+        return content if isinstance(content, str) else None
+
+    pipfile = read("Pipfile")
+    if pipfile is not None:
+        lockfile = read("Pipfile.lock")
+        operation = "sync --dev" if lockfile is not None else "install --dev"
+        return f"PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv {operation}"
+
+    commands: list[str] = []
+    if read("requirements.txt") is not None:
+        commands.append(".venv/bin/python -m pip install -r requirements.txt")
+
+    pyproject = read("pyproject.toml") or ""
+    setup_cfg = read("setup.cfg") or ""
+    has_project_metadata = (
+        "[project]" in pyproject or "[options]" in setup_cfg or read("setup.py") is not None
+    )
+    if has_project_metadata:
+        commands.append(".venv/bin/python -m pip install -e .")
+    if not commands:
+        commands.append(".venv/bin/python -m pip install pytest")
+    return " && ".join(commands)
+
+
 def _run_install(
     sandbox: DockerSandbox,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _QAInstallOutcome:
-    """Install project dependencies with the language's configured command.
+    """Run the language-specific dependency install and retain bounded evidence.
 
     Args:
-        sandbox: Active QA sandbox in which dependency installation should run.
+        sandbox: Active QA sandbox in which dependencies should be installed.
         project_language: Project language selecting the deterministic install command.
 
     Returns:
-        A structured install outcome. Raw streams remain private to the
-        invocation and are also represented by one immutable log record.
+        A structured install outcome with bounded command evidence.
     """
-    error: BaseException | None = None
-    command = LANGUAGE_CONFIGS[project_language].install_command
-    label = (
-        "npm install"
-        if project_language == ProjectLanguage.NODEJS
-        else "mvn -B -q -DskipTests clean package"
+
+    is_python = project_language == ProjectLanguage.PYTHON
+    command = (
+        _python_install_command(sandbox)
+        if is_python
+        else LANGUAGE_CONFIGS[project_language].install_command
     )
+    label = {
+        ProjectLanguage.NODEJS: "npm install",
+        ProjectLanguage.JAVA: "mvn -B -q -DskipTests clean package",
+        ProjectLanguage.PYTHON: "python dependency install",
+    }[project_language]
+    error: BaseException | None = None
     try:
         result = sandbox.run(command, timeout=_NPM_INSTALL_TIMEOUT_SECONDS)
         exit_code = int(getattr(result, "exit_code", 1))
@@ -1505,24 +1548,29 @@ def _run_unit_tests(
     sandbox: DockerSandbox,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _QATestExecutionOutcome:
-    """Run the configured language test command and retain deterministic evidence.
+    """Run configured tests and retain deterministic command evidence.
 
     Args:
         sandbox: Active QA sandbox containing the remediation workspace.
-        project_language: Project language selecting Maven or npm test execution.
+        project_language: Project language selecting npm, Maven, or pytest.
 
     Returns:
         Structured command outcome with bounded summary and raw output streams.
     """
-    if project_language == ProjectLanguage.JAVA:
+    if project_language in {ProjectLanguage.JAVA, ProjectLanguage.PYTHON}:
         command = LANGUAGE_CONFIGS[project_language].test_command
+        timeout = (
+            _MAVEN_TEST_TIMEOUT_SECONDS
+            if project_language == ProjectLanguage.JAVA
+            else _NPM_TEST_TIMEOUT_SECONDS
+        )
         error: BaseException | None = None
         try:
-            result = sandbox.run(command, timeout=_MAVEN_TEST_TIMEOUT_SECONDS)
+            result = sandbox.run(command, timeout=timeout)
             exit_code = int(getattr(result, "exit_code", 1))
             stdout = _subprocess_text(getattr(result, "stdout", ""))
             stderr = _subprocess_text(getattr(result, "stderr", ""))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - retain deterministic QA evidence
             error = exc
             raw_exit_code = getattr(exc, "exit_code", getattr(exc, "returncode", None))
             try:
@@ -1533,22 +1581,33 @@ def _run_unit_tests(
             stderr = _exception_stream(exc, "stderr")
 
         if exit_code == 0:
-            summary = "mvn test passed."
+            summary = (
+                "mvn test passed."
+                if project_language == ProjectLanguage.JAVA
+                else "pytest passed."
+            )
             failure_count = 0
         else:
-            combined = f"{stdout}\n{stderr}"
-            stats = re.search(
-                r"Tests run:\s*\d+,\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)",
-                combined,
-                re.IGNORECASE,
-            )
-            failure_count = int(stats.group(1)) + int(stats.group(2)) if stats is not None else None
-            stdout_tail = "\n".join(stdout.splitlines()[-_TEST_LOG_TAIL_LINES:])
-            stderr_tail = "\n".join(stderr.splitlines()[-_STDERR_TAIL_LINES:])
-            summary = (
-                f"mvn test FAILED (exit {exit_code if exit_code is not None else 'unknown'}).\n"
-                f"stdout tail:\n{stdout_tail}\nstderr tail:\n{stderr_tail}"
-            )
+            if project_language == ProjectLanguage.PYTHON:
+                summary = _summarize_failed_test_output(exit_code or 1, stdout, stderr)
+                evidence = extract_qa_failure_evidence(exit_code or 1, stdout, stderr)
+                failure_count = len(evidence.failed_tests) if evidence.failed_tests else None
+            else:
+                combined = f"{stdout}\n{stderr}"
+                stats = re.search(
+                    r"Tests run:\s*\d+,\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)",
+                    combined,
+                    re.IGNORECASE,
+                )
+                failure_count = (
+                    int(stats.group(1)) + int(stats.group(2)) if stats is not None else None
+                )
+                stdout_tail = "\n".join(stdout.splitlines()[-_TEST_LOG_TAIL_LINES:])
+                stderr_tail = "\n".join(stderr.splitlines()[-_STDERR_TAIL_LINES:])
+                summary = (
+                    f"mvn test FAILED (exit {exit_code if exit_code is not None else 'unknown'}).\n"
+                    f"stdout tail:\n{stdout_tail}\nstderr tail:\n{stderr_tail}"
+                )
             if error is not None:
                 summary += f"\nerror: {error}"
         return _QATestExecutionOutcome(
@@ -1561,7 +1620,11 @@ def _run_unit_tests(
             log_records=(
                 _QALogRecord(
                     phase="tests",
-                    label="mvn test",
+                    label=(
+                        "mvn test"
+                        if project_language == ProjectLanguage.JAVA
+                        else "pytest"
+                    ),
                     exit_code=exit_code,
                     stdout=stdout,
                     stderr=stderr,

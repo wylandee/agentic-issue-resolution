@@ -18,6 +18,7 @@ from .contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
+from .language import ProjectLanguage, resolve_project_language
 from .orchestration.portfolio_orchestrator import (
     apply_portfolio_plan,
     build_portfolio_plan,
@@ -28,6 +29,24 @@ from .tools.odc_parser import parse_vulnerabilities
 from .tools.semgrep_parser import load_findings_from_json, normalize_finding
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_cli_language(repo_root: Path | None, option: str) -> ProjectLanguage:
+    """Resolve the CLI's auto or explicit language selection."""
+    return resolve_project_language(
+        repo_root or Path.cwd(), None if option == "auto" else option
+    )
+
+
+def _system_context(language: ProjectLanguage) -> SystemContext:
+    """Build the CLI's established production context for one language."""
+    return SystemContext(
+        public_facing=True,
+        deployment_os="linux",
+        deployment_architecture="containerized",
+        environment="production",
+        primary_language=language.value,
+    )
 
 
 def _load_json_fixture(path: Path) -> Any:
@@ -245,17 +264,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", choices=("auto", "odc-json", "semgrep-json", "jsonl"), default="auto"
     )
     triage.add_argument("--repo", type=Path)
-    triage.add_argument("--language", choices=("auto", "nodejs", "java"), default="auto")
+    triage.add_argument(
+        "--language",
+        choices=("auto", "nodejs", "java", "python"),
+        default="auto",
+    )
     triage.add_argument("--output", type=Path)
     run = sub.add_parser("run", help="run remediation and emit a patch result")
     run.add_argument("input", type=Path)
     run.add_argument("--repo", required=True, type=Path)
     run.add_argument(
+        "--language",
+        choices=("auto", "nodejs", "java", "python"),
+        default="auto",
+    )
+    run.add_argument(
         "--format", choices=("auto", "odc-json", "semgrep-json", "jsonl"), default="auto"
     )
     run.add_argument("--output", type=Path)
     run.add_argument("--patch-out", type=Path)
-    run.add_argument("--language", choices=("auto", "nodejs", "java"), default="auto")
     run.add_argument("--report-out", type=Path)
     solve = sub.add_parser(
         "solve",
@@ -341,16 +368,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_jsonl(args.output, [issue.model_dump(mode="json") for issue in issues])
             return 0
         if args.command == "triage":
+            language = _resolve_cli_language(args.repo, args.language)
             groups = triage_issues(
                 issues,
                 repo_root=args.repo,
-                system_context=SystemContext(
-                    public_facing=True,
-                    deployment_os="linux",
-                    deployment_architecture="containerized",
-                    environment="production",
-                    primary_language=args.language,
-                ),
+                system_context=_system_context(language),
                 settings=settings,
             )
             _write_json(args.output, [group.model_dump(mode="json") for group in groups])
@@ -359,12 +381,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_root=args.repo,
             issues=issues,
             valid_groups=[],
-            system_context=SystemContext(
-                public_facing=True,
-                deployment_os="linux",
-                deployment_architecture="containerized",
-                environment="production",
-                primary_language=args.language,
+            system_context=_system_context(
+                _resolve_cli_language(args.repo, args.language)
             ),
         )
         result = run_remediation(request, settings=settings)

@@ -1,0 +1,25 @@
+{
+  "reportSchema": "1.1",
+  "projectInfo": {
+    "name": "PyGoat"
+  },
+  "dependencies": [
+    {
+      "fileName": "django-2.2.9.dist-info/METADATA",
+      "filePath": "requirements.txt",
+      "packages": [
+        {
+          "id": "pkg:pypi/django@2.2.9"
+        }
+      ],
+      "vulnerabilities": [
+        {
+          "source": "NVD",
+          "name": "CVE-2021-35042",
+          "severity": "HIGH",
+          "description": "Django versions before 2.2.24 are vulnerable to SQL injection in QuerySet.order_by() when untrusted values are used."
+        }
+      ]
+    }
+  ]
+}

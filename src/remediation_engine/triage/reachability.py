@@ -58,6 +58,16 @@ def _imported_package_names(statement: str) -> set[str]:
     return packages
 
 
+def _is_pypi_issue_group(group: VulnerabilityGroup) -> bool:
+    """Return whether an SCA group is explicitly identified as PyPI."""
+    for issue in group.issues:
+        ecosystem = str(issue.ecosystem or "").strip().casefold()
+        purl = str(issue.purl or "").strip().casefold()
+        if ecosystem in {"pypi", "python"} or purl.startswith("pkg:pypi/"):
+            return True
+    return False
+
+
 def _load_direct_dependencies(repo_root: Path) -> set[str]:
     """Best-effort load of direct dependencies from package.json."""
     try:
@@ -161,16 +171,29 @@ def analyze_reachability(
             ):
                 group.is_reachable = None
                 maven_groups.add(id(group))
-        if all(group.issue_type != IssueType.SCA or id(group) in maven_groups for group in groups):
+        if all(
+            group.issue_type != IssueType.SCA or id(group) in maven_groups for group in groups
+        ):
             return
 
-    direct_deps = _load_direct_dependencies(root)
-    global_imports = _collect_global_imports(root)
-
+    npm_groups: list[VulnerabilityGroup] = []
     for group in groups:
         if group.issue_type != IssueType.SCA or id(group) in maven_groups:
             continue
+        if _is_pypi_issue_group(group):
+            # JavaScript import names and package.json declarations do not
+            # establish whether a PyPI distribution is used by Python code.
+            group.is_reachable = None
+        else:
+            npm_groups.append(group)
+    if not npm_groups:
+        return
 
+    root = Path(repo_root)
+    direct_deps = _load_direct_dependencies(root)
+    global_imports = _collect_global_imports(root)
+
+    for group in npm_groups:
         component = (group.vulnerable_component or "").strip()
         if component and component in global_imports:
             group.is_reachable = True

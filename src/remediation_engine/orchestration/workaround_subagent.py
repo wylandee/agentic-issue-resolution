@@ -82,6 +82,33 @@ def _filter_constraints_ledger(
     return filter_constraints_ledger(constraints_ledger, target_group)
 
 
+def _default_no_fix_package_manager(
+    project_language: ProjectLanguage,
+    manifest_paths: Sequence[str],
+) -> str:
+    """Infer a safe package manager from the selected language and manifests.
+
+    Python package removal is exposed only when all recognized target
+    manifests use one manager. Mixed or unrecognized Python targets fail
+    closed so a worker cannot remove a declaration with the wrong resolver.
+    """
+    if project_language != ProjectLanguage.PYTHON:
+        return "npm"
+
+    managers: set[str] = set()
+    for raw_path in manifest_paths:
+        name = Path(str(raw_path or "")).name.casefold()
+        if name in {"pipfile", "pipfile.lock"}:
+            managers.add("pipenv")
+        elif (name.startswith("requirements") and name.endswith(".txt")) or name in {
+            "pyproject.toml",
+            "setup.cfg",
+            "setup.py",
+        }:
+            managers.add("pip")
+    return next(iter(managers)) if len(managers) == 1 else ""
+
+
 _QA_ERROR_MARKER = re.compile(
     r"(?:error|exception|failed|failure|not\s+a\s+function|undefined|cannot|invalid|missing|required\s+option|not\s+exported|cannot\s+find)",
     re.IGNORECASE,
@@ -807,6 +834,47 @@ def _workaround_static_instructions(project_language: ProjectLanguage) -> str:
     )
 
 
+_PYTHON_WORKAROUND_LANGUAGE_INSTRUCTIONS = """Python-specific environment and
+capabilities: Work on Python source files (`.py`) and use pip or Pipenv; tests
+are run with pytest. Use validate_python_syntax to check syntax and
+run_targeted_python_test for the focused pytest run.
+
+Supported dependency declarations include requirements files such as
+requirements.txt, static PEP 621 pyproject.toml, static setup.cfg, and Pipfile.
+Ordinary workarounds must not modify dependency manifests or lockfiles. For
+NO_FIX PACKAGE_REMOVAL, the Python manifest-removal tool is the sole manifest
+operation; never manually edit Pipfile.lock. Runtime smoke must import a
+lightweight Python source module and remain separate from the targeted pytest
+run."""
+
+
+def _build_workaround_system_prompt(
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str:
+    """Return the language-matched workaround instructions."""
+    if not isinstance(project_language, ProjectLanguage):
+        project_language = ProjectLanguage(project_language)
+    if project_language == ProjectLanguage.PYTHON:
+        shared_instructions = (
+            _WORKAROUND_STATIC_INSTRUCTIONS.replace(
+                "You are a code security specialist",
+                "You are a Python code security specialist",
+            )
+            .replace("validate_workaround", "validate_python_workaround")
+            .replace("remove_no_fix_dependency", "remove_no_fix_python_dependency")
+            .replace(
+                "configured authorized package.json and lockfile paths",
+                "configured authorized Python manifest paths (and Pipfile.lock when applicable)",
+            )
+            .replace(
+                "Never manually edit or delete lockfile nodes",
+                "Never manually edit or delete dependency lockfiles",
+            )
+        )
+        return "\n\n".join([shared_instructions, _PYTHON_WORKAROUND_LANGUAGE_INSTRUCTIONS])
+    return _WORKAROUND_STATIC_INSTRUCTIONS
+
+
 def _build_workaround_prompt(
     target_task: RemediationTask,
     target_group: VulnerabilityGroup,
@@ -872,6 +940,10 @@ def _build_workaround_prompt(
         f"Vulnerability Mechanism: {vulnerability_mechanism or 'not provided'}",
         f"Task Instruction: {_clean_prompt_snippet(getattr(target_task, 'instruction', '') or 'Apply defensive code fix.', max_chars=None)}",
     ]
+    if not isinstance(project_language, ProjectLanguage):
+        project_language = ProjectLanguage(project_language)
+    if project_language == ProjectLanguage.PYTHON:
+        sections.insert(1, "Canonical project language: python (Python).")
 
     if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
         if project_language == ProjectLanguage.JAVA:
@@ -1181,6 +1253,12 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
     workspace_volume = state.get("workspace_volume", "")
     target_task = state.get("target_task")
     target_group = state.get("target_group")
+    raw_language = state.get("project_language", ProjectLanguage.NODEJS)
+    project_language = (
+        raw_language
+        if isinstance(raw_language, ProjectLanguage)
+        else ProjectLanguage(raw_language or ProjectLanguage.NODEJS.value)
+    )
     t_id = target_task.task_id if target_task else "unknown"
 
     if get_runtime_settings().remedy_bypass_workaround_subagent:
@@ -1296,8 +1374,9 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
         replayed_edit_sets = []
 
     sandbox_options: dict[str, Any] = {"workspace_volume": workspace_volume}
-    if project_language == ProjectLanguage.JAVA:
+    if project_language != ProjectLanguage.NODEJS:
         sandbox_options["image"] = LANGUAGE_CONFIGS[project_language].docker_image
+    if project_language == ProjectLanguage.JAVA:
         sandbox_options["maven_repository_volume"] = state.get("maven_cache_volume")
     try:
         with DockerSandbox(repo_root=None, **sandbox_options) as sandbox:
@@ -1424,47 +1503,62 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 effective_no_fix_stage = effective_no_fix_stage.value
             package_manager = next(
                 (
-                    str(issue.package_manager).strip().lower()
+                    str(issue.package_manager).strip().casefold()
                     for issue in getattr(target_group, "localized_issues", []) or []
                     if getattr(issue, "package_manager", None)
                 ),
                 None,
             )
-            if package_manager is None:
-                package_manager = (
-                    "maven"
-                    if project_language == ProjectLanguage.JAVA
-                    and is_maven_group(target_group, project_language)
-                    else "npm"
-                    if project_language != ProjectLanguage.JAVA
-                    else ""
-                )
-            no_fix_package_manager = package_manager
             no_fix_manifest_paths: list[str] = []
             if effective_no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
-                if project_language == ProjectLanguage.JAVA and no_fix_package_manager == "maven":
-                    no_fix_manifest_paths, scope_errors = _resolve_maven_manifest_scope(
-                        target_group,
-                        repo_root,
+                candidates = [
+                    *(getattr(target_group, "file_paths", []) or []),
+                    getattr(target_group, "file_path", None),
+                    *(
+                        getattr(issue, "manifest_file", None)
+                        for issue in getattr(target_group, "localized_issues", []) or []
+                    ),
+                ]
+                normalized_candidates = [
+                    str(candidate or "").replace("\\", "/").lstrip("/")
+                    for candidate in candidates
+                    if str(candidate or "").strip()
+                ]
+                if project_language == ProjectLanguage.JAVA:
+                    no_fix_package_manager = package_manager or (
+                        "maven" if is_maven_group(target_group, project_language) else ""
                     )
-                    if scope_errors:
-                        plan_state["maven_manifest_scope_errors"] = scope_errors
-                elif no_fix_package_manager in {"npm", "yarn", "pnpm"}:
-                    for candidate in [
-                        *(getattr(target_group, "file_paths", []) or []),
-                        getattr(target_group, "file_path", None),
-                        *(
-                            getattr(issue, "manifest_file", None)
-                            for issue in getattr(target_group, "localized_issues", []) or []
-                        ),
-                    ]:
-                        normalized = str(candidate or "").replace("\\", "/").lstrip("/")
-                        if (
-                            normalized
-                            and Path(normalized).name == "package.json"
-                            and normalized not in no_fix_manifest_paths
+                    if no_fix_package_manager == "maven":
+                        no_fix_manifest_paths, scope_errors = _resolve_maven_manifest_scope(
+                            target_group,
+                            repo_root,
+                        )
+                        if scope_errors:
+                            plan_state["maven_manifest_scope_errors"] = scope_errors
+                elif project_language == ProjectLanguage.PYTHON:
+                    no_fix_package_manager = package_manager or _default_no_fix_package_manager(
+                        project_language,
+                        normalized_candidates,
+                    )
+                    for path in normalized_candidates:
+                        name = Path(path).name.casefold()
+                        if no_fix_package_manager == "pipenv" and name == "pipfile":
+                            no_fix_manifest_paths.append(path)
+                        elif no_fix_package_manager == "pip" and (
+                            (name.startswith("requirements") and name.endswith(".txt"))
+                            or name in {"pyproject.toml", "setup.cfg", "setup.py"}
                         ):
-                            no_fix_manifest_paths.append(normalized)
+                            no_fix_manifest_paths.append(path)
+                else:
+                    no_fix_package_manager = package_manager or "npm"
+                    if no_fix_package_manager in {"npm", "yarn", "pnpm"}:
+                        no_fix_manifest_paths = [
+                            path
+                            for path in normalized_candidates
+                            if Path(path).name.casefold() == "package.json"
+                        ]
+            else:
+                no_fix_package_manager = package_manager
 
             prompt = _build_workaround_prompt(
                 target_task,
@@ -1477,11 +1571,15 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 project_language=project_language,
                 authorized_manifest_paths=no_fix_manifest_paths,
             )
+            static_instructions = (
+                _workaround_static_instructions(project_language)
+                if project_language == ProjectLanguage.JAVA
+                else _build_workaround_system_prompt(project_language)
+            )
             initial_messages = [
-                SystemMessage(content=_workaround_static_instructions(project_language)),
+                SystemMessage(content=static_instructions),
                 HumanMessage(content=prompt),
             ]
-
             toolbelt = build_workaround_toolbelt(
                 sandbox,
                 touched_files,
@@ -1497,6 +1595,7 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 no_fix_manifest_paths=no_fix_manifest_paths,
                 no_fix_package_manager=no_fix_package_manager,
                 project_language=project_language,
+                language=project_language,
             )
             context_manager = ContextManager(toolbelt)
             runtime = run_bounded_subagent_loop(

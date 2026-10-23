@@ -683,11 +683,6 @@ def build_system_context(case: Mapping[str, Any]) -> SystemContext:
     raw = replay.get("input", {}).get("system_context", {}) if isinstance(replay, Mapping) else {}
     raw = raw if isinstance(raw, Mapping) else {}
     replay_input = replay.get("input", {}) if isinstance(replay, Mapping) else {}
-    language = (
-        str(replay_input.get("project_language", ProjectLanguage.NODEJS.value))
-        if isinstance(replay_input, Mapping)
-        else ProjectLanguage.NODEJS.value
-    )
     scenario = str(case.get("scenario", case.get("input", "")))
     scenario_lower = scenario.lower()
     completion = str(case.get("completion_task", ""))
@@ -734,6 +729,7 @@ def build_system_context(case: Mapping[str, Any]) -> SystemContext:
         if isinstance(raw_tags, Mapping)
         else {}
     )
+    project_language = _case_project_language(case)
     return SystemContext(
         repo_url=raw.get("repo_url"),
         base_ref=raw.get("base_ref"),
@@ -743,12 +739,57 @@ def build_system_context(case: Mapping[str, Any]) -> SystemContext:
         public_facing=raw.get("public_facing", public_facing),
         primary_language=raw.get(
             "primary_language",
-            "java" if language == ProjectLanguage.JAVA.value else "javascript",
+            {
+                ProjectLanguage.JAVA: "java",
+                ProjectLanguage.PYTHON: "python",
+                ProjectLanguage.NODEJS: "javascript",
+            }[project_language],
         ),
         deployment_architecture=raw.get("deployment_architecture", "service"),
         data_sensitivity=raw.get("data_sensitivity", sensitivity),
         tags=tags,
     )
+
+
+def _case_project_language(case: Mapping[str, Any]) -> ProjectLanguage:
+    """Resolve the execution language recorded on an evaluation case."""
+    replay = case.get("replay", {})
+    replay_input = replay.get("input", {}) if isinstance(replay, Mapping) else {}
+    raw_language = (
+        replay_input.get(
+            "project_language",
+            case.get("project_language", case.get("language")),
+        )
+        if isinstance(replay_input, Mapping)
+        else case.get("project_language", case.get("language"))
+    )
+    vulnerability = (
+        replay_input.get("vulnerability_context", {}) if isinstance(replay_input, Mapping) else {}
+    )
+    if not raw_language and isinstance(vulnerability, Mapping):
+        raw_language = vulnerability.get("project_language")
+    if not raw_language and isinstance(vulnerability, Mapping):
+        raw_language = (
+            "python" if str(vulnerability.get("ecosystem", "")).casefold() == "pypi" else None
+        )
+    normalized_language = str(raw_language or "").strip().casefold()
+    if normalized_language in {"java", "maven"} or (
+        isinstance(vulnerability, Mapping)
+        and (
+            str(vulnerability.get("ecosystem", "")).casefold() == "maven"
+            or str(vulnerability.get("purl", "")).casefold().startswith("pkg:maven/")
+        )
+    ):
+        return ProjectLanguage.JAVA
+    if normalized_language in {"python", "python3", "pypi"} or (
+        isinstance(vulnerability, Mapping)
+        and (
+            str(vulnerability.get("ecosystem", "")).casefold() in {"python", "pypi"}
+            or str(vulnerability.get("purl", "")).casefold().startswith("pkg:pypi/")
+        )
+    ):
+        return ProjectLanguage.PYTHON
+    return ProjectLanguage.NODEJS
 
 
 def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
@@ -766,12 +807,8 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
         return VulnerabilityGroup.model_validate(raw_group)
 
     scenario = str(case.get("scenario", case.get("input", "")))
-    language = (
-        str(replay_input.get("project_language", ProjectLanguage.NODEJS.value))
-        if isinstance(replay_input, Mapping)
-        else ProjectLanguage.NODEJS.value
-    )
-    is_java = language == ProjectLanguage.JAVA.value
+    project_language = _case_project_language(case)
+    is_java = project_language == ProjectLanguage.JAVA
     vulnerability = case.get("vulnerability_context", {})
     vulnerability = vulnerability if isinstance(vulnerability, Mapping) else {}
     group_id = str(vulnerability.get("group_id") or case.get("case_id") or "replay-group")
@@ -823,7 +860,11 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
     file_path = str(
         vulnerability.get("file_path")
         or _first_match(r"(test(?:/|\\)[^\s,]+|lib(?:/|\\)[^\s,]+\.\w+)", scenario)
-        or ("pom.xml" if is_java else "package.json")
+        or {
+            ProjectLanguage.NODEJS: "package.json",
+            ProjectLanguage.JAVA: "pom.xml",
+            ProjectLanguage.PYTHON: "requirements.txt",
+        }[project_language]
     ).rstrip(".,")
     severity_name = (
         _first_match(r"original\s+(?:scanner\s+)?severity\s*(?:is|=)?\s*([A-Z]+)", scenario)
@@ -834,6 +875,12 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
     except ValueError:
         severity = Severity.MEDIUM
     issue_id = f"{group_id}:issue"
+    project_language = _case_project_language(case)
+    ecosystem = {
+        ProjectLanguage.NODEJS: "npm",
+        ProjectLanguage.JAVA: "maven",
+        ProjectLanguage.PYTHON: "pypi",
+    }[project_language]
     issue = VulnerabilityIssue(
         id=uuid5(NAMESPACE_URL, issue_id),
         finding_id=issue_id,
@@ -851,7 +898,7 @@ def build_vulnerability_group(case: Mapping[str, Any]) -> VulnerabilityGroup:
             else None
         ),
         purl=str(vulnerability["purl"]) if vulnerability.get("purl") else None,
-        ecosystem="maven" if is_java else "npm",
+        ecosystem=ecosystem,
         message=scenario,
     )
     epss_matches = [
@@ -920,12 +967,8 @@ def seed_replay_files(case: Mapping[str, Any]) -> dict[str, str]:
     files = raw.get("workspace_files", {}) if isinstance(raw, Mapping) else {}
     if isinstance(files, Mapping) and files:
         return {str(path): str(content) for path, content in files.items()}
-    language = (
-        str(raw.get("project_language", ProjectLanguage.NODEJS.value))
-        if isinstance(raw, Mapping)
-        else ProjectLanguage.NODEJS.value
-    )
-    if language == ProjectLanguage.JAVA.value:
+    project_language = _case_project_language(case)
+    if project_language == ProjectLanguage.JAVA:
         return {
             "pom.xml": (
                 '<project xmlns="http://maven.apache.org/POM/4.0.0" '
@@ -942,6 +985,12 @@ def seed_replay_files(case: Mapping[str, Any]) -> dict[str, str]:
             "src/test/java/eval/ReplayTest.java": (
                 "package eval;\npublic final class ReplayTest { public void passes() {} }\n"
             ),
+        }
+    if project_language == ProjectLanguage.PYTHON:
+        return {
+            "requirements.txt": "replay-package==1.0.0\n",
+            "src/replay.py": "def replay() -> bool:\n    return True\n",
+            "tests/test_replay.py": "def test_replay() -> None:\n    assert True\n",
         }
     return {
         "package.json": json.dumps(

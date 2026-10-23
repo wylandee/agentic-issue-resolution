@@ -184,7 +184,10 @@ class SolverTarget(_SolverModel):
     package_name: str = Field(..., min_length=1)
     target_package_name: str = Field(..., min_length=1)
     manifest_path: str = Field(..., min_length=1)
-    lockfile_package_key: str = Field(..., min_length=1)
+    # Python direct declarations do not have a package-lock location.  npm
+    # targets continue to carry their physical lockfile key; ecosystem adapters
+    # without lockfiles leave this unset rather than inventing one.
+    lockfile_package_key: str | None = None
     installed_version: str = Field(..., min_length=1)
     version_scheme: Literal["semver", "maven"] = "semver"
     dependency_type: str = Field(default="dependencies", min_length=1)
@@ -207,7 +210,6 @@ class SolverTarget(_SolverModel):
         "target_package_name",
         "dependency_type",
         "strategy",
-        "lockfile_package_key",
         mode="before",
     )
     @classmethod
@@ -218,6 +220,11 @@ class SolverTarget(_SolverModel):
     @classmethod
     def _path(cls, value: Any) -> str:
         return _relative_manifest_path(value)
+
+    @field_validator("lockfile_package_key", mode="before")
+    @classmethod
+    def _optional_lockfile_key(cls, value: Any) -> str | None:
+        return _optional_text(value, "lockfile_package_key")
 
     @field_validator("installed_version", mode="before")
     @classmethod
@@ -492,6 +499,23 @@ class SolverRuntimeFingerprint(_SolverModel):
         return _required_text(value, info.field_name)
 
 
+class SolverPythonRuntimeFingerprint(_SolverModel):
+    """Python and pip runtime identity used by PyPI portfolio certification."""
+
+    ecosystem: Literal["pypi"] = "pypi"
+    python_version: str = Field(..., min_length=1)
+    pip_version: str = Field(..., min_length=1)
+    platform: str = Field(..., min_length=1)
+    architecture: str = Field(..., min_length=1)
+
+    @field_validator(
+        "python_version", "pip_version", "platform", "architecture", mode="before"
+    )
+    @classmethod
+    def _text(cls, value: Any, info: Any) -> str:
+        return _required_text(value, info.field_name)
+
+
 class PackageResolutionStatus(StrEnum):
     """Outcome of package-manager certification for a solver assignment."""
 
@@ -501,7 +525,7 @@ class PackageResolutionStatus(StrEnum):
 
 
 class SolverCandidateRejectionReason(StrEnum):
-    """Structured evidence category for one strict-resolver rejection."""
+    """Structured category for one candidate certification rejection or failure."""
 
     RUNTIME_ENGINE = "runtime_engine"
     RUNTIME_PLATFORM = "runtime_platform"
@@ -510,6 +534,7 @@ class SolverCandidateRejectionReason(StrEnum):
     REQUIRED_DEPENDENCY_MISSING = "required_dependency_missing"
     NEW_VULNERABLE_COPY = "new_vulnerable_copy"
     COVERAGE_UNRESOLVED = "coverage_unresolved"
+    BUILD_TOOLCHAIN = "build_toolchain"
     UNCLASSIFIED = "unclassified"
 
 
@@ -706,7 +731,7 @@ class PackageResolutionCertificate(_SolverModel):
     candidate_assignment_digest: str = Field(..., min_length=1)
     resolved_graph_digest: str = Field(..., min_length=1)
     resolved_lockfile_digests: dict[str, str] = Field(default_factory=dict)
-    runtime_fingerprint: SolverRuntimeFingerprint
+    runtime_fingerprint: SolverRuntimeFingerprint | SolverPythonRuntimeFingerprint
     covered_coverage_ids: list[str] = Field(default_factory=list)
     workaround_coverage_ids: list[str] = Field(default_factory=list)
     unresolved_coverage_ids: list[str] = Field(default_factory=list)
@@ -817,6 +842,11 @@ class SolverTaskDecision(_SolverModel):
     manifest_path: str | None = None
     lockfile_package_key: str | None = None
     dependency_type: str | None = None
+    parent_package_name: str | None = None
+    parent_package_version: str | None = None
+    parent_minimum_version: str | None = None
+    vulnerable_package_name: str | None = None
+    vulnerable_fixed_version: str | None = None
 
     @field_validator(
         "task_id", "selected_strategy", "strategy_stage", "instruction_source", mode="before"
@@ -833,6 +863,9 @@ class SolverTaskDecision(_SolverModel):
         "target_package_name",
         "manifest_path",
         "lockfile_package_key",
+        "parent_package_name",
+        "parent_package_version",
+        "vulnerable_package_name",
         "exact_instruction",
         "installed_version",
         mode="before",
@@ -840,6 +873,11 @@ class SolverTaskDecision(_SolverModel):
     @classmethod
     def _optional(cls, value: Any, info: Any) -> str | None:
         return _optional_text(value, info.field_name)
+
+    @field_validator("parent_minimum_version", "vulnerable_fixed_version", mode="before")
+    @classmethod
+    def _parent_versions(cls, value: Any, info: Any) -> str | None:
+        return _optional_version(value, info.field_name)
 
     @field_validator("selected_version", mode="before")
     @classmethod

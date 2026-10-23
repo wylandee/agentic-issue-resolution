@@ -1369,3 +1369,210 @@ class TestTestFailureExtraction:
         assert "stdout tail:" in summary
         assert "line 119" in summary
         assert "stderr tail:" in summary
+
+# Stage-2 behavior retained during the architecture merge.
+from remediation_engine.language import ProjectLanguage
+
+from remediation_engine.orchestration._qa_runtime import _workspace_remediation_fingerprint
+
+from remediation_engine.orchestration.qa_odc import _odc_command
+
+from remediation_engine.orchestration.qa_odc import _parse_report_python_packages
+
+from remediation_engine.orchestration.qa_odc import _run_targeted_security_scan
+
+class TestRunOdcStage2Parity:
+    def test_node_command_keeps_configured_odc_arguments_without_python_mode(self):
+        with patch(
+            "remediation_engine.orchestration.qa_odc.get_runtime_settings",
+            return_value=MagicMock(odc_extra_args="--format XML"),
+        ):
+            command = _odc_command("node-vol")
+
+        assert command[-2:] == ["--format", "XML"]
+        assert "--enableExperimental" not in command
+        assert "**/.remedy-pipenv/**" not in command
+        assert "**/.venv/**" not in command
+
+    def test_pipfile_is_authoritative_for_python_install(self):
+        sandbox = _make_sandbox()
+        sandbox.read_file.side_effect = lambda path: (
+            '[packages]\\nrequests = "*"\\n'
+            if path == "Pipfile"
+            else '{"default": {}, "develop": {}}'
+            if path == "Pipfile.lock"
+            else "requests==2.32.0"
+        )
+
+        _run_install(sandbox, ProjectLanguage.PYTHON)
+
+        assert sandbox.run.call_args.args[0] == (
+            "PIPENV_VENV_IN_PROJECT=1 .remedy-pipenv/bin/pipenv sync --dev"
+        )
+
+    def test_python_command_does_not_duplicate_configured_experimental_flag(self):
+        with patch(
+            "remediation_engine.orchestration.qa_odc.get_runtime_settings",
+            return_value=MagicMock(odc_extra_args="--enableExperimental --format XML"),
+        ):
+            command = _odc_command("python-vol", project_language=ProjectLanguage.PYTHON)
+
+        assert command.count("--enableExperimental") == 1
+        assert command[-3:] == ["--enableExperimental", "--format", "XML"]
+
+    def test_python_command_enables_experimental_mode_once(self):
+        with patch(
+            "remediation_engine.orchestration.qa_odc.get_runtime_settings",
+            return_value=MagicMock(odc_extra_args="--format XML"),
+        ):
+            command = _odc_command("python-vol", project_language=ProjectLanguage.PYTHON)
+
+        assert command.count("--enableExperimental") == 1
+        assert command[-3:] == ["--format", "XML", "--enableExperimental"]
+        assert "**/.remedy-pipenv/**" in command
+        assert "**/.venv/**" in command
+
+    def test_python_install_and_tests_use_persistent_venv(self):
+        sandbox = _make_sandbox()
+        sandbox.read_file.side_effect = lambda path: {
+            "requirements.txt": "requests==2.32.0",
+            "pyproject.toml": "[project]\\nname = 'sample'\\n",
+        }.get(path)
+
+        install = _run_install(sandbox, ProjectLanguage.PYTHON)
+        tests = _run_unit_tests(sandbox, ProjectLanguage.PYTHON)
+
+        assert install.ok is True
+        install_command = sandbox.run.call_args_list[0].args[0]
+        assert ".venv/bin/python -m pip install -r requirements.txt" in install_command
+        assert ".venv/bin/python -m pip install -e ." in install_command
+        assert "npm" not in install_command
+        assert tests.ok is True
+        assert sandbox.run.call_args_list[1].args[0] == ".venv/bin/python -m pytest"
+
+def test_workspace_remediation_fingerprint_changes_with_material_file_change(tmp_path) -> None:
+    """The fingerprint reflects content changes, not only candidate file names."""
+    (tmp_path / "package.json").write_text('{"version":"1.0.0"}', encoding="utf-8")
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = '{"version":"1.0.0"}'
+
+    unchanged = _workspace_remediation_fingerprint(str(tmp_path), sandbox, ["package.json"])
+
+    sandbox.read_file.return_value = '{"version":"2.0.0"}'
+    changed = _workspace_remediation_fingerprint(str(tmp_path), sandbox, ["package.json"])
+
+    assert changed != unchanged
+
+def test_python_package_inventory_includes_nonvulnerable_dependencies():
+    report = json.dumps(
+        {
+            "dependencies": [
+                {
+                    "packages": [{"id": "pkg:pypi/Certifi@2024.7.4"}],
+                    "vulnerabilities": [],
+                },
+                {
+                    "packages": [{"id": "pkg:npm/example@1.0.0"}],
+                    "vulnerabilities": [],
+                },
+            ]
+        }
+    )
+
+    assert _parse_report_python_packages(report) == {("certifi", "2024.7.4")}
+
+def test_targeted_python_scan_reports_clean_package_inventory():
+    sandbox = MagicMock()
+    report = json.dumps(
+        {
+            "dependencies": [
+                {
+                    "packages": [{"id": "pkg:pypi/certifi@2024.7.4"}],
+                    "vulnerabilities": [],
+                }
+            ]
+        }
+    )
+    process = subprocess.CompletedProcess(
+        args=["docker"],
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/docker"),
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_targeted_odc",
+            return_value=process,
+        ) as targeted_odc,
+        patch(
+            "remediation_engine.orchestration.qa_odc._read_report_from_workspace",
+            return_value=report,
+        ),
+        patch(
+            "remediation_engine.orchestration.qa_odc._persist_workspace_report_to_host",
+            return_value=None,
+        ),
+    ):
+        result = _run_targeted_security_scan(
+            sandbox,
+            "test-volume",
+            set(),
+            set(),
+            ".odc-targeted",
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+    assert result.ok is True
+    assert result.execution_status.value == "success"
+    assert result.scanned_packages == {("certifi", "2024.7.4")}
+    assert targeted_odc.call_args.args[2] == ProjectLanguage.PYTHON
+
+def test_targeted_scan_accepts_parseable_report_with_nonzero_exit() -> None:
+    report = json.dumps(
+        {
+            "dependencies": [
+                {
+                    "packages": [{"id": "pkg:pypi/certifi@2024.7.4"}],
+                    "vulnerabilities": [],
+                }
+            ]
+        }
+    )
+    process = subprocess.CompletedProcess(
+        args=["docker"],
+        returncode=14,
+        stdout="ODC emitted a parseable report with analyzer warnings",
+        stderr="",
+    )
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/docker"),
+        patch(
+            "remediation_engine.orchestration.qa_odc._run_targeted_odc",
+            return_value=process,
+        ) as targeted_odc,
+        patch(
+            "remediation_engine.orchestration.qa_odc._read_report_from_workspace",
+            return_value=report,
+        ),
+        patch(
+            "remediation_engine.orchestration.qa_odc._persist_workspace_report_to_host",
+            return_value=None,
+        ),
+    ):
+        result = _run_targeted_security_scan(
+            MagicMock(),
+            "test-volume",
+            {"CVE-2026-0001"},
+            {"CVE-2026-0001"},
+            ".odc-targeted",
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+    assert result.ok is True
+    assert result.execution_status.value == "success"
+    assert result.scanned_packages == {("certifi", "2024.7.4")}
+    assert result.exit_code == 14
+    assert targeted_odc.call_args.args[2] == ProjectLanguage.PYTHON

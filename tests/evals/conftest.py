@@ -111,6 +111,28 @@ def _normalise_nodeid(nodeid: str) -> str:
     return nodeid.replace("\\", "/").casefold()
 
 
+def _redact_eval_secrets(value: str) -> str:
+    """Redact the configured OpenAI key and recognizable API-key tokens.
+
+    Args:
+        value: Text that may be persisted as evaluation input, output, or error data.
+
+    Returns:
+        The input text with known credentials replaced by a fixed marker.
+    """
+    secrets = {
+        candidate
+        for candidate in (
+            _INITIAL_OPENAI_API_KEY,
+            os.environ.get("OPENAI_API_KEY", "").strip(),
+        )
+        if candidate
+    }
+    for secret in sorted(secrets, key=len, reverse=True):
+        value = value.replace(secret, "[REDACTED]")
+    return re.sub(r"(?i)\bsk-[A-Za-z0-9_-]{16,}\b", "[REDACTED]", value)
+
+
 def _is_eval_nodeid(nodeid: str) -> bool:
     """Return whether a node ID belongs to a dedicated evaluation file."""
     normalized = _normalise_nodeid(nodeid)
@@ -276,7 +298,7 @@ def _pytest_item_observation(nodeid: str) -> dict[str, Any]:
         if getattr(report, "longrepr", None) is not None
         and getattr(report, "outcome", "") in {"failed", "skipped"}
     ]
-    error_message = "\n\n".join(detail for detail in details if detail) or None
+    error_message = _redact_eval_secrets("\n\n".join(details)) or None
     duration = sum(_safe_float(getattr(report, "duration", 0.0)) for report in ordered_reports)
 
     return {
@@ -464,9 +486,17 @@ def _record_from_deep_eval_case(
             score=_safe_float(getattr(metric, "score", 0.0)),
             threshold=_safe_float(getattr(metric, "threshold", 0.70), 0.70),
             success=bool(getattr(metric, "success", False)),
-            reason=getattr(metric, "reason", None),
+            reason=(
+                _redact_eval_secrets(str(metric.reason))
+                if getattr(metric, "reason", None) is not None
+                else None
+            ),
             evaluation_model=getattr(metric, "evaluation_model", None) or judge_model,
-            verbose_logs=getattr(metric, "verbose_logs", None),
+            verbose_logs=(
+                _redact_eval_secrets(str(metric.verbose_logs))
+                if getattr(metric, "verbose_logs", None) is not None
+                else None
+            ),
         )
         for metric in (getattr(tc, "metrics_data", None) or [])
     ]
@@ -497,11 +527,15 @@ def _record_from_deep_eval_case(
         test_name=nodeid or str(getattr(tc, "name", "unnamed_test")),
         suite=_suite_from_nodeid(nodeid) if nodeid else _suite_from_test_case(tc),
         status=observation["status"],
-        input_text=str(getattr(tc, "input", "") or ""),
-        actual_output=str(getattr(tc, "actual_output", "") or ""),
-        expected_output=getattr(tc, "expected_output", None),
-        context_text=context_text,
-        retrieval_context=retrieval_context,
+        input_text=_redact_eval_secrets(str(getattr(tc, "input", "") or "")),
+        actual_output=_redact_eval_secrets(str(getattr(tc, "actual_output", "") or "")),
+        expected_output=(
+            _redact_eval_secrets(str(tc.expected_output))
+            if getattr(tc, "expected_output", None) is not None
+            else None
+        ),
+        context_text=_redact_eval_secrets(context_text) if context_text else None,
+        retrieval_context=(_redact_eval_secrets(retrieval_context) if retrieval_context else None),
         latency_seconds=_safe_float(getattr(tc, "run_duration", 0.0))
         or observation["latency_seconds"],
         cost=_safe_float(getattr(tc, "evaluation_cost", 0.0)),
@@ -511,7 +545,10 @@ def _record_from_deep_eval_case(
         token_cost=token_cost,
         token_usage_available=token_usage_available,
         error_message=observation["error_message"],
-        additional_metadata=metadata,
+        additional_metadata={
+            key: _redact_eval_secrets(str(value)) if isinstance(value, str) else value
+            for key, value in metadata.items()
+        },
         metrics=metrics,
     )
 
@@ -637,6 +674,9 @@ def _write_session_message(session: pytest.Session, message: str) -> None:
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Persist one SQLite record for every selected eval pytest item."""
     del exitstatus
+    if session.config.option.collectonly:
+        return
+
     from remediation_engine.evals.db import EvalDatabase
     from remediation_engine.evals.models import EvalRunRecord
 

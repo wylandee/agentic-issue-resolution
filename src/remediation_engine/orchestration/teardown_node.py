@@ -15,11 +15,15 @@ from pathlib import Path
 from typing import Any
 
 from remediation_engine.contracts.accessors import model_or_dict_value
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.state import ChangedFilesProjection, OrchestratorState
 from remediation_engine.orchestration.task_utils import (
     effective_group_status,
     task_group_lineage,
     terminal_outcome_issues,
+)
+from remediation_engine.orchestration.tools_manifest_python import (
+    restore_python_package_changes,
 )
 from remediation_engine.runtime.docker_client import close_docker_client
 from remediation_engine.runtime.path_policy import (
@@ -739,8 +743,15 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                 target_package = getattr(task, "target_package_name", None)
                 if target_package:
                     unfixable_packages.add(target_package)
-
     files_to_exclude = unfixable_files - passed_files
+
+    raw_language = state.get("project_language", ProjectLanguage.NODEJS)
+    project_language = (
+        raw_language
+        if isinstance(raw_language, ProjectLanguage)
+        else ProjectLanguage(raw_language or ProjectLanguage.NODEJS.value)
+    )
+    sandbox_image = LANGUAGE_CONFIGS[project_language].docker_image
 
     try:
         if candidate_changed_files and workspace_volume and repo_root_str:
@@ -753,6 +764,7 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                 try:
                     with DockerSandbox(
                         repo_root=None,
+                        image=sandbox_image,
                         workspace_volume=workspace_volume,
                     ) as sandbox:
                         # Attempt archives are internal transaction state and
@@ -787,12 +799,39 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                                 )
                                 continue
 
-                            if rel_path.endswith(".json") and unfixable_packages:
+                            if (
+                                project_language == ProjectLanguage.NODEJS
+                                and rel_path.endswith(".json")
+                                and unfixable_packages
+                            ):
                                 updated_text = _revert_unfixable_packages_in_json(
                                     original_text,
                                     updated_text,
                                     unfixable_packages,
                                     errors,
+                                )
+                            elif project_language == ProjectLanguage.PYTHON and unfixable_packages:
+                                companion_manifest_text = None
+                                if Path(rel_path).name.casefold() == "pipfile.lock":
+                                    companion_path = (Path(rel_path).parent / "Pipfile").as_posix()
+                                    original_companion = _read_host_text(repo_root, companion_path)
+                                    workspace_companion = sandbox.read_file(companion_path)
+                                    if not isinstance(workspace_companion, str):
+                                        workspace_companion = original_companion
+                                    companion_manifest_text = restore_python_package_changes(
+                                        companion_path,
+                                        original_companion,
+                                        workspace_companion,
+                                        unfixable_packages,
+                                        errors,
+                                    )
+                                updated_text = restore_python_package_changes(
+                                    rel_path,
+                                    original_text,
+                                    updated_text,
+                                    unfixable_packages,
+                                    errors,
+                                    companion_manifest_text=companion_manifest_text,
                                 )
 
                             diff_text = _build_diff(

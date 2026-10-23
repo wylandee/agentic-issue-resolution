@@ -22,6 +22,7 @@ from remediation_engine.orchestration.portfolio_orchestrator import (
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
 from remediation_engine.orchestration.task_utils import TERMINAL_TASK_STATUSES
+from remediation_engine.language import resolve_project_language
 
 log = logging.getLogger(__name__)
 
@@ -277,11 +278,15 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
 
     try:
         settings = get_runtime_settings()
+        project_language = resolve_project_language(
+            state["repo_root"], str(state.get("project_language") or "") or None
+        )
         prepared_groups, prepared_queue, prepare_diagnostics = prepare_portfolio_inputs(
             state["repo_root"],
             state.get("valid_groups", []),
             dict(state.get("task_queue", {}) or {}),
             target_packages=state.get("target_packages", []),
+            project_language=project_language,
         )
         source_queue = dict(state.get("task_queue", {}) or {})
         portfolio_queue: dict[str, Any] = {}
@@ -332,7 +337,9 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             prior_portfolio_plan=state.get("portfolio_plan") if request is not None else None,
             qa_results_by_attempt=state.get("qa_results_by_attempt") or {},
             attempt_snapshots_by_id=state.get("attempt_snapshots_by_id") or {},
+            retry_diagnostics_by_task=state.get("retry_diagnostics_by_task") or {},
             qa_passed_workspace_prefix=state.get("qa_passed_workspace_prefix"),
+            project_language=project_language,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed at the transaction boundary
         return {

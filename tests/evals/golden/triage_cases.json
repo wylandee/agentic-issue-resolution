@@ -592,5 +592,146 @@
       "actual_output": "Synthetic case: no historical model output is claimed.",
       "actual_tools": []
     }
+  },
+  {
+    "case_id": "triage-python-certifi-actionable",
+    "eval_type": "triage",
+    "golden_kind": "historical_analogue",
+    "provenance_status": "historical",
+    "scenario": "A PyPI certifi 2022.12.7 finding in requirements.txt has scanner identifier CVE-2023-37920; the approved fixed version is 2024.7.4.",
+    "completion_task": "Triage the reachable Python dependency finding for certifi. Preserve the scanner identity and return an actionable remediation priority.",
+    "expected_output": "The actionable PyPI certifi finding remains valid and is prioritized HIGH for remediation.",
+    "expected_completion_pass": true,
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261016T075629Z_ba0b44c1-7a62-4523-b00e-7797df5e29c9.md",
+        "observation": "The reachable PyPI certifi finding remained actionable; the worker later updated the requirements pin and task-scoped QA passed."
+      }
+    ],
+    "input": "A PyPI certifi 2022.12.7 finding in requirements.txt has scanner identifier CVE-2023-37920; the approved fixed version is 2024.7.4. The project language is Python.",
+    "context": [
+      "Return the final post-guardrail triage decision. Completion requires is_valid=true, revised_priority=HIGH, is_unreachable_code=false, and a preserved remediation handoff. Do not invent a proxy or frontend defense that is not in the finding evidence.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Root Input State contains a direct cookie group with a domain-isolation flaw, cookie version 0.4.2, GHSA-PXG6-PF52-XH8X, and is_reachable=true. The run finished all_passed, although its triage span was triage_skipped, so this supports the finding context rather than an observed LLM verdict.\",\n    \"trajectory\": \"data/trajectories/phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Final post-guardrail triage: is_valid=true; revised_priority=HIGH; is_unreachable_code=false; remediation handoff preserved; ecosystem=pypi; package=certifi.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "system_context": {
+          "primary_language": "python"
+        }
+      }
+    },
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:certifi",
+      "vulnerable_component": "certifi",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "2022.12.7",
+      "cve_ids": [
+        "CVE-2023-37920"
+      ],
+      "ghsa_ids": [],
+      "fixed_version": "2024.7.4",
+      "is_reachable": true
+    }
+  },
+  {
+    "case_id": "triage-python-pyyaml-actionable",
+    "eval_type": "triage",
+    "golden_kind": "historical_analogue",
+    "provenance_status": "historical",
+    "scenario": "A PyPI pyyaml 5.1 finding in requirements.txt has scanner identifier CVE-2020-14343; the approved fixed version is 6.0.3.",
+    "completion_task": "Triage the reachable Python dependency finding for pyyaml. Preserve the scanner identity and return an actionable remediation priority.",
+    "expected_output": "The actionable PyPI pyyaml finding remains valid and is prioritized HIGH for remediation.",
+    "expected_completion_pass": true,
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T120726Z_cdef0f21-e8b5-44bd-a160-dbcd055766b6.md",
+        "observation": "The PyYAML task completed with a QA-passed requirements update; package-name matching must tolerate the historical PyYAML capitalization."
+      }
+    ],
+    "input": "A PyPI pyyaml 5.1 finding in requirements.txt has scanner identifier CVE-2020-14343; the approved fixed version is 6.0.3. The project language is Python.",
+    "context": [
+      "Return the final post-guardrail triage decision. Completion requires is_valid=true, revised_priority=HIGH, is_unreachable_code=false, and a preserved remediation handoff. Do not invent a proxy or frontend defense that is not in the finding evidence.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Root Input State contains a direct cookie group with a domain-isolation flaw, cookie version 0.4.2, GHSA-PXG6-PF52-XH8X, and is_reachable=true. The run finished all_passed, although its triage span was triage_skipped, so this supports the finding context rather than an observed LLM verdict.\",\n    \"trajectory\": \"data/trajectories/phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Final post-guardrail triage: is_valid=true; revised_priority=HIGH; is_unreachable_code=false; remediation handoff preserved; ecosystem=pypi; package=pyyaml.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "system_context": {
+          "primary_language": "python"
+        }
+      }
+    },
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:pyyaml",
+      "vulnerable_component": "pyyaml",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "5.1",
+      "cve_ids": [
+        "CVE-2020-14343"
+      ],
+      "ghsa_ids": [],
+      "fixed_version": "6.0.3",
+      "is_reachable": true
+    }
+  },
+  {
+    "case_id": "triage-python-pypi-batch",
+    "eval_type": "triage",
+    "golden_kind": "historical_analogue",
+    "provenance_status": "historical",
+    "scenario": "A PyPI certifi 2022.12.7 finding in requirements.txt has scanner identifier CVE-2023-37920; the approved fixed version is 2024.7.4.",
+    "completion_task": "Triage the reachable Python dependency finding for certifi. Preserve the scanner identity and return an actionable remediation priority.",
+    "expected_output": "The actionable PyPI certifi finding remains valid and is prioritized HIGH for remediation.",
+    "expected_completion_pass": true,
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T165913Z_9ede9474-e210-431f-bb8b-4def9e00cca8.md",
+        "observation": "The certified requirements batch updated certifi and sqlparse atomically; both targeted tasks passed QA."
+      }
+    ],
+    "input": "A PyPI certifi 2022.12.7 finding in requirements.txt has scanner identifier CVE-2023-37920; the approved fixed version is 2024.7.4. The project language is Python.",
+    "context": [
+      "Return the final post-guardrail triage decision. Completion requires is_valid=true, revised_priority=HIGH, is_unreachable_code=false, and a preserved remediation handoff. Do not invent a proxy or frontend defense that is not in the finding evidence.",
+      "Historical trajectory mapping:\n[\n  {\n    \"observation\": \"Root Input State contains a direct cookie group with a domain-isolation flaw, cookie version 0.4.2, GHSA-PXG6-PF52-XH8X, and is_reachable=true. The run finished all_passed, although its triage span was triage_skipped, so this supports the finding context rather than an observed LLM verdict.\",\n    \"trajectory\": \"data/trajectories/phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md\"\n  }\n]"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {
+      "actual_output": "Final post-guardrail triage: is_valid=true; revised_priority=HIGH; is_unreachable_code=false; remediation handoff preserved; ecosystem=pypi; package=certifi.",
+      "actual_tools": []
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "system_context": {
+          "primary_language": "python"
+        }
+      }
+    },
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:certifi",
+      "vulnerable_component": "certifi",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "2022.12.7",
+      "cve_ids": [
+        "CVE-2023-37920"
+      ],
+      "ghsa_ids": [],
+      "fixed_version": "2024.7.4",
+      "is_reachable": true
+    }
   }
 ]

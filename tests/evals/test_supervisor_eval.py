@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from remediation_engine.contracts.schemas import TaskStatus
+from remediation_engine.contracts.schemas import DecisionCode, TaskStatus
 from remediation_engine.orchestration.tactical_supervisor import _safe_relative_file_hints
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
@@ -472,12 +472,12 @@ def test_supervisor_offline_production_replay(
         assert decision.task_status_updates[task_id] == TaskStatus.UNFIXABLE
         assert decision.new_constraints
         assert decision.spawn_requests == []
-    elif case_id == "supervisor-workaround-pivot-breaking-change":
+    elif decision is not None and decision.decision_code == DecisionCode.PIVOT_TO_WORKAROUND:
         assert decision.next_node == "workaround_subagent"
         assert len(decision.spawn_requests) == 1
         assert decision.spawn_requests[0].strategy.value == "code_workaround"
         assert decision.spawn_requests[0].instruction == verification.instruction
-    elif decision is not None:
+    elif decision is not None and decision.next_node == "update_subagent":
         assert decision.next_node == "update_subagent"
 
     if case_id == "supervisor-repair-loop-recovery":
@@ -496,7 +496,7 @@ def test_supervisor_offline_production_replay(
 
 
 def test_supervisor_eval_case_labels_and_expected_action_contract() -> None:
-    """Preserve existing npm cases and require the Java tactical slice."""
+    """Keep Node, Java, and Python cases explicit about metric applicability."""
     existing_npm_ids = {
         "supervisor-direct-version-bump-clean",
         "supervisor-transitive-package-override",
@@ -515,11 +515,21 @@ def test_supervisor_eval_case_labels_and_expected_action_contract() -> None:
         "supervisor-maven-qualified-version",
         "supervisor-maven-reject-unapproved",
     }
+    required_python_ids = {
+        "python-supervisor-version-bump-certifi",
+        "python-supervisor-pyjwt-workaround-pivot",
+        "python-supervisor-inconclusive-qa-suppressed",
+    }
     assert existing_npm_ids <= set(_SUPERVISOR_CASE_IDS)
     assert required_java_ids <= set(_SUPERVISOR_CASE_IDS)
-    assert len(set(_SUPERVISOR_CASE_IDS)) == len(_SUPERVISOR_CASE_IDS)
+    assert required_python_ids <= set(_SUPERVISOR_CASE_IDS)
+    assert len(_SUPERVISOR_CASES) == 17
+    assert len(set(_SUPERVISOR_CASE_IDS)) == 17
     no_call_cases = [case for case in _SUPERVISOR_CASES if not case["tool_correctness_applicable"]]
-    assert [case["case_id"] for case in no_call_cases] == ["supervisor-inconclusive-qa-suppressed"]
+    assert {case["case_id"] for case in no_call_cases} == {
+        "supervisor-inconclusive-qa-suppressed",
+        "python-supervisor-inconclusive-qa-suppressed",
+    }
     for case in _SUPERVISOR_CASES:
         if case["tool_correctness_applicable"]:
             assert case["expected_tool_correctness_pass"] is True

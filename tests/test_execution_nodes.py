@@ -26,7 +26,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
-from remediation_engine.language import ProjectLanguage
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.graph_wrappers import (
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
@@ -42,6 +42,9 @@ from remediation_engine.orchestration.teardown_node import (
     _build_diff,
     _revert_unfixable_packages_in_json,
     run_teardown_node,
+)
+from remediation_engine.orchestration.tools_manifest_python import (
+    restore_python_package_changes,
 )
 from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
 
@@ -352,6 +355,120 @@ def test_unfixable_lockfile_candidate_is_absent_from_final_patch(tmp_path):
     assert '"version": "9.9.9"' not in result["diff"]
     assert '"bar": "2.0.0"' in result["diff"]
     assert '"version": "2.0.0"' in result["diff"]
+
+
+def test_python_teardown_restores_only_unfixable_requirements_declaration(tmp_path):
+    original = "foo==1.0.0\nbar==1.0.0\n"
+    updated = "foo==2.0.0\nbar==2.0.0\n"
+    (tmp_path / "requirements.txt").write_text(original, encoding="utf-8")
+    groups = [
+        VulnerabilityGroup(
+            group_id="group-foo",
+            issue_type=IssueType.SCA,
+            vulnerable_component="foo",
+            file_path="requirements.txt",
+            file_paths=["requirements.txt"],
+            representative_issue_id="00000000-0000-0000-0000-000000000003",
+        ),
+        VulnerabilityGroup(
+            group_id="group-bar",
+            issue_type=IssueType.SCA,
+            vulnerable_component="bar",
+            file_path="requirements.txt",
+            file_paths=["requirements.txt"],
+            representative_issue_id="00000000-0000-0000-0000-000000000004",
+        ),
+    ]
+    state = initial_orchestrator_state(str(tmp_path), groups)
+    state.update(
+        {
+            "project_language": "python",
+            "task_queue": {
+                "task-foo": RemediationTask(
+                    task_id="task-foo",
+                    parent_group_id="group-foo",
+                    strategy=RoutingStrategy.VERSION_BUMP,
+                    target_package_name="foo",
+                    instruction="Update foo.",
+                    status=TaskStatus.UNFIXABLE,
+                ),
+                "task-bar": RemediationTask(
+                    task_id="task-bar",
+                    parent_group_id="group-bar",
+                    strategy=RoutingStrategy.VERSION_BUMP,
+                    target_package_name="bar",
+                    instruction="Update bar.",
+                    status=TaskStatus.QA_PASSED,
+                ),
+            },
+            "workspace_volume": "agent_workspace_python_manifest",
+            "changed_files": ["requirements.txt"],
+        }
+    )
+    sandbox = _sandbox_mock()
+    sandbox.read_file.side_effect = {"requirements.txt": updated}.get
+    client = MagicMock()
+
+    with (
+        patch(
+            "remediation_engine.orchestration.teardown_node.DockerSandbox",
+            return_value=sandbox,
+        ),
+        patch(
+            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            return_value=client,
+        ),
+    ):
+        result = run_teardown_node(state)
+
+    assert "-foo==1.0.0" not in result["diff"]
+    assert "-foo==2.0.0" not in result["diff"]
+    assert "bar==2.0.0" in result["diff"]
+
+
+def test_restore_python_package_changes_updates_pyproject_and_pipfile_lock():
+    original_pyproject = '[project]\nname = "app"\ndependencies = ["foo==1.0.0", "bar==1.0.0"]\n'
+    updated_pyproject = '[project]\nname = "app"\ndependencies = ["foo==2.0.0", "bar==2.0.0"]\n'
+
+    restored_pyproject = restore_python_package_changes(
+        "pyproject.toml",
+        original_pyproject,
+        updated_pyproject,
+        {"foo"},
+    )
+
+    assert '"foo==1.0.0"' in restored_pyproject
+    assert '"bar==2.0.0"' in restored_pyproject
+    original_pipfile = '[packages]\nfoo = "==1.0.0"\nbar = "==1.0.0"\n'
+    updated_pipfile = '[packages]\nfoo = "==2.0.0"\nbar = "==2.0.0"\n'
+    restored_pipfile = restore_python_package_changes(
+        "Pipfile",
+        original_pipfile,
+        updated_pipfile,
+        {"foo"},
+    )
+    original_lock = (
+        '{"_meta":{"hash":{"sha256":"old"}},'
+        '"default":{"foo":{"version":"==1.0.0"},'
+        '"bar":{"version":"==1.0.0"}}}\n'
+    )
+    updated_lock = (
+        '{"_meta":{"hash":{"sha256":"stale"}},'
+        '"default":{"foo":{"version":"==2.0.0"},'
+        '"bar":{"version":"==2.0.0"}}}\n'
+    )
+
+    restored_lock = restore_python_package_changes(
+        "Pipfile.lock",
+        original_lock,
+        updated_lock,
+        {"foo"},
+        companion_manifest_text=restored_pipfile,
+    )
+    lock = json.loads(restored_lock)
+    assert lock["default"]["foo"]["version"] == "==1.0.0"
+    assert lock["default"]["bar"]["version"] == "==2.0.0"
+    assert lock["_meta"]["hash"]["sha256"] != "stale"
 
 
 class TestStateDefaults:
@@ -928,3 +1045,47 @@ class TestTeardownNode:
         result = run_teardown_node(state)
 
         assert result["status"] == "completed_with_errors"
+
+
+# Stage-2 behavior retained during the architecture merge.
+class TestTeardownNodeStage2Parity:
+    def test_changed_files_are_deduplicated_diffed_and_volume_removed_python_stage2(self, tmp_path):
+        route_dir = tmp_path / "routes"
+        route_dir.mkdir()
+        (route_dir / "login.ts").write_text("const x = 1;\n", encoding="utf-8")
+
+        state = initial_orchestrator_state(str(tmp_path), [])
+        state["status"] = "edits_completed"
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["changed_files"] = ["routes/login.ts", "routes/login.ts"]
+        state["project_language"] = "python"
+
+        sandbox = _sandbox_mock()
+        sandbox.read_file.return_value = "const x = 2;\n"
+        client = MagicMock()
+
+        with (
+            patch(
+                "remediation_engine.orchestration.teardown_node.DockerSandbox",
+                return_value=sandbox,
+            ) as sandbox_type,
+            patch(
+                "remediation_engine.orchestration.teardown_node.get_docker_client",
+                return_value=client,
+            ),
+        ):
+            result = run_teardown_node(state)
+
+        sandbox.read_file.assert_called_once_with("routes/login.ts")
+        sandbox_type.assert_called_once_with(
+            repo_root=None,
+            image=LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image,
+            workspace_volume="agent_workspace_deadbeef",
+        )
+        client.volumes.get.assert_called_once_with("agent_workspace_deadbeef")
+        client.volumes.get.return_value.remove.assert_called_once_with(force=True)
+        assert result["status"] == "completed"
+        assert result["workspace_volume"] is None
+        assert result["changed_files"] == ["routes/login.ts"]
+        assert "a/routes/login.ts" in result["diff"]
+        assert "b/routes/login.ts" in result["diff"]

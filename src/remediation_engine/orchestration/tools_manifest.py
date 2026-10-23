@@ -36,13 +36,34 @@ class _PackageCheckpoint:
     touched_files_before: set[str]
 
 
-def _package_checkpoint_paths(manifest_paths: Iterable[str]) -> list[str]:
-    """Return manifests and npm lockfiles that may change for a package update."""
+def _package_checkpoint_paths(
+    manifest_paths: Iterable[str],
+    *,
+    package_ecosystem: str = "npm",
+) -> list[str]:
+    """Return manifests and manager-owned lockfiles that may change.
+
+    Args:
+        manifest_paths: Repository-relative declaration files for a package.
+        package_ecosystem: ``npm`` or ``pypi``; Python Pipfile transactions
+            own their adjacent ``Pipfile.lock`` while requirements and PEP 621
+            installs do not claim to create a lockfile.
+
+    Returns:
+        Sorted, validated paths captured by the transaction checkpoint.
+    """
     paths: set[str] = set()
+    ecosystem = str(package_ecosystem or "").strip().casefold()
     for manifest_path in manifest_paths:
         normalized_manifest = _validate_workspace_path(manifest_path)
         paths.add(normalized_manifest)
         parent = Path(normalized_manifest).parent
+        if ecosystem == "pypi":
+            if Path(normalized_manifest).name.casefold() == "pipfile":
+                paths.add(_validate_workspace_path((parent / "Pipfile.lock").as_posix()))
+            continue
+        if ecosystem != "npm":
+            raise ValueError(f"Unsupported package ecosystem: {package_ecosystem!r}.")
         ancestor_dirs = [parent, *parent.parents]
         for directory in ancestor_dirs:
             for lockfile_name in ("package-lock.json", "npm-shrinkwrap.json"):
@@ -50,14 +71,52 @@ def _package_checkpoint_paths(manifest_paths: Iterable[str]) -> list[str]:
     return sorted(paths)
 
 
+def _normalize_python_manifest_targets(target_manifest_paths: Iterable[str]) -> list[str]:
+    """Return safe, validated Python declarations that workers may edit.
+
+    Args:
+        target_manifest_paths: Candidate declaration paths committed by the
+            Supervisor.
+
+    Returns:
+        Sorted repository-relative paths limited to supported Python files.
+
+    Raises:
+        ValueError: If a path is unsafe or is not a supported declaration.
+    """
+    requirements_pattern = re.compile(r"requirements(?:[-_.][^/\\]+)?\.txt$", re.IGNORECASE)
+    manifest_paths = sorted(
+        {_validate_workspace_path(path) for path in target_manifest_paths if path}
+    )
+    invalid = [
+        path
+        for path in manifest_paths
+        if not (
+            requirements_pattern.fullmatch(Path(path).name)
+            or Path(path).name.casefold() in {"pyproject.toml", "setup.cfg", "pipfile"}
+        )
+    ]
+    if invalid:
+        raise ValueError(
+            "Python target manifest paths must point to requirements.txt variants, "
+            f"pyproject.toml, setup.cfg, or Pipfile. Invalid values: {invalid}"
+        )
+    return manifest_paths
+
+
 def _capture_package_checkpoint(
     sandbox: DockerSandbox,
     manifest_paths: Iterable[str],
     touched_files: set[str],
+    *,
+    package_ecosystem: str = "npm",
 ) -> _PackageCheckpoint:
     """Capture the current package manifests and related lockfiles before editing."""
     files: dict[str, str | None] = {}
-    for path in _package_checkpoint_paths(manifest_paths):
+    for path in _package_checkpoint_paths(
+        manifest_paths,
+        package_ecosystem=package_ecosystem,
+    ):
         content = sandbox.read_file(path)
         files[path] = content if isinstance(content, str) else None
     return _PackageCheckpoint(files=files, touched_files_before=set(touched_files))
@@ -801,7 +860,12 @@ def _is_prohibited_target(rel_path: str) -> bool:
         "pom.xml",
         "build.gradle",
         "requirements.txt",
+        "requirements-dev.txt",
+        "pipfile",
+        "pipfile.lock",
+        "setup.cfg",
         "pyproject.toml",
+        "setup.py",
     ):
         return True
 

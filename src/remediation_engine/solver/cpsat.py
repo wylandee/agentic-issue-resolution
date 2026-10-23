@@ -241,6 +241,13 @@ def _at_least(version: str, floor: str | None, version_scheme: str = "semver") -
     """Return whether a candidate version is at least a security floor."""
     if not floor:
         return True
+    if ".post" in version.casefold() or ".post" in floor.casefold():
+        try:
+            from packaging.version import Version
+
+            return Version(version) >= Version(floor)
+        except Exception:  # noqa: BLE001 - malformed Python version is not proof
+            return False
     try:
         return _compare_versions(version, floor, version_scheme) >= 0
     except (TypeError, ValueError):
@@ -469,23 +476,50 @@ def _floor_for_target(
     )
     floors: list[str] = []
     for finding in requirements:
-        if not finding.fixed_version:
+        fixed = finding.direct_parent_minimum_version or finding.fixed_version
+        if not fixed:
             continue
-        try:
-            _compare_versions(finding.fixed_version, finding.fixed_version, target.version_scheme)
-        except (TypeError, ValueError):
+        if target.version_scheme == "maven":
+            try:
+                _compare_versions(fixed, fixed, target.version_scheme)
+            except (TypeError, ValueError):
+                valid = False
+            else:
+                valid = True
+        else:
+            valid = _version_key(fixed) is not None
+            if ".post" in fixed.casefold():
+                try:
+                    from packaging.version import Version
+
+                    parsed = Version(fixed)
+                    valid = parsed.epoch == 0 and not parsed.is_prerelease and not parsed.is_devrelease
+                except Exception:  # noqa: BLE001 - malformed PEP 440 floor is not proof
+                    valid = False
+        if not valid:
             _diagnostic(
                 diagnostics,
-                f"invalid security floor {finding.fixed_version!r} for {finding.coverage_id}",
+                f"invalid security floor {fixed!r} for {finding.coverage_id}",
             )
             continue
-        floors.append(finding.fixed_version)
+        floors.append(fixed)
     if not floors:
         return None
-    return max(
-        floors,
-        key=cmp_to_key(lambda left, right: _compare_versions(left, right, target.version_scheme)),
-    )
+    if target.version_scheme == "maven":
+        return max(
+            floors,
+            key=cmp_to_key(
+                lambda left, right: _compare_versions(left, right, target.version_scheme)
+            ),
+        )
+    if any(".post" in item.casefold() for item in floors):
+        try:
+            from packaging.version import Version
+
+            return str(max((Version(item) for item in floors)))
+        except Exception:  # noqa: BLE001 - validation above already failed closed
+            return None
+    return max(floors, key=lambda item: _version_key(item) or ())
 
 
 def _pair_allowed(
@@ -876,6 +910,9 @@ def _build_decision(
             "Migrate all affected production and test code to the selected package API "
             "while preserving behavior; do not change the solver-approved package or version."
         )
+    parent_requirement = next(
+        (finding for finding in requirements if finding.direct_parent_name), None
+    )
     return SolverTaskDecision(
         task_id=target.task_id,
         selected_strategy=strategy,
@@ -895,6 +932,23 @@ def _build_decision(
         manifest_path=target.manifest_path,
         lockfile_package_key=target.lockfile_package_key,
         dependency_type=None if non_mutating_workaround else target.dependency_type,
+        parent_package_name=(
+            parent_requirement.direct_parent_name if parent_requirement is not None else None
+        ),
+        parent_package_version=(
+            target.installed_version if parent_requirement is not None else None
+        ),
+        parent_minimum_version=(
+            parent_requirement.direct_parent_minimum_version
+            if parent_requirement is not None
+            else None
+        ),
+        vulnerable_package_name=(
+            parent_requirement.vulnerable_package if parent_requirement is not None else None
+        ),
+        vulnerable_fixed_version=(
+            parent_requirement.fixed_version if parent_requirement is not None else None
+        ),
     )
 
 
@@ -1712,9 +1766,13 @@ def solve_portfolio(
             sum(
                 1
                 for candidate in domains.get(finding.target_occurrence_id, ())
-                if finding.fixed_version
+                if (finding.direct_parent_minimum_version or finding.fixed_version)
                 and candidate.meets_security_floor
-                and _at_least(candidate.version, finding.fixed_version, candidate.version_scheme)
+                and _at_least(
+                    candidate.version,
+                    finding.direct_parent_minimum_version or finding.fixed_version,
+                    candidate.version_scheme,
+                )
             )
             for finding in finding_list
         )
@@ -2269,12 +2327,17 @@ def solve_portfolio(
         occurrence_var = vars_by_id.get(finding.target_occurrence_id)
         candidates = domains.get(finding.target_occurrence_id, ())
         good_indices: list[int] = []
-        if occurrence_var is not None and finding.fixed_version:
+        finding_floor = (
+            finding.direct_parent_minimum_version
+            if finding.direct_parent_name
+            else finding.fixed_version
+        )
+        if occurrence_var is not None and finding_floor:
             good_indices = [
                 index
                 for index, candidate in enumerate(candidates)
                 if candidate.meets_security_floor
-                and _at_least(candidate.version, finding.fixed_version, candidate.version_scheme)
+                and _at_least(candidate.version, finding_floor, candidate.version_scheme)
             ]
         target = target_by_id.get(finding.target_occurrence_id)
         terminal_status = (
@@ -2283,9 +2346,11 @@ def solve_portfolio(
         if terminal_status is not None:
             status_quo_covered = (
                 terminal_status == "qa_passed"
-                and finding.fixed_version is not None
+                and finding_floor is not None
                 and _at_least(
-                    target.installed_version, finding.fixed_version, target.version_scheme
+                    target.installed_version,
+                    finding_floor,
+                    target.version_scheme,
                 )
             )
             model.Add(version_bool == int(status_quo_covered))
@@ -2318,7 +2383,7 @@ def solve_portfolio(
                 # workaround carries the plan IDs that authorize it.
                 model.Add(workaround == 1)
         model.AddMaxEquality(covered, [version_bool, workaround])
-        coverage_meta[finding.coverage_id] = (good_indices, finding.fixed_version)
+        coverage_meta[finding.coverage_id] = (good_indices, finding_floor)
 
     candidate_literals: dict[str, list[Any]] = {}
     for target in eligible:

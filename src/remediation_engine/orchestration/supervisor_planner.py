@@ -30,8 +30,10 @@ from remediation_engine.orchestration.supervisor_policy import (
     _TERMINAL_STATUSES,
     _canonical_security_floor,
     _is_exhausted_update_pivot_candidate,
+    _latest_sca_stage,
     _next_sca_stage,
     _task_sort_key,
+    _task_uses_pypi,
     instruction_digest,
 )
 from remediation_engine.orchestration.task_utils import (
@@ -40,6 +42,10 @@ from remediation_engine.orchestration.task_utils import (
 )
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.tools.maven_registry_tools import fetch_maven_registry_candidates
+from remediation_engine.tools.pypi_registry_tools import (
+    fetch_pypi_registry_candidates,
+    plan_python_parent_version,
+)
 from remediation_engine.tools.registry_tools import (
     fetch_registry_candidates,
     plan_npm_parent_version,
@@ -52,8 +58,10 @@ QA_DISPATCH_LIMIT: int = 30
 _SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.OSV_MINIMUM: 0,
     SCARemediationStage.NPM_SAME_MAJOR: 1,
+    SCARemediationStage.PYPI_SAME_MAJOR: 1,
     SCARemediationStage.NPM_LATEST: 2,
     SCARemediationStage.MAVEN_LATEST: 1,
+    SCARemediationStage.PYPI_LATEST: 2,
     SCARemediationStage.PACKAGE_OVERRIDE: 3,
     SCARemediationStage.CODE_WORKAROUND: 4,
 }
@@ -68,24 +76,55 @@ def _supervisor_fetch_registry_candidates(
     *,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
     maven_mode: bool = False,
+    ecosystem: str | None = None,
 ) -> list[RegistryCandidate | MavenRegistryCandidate]:
-    """Fetch registry candidates as a Supervisor-owned traced operation."""
+    """Fetch registry candidates as a Supervisor-owned traced operation.
+
+    Args:
+        package_name: Exact package identity committed by the Supervisor.
+        security_floor: Minimum non-vulnerable version to consider.
+        attempted_versions: Previously attempted versions to exclude.
+        project_language: Language profile associated with the task.
+        maven_mode: Whether Java dependency coordinates use Maven semantics.
+        ecosystem: Optional explicit registry ecosystem for non-Maven tasks.
+
+    Returns:
+        Candidates returned by the selected registry adapter.
+    """
+    normalized_ecosystem = str(
+        ecosystem
+        or (
+            "maven"
+            if project_language == ProjectLanguage.JAVA and maven_mode
+            else "pypi"
+            if project_language == ProjectLanguage.PYTHON
+            else "npm"
+        )
+    ).strip().casefold()
+    if normalized_ecosystem not in {"npm", "maven", "pypi"}:
+        raise ValueError(f"Unsupported registry ecosystem: {normalized_ecosystem}")
     inputs = {
         "package_name": package_name,
         "security_floor": security_floor,
         "attempted_versions": attempted_versions,
         "project_language": project_language.value,
+        "ecosystem": normalized_ecosystem,
     }
 
     def fetch() -> list[RegistryCandidate | MavenRegistryCandidate]:
-        if project_language == ProjectLanguage.JAVA and maven_mode:
+        if normalized_ecosystem == "maven":
             return fetch_maven_registry_candidates(
                 package_name,
                 security_floor,
                 attempted_versions,
             )
+        if normalized_ecosystem == "pypi":
+            return fetch_pypi_registry_candidates(
+                package_name,
+                security_floor,
+                attempted_versions,
+            )
         return fetch_registry_candidates(package_name, security_floor, attempted_versions)
-
     return invoke_with_trajectory(
         "supervisor.fetch_registry_candidates",
         fetch,
@@ -220,6 +259,16 @@ def _supervisor_plan_npm_parent_version(inputs: dict[str, Any]) -> str:
     )
 
 
+def _supervisor_plan_python_parent_version(inputs: dict[str, Any]) -> str:
+    """Run the PyPI parent planner under an explicit Supervisor tool span."""
+    return invoke_with_trajectory(
+        "supervisor.plan_python_parent_version",
+        lambda: plan_python_parent_version.invoke(inputs),
+        inputs,
+        run_type="tool",
+    )
+
+
 def _commit_task_transition(*args: Any, **kwargs: Any) -> Any:
     from remediation_engine.orchestration import supervisor_node
 
@@ -331,6 +380,7 @@ def _planner_plan_violations(
     plans: dict[str, SupervisorRetryPlan],
     task_queue: dict[str, RemediationTask],
     diagnostics_by_task: dict[str, UpdateRetryDiagnostics],
+    group_by_id: dict[str, VulnerabilityGroup] | None = None,
 ) -> list[str]:
     """Validate retry-plan semantics before a plan can mutate routing state.
 
@@ -346,6 +396,30 @@ def _planner_plan_violations(
         if task is None:
             violations.append(f"task {task_id}: planner returned an unknown task")
             continue
+        group = (group_by_id or {}).get(task.parent_group_id)
+        python_task = _task_uses_pypi(task, group)
+        latest_stage = _latest_sca_stage(task, group)
+        allowed_stages = (
+            {
+                SCARemediationStage.OSV_MINIMUM,
+                SCARemediationStage.PYPI_SAME_MAJOR,
+                SCARemediationStage.PYPI_LATEST,
+                SCARemediationStage.CODE_WORKAROUND,
+            }
+            if python_task
+            else {
+                SCARemediationStage.OSV_MINIMUM,
+                SCARemediationStage.NPM_SAME_MAJOR,
+                SCARemediationStage.NPM_LATEST,
+                SCARemediationStage.PACKAGE_OVERRIDE,
+                SCARemediationStage.CODE_WORKAROUND,
+            }
+        )
+        if plan.strategy_stage not in allowed_stages:
+            violations.append(
+                f"task {task_id}: stage {plan.strategy_stage.value} is not valid for "
+                f"{'pypi' if python_task else 'npm'}"
+            )
         if task.status in _TERMINAL_STATUSES:
             violations.append(f"task {task_id}: planner returned a plan for terminal task")
         if plan.source_task_revision != task.task_revision:
@@ -371,13 +445,13 @@ def _planner_plan_violations(
                 f"task {task_id}: selected version {plan.selected_version} was already attempted"
             )
         if (
-            plan.strategy_stage == SCARemediationStage.NPM_LATEST
+            plan.strategy_stage == latest_stage
             and selected
             and plan.latest_version_seen
             and selected != plan.latest_version_seen.strip().lstrip("vV").lower()
         ):
             violations.append(
-                f"task {task_id}: npm_latest selected {plan.selected_version}, "
+                f"task {task_id}: {latest_stage.value} selected {plan.selected_version}, "
                 f"but registry latest is {plan.latest_version_seen}"
             )
         if plan.action == "retry_update" and selected is None:
@@ -403,7 +477,7 @@ def _planner_plan_violations(
         required_pivot_stage = (
             SCARemediationStage.MAVEN_LATEST
             if plan.version_scheme == "maven"
-            else SCARemediationStage.NPM_LATEST
+            else latest_stage
         )
         if plan.action == "pivot_workaround" and plan.strategy_stage != required_pivot_stage:
             violations.append(
@@ -563,17 +637,36 @@ def _repair_invalid_planner_plans(
             continue
 
         candidate = None
-        plan_regresses = (
-            task_queue[task_id].strategy == RoutingStrategy.VERSION_BUMP
-            and _SCA_STAGE_ORDER[plan.strategy_stage]
-            < _SCA_STAGE_ORDER[task_queue[task_id].strategy_stage]
+        task = task_queue[task_id]
+        group = group_by_id.get(task.parent_group_id)
+        latest_stage = _latest_sca_stage(task, group)
+        python_task = _task_uses_pypi(task, group)
+        valid_stages = (
+            {
+                SCARemediationStage.OSV_MINIMUM,
+                SCARemediationStage.PYPI_SAME_MAJOR,
+                SCARemediationStage.PYPI_LATEST,
+                SCARemediationStage.CODE_WORKAROUND,
+            }
+            if python_task
+            else {
+                SCARemediationStage.OSV_MINIMUM,
+                SCARemediationStage.NPM_SAME_MAJOR,
+                SCARemediationStage.NPM_LATEST,
+                SCARemediationStage.PACKAGE_OVERRIDE,
+                SCARemediationStage.CODE_WORKAROUND,
+            }
         )
+        plan_regresses = (
+            task.strategy == RoutingStrategy.VERSION_BUMP
+            and _SCA_STAGE_ORDER[plan.strategy_stage] < _SCA_STAGE_ORDER[task.strategy_stage]
+        ) or plan.strategy_stage not in valid_stages
         # A correction cannot reopen an earlier stage.  In particular, a
         # stale same-major proposal must not revive a version-bump parent that
         # has already reached code_workaround.  Let the fail-closed branch
         # below create the deterministic latest-stage pivot instead.
         if not plan_regresses and plan.strategy_stage != SCARemediationStage.CODE_WORKAROUND:
-            # At npm_latest, only the registry's declared latest version is
+            # At the ecosystem's latest stage, only the registry's declared latest version is
             # safe to repair into a retry. Older candidates are already
             # covered by the bounded update stages and selecting one here can
             # produce a null/stale dispatch state after the guardrail clears
@@ -581,7 +674,7 @@ def _repair_invalid_planner_plans(
             # deterministic workaround pivot.
             repair_candidates = (
                 [plan.latest_version_seen]
-                if plan.strategy_stage == SCARemediationStage.NPM_LATEST
+                if plan.strategy_stage == latest_stage
                 else [plan.latest_version_seen, *plan.candidate_versions_considered]
             )
             for version in repair_candidates:
@@ -591,12 +684,17 @@ def _repair_invalid_planner_plans(
 
         if candidate:
             effective_stage = plan.strategy_stage
+            same_major_stage = (
+                SCARemediationStage.PYPI_SAME_MAJOR
+                if python_task
+                else SCARemediationStage.NPM_SAME_MAJOR
+            )
             if (
-                effective_stage == SCARemediationStage.NPM_SAME_MAJOR
+                effective_stage == same_major_stage
                 and plan.latest_version_seen
                 and candidate == plan.latest_version_seen.strip().lstrip("vV")
             ):
-                effective_stage = SCARemediationStage.NPM_LATEST
+                effective_stage = latest_stage
             if diagnostics is None:
                 diagnostics = UpdateRetryDiagnostics(task_id=task_id)
             group = group_by_id.get(task_queue[task_id].parent_group_id)
@@ -641,7 +739,7 @@ def _repair_invalid_planner_plans(
         # No direct unattempted candidate can be proven. Clear stale selection
         # and pivot at the terminal update stage so no guessed/old version is
         # sent to the dumb update worker.
-        effective_stage = SCARemediationStage.NPM_LATEST
+        effective_stage = latest_stage
         if diagnostics is None:
             diagnostics = UpdateRetryDiagnostics(task_id=task_id)
         diagnostics = diagnostics.model_copy(
@@ -654,7 +752,6 @@ def _repair_invalid_planner_plans(
             }
         )
         repaired_diagnostics[task_id] = diagnostics
-        group = group_by_id.get(task_queue[task_id].parent_group_id)
         component = group.vulnerable_component if group else task_queue[task_id].parent_group_id
         instruction = (
             f"Implement a code workaround or isolation strategy for {component} "
@@ -950,7 +1047,8 @@ def _needs_planner(
     """Return True when deterministic retry planning should run.
 
     Retry planning is reserved for VERSION_BUMP retry analysis and playbook selection.
-    CODE_WORKAROUND tasks do not use the npm version planner.
+    Both npm and PyPI candidates come only from the committed outer allowlist;
+    CODE_WORKAROUND tasks do not use the version planner.
     """
     version_bump_retries = [
         t
@@ -965,6 +1063,8 @@ def _needs_planner(
                     SCARemediationStage.NPM_SAME_MAJOR,
                     SCARemediationStage.NPM_LATEST,
                     SCARemediationStage.MAVEN_LATEST,
+                    SCARemediationStage.PYPI_SAME_MAJOR,
+                    SCARemediationStage.PYPI_LATEST,
                 }
                 or (
                     t.strategy_stage == SCARemediationStage.CODE_WORKAROUND
@@ -1015,6 +1115,8 @@ def _run_deterministic_retry_planner(
                 SCARemediationStage.NPM_SAME_MAJOR,
                 SCARemediationStage.NPM_LATEST,
                 SCARemediationStage.MAVEN_LATEST,
+                SCARemediationStage.PYPI_SAME_MAJOR,
+                SCARemediationStage.PYPI_LATEST,
                 SCARemediationStage.CODE_WORKAROUND,
             }
             and (

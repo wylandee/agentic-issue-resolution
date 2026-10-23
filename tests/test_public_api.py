@@ -361,3 +361,69 @@ def test_cli_exposes_ingest_triage_and_run_commands() -> None:
             else [command, "issues.jsonl"]
         )
         assert args.command == command
+
+# Stage-2 behavior retained during the architecture merge.
+from remediation_engine.language import ProjectLanguage
+
+from remediation_engine.orchestration.graph import triage_node
+
+from remediation_engine.orchestration.state import initial_orchestrator_state
+
+def test_run_remediation_preserves_context_when_filling_language(tmp_path: Path) -> None:
+    """A missing language is filled without replacing caller context."""
+    (tmp_path / "requirements.txt").touch()
+    context = SystemContext(
+        public_facing=False,
+        deployment_os="linux",
+        deployment_architecture="service",
+        environment="staging",
+        data_sensitivity="high",
+        tags={"team": "platform"},
+    )
+    request = RemediationRequest(repo_root=tmp_path, system_context=context)
+    with patch(
+        "remediation_engine.api.run_orchestrator",
+        return_value={"status": "completed", "errors": []},
+    ) as orchestrator:
+        run_remediation(request)
+
+    received = orchestrator.call_args.kwargs["system_context"]
+    assert received is not context
+    assert received.primary_language == ProjectLanguage.PYTHON.value
+    assert received.environment == "staging"
+    assert received.public_facing is False
+    assert received.deployment_architecture == "service"
+    assert received.data_sensitivity == "high"
+    assert received.tags == {"team": "platform"}
+    assert context.primary_language is None
+    assert orchestrator.call_args.kwargs["project_language"] is ProjectLanguage.PYTHON
+
+def test_triage_issues_preserves_context_when_filling_language(tmp_path: Path) -> None:
+    """Triage derives execution language without discarding caller metadata."""
+    (tmp_path / "Pipfile").touch()
+    context = SystemContext(environment="staging", tags={"owner": "security"})
+    with patch("remediation_engine.api.run_triage_pipeline", return_value=[]) as pipeline:
+        triage_issues([], repo_root=tmp_path, system_context=context)
+
+    received = pipeline.call_args.args[1]
+    assert received is not context
+    assert received.primary_language == ProjectLanguage.PYTHON.value
+    assert received.environment == "staging"
+    assert received.tags == {"owner": "security"}
+    assert context.primary_language is None
+
+def test_context_free_raw_issue_triage_keeps_graph_skip(tmp_path: Path) -> None:
+    """Raw findings without a system context still skip graph triage."""
+    state = initial_orchestrator_state(
+        str(tmp_path),
+        [],
+        issues=[_issue()],
+        system_context=None,
+    )
+    with patch("remediation_engine.orchestration.graph.run_triage_pipeline") as pipeline:
+        result = triage_node(state)
+
+    pipeline.assert_not_called()
+    assert state["project_language"] is ProjectLanguage.NODEJS
+    assert result["status"] == "triage_skipped"
+    assert result["initial_triage_status"] == "skipped_missing_input"

@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from remediation_engine.contracts.schemas import AgentActionStatus
+from remediation_engine.language import ProjectLanguage
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,
@@ -24,6 +25,7 @@ from tests.evals.replay_adapters import replay_workaround_case
 from tests.evals.replay_harness import (
     ReplayCapture,
     ScriptedReplayModel,
+    _case_project_language,
     cached_replay,
     format_tool_trace,
 )
@@ -115,22 +117,85 @@ def build_workaround_test_case(
 
 def _measure_expected(
     metric: Any,
-    test_case: LLMTestCase,
+    test_case: Any,
     *,
     expected_pass: bool,
     case_id: str,
     label: str,
 ) -> None:
-    """Measure an expected-positive or expected-negative metric."""
-    if expected_pass:
-        if assert_test is not None:
-            assert_test(test_case, [metric], run_async=False)
-        else:
-            metric.measure(test_case)
-            assert metric.is_successful(), f"Case {case_id!r} failed {label}."
-    else:
+    """Measure and register an expected-positive or expected-negative metric."""
+    if assert_test is None:
         metric.measure(test_case)
-        assert not metric.is_successful(), f"Case {case_id!r} unexpectedly passed {label}."
+    else:
+        try:
+            assert_test(test_case, [metric], run_async=False)
+        except AssertionError:
+            if expected_pass or metric.is_successful() or getattr(metric, "error", None):
+                raise
+
+    actual_pass = bool(metric.is_successful())
+    assert actual_pass is expected_pass, (
+        f"Case {case_id!r} expected {label} to {'pass' if expected_pass else 'fail'}."
+    )
+
+
+def test_expected_negative_metric_is_registered_with_deepeval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expected-negative judgments should be recorded instead of silently measured."""
+
+    class FailedMetric:
+        error = None
+
+        def is_successful(self) -> bool:
+            return False
+
+        def measure(self, test_case: Any) -> None:
+            raise AssertionError("DeepEval registration should own measurement")
+
+    test_case = object()
+    metric = FailedMetric()
+    registered: list[tuple[Any, list[Any], bool]] = []
+
+    def fake_assert_test(
+        actual_case: Any,
+        metrics: list[Any],
+        *,
+        run_async: bool = False,
+    ) -> None:
+        registered.append((actual_case, metrics, run_async))
+        raise AssertionError("expected-negative metric did not pass")
+
+    monkeypatch.setattr(
+        "tests.evals.test_workaround_subagent_eval.assert_test",
+        fake_assert_test,
+    )
+    _measure_expected(
+        metric,
+        test_case,
+        expected_pass=False,
+        case_id="negative-case",
+        label="task completion",
+    )
+
+    assert registered == [(test_case, [metric], False)]
+
+
+def test_python_validation_failure_cases_require_successful_validation_for_completion() -> None:
+    """Negative task-completion labels must require all Python gates to pass."""
+    case_ids = {
+        "python-workaround-invalid-test-target",
+        "python-workaround-runtime-smoke-failure",
+    }
+    cases = {case["case_id"]: case for case in _WORKAROUND_CASES if case["case_id"] in case_ids}
+    assert set(cases) == case_ids
+    for case in cases.values():
+        assert case["expected_completion_pass"] is False
+        assert (
+            "pass syntax, runtime smoke, and the assigned pytest target" in case["completion_task"]
+        )
+        assert "does not complete the task" in case["completion_task"]
+        assert case.get("task_completion_applicable") is False
 
 
 def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
@@ -175,24 +240,25 @@ class TestWorkaroundSubagentEval:
             replay_source="production_live",
             capture=capture,
         )
-        if DeepEvalToolCorrectnessMetric is not None:
+        if DeepEvalToolCorrectnessMetric is not None and bool(
+            case.get("tool_correctness_applicable", True)
+        ):
             tool_metric = DeepEvalToolCorrectnessMetric(
                 threshold=0.50,
                 evaluation_params=[],
                 should_consider_ordering=True,
                 should_exact_match=False,
             )
-            if bool(case.get("expected_tool_correctness_pass", True)):
-                _measure_expected(
-                    tool_metric,
-                    test_case,
-                    expected_pass=True,
-                    case_id=str(case["case_id"]),
-                    label="workaround tool correctness",
-                )
-            else:
-                tool_metric.measure(test_case)
-        if DeepEvalTaskCompletionMetric is not None:
+            _measure_expected(
+                tool_metric,
+                test_case,
+                expected_pass=bool(case.get("expected_tool_correctness_pass", True)),
+                case_id=str(case["case_id"]),
+                label="workaround tool correctness",
+            )
+        if DeepEvalTaskCompletionMetric is not None and bool(
+            case.get("task_completion_applicable", True)
+        ):
             task_metric = DeepEvalTaskCompletionMetric(
                 threshold=0.70,
                 model=eval_settings.judge_model,
@@ -253,7 +319,15 @@ def test_workaround_subagent_offline_production_replay(
     assert _tool_signature(capture.actual_tools) == _tool_signature(
         scripted_tools[: len(capture.actual_tools)]
     )
-    assert model.invocation_count == len(capture.actual_tools)
+    expected_invocations = len(capture.actual_tools)
+    if case.get("expected_failure_marker") in {
+        "INVALID_VALIDATION_INPUT",
+        "runtime_smoke",
+    }:
+        # A terminal validation failure can be followed by one final model turn
+        # before the worker ends the attempt without another tool call.
+        expected_invocations += 1
+    assert model.invocation_count == expected_invocations
     assert capture.attempt_id == case.get("attempt_id")
     assert capture.task_revision == int(case.get("task_revision") or 1)
     assert all(
@@ -267,30 +341,43 @@ def test_workaround_subagent_offline_production_replay(
         "workaround-surrender-after-max-tool-round-limit",
     }
     summary = capture.typed_result["action_summaries"][0]
-    if case_id in surrender_cases:
+    if case_id in surrender_cases or case.get("action_status") == "SURRENDER":
         assert summary.status == AgentActionStatus.SURRENDER
-        evidence = "\n".join(
-            [*capture.errors, capture.actual_output]
-            + [str(event.get("output", "")) for event in capture.actual_tools]
-        )
-        terminal_marker = str(case["terminal_error_code"])
-        if terminal_marker == "MAX_SUBAGENT_TOOL_CALL_ROUNDS":
-            assert "maximum tool-call rounds" in evidence
-        else:
-            assert terminal_marker in evidence
+        if "terminal_error_code" in case:
+            evidence = "\n".join(
+                [*capture.errors, capture.actual_output]
+                + [str(event.get("output", "")) for event in capture.actual_tools]
+            )
+            terminal_marker = str(case["terminal_error_code"])
+            if terminal_marker == "MAX_SUBAGENT_TOOL_CALL_ROUNDS":
+                assert "maximum tool-call rounds" in evidence
+            else:
+                assert terminal_marker in evidence
         source_path = next(
             path for path in case["changed_files"] if not str(path).endswith(".json")
         )
-        baseline = case["replay"]["input"]["workspace_files"][source_path]
-        assert capture.final_files[source_path] == baseline
+        if case.get("expect_restored", True):
+            baseline = case["replay"]["input"]["workspace_files"][source_path]
+            assert capture.final_files[source_path] == baseline
+        marker = case.get("expected_failure_marker")
+        if marker:
+            assert marker in "\n".join(
+                [capture.actual_output, *capture.errors]
+                + [str(event.get("output", "")) for event in capture.actual_tools]
+            )
         return
     assert summary.status == AgentActionStatus.SUCCESS
     expected_changed_files = set(case["changed_files"])
     if case_id == "workaround-no-fix-package-removal":
         expected_changed_files.discard("package-lock.json")
     assert set(capture.changed_files) == expected_changed_files
+    validation_tool = (
+        "validate_python_workaround"
+        if _case_project_language(case) == ProjectLanguage.PYTHON
+        else "validate_workaround"
+    )
     assert any(
-        event["name"] == "validate_workaround" and event["output"].startswith("SUCCESS:")
+        event["name"] == validation_tool and event["output"].startswith("SUCCESS:")
         for event in capture.actual_tools
     )
 

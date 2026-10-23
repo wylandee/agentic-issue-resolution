@@ -10,6 +10,7 @@ from remediation_engine.contracts import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    LocalizedIssue,
     NoFixMitigationStage,
     RegistryCandidate,
     RemediationTask,
@@ -35,6 +36,7 @@ from remediation_engine.orchestration.supervisor_node import (
     supervisor_router,
 )
 from remediation_engine.orchestration.tactical_supervisor import TacticalCandidateSet
+from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 
 
 def _group(group_id: str, severity: Severity = Severity.HIGH, *, no_fix: bool = False):
@@ -393,31 +395,27 @@ def test_version_policy_is_deterministic_and_skips_attempts():
 def test_deterministic_retry_planner_preserves_committed_stage(monkeypatch):
     group = _group("g")
     task = _task("task-1", "g", status=TaskStatus.NEEDS_RETRY).model_copy(
-        update={"strategy_stage": SCARemediationStage.NPM_LATEST}
+        update={
+            "strategy_stage": SCARemediationStage.NPM_LATEST,
+            "allowed_target_versions": ["1.3.0"],
+        }
     )
     diagnostics = UpdateRetryDiagnostics(task_id="task-1")
-    candidates = [
-        RegistryCandidate(
-            version="1.3.0",
-            semver_key=(1, 3, 0),
-            security_floor_met=True,
-            is_stable=True,
-            same_major=True,
-            already_attempted=False,
-        )
-    ]
+    registry_calls = []
     monkeypatch.setattr(
         "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
-        lambda *args, **kwargs: candidates,
+        lambda *args, **kwargs: registry_calls.append((args, kwargs)),
     )
     plan = _build_deterministic_retry_plan(task, diagnostics, group)
     assert plan.strategy_stage == SCARemediationStage.NPM_LATEST
     assert plan.selected_version == "1.3.0"
+    assert registry_calls == []
 
 
 def test_deterministic_retry_planner_does_not_widen_approved_candidate_pool(monkeypatch):
     group = _group("g")
     task = _task("task-1", "g", status=TaskStatus.NEEDS_RETRY)
+    task = task.model_copy(update={"allowed_target_versions": ["1.0.0", "1.2.0", "2.0.0"]})
     diagnostics = UpdateRetryDiagnostics(
         task_id="task-1",
         target_package_name="test-package",
@@ -427,34 +425,14 @@ def test_deterministic_retry_planner_does_not_widen_approved_candidate_pool(monk
     )
     calls: list[set[str]] = []
 
-    def candidates(_package_name, _security_floor, attempted_versions):
-        calls.append(set(attempted_versions))
-        return [
-            RegistryCandidate(
-                version=version,
-                semver_key=tuple(int(part) for part in version.split(".")),
-                security_floor_met=True,
-                is_stable=True,
-                same_major=version.startswith("1."),
-                already_attempted=False,
-                selection_roles=roles,
-            )
-            for version, roles in (
-                ("1.0.0", ("osv_minimum",)),
-                ("1.1.0", ("osv_minimum",)),
-                ("1.2.0", ("same_major",)),
-                ("2.0.0", ("npm_latest",)),
-            )
-        ]
-
     monkeypatch.setattr(
         "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
-        candidates,
+        lambda *args, **kwargs: calls.append((args, kwargs)),
     )
 
     plan = _build_deterministic_retry_plan(task, diagnostics, group)
 
-    assert calls == [set()]
+    assert calls == []
     assert plan.selected_version == "1.2.0"
     assert plan.candidate_versions_considered == ["1.0.0", "1.2.0", "2.0.0"]
 
@@ -492,3 +470,67 @@ def test_authoritative_route_and_audit_are_typed():
     assert decision.target_task_ids == ["task-1"]
     assert audit.decision_code == DecisionCode.NEW_VERSION_BUMP
     assert audit.state_revision == 4
+
+
+def _pypi_group(group_id: str, *, transitive: bool = False) -> VulnerabilityGroup:
+    group = _group(group_id)
+    issue = group.issues[0].model_copy(
+        update={
+            "ecosystem": "pypi",
+            "purl": "pkg:pypi/Requests@1.0.0",
+            "package_name": "Requests",
+            "package_version": "1.0.0",
+        }
+    )
+    manifest = "Pipfile.lock" if transitive else "requirements.txt"
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file=manifest,
+        package_manager="pipenv" if transitive else "pip",
+        is_direct_dependency=not transitive,
+        declaration_type=None if transitive else "requirements",
+    )
+    return group.model_copy(
+        update={
+            "vulnerable_component": "Requests",
+            "issues": [issue],
+            "localized_issues": [localized],
+            "file_path": manifest,
+            "file_paths": [manifest],
+        }
+    )
+
+
+def test_initial_python_direct_task_preserves_declaration():
+    direct_group = _pypi_group("pypi-direct")
+    direct_task = build_initial_remediation_task(direct_group, "task-direct")
+    assert direct_task.target_package_name == "Requests"
+    assert direct_task.target_dependency_type == "requirements"
+    assert direct_task.strategy_stage == SCARemediationStage.OSV_MINIMUM
+
+
+def test_pypi_retry_uses_pep440_order_and_canonical_attempted_target(monkeypatch):
+    group = _pypi_group("pypi-direct")
+    task = build_initial_remediation_task(group, "task-pypi").model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PYPI_SAME_MAJOR,
+            "allowed_target_versions": ["1.9.0", "1.10.0", "2.0.0"],
+        }
+    )
+    diagnostics = UpdateRetryDiagnostics(
+        task_id=task.task_id,
+        attempted_versions_by_target={"Requests": ["1.10.0"]},
+        target_package_name="REQUESTS",
+        target_dependency_type="requirements",
+    )
+    queried = {}
+
+    monkeypatch.setattr(
+        "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
+        lambda *args, **kwargs: queried.update(args=args, kwargs=kwargs),
+    )
+    plan = _build_deterministic_retry_plan(task, diagnostics, group)
+    assert queried == {}
+    assert plan.selected_version == "1.9.0"
+    assert plan.target_package_name == "Requests"
+    assert plan.target_dependency_type == "requirements"

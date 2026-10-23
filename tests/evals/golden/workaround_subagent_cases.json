@@ -4484,5 +4484,691 @@
         "allowed_dependency_types": []
       }
     }
+  },
+  {
+    "case_id": "python-workaround-pyjwt-crit-header",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "synthetic_policy_case",
+    "provenance": "Synthetic Python workaround replay",
+    "evaluation_note": "Checks a bounded source mitigation against an explicit JWT security invariant; no historical successful PyJWT workaround is claimed.",
+    "supervisor_instruction": "Apply the committed Python source workaround to reject JWTs with unsupported critical headers. Do not change dependency manifests.",
+    "completion_task": "Validate the Python source mitigation with syntax, runtime smoke, and the assigned pytest target.",
+    "target_package_name": "pyjwt",
+    "attempt_id": "attempt-python-workaround-pyjwt-crit-header",
+    "task_revision": 1,
+    "is_retry": false,
+    "expected_output": "The worker applies the source mitigation and all Python validation gates pass.",
+    "changed_files": [
+      "src/auth.py"
+    ],
+    "action_status": "APPLIED",
+    "expected_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "input": "Python PyJWT workaround case: python-workaround-pyjwt-crit-header.",
+    "context": [
+      "Checks a bounded source mitigation against an explicit JWT security invariant; no historical successful PyJWT workaround is claimed.",
+      "Project language: Python",
+      "The dependency is committed as a version-bump candidate; this worker may only edit the authorized source file."
+    ],
+    "expected_tools": [
+      {
+        "name": "read_repository_map",
+        "args": {}
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "jwt.decode|jwt.get_unverified_header",
+          "target_directory": "src"
+        }
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "src/auth.py",
+          "start_line": 1,
+          "end_line": 20
+        }
+      },
+      {
+        "name": "search_web",
+        "args": {
+          "query": "PyJWT critical crit header validation reject unsupported crit token"
+        }
+      },
+      {
+        "name": "read_web_page",
+        "args": {
+          "url": "https://example.invalid/pyjwt-crit-advisory"
+        }
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "src/auth.py"
+          ],
+          "affected_symbols": [
+            "decode_cookie"
+          ],
+          "security_invariant": "JWT cookies with unsupported critical JOSE headers are rejected before decoded claims are trusted.",
+          "causal_hypothesis": "The application decodes tokens without checking the critical header extensions.",
+          "planned_replacements": [
+            {
+              "file_path": "src/auth.py",
+              "old_text": "    return decode(token, key, algorithms=[\"HS256\"])",
+              "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return decode(token, key, algorithms=[\"HS256\"])",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:src/auth.py; package:pyjwt",
+          "package_removal_requested": false
+        }
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "src/auth.py",
+              "old_text": "    return decode(token, key, algorithms=[\"HS256\"])",
+              "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return decode(token, key, algorithms=[\"HS256\"])",
+              "expected_occurrences": 1
+            }
+          ]
+        }
+      },
+      {
+        "name": "validate_python_workaround",
+        "args": {
+          "modified_files": [
+            "src/auth.py"
+          ],
+          "runtime_smoke_file": "src/auth.py",
+          "targeted_test_file": "tests/test_auth.py",
+          "targeted_test_name": "test_decode_cookie"
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "The Python JWT source mitigation passed its validation gates.",
+      "actual_tools": [
+        {
+          "name": "read_repository_map",
+          "args": {},
+          "output": "SUCCESS: Repository structure loaded."
+        },
+        {
+          "name": "search_codebase_pattern",
+          "args": {
+            "search_pattern": "jwt.decode|jwt.get_unverified_header",
+            "target_directory": "src"
+          },
+          "output": "SUCCESS: Found the JWT decode helper in src/auth.py."
+        },
+        {
+          "name": "read_workspace_file",
+          "args": {
+            "file_path": "src/auth.py",
+            "start_line": 1,
+            "end_line": 20
+          },
+          "output": "SUCCESS: Read src/auth.py."
+        },
+        {
+          "name": "search_web",
+          "args": {
+            "query": "PyJWT critical crit header validation reject unsupported crit token"
+          },
+          "output": "SUCCESS: Found the PyJWT critical-header advisory."
+        },
+        {
+          "name": "read_web_page",
+          "args": {
+            "url": "https://example.invalid/pyjwt-crit-advisory"
+          },
+          "output": "SUCCESS: Read advisory guidance requiring unsupported critical headers to be rejected."
+        },
+        {
+          "name": "record_plan",
+          "args": {
+            "affected_files": [
+              "src/auth.py"
+            ],
+            "affected_symbols": [
+              "decode_cookie"
+            ],
+            "security_invariant": "JWT cookies with unsupported critical JOSE headers are rejected before decoded claims are trusted.",
+            "causal_hypothesis": "The application decodes tokens without checking the critical header extensions.",
+            "planned_replacements": [
+              {
+                "file_path": "src/auth.py",
+                "old_text": "    return decode(token, key, algorithms=[\"HS256\"])",
+                "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return decode(token, key, algorithms=[\"HS256\"])",
+                "expected_occurrences": 1
+              }
+            ],
+            "evidence_source": "workspace:src/auth.py; package:pyjwt",
+            "package_removal_requested": false
+          },
+          "output": "SUCCESS: Plan revision 1 recorded successfully."
+        },
+        {
+          "name": "deterministic_apply_edit_set",
+          "args": {
+            "replacements": [
+              {
+                "file_path": "src/auth.py",
+                "old_text": "    return decode(token, key, algorithms=[\"HS256\"])",
+                "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return decode(token, key, algorithms=[\"HS256\"])",
+                "expected_occurrences": 1
+              }
+            ]
+          },
+          "output": "SUCCESS: Atomic edit set applied and is pending validation."
+        },
+        {
+          "name": "validate_python_workaround",
+          "args": {
+            "modified_files": [
+              "src/auth.py"
+            ],
+            "runtime_smoke_file": "src/auth.py",
+            "targeted_test_file": "tests/test_auth.py",
+            "targeted_test_name": "test_decode_cookie"
+          },
+          "output": "SUCCESS: Python syntax, runtime smoke, and targeted pytest validation passed."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "workspace_files": {
+          "requirements.txt": "PyJWT==2.4.0\n",
+          "src/auth.py": "from jwt import InvalidTokenError, decode, get_unverified_header\n\n\ndef decode_cookie(token: str, key: str) -> dict:\n    return decode(token, key, algorithms=[\"HS256\"])\n",
+          "tests/test_auth.py": "from src.auth import decode_cookie\n\ndef test_decode_cookie_rejects_crit():\n    assert callable(decode_cookie)\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "2.13.0"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ],
+        "web_pages": [
+          {
+            "url": "https://example.invalid/pyjwt-crit-advisory",
+            "content": "PyJWT must reject unsupported critical JOSE header parameters. Applications should reject tokens with unrecognized crit headers before trusting decoded claims."
+          }
+        ]
+      }
+    },
+    "expect_restored": true,
+    "expected_failure_marker": null
+  },
+  {
+    "case_id": "python-workaround-invalid-test-target",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "historical_analogue",
+    "provenance": "PyGoat Python validation trace",
+    "evaluation_note": "The historical validator rejected introduction/tests.py because it was a source module, not a test/spec file. This worker case preserves that invalid-target input.",
+    "supervisor_instruction": "Apply the committed Python source workaround to reject JWTs with unsupported critical headers. Do not change dependency manifests.",
+    "completion_task": "Apply the Python source mitigation successfully and pass syntax, runtime smoke, and the assigned pytest target. A failed or invalid validation gate does not complete the task.",
+    "target_package_name": "pyjwt",
+    "attempt_id": "attempt-python-workaround-invalid-test-target",
+    "task_revision": 1,
+    "is_retry": false,
+    "expected_output": "The worker reports the Python validation failure and does not claim a successful remediation.",
+    "changed_files": [
+      "introduction/views.py"
+    ],
+    "action_status": "SURRENDER",
+    "expected_completion_pass": false,
+    "tool_correctness_applicable": false,
+    "task_completion_applicable": false,
+    "input": "Python PyJWT workaround case: python-workaround-invalid-test-target.",
+    "context": [
+      "The historical validator rejected introduction/tests.py because it was a source module, not a test/spec file. This worker case preserves that invalid-target input.",
+      "Project language: Python",
+      "The dependency is committed as a version-bump candidate; this worker may only edit the authorized source file."
+    ],
+    "expected_tools": [
+      {
+        "name": "read_repository_map",
+        "args": {}
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "jwt.decode|jwt.get_unverified_header",
+          "target_directory": "introduction"
+        }
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "introduction/views.py",
+          "start_line": 1,
+          "end_line": 20
+        }
+      },
+      {
+        "name": "search_web",
+        "args": {
+          "query": "PyJWT critical crit header validation reject unsupported crit token"
+        }
+      },
+      {
+        "name": "read_web_page",
+        "args": {
+          "url": "https://example.invalid/pyjwt-crit-advisory"
+        }
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "introduction/views.py"
+          ],
+          "affected_symbols": [
+            "sec_misconfig_lab3"
+          ],
+          "security_invariant": "JWT cookies with unsupported critical JOSE headers are rejected before decoded claims are trusted.",
+          "causal_hypothesis": "The application decodes tokens without checking the critical header extensions.",
+          "planned_replacements": [
+            {
+              "file_path": "introduction/views.py",
+              "old_text": "    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+              "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:introduction/views.py; package:pyjwt",
+          "package_removal_requested": false
+        }
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "introduction/views.py",
+              "old_text": "    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+              "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+              "expected_occurrences": 1
+            }
+          ]
+        }
+      },
+      {
+        "name": "validate_python_workaround",
+        "args": {
+          "modified_files": [
+            "introduction/views.py"
+          ],
+          "runtime_smoke_file": "introduction/utility.py",
+          "targeted_test_file": "introduction/tests.py",
+          "targeted_test_name": "test_sec_misconfig_lab3"
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "The historical Python validation path ended without an accepted workaround.",
+      "actual_tools": [
+        {
+          "name": "read_repository_map",
+          "args": {},
+          "output": "SUCCESS: Repository structure loaded."
+        },
+        {
+          "name": "search_codebase_pattern",
+          "args": {
+            "search_pattern": "jwt.decode|jwt.get_unverified_header",
+            "target_directory": "introduction"
+          },
+          "output": "SUCCESS: Found the JWT decode helper in introduction/views.py."
+        },
+        {
+          "name": "read_workspace_file",
+          "args": {
+            "file_path": "introduction/views.py",
+            "start_line": 1,
+            "end_line": 20
+          },
+          "output": "SUCCESS: Read introduction/views.py."
+        },
+        {
+          "name": "search_web",
+          "args": {
+            "query": "PyJWT critical crit header validation reject unsupported crit token"
+          },
+          "output": "SUCCESS: Found the PyJWT critical-header advisory."
+        },
+        {
+          "name": "read_web_page",
+          "args": {
+            "url": "https://example.invalid/pyjwt-crit-advisory"
+          },
+          "output": "SUCCESS: Read advisory guidance requiring unsupported critical headers to be rejected."
+        },
+        {
+          "name": "record_plan",
+          "args": {
+            "affected_files": [
+              "introduction/views.py"
+            ],
+            "affected_symbols": [
+              "sec_misconfig_lab3"
+            ],
+            "security_invariant": "JWT cookies with unsupported critical JOSE headers are rejected before decoded claims are trusted.",
+            "causal_hypothesis": "The application decodes tokens without checking the critical header extensions.",
+            "planned_replacements": [
+              {
+                "file_path": "introduction/views.py",
+                "old_text": "    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+                "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+                "expected_occurrences": 1
+              }
+            ],
+            "evidence_source": "workspace:introduction/views.py; package:pyjwt",
+            "package_removal_requested": false
+          },
+          "output": "SUCCESS: Plan revision 1 recorded successfully."
+        },
+        {
+          "name": "deterministic_apply_edit_set",
+          "args": {
+            "replacements": [
+              {
+                "file_path": "introduction/views.py",
+                "old_text": "    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+                "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+                "expected_occurrences": 1
+              }
+            ]
+          },
+          "output": "SUCCESS: Atomic edit set applied and is pending validation."
+        },
+        {
+          "name": "validate_python_workaround",
+          "args": {
+            "modified_files": [
+              "introduction/views.py"
+            ],
+            "runtime_smoke_file": "introduction/utility.py",
+            "targeted_test_file": "introduction/tests.py",
+            "targeted_test_name": "test_sec_misconfig_lab3"
+          },
+          "output": "ERROR: [INVALID_VALIDATION_INPUT] Targeted test is a source module, not a test/spec file."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "workspace_files": {
+          "requirements.txt": "PyJWT==2.4.0\n",
+          "introduction/views.py": "import jwt\n\n\ndef sec_misconfig_lab3(cookie: str, key: str) -> dict:\n    return jwt.decode(cookie, key, algorithms=[\"HS256\"])\n",
+          "introduction/tests.py": "def sec_misconfig_lab3_helper() -> bool:\n    return True\n",
+          "tests/test_lab_views.py": "from introduction.views import sec_misconfig_lab3\n\ndef test_sec_misconfig_lab3_rejects_crit():\n    assert callable(sec_misconfig_lab3)\n",
+          "introduction/mitre.py": "from django.conf import settings\n",
+          "introduction/utility.py": "def customHash(value: str) -> str:\n    return value\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "2.13.0"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ],
+        "web_pages": [
+          {
+            "url": "https://example.invalid/pyjwt-crit-advisory",
+            "content": "PyJWT must reject unsupported critical JOSE header parameters. Applications should reject tokens with unrecognized crit headers before trusting decoded claims."
+          }
+        ]
+      }
+    },
+    "expect_restored": false,
+    "expected_failure_marker": "INVALID_VALIDATION_INPUT",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T155736Z_2f772cbc-204b-44b7-a1b5-3f2a0f177a25.md",
+        "observation": "The historical validator rejected introduction/tests.py because it was a source module, not a test/spec file. This worker case preserves that invalid-target input."
+      }
+    ]
+  },
+  {
+    "case_id": "python-workaround-runtime-smoke-failure",
+    "eval_type": "workaround_subagent",
+    "golden_kind": "historical_analogue",
+    "provenance": "PyGoat Python runtime-smoke validation trace",
+    "evaluation_note": "The historical Python workaround failed its runtime import smoke gate while importing introduction/mitre.py; no accepted patch resulted.",
+    "supervisor_instruction": "Apply the committed Python source workaround to reject JWTs with unsupported critical headers. Do not change dependency manifests.",
+    "completion_task": "Apply the Python source mitigation successfully and pass syntax, runtime smoke, and the assigned pytest target. A failed or invalid validation gate does not complete the task.",
+    "target_package_name": "pyjwt",
+    "attempt_id": "attempt-python-workaround-runtime-smoke-failure",
+    "task_revision": 1,
+    "is_retry": false,
+    "expected_output": "The worker reports the Python validation failure and does not claim a successful remediation.",
+    "changed_files": [
+      "introduction/views.py"
+    ],
+    "action_status": "SURRENDER",
+    "expected_completion_pass": false,
+    "expected_tool_correctness_pass": true,
+    "task_completion_applicable": false,
+    "input": "Python PyJWT workaround case: python-workaround-runtime-smoke-failure.",
+    "context": [
+      "The historical Python workaround failed its runtime import smoke gate while importing introduction/mitre.py; no accepted patch resulted.",
+      "Project language: Python",
+      "The dependency is committed as a version-bump candidate; this worker may only edit the authorized source file."
+    ],
+    "expected_tools": [
+      {
+        "name": "read_repository_map",
+        "args": {}
+      },
+      {
+        "name": "search_codebase_pattern",
+        "args": {
+          "search_pattern": "jwt.decode|jwt.get_unverified_header",
+          "target_directory": "introduction"
+        }
+      },
+      {
+        "name": "read_workspace_file",
+        "args": {
+          "file_path": "introduction/views.py",
+          "start_line": 1,
+          "end_line": 20
+        }
+      },
+      {
+        "name": "search_web",
+        "args": {
+          "query": "PyJWT critical crit header validation reject unsupported crit token"
+        }
+      },
+      {
+        "name": "read_web_page",
+        "args": {
+          "url": "https://example.invalid/pyjwt-crit-advisory"
+        }
+      },
+      {
+        "name": "record_plan",
+        "args": {
+          "affected_files": [
+            "introduction/views.py"
+          ],
+          "affected_symbols": [
+            "sec_misconfig_lab3"
+          ],
+          "security_invariant": "JWT cookies with unsupported critical JOSE headers are rejected before decoded claims are trusted.",
+          "causal_hypothesis": "The application decodes tokens without checking the critical header extensions.",
+          "planned_replacements": [
+            {
+              "file_path": "introduction/views.py",
+              "old_text": "    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+              "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+              "expected_occurrences": 1
+            }
+          ],
+          "evidence_source": "workspace:introduction/views.py; package:pyjwt",
+          "package_removal_requested": false
+        }
+      },
+      {
+        "name": "deterministic_apply_edit_set",
+        "args": {
+          "replacements": [
+            {
+              "file_path": "introduction/views.py",
+              "old_text": "    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+              "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+              "expected_occurrences": 1
+            }
+          ]
+        }
+      },
+      {
+        "name": "validate_python_workaround",
+        "args": {
+          "modified_files": [
+            "introduction/views.py"
+          ],
+          "runtime_smoke_file": "introduction/mitre.py",
+          "targeted_test_file": "tests/test_lab_views.py",
+          "targeted_test_name": "test_sec_misconfig_lab3"
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": "The historical Python validation path ended without an accepted workaround.",
+      "actual_tools": [
+        {
+          "name": "read_repository_map",
+          "args": {},
+          "output": "SUCCESS: Repository structure loaded."
+        },
+        {
+          "name": "search_codebase_pattern",
+          "args": {
+            "search_pattern": "jwt.decode|jwt.get_unverified_header",
+            "target_directory": "introduction"
+          },
+          "output": "SUCCESS: Found the JWT decode helper in introduction/views.py."
+        },
+        {
+          "name": "read_workspace_file",
+          "args": {
+            "file_path": "introduction/views.py",
+            "start_line": 1,
+            "end_line": 20
+          },
+          "output": "SUCCESS: Read introduction/views.py."
+        },
+        {
+          "name": "search_web",
+          "args": {
+            "query": "PyJWT critical crit header validation reject unsupported crit token"
+          },
+          "output": "SUCCESS: Found the PyJWT critical-header advisory."
+        },
+        {
+          "name": "read_web_page",
+          "args": {
+            "url": "https://example.invalid/pyjwt-crit-advisory"
+          },
+          "output": "SUCCESS: Read advisory guidance requiring unsupported critical headers to be rejected."
+        },
+        {
+          "name": "record_plan",
+          "args": {
+            "affected_files": [
+              "introduction/views.py"
+            ],
+            "affected_symbols": [
+              "sec_misconfig_lab3"
+            ],
+            "security_invariant": "JWT cookies with unsupported critical JOSE headers are rejected before decoded claims are trusted.",
+            "causal_hypothesis": "The application decodes tokens without checking the critical header extensions.",
+            "planned_replacements": [
+              {
+                "file_path": "introduction/views.py",
+                "old_text": "    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+                "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+                "expected_occurrences": 1
+              }
+            ],
+            "evidence_source": "workspace:introduction/views.py; package:pyjwt",
+            "package_removal_requested": false
+          },
+          "output": "SUCCESS: Plan revision 1 recorded successfully."
+        },
+        {
+          "name": "deterministic_apply_edit_set",
+          "args": {
+            "replacements": [
+              {
+                "file_path": "introduction/views.py",
+                "old_text": "    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+                "new_text": "    header = get_unverified_header(token)\n    if header.get(\"crit\"):\n        raise InvalidTokenError(\"Unsupported critical header parameter\")\n    return jwt.decode(cookie, key, algorithms=[\"HS256\"])",
+                "expected_occurrences": 1
+              }
+            ]
+          },
+          "output": "SUCCESS: Atomic edit set applied and is pending validation."
+        },
+        {
+          "name": "validate_python_workaround",
+          "args": {
+            "modified_files": [
+              "introduction/views.py"
+            ],
+            "runtime_smoke_file": "introduction/mitre.py",
+            "targeted_test_file": "tests/test_lab_views.py",
+            "targeted_test_name": "test_sec_misconfig_lab3"
+          },
+          "output": "FAILURE: Workaround validation gate 'runtime_smoke' failed. Runtime smoke import failed."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "workspace_files": {
+          "requirements.txt": "PyJWT==2.4.0\n",
+          "introduction/views.py": "import jwt\n\n\ndef sec_misconfig_lab3(cookie: str, key: str) -> dict:\n    return jwt.decode(cookie, key, algorithms=[\"HS256\"])\n",
+          "introduction/tests.py": "def sec_misconfig_lab3_helper() -> bool:\n    return True\n",
+          "tests/test_lab_views.py": "from introduction.views import sec_misconfig_lab3\n\ndef test_sec_misconfig_lab3_rejects_crit():\n    assert callable(sec_misconfig_lab3)\n",
+          "introduction/mitre.py": "from django.conf import settings\n",
+          "introduction/utility.py": "def customHash(value: str) -> str:\n    return value\n"
+        },
+        "command_responses": {},
+        "allowed_target_versions": [
+          "2.13.0"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ],
+        "web_pages": [
+          {
+            "url": "https://example.invalid/pyjwt-crit-advisory",
+            "content": "PyJWT must reject unsupported critical JOSE header parameters. Applications should reject tokens with unrecognized crit headers before trusting decoded claims."
+          }
+        ]
+      }
+    },
+    "expect_restored": true,
+    "expected_failure_marker": "runtime_smoke",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T155736Z_2f772cbc-204b-44b7-a1b5-3f2a0f177a25.md",
+        "observation": "The historical Python workaround failed its runtime import smoke gate while importing introduction/mitre.py; no accepted patch resulted."
+      }
+    ]
   }
 ]

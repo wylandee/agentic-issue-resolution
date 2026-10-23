@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from remediation_engine.contracts.schemas import FinalFullScanResult, ScannerExecutionStatus
+from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
 from remediation_engine.orchestration.qa_odc import _run_security_scan
 from remediation_engine.orchestration.qa_types import _SecurityScanResult
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
@@ -45,14 +46,33 @@ def run_final_full_scan_node(state: Mapping[str, Any]) -> dict[str, Any]:
             execution_status=ScannerExecutionStatus.NOT_RUN,
         )
     else:
+        project_language = state.get("project_language", ProjectLanguage.NODEJS)
+        if not isinstance(project_language, ProjectLanguage):
+            try:
+                project_language = ProjectLanguage(project_language)
+            except (TypeError, ValueError):
+                project_language = ProjectLanguage.NODEJS
         try:
-            with DockerSandbox(repo_root=None, workspace_volume=workspace_volume) as sandbox:
-                result = _run_security_scan(
-                    sandbox,
-                    workspace_volume,
-                    baseline,
-                    baseline,
-                )
+            with DockerSandbox(
+                repo_root=None,
+                workspace_volume=workspace_volume,
+                image=LANGUAGE_CONFIGS[project_language].docker_image,
+            ) as sandbox:
+                if project_language == ProjectLanguage.NODEJS:
+                    result = _run_security_scan(
+                        sandbox,
+                        workspace_volume,
+                        baseline,
+                        baseline,
+                    )
+                else:
+                    result = _run_security_scan(
+                        sandbox,
+                        workspace_volume,
+                        baseline,
+                        baseline,
+                        project_language=project_language,
+                    )
         except Exception as exc:  # noqa: BLE001 - teardown must still run
             logger.exception("final_full_scan: Dependency-Check execution failed.")
             result = _SecurityScanResult(

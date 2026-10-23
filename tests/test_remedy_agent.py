@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from langchain_core.messages import AIMessage
 
 from remediation_engine.contracts.schemas import (
@@ -1469,3 +1471,437 @@ class TestUpdateSubagentWrapper:
         with patch.dict(os.environ, {"REMEDY_DISABLE_POST_QA_TRIAGE": "true"}):
             res = post_qa_triage_node(state)
         assert res["status"] == "triage_skipped"
+
+# Stage-2 behavior retained during the architecture merge.
+from remediation_engine.language import ProjectLanguage
+
+from remediation_engine.orchestration.update_subagent import _build_update_system_prompt
+
+from remediation_engine.orchestration.workaround_subagent import _WORKAROUND_STATIC_INSTRUCTIONS
+
+from remediation_engine.orchestration.workaround_subagent import _build_workaround_system_prompt
+
+from remediation_engine.orchestration.update_subagent import (
+    _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS,
+    _build_multi_package_update_prompt,
+)
+
+
+class TestUpdateWorkerPromptLanguageParity:
+    @pytest.mark.parametrize(
+        ("language", "ecosystem", "package", "manifest", "expected_tool", "wrong_tool"),
+        [
+            (
+                ProjectLanguage.NODEJS,
+                "npm",
+                "lodash",
+                "package.json",
+                "modify_and_validate_npm_dependency",
+                "modify_and_validate_python_dependency",
+            ),
+            (
+                ProjectLanguage.PYTHON,
+                "pypi",
+                "certifi",
+                "requirements.txt",
+                "modify_and_validate_python_dependency",
+                "modify_and_validate_npm_dependency",
+            ),
+        ],
+    )
+    def test_singleton_prompts_share_authorization_policy_and_expose_matching_tool(
+        self, language, ecosystem, package, manifest, expected_tool, wrong_tool
+    ):
+        from remediation_engine.orchestration.update_subagent import _build_update_system_prompt
+
+        system_prompt = " ".join(_build_update_system_prompt(language).split())
+        assert "If the exact Supervisor instruction requires a major-version migration" in (
+            system_prompt
+        )
+        assert "authorized and required to update affected production and test code" in (
+            system_prompt
+        )
+        assert "Otherwise, do not edit source-code files" in system_prompt
+        assert expected_tool in system_prompt
+        assert wrong_tool not in system_prompt
+
+    @pytest.mark.parametrize(
+        ("language", "ecosystem", "package", "manifest", "expected_tool", "wrong_tool"),
+        [
+            (
+                ProjectLanguage.NODEJS,
+                "npm",
+                "lodash",
+                "package.json",
+                "modify_batch_npm_dependencies",
+                "modify_batch_python_dependencies",
+            ),
+            (
+                ProjectLanguage.PYTHON,
+                "pypi",
+                "certifi",
+                "requirements.txt",
+                "modify_batch_python_dependencies",
+                "modify_batch_npm_dependencies",
+            ),
+        ],
+    )
+    def test_batch_prompts_share_authorization_policy_and_expose_matching_tool(
+        self, language, ecosystem, package, manifest, expected_tool, wrong_tool
+    ):
+        from remediation_engine.orchestration.update_subagent import (
+            _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS,
+        )
+
+        action = MultiPackageAction(
+            cluster_id="cluster-prompt-test",
+            dispatch_batch_id="batch-prompt-test",
+            selected_strategy=TacticalStrategy.VERSION_BUMP,
+            package_mutations=[
+                PackageMutation(
+                    task_id="task-prompt-test",
+                    package_name=package,
+                    manifest_path=manifest,
+                    target_version="1.2.3",
+                    ecosystem=ecosystem,
+                    dependency_type="requirements" if ecosystem == "pypi" else "dependencies",
+                )
+            ],
+            rationale="Check language-specific package tool selection.",
+        )
+        dynamic_prompt = _build_multi_package_update_prompt(
+            [],
+            action,
+            [],
+            {},
+            {},
+            project_language=language,
+        )
+        static_prompt = (
+            _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS
+            if language == ProjectLanguage.PYTHON
+            else _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS
+        )
+        normalized_static = " ".join(static_prompt.split())
+        normalized_dynamic = " ".join(dynamic_prompt.split())
+        assert "major-version migration" in normalized_static
+        assert "source and test migration to the committed package API is authorized and required" in (
+            normalized_static
+        )
+        assert "Do not reselect or change any package name or version" in normalized_static
+        assert f"Invoke {expected_tool} exactly once" in normalized_dynamic
+        assert wrong_tool not in normalized_static + normalized_dynamic
+
+class TestUpdateSubagentWrapperStage2Parity:
+    def test_language_matched_worker_prompts_limit_python_authority(self):
+        group = _sast_group()
+        task = _task_for_group(group)
+        update_state = initial_update_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            [task],
+            [group],
+            project_language=ProjectLanguage.PYTHON,
+        )
+        workaround_state = initial_workaround_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            task,
+            group,
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+        assert _build_update_system_prompt() == _UPDATE_WORKER_STATIC_INSTRUCTIONS
+        assert _build_workaround_system_prompt() == _WORKAROUND_STATIC_INSTRUCTIONS
+
+        update_prompt = _build_update_system_prompt(update_state["project_language"])
+        assert "Python dependency-manifest" in update_prompt
+        assert "requirements.txt" in update_prompt
+        assert "pyproject.toml" in update_prompt
+        assert "setup.cfg" in update_prompt
+        assert "Pipfile" in update_prompt
+        assert "setup.py is install-only" in update_prompt
+        assert "only modify_and_validate_python_dependency" in update_prompt
+        assert "Do\nnot search PyPI" in update_prompt
+        assert "get_pypi_versions" not in update_prompt
+        assert "select_python_safe_version" not in update_prompt
+        assert "modify_and_validate_npm_dependency" not in update_prompt
+
+        group = _sca_group()
+        task = _task_for_group(group).model_copy(
+            update={
+                "selected_version": "4.17.21",
+                "target_dependency_type": "requirements",
+            }
+        )
+        dynamic_update_prompt = _build_update_prompt(
+            [(task, group, ["requirements.txt"])],
+            [],
+            {},
+            {},
+            allowed_target_versions_by_task={
+                task.task_id: ["4.17.21", "4.17.22"],
+            },
+            allowed_dependency_types_by_task={
+                task.task_id: ["requirements", "optional-dependencies"],
+            },
+            project_language=ProjectLanguage.PYTHON,
+        )
+        assert "Canonical project language: python (Python)." in dynamic_update_prompt
+        assert "Committed target version: 4.17.21" in dynamic_update_prompt
+        assert "Committed dependency type: requirements" in dynamic_update_prompt
+        assert "4.17.22" not in dynamic_update_prompt
+        assert "optional-dependencies" not in dynamic_update_prompt
+        assert "Allowed target versions:" not in dynamic_update_prompt
+
+        workaround_prompt = _build_workaround_system_prompt(workaround_state["project_language"])
+        dynamic_prompt = _build_workaround_prompt(
+            task,
+            group,
+            project_language=workaround_state["project_language"],
+        )
+        for expected in (
+            "Python code security",
+            "`.py`",
+            "pip or Pipenv",
+            "pytest",
+            "validate_python_syntax",
+            "run_targeted_python_test",
+            "validate_python_workaround",
+        ):
+            assert expected in workaround_prompt
+        assert "Canonical project language: python" in dynamic_prompt
+        assert "modify_and_validate_npm_dependency" not in workaround_prompt
+
+    def test_subagent_state_helpers_default_to_nodejs(self):
+        group = _sast_group()
+        task = _task_for_group(group)
+
+        update_state = initial_update_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            [task],
+            [group],
+        )
+        workaround_state = initial_workaround_subagent_state(
+            _repo_root(),
+            "agent_workspace_deadbeef",
+            task,
+            group,
+        )
+
+        assert update_state["project_language"] is ProjectLanguage.NODEJS
+        assert workaround_state["project_language"] is ProjectLanguage.NODEJS
+
+    def test_success_requires_validation_after_code_edit_python_stage2(self):
+        group = _sast_group()
+        repo_root = _repo_root()
+        task = _task_for_group(group)
+        state = initial_workaround_subagent_state(
+            repo_root,
+            "agent_workspace_deadbeef",
+            task,
+            group,
+            constraints_ledger=["express must remain >= 4.22.1"],
+            previous_feedback="Fix the broken regex from the previous attempt.",
+            project_language=ProjectLanguage.PYTHON,
+        )
+
+        replacement = {
+            "file_path": "routes/login.ts",
+            "old_text": "unsafeRender(input)",
+            "new_text": "safeRender(input)",
+            "expected_occurrences": 1,
+        }
+        llm, bound = _mock_llm_with_responses(
+            AIMessage(
+                content="map",
+                tool_calls=[
+                    {
+                        "name": "read_repository_map",
+                        "args": {},
+                        "id": "call-0",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="read",
+                tool_calls=[
+                    {
+                        "name": "read_workspace_file",
+                        "args": {"file_path": "routes/login.ts"},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="searching",
+                tool_calls=[
+                    {
+                        "name": "search_codebase_pattern",
+                        "args": {"search_pattern": "unsafeRender"},
+                        "id": "call-2",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="planning",
+                tool_calls=[
+                    {
+                        "name": "record_plan",
+                        "args": {
+                            "affected_files": ["routes/login.ts"],
+                            "affected_symbols": ["login"],
+                            "security_invariant": "User-controlled HTML is escaped.",
+                            "causal_hypothesis": "The unsafe renderer receives raw login input.",
+                            "planned_replacements": [replacement],
+                            "evidence_source": "workspace:routes/login.ts",
+                        },
+                        "id": "call-3",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="editing",
+                tool_calls=[
+                    {
+                        "name": "deterministic_apply_edit_set",
+                        "args": {"replacements": [replacement]},
+                        "id": "call-4",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="validating",
+                tool_calls=[
+                    {
+                        "name": "validate_python_workaround",
+                        "args": {
+                            "modified_files": ["routes/login.ts"],
+                            "runtime_smoke_file": "routes/login.ts",
+                        },
+                        "id": "call-5",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        )
+        sandbox = _sandbox_mock()
+        plan_state_ref: dict[str, dict] = {}
+
+        def _state() -> dict:
+            return plan_state_ref["state"]
+
+        def _tool(name: str, result: str, mutate=None) -> MagicMock:
+            tool = MagicMock()
+            tool.name = name
+
+            def invoke(args):
+                if mutate is not None:
+                    mutate(args)
+                return result
+
+            tool.invoke.side_effect = invoke
+            return tool
+
+        def _mark_investigated(_args):
+            _state()["local_investigation_complete"] = True
+            _state().setdefault("read_files", set()).add("routes/login.ts")
+
+        def _record(_args):
+            _state().update(
+                {
+                    "recorded": True,
+                    "phase": "EXECUTE",
+                    "planned_replacements": [replacement],
+                    "plan_revision": 1,
+                }
+            )
+
+        def _edit(_args):
+            _state().update(
+                {
+                    "phase": "VALIDATE",
+                    "successful_edit_count_this_iteration": 1,
+                }
+            )
+
+        def _validate(_args):
+            _state().update(
+                {
+                    "phase": "VALIDATE",
+                    "validated_files": ["routes/login.ts"],
+                    "validation_passed": True,
+                    "last_validation_result": {
+                        "overall_status": "PASS",
+                        "validated_files": ["routes/login.ts"],
+                    },
+                }
+            )
+            return (
+                "SUCCESS: Workaround validation gate passed. Validated files: routes/login.ts.\n"
+                'JSON: {"overall_status":"PASS","validated_files":["routes/login.ts"]}'
+            )
+
+        tool_map = [
+            _tool("record_plan", "SUCCESS: Plan recorded.", _record),
+            _tool("read_repository_map", "SUCCESS: Repository map read."),
+            _tool("read_workspace_file", "SUCCESS: routes/login.ts", _mark_investigated),
+            _tool(
+                "search_codebase_pattern",
+                "routes/login.ts:10: unsafeRender(input)",
+                _mark_investigated,
+            ),
+            _tool(
+                "deterministic_apply_edit_set",
+                'SUCCESS: Atomic edit set applied.\nJSON: {"affected_files":["routes/login.ts"]}',
+                _edit,
+            ),
+            _tool(
+                "validate_python_workaround",
+                "SUCCESS: Workaround validation gate passed. Validated files: routes/login.ts.\n"
+                'JSON: {"overall_status":"PASS","validated_files":["routes/login.ts"]}',
+                _validate,
+            ),
+        ]
+
+        def _build_toolbelt(*_args, **_kwargs):
+            plan_state_ref["state"] = _kwargs["plan_state"]
+            return tool_map
+
+        from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
+
+        with (
+            patch.dict(os.environ, {"REMEDY_BYPASS_WORKAROUND_SUBAGENT": "false"}),
+            patch(
+                "remediation_engine.orchestration.workaround_subagent.ChatOpenAI", return_value=llm
+            ),
+            patch(
+                "remediation_engine.orchestration.workaround_subagent.DockerSandbox",
+                return_value=sandbox,
+            ),
+            patch(
+                "remediation_engine.orchestration.workaround_subagent.build_workaround_toolbelt",
+                side_effect=_build_toolbelt,
+            ) as toolbelt_builder,
+            patch(
+                "remediation_engine.orchestration.workaround_subagent.run_bounded_subagent_loop",
+                wraps=run_bounded_subagent_loop,
+            ) as loop,
+        ):
+            result = run_workaround_subagent_node(state)
+
+        # The successful validation gate is terminal; the old extra textual
+        # model round must not be requested.
+        assert bound.invoke.call_count == 6
+        assert toolbelt_builder.call_args.kwargs["language"] is ProjectLanguage.PYTHON
+        assert loop.call_args.kwargs["context_manager"] is not None
+        assert result["action_summary"].status == AgentActionStatus.SUCCESS
+        assert result["changed_files"] == ["routes/login.ts"]
+        assert "messages" not in result

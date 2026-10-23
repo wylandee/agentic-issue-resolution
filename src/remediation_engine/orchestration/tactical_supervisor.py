@@ -17,6 +17,7 @@ from functools import cmp_to_key
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from packaging.version import InvalidVersion, Version
 from pydantic import ValidationError
 
 from remediation_engine.contracts.schemas import (
@@ -44,6 +45,7 @@ from remediation_engine.contracts.version_policy import (
     RegistryCandidate,
     compare_maven_versions,
     is_stable_maven_version,
+    registry_version_key,
     select_maven_version,
 )
 from remediation_engine.language import ProjectLanguage
@@ -56,8 +58,12 @@ from remediation_engine.orchestration.supervisor_planner import (
     _registry_selected_version,
     _supervisor_fetch_registry_candidates,
     _supervisor_plan_npm_parent_version,
+    _supervisor_plan_python_parent_version,
 )
-from remediation_engine.orchestration.supervisor_policy import _canonical_security_floor
+from remediation_engine.orchestration.supervisor_policy import (
+    _canonical_security_floor,
+    _task_uses_pypi,
+)
 from remediation_engine.orchestration.task_utils import (
     group_parent_context,
     is_maven_group,
@@ -101,6 +107,15 @@ _SUPERVISOR_ACTION_CONTRACTS_BY_NAME.update(
 _MAX_CONTEXT_CHARS = 2000
 _MAX_LIST_ITEMS = 10
 _MAX_CANDIDATES = 3
+
+
+def _supervisor_plan_parent_version(inputs: dict[str, Any], ecosystem: str) -> str:
+    """Select a package-manager-specific parent planner behind one seam."""
+    if ecosystem == "pypi":
+        return _supervisor_plan_python_parent_version(inputs)
+    return _supervisor_plan_npm_parent_version(inputs)
+
+
 _MAX_DIAGNOSTIC_BASIS_CHARS = 1200
 _FORBIDDEN_WORKAROUND_TARGET_BASENAMES = frozenset(
     {
@@ -461,13 +476,13 @@ def allowed_tactical_strategies(
     if task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
         return (
             (TacticalStrategy.PACKAGE_OVERRIDE, TacticalStrategy.CODE_WORKAROUND)
-            if is_transitive_group(group)
+            if is_transitive_group(group) and not _task_uses_pypi(task, group)
             else (TacticalStrategy.CODE_WORKAROUND,)
         )
     if task.strategy_stage == SCARemediationStage.CODE_WORKAROUND:
         return (TacticalStrategy.CODE_WORKAROUND,)
     strategies = [TacticalStrategy.VERSION_BUMP, TacticalStrategy.CODE_WORKAROUND]
-    if is_transitive_group(group):
+    if is_transitive_group(group) and not _task_uses_pypi(task, group):
         strategies.insert(1, TacticalStrategy.PACKAGE_OVERRIDE)
     return tuple(strategies)
 
@@ -1075,6 +1090,13 @@ def registry_candidates_for_context(
             if not floor_error
             else f"Security floor verification failed: {floor_error}."
         )
+    ecosystem = (
+        "maven"
+        if maven_mode
+        else "pypi"
+        if _task_uses_pypi(context.task, context.group)
+        else "npm"
+    )
     approved_pool = _approved_candidate_pool(
         context,
         package_name,
@@ -1088,7 +1110,10 @@ def registry_candidates_for_context(
     )
     try:
         if registry_provider is not None:
-            candidates = registry_provider(package_name, floor, attempts)
+            if ecosystem == "pypi":
+                candidates = registry_provider(package_name, floor, attempts, ecosystem)
+            else:
+                candidates = registry_provider(package_name, floor, attempts)
         elif maven_mode:
             candidates = _supervisor_fetch_registry_candidates(
                 package_name,
@@ -1098,7 +1123,13 @@ def registry_candidates_for_context(
                 maven_mode=True,
             )
         else:
-            candidates = _supervisor_fetch_registry_candidates(package_name, floor, attempts)
+            candidates = _supervisor_fetch_registry_candidates(
+                package_name,
+                floor,
+                attempts,
+                project_language=context.project_language,
+                ecosystem=ecosystem,
+            )
     except Exception as exc:  # noqa: BLE001
         return (), f"Registry verification unavailable: {exc}"
     versions = _current_candidate_versions(
@@ -1109,7 +1140,10 @@ def registry_candidates_for_context(
         maven_mode=maven_mode,
         stage=context.task.strategy_stage,
         security_floor=floor,
+        ecosystem=ecosystem,
     )
+    if ecosystem == "pypi" and not is_transitive_group(context.group):
+        versions = _python_stage_versions(candidates, versions, context.task.strategy_stage)
     return versions, None
 
 
@@ -1121,18 +1155,32 @@ def _eligible_candidate_versions(
     stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM,
     attempted_versions: Iterable[str] = (),
     security_floor: str | None = None,
+    ecosystem: str | None = None,
 ) -> tuple[str, ...]:
-    """Return only policy-eligible candidates for the active ecosystem stage."""
-    candidates = list(candidates)
-    if project_language == ProjectLanguage.JAVA and maven_mode:
-        eligible: list[MavenRegistryCandidate] = []
-        for candidate in candidates:
+    """Return strategic stable candidates using ecosystem-specific ordering."""
+    candidate_list = list(candidates)
+    resolved_ecosystem = str(
+        ecosystem
+        or (
+            "maven"
+            if project_language == ProjectLanguage.JAVA and maven_mode
+            else "pypi"
+            if project_language == ProjectLanguage.PYTHON
+            else "npm"
+        )
+    ).strip().casefold()
+    if resolved_ecosystem == "maven":
+        eligible_maven: list[MavenRegistryCandidate] = []
+        attempted = {str(value).strip() for value in attempted_versions}
+        for candidate in candidate_list:
             if not isinstance(candidate, MavenRegistryCandidate):
                 continue
             if (
                 not candidate.is_stable
                 or not candidate.security_floor_met
                 or not is_stable_maven_version(candidate.version)
+                or candidate.already_attempted
+                or candidate.version in attempted
             ):
                 continue
             if security_floor is not None:
@@ -1141,23 +1189,30 @@ def _eligible_candidate_versions(
                         continue
                 except ValueError:
                     continue
-            eligible.append(candidate)
-        selected = select_maven_version(
-            eligible,
-            stage,
-            {str(value).strip() for value in attempted_versions},
-        )
+            eligible_maven.append(candidate)
+        selected = select_maven_version(eligible_maven, stage, attempted)
         return (selected,) if selected else ()
 
+    attempted = {
+        _normalise_candidate_version(version).casefold()
+        for version in attempted_versions
+        if str(version).strip()
+    }
     node_candidates = [
         candidate
-        for candidate in candidates
+        for candidate in candidate_list
         if isinstance(candidate, RegistryCandidate)
         and candidate.is_stable
         and candidate.security_floor_met
         and not candidate.already_attempted
+        and _normalise_candidate_version(candidate.version).casefold() not in attempted
     ]
-    node_candidates.sort(key=lambda candidate: (candidate.semver_key, candidate.version))
+    node_candidates.sort(
+        key=lambda candidate: (
+            registry_version_key(candidate.version, resolved_ecosystem, candidate.semver_key),
+            candidate.version,
+        )
+    )
     if not node_candidates:
         return ()
     by_version = {candidate.version: candidate for candidate in node_candidates}
@@ -1177,22 +1232,30 @@ def _eligible_candidate_versions(
     same_major_latest = (
         max(
             same_major_candidates,
-            key=lambda candidate: (candidate.semver_key, candidate.version),
+            key=lambda candidate: (
+                registry_version_key(
+                    candidate.version,
+                    resolved_ecosystem,
+                    candidate.semver_key,
+                ),
+                candidate.version,
+            ),
         ).version
         if same_major_candidates
         else None
     )
-    npm_latest = next(
+    latest_role = "pypi_latest" if resolved_ecosystem == "pypi" else "npm_latest"
+    registry_latest = next(
         (
             candidate.version
             for candidate in node_candidates
-            if "npm_latest" in candidate.selection_roles
+            if latest_role in candidate.selection_roles
         ),
         node_candidates[-1].version,
     )
     strategic_versions = {
         version
-        for version in (osv_minimum, same_major_latest, npm_latest)
+        for version in (osv_minimum, same_major_latest, registry_latest)
         if version is not None and version in by_version
     }
     return tuple(
@@ -1260,6 +1323,47 @@ def _stable_semver_versions(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(version for _, version in parsed))[:_MAX_CANDIDATES]
 
 
+def _stable_registry_versions(values: Iterable[str], ecosystem: str) -> tuple[str, ...]:
+    """Normalize stable package versions with language-specific ordering."""
+    if ecosystem != "pypi":
+        return _stable_semver_versions(values)
+    parsed: set[Version] = set()
+    for value in values:
+        try:
+            version = Version(str(value).strip())
+        except InvalidVersion:
+            continue
+        if not version.is_prerelease and not version.is_devrelease:
+            parsed.add(version)
+    return tuple(str(version) for version in sorted(parsed))[:_MAX_CANDIDATES]
+
+
+def _python_stage_versions(
+    candidates: Iterable[RegistryCandidate],
+    candidate_versions: Sequence[str],
+    stage: SCARemediationStage,
+) -> tuple[str, ...]:
+    """Select the PyPI candidate role authorized by the committed stage."""
+    role = {
+        SCARemediationStage.PYPI_SAME_MAJOR: "same_major",
+        SCARemediationStage.PYPI_LATEST: "pypi_latest",
+    }.get(stage)
+    if role is None:
+        return tuple(candidate_versions)
+    selected = set(candidate_versions)
+    role_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.version in selected
+        and (role in candidate.selection_roles or (role == "same_major" and candidate.same_major))
+    ]
+    if not role_candidates:
+        return tuple(candidate_versions)
+    if role == "pypi_latest":
+        return (max(role_candidates, key=lambda candidate: Version(candidate.version)).version,)
+    return (max(role_candidates, key=lambda candidate: Version(candidate.version)).version,)
+
+
 def _candidate_set(
     strategy: TacticalStrategy,
     package_name: str,
@@ -1272,22 +1376,36 @@ def _candidate_set(
     maven_mode: bool = False,
     preferred_version: str | None = None,
     approved_version_pool: Sequence[str] = (),
+    ecosystem: str | None = None,
 ) -> TacticalCandidateSet:
     """Build one normalized strategy-specific candidate whitelist."""
+    resolved_ecosystem = str(
+        ecosystem
+        or (
+            "maven"
+            if project_language == ProjectLanguage.JAVA and maven_mode
+            else "pypi"
+            if project_language == ProjectLanguage.PYTHON
+            else "npm"
+        )
+    ).strip().casefold()
     approved_pool: tuple[str, ...] = ()
-    if project_language == ProjectLanguage.JAVA and maven_mode:
+    if resolved_ecosystem == "maven":
         ordered = tuple(
             version
             for version in _stable_maven_versions(versions)
-            if is_stable_maven_version(floor) and compare_maven_versions(version, floor) >= 0
+            if is_stable_maven_version(floor)
+            and compare_maven_versions(version, floor) >= 0
         )
         approved_pool = tuple(
             version
             for version in _stable_maven_versions(approved_version_pool)
-            if is_stable_maven_version(floor) and compare_maven_versions(version, floor) >= 0
+            if is_stable_maven_version(floor)
+            and compare_maven_versions(version, floor) >= 0
         )
     else:
-        ordered = _stable_semver_versions(versions)
+        ordered = _stable_registry_versions(versions, resolved_ecosystem)
+        approved_pool = _stable_registry_versions(approved_version_pool, resolved_ecosystem)
     return TacticalCandidateSet(
         strategy=strategy,
         target_package_name=package_name,
@@ -1337,6 +1455,13 @@ def _normalise_context_candidate_sets(
                     candidate_versions,
                     project_language=project_language,
                     maven_mode=maven_mode,
+                    ecosystem=(
+                        "maven"
+                        if maven_mode
+                        else "pypi"
+                        if _task_uses_pypi(task, group)
+                        else "npm"
+                    ),
                 )
             )
     if maven_mode:
@@ -1464,22 +1589,25 @@ def _current_candidate_versions(
     maven_mode: bool = False,
     stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM,
     security_floor: str | None = None,
+    ecosystem: str | None = None,
 ) -> tuple[str, ...]:
     """Project registry candidates onto an immutable pool and retry state."""
-    attempted = {
-        _normalise_candidate_version(version, maven_mode=maven_mode)
-        for version in attempted_versions
-    }
     versions = _eligible_candidate_versions(
         candidates,
         project_language=project_language,
         maven_mode=maven_mode,
         stage=stage,
-        attempted_versions=attempted,
+        attempted_versions=attempted_versions,
         security_floor=security_floor,
+        ecosystem=ecosystem,
     )
     approved = {
-        _normalise_candidate_version(version, maven_mode=maven_mode) for version in approved_pool
+        _normalise_candidate_version(version, maven_mode=maven_mode)
+        for version in approved_pool
+    }
+    attempted = {
+        _normalise_candidate_version(version, maven_mode=maven_mode)
+        for version in attempted_versions
     }
     if approved:
         versions = tuple(version for version in versions if version in approved)
@@ -1603,8 +1731,11 @@ def registry_candidate_sets_for_context(
             return (), f"Registry verification unavailable: {exc}"
 
     provider = registry_provider or _supervisor_fetch_registry_candidates
+    ecosystem = "pypi" if _task_uses_pypi(context.task, context.group) else "npm"
     targets: list[tuple[TacticalStrategy, str | None, str | None]] = []
     if context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
+        if ecosystem == "pypi":
+            return (), "Python package overrides are not supported."
         if not is_transitive_group(context.group) or not context.group.vulnerable_component:
             return (), "Package override requires a transitive vulnerable child."
         targets.append(
@@ -1617,7 +1748,11 @@ def registry_candidate_sets_for_context(
     else:
         if direct_package:
             targets.append((TacticalStrategy.VERSION_BUMP, direct_package, direct_type))
-        if is_transitive_group(context.group) and context.group.vulnerable_component:
+        if (
+            ecosystem == "npm"
+            and is_transitive_group(context.group)
+            and context.group.vulnerable_component
+        ):
             targets.append(
                 (
                     TacticalStrategy.PACKAGE_OVERRIDE,
@@ -1638,6 +1773,8 @@ def registry_candidate_sets_for_context(
                     SCARemediationStage.OSV_MINIMUM: "minimum",
                     SCARemediationStage.NPM_SAME_MAJOR: "same_major",
                     SCARemediationStage.NPM_LATEST: "latest",
+                    SCARemediationStage.PYPI_SAME_MAJOR: "same_major",
+                    SCARemediationStage.PYPI_LATEST: "latest",
                 }.get(context.task.strategy_stage, "minimum")
                 plan_input = {
                     "parent_package_name": parent_name,
@@ -1650,12 +1787,13 @@ def registry_candidate_sets_for_context(
                     ),
                     "dependency_ancestry": ",".join(context.group.dependency_ancestry),
                 }
-                report = _supervisor_plan_npm_parent_version(plan_input)
+                report = _supervisor_plan_parent_version(plan_input, ecosystem)
                 report_versions = _registry_report_versions(
                     report, "Eligible Candidates"
                 ) or _registry_report_versions(report, "Compatible Parent Versions")
-                report_versions = _stable_semver_versions(
-                    [*report_versions, _registry_selected_version(report)]
+                report_versions = _stable_registry_versions(
+                    [*report_versions, _registry_selected_version(report)],
+                    ecosystem,
                 )
                 if approved_pool:
                     approved = set(approved_pool)
@@ -1672,12 +1810,20 @@ def registry_candidate_sets_for_context(
                     package_name,
                     floor,
                     _candidate_query_attempts(approved_pool, context.attempted_versions),
+                    ecosystem,
                 )
                 versions = _current_candidate_versions(
                     candidates,
                     approved_pool=approved_pool,
                     attempted_versions=context.attempted_versions,
+                    ecosystem=ecosystem,
                 )
+                if ecosystem == "pypi" and not is_transitive_group(context.group):
+                    versions = _python_stage_versions(
+                        candidates,
+                        versions,
+                        context.task.strategy_stage,
+                    )
             result.append(
                 _candidate_set(
                     strategy,
@@ -1685,6 +1831,7 @@ def registry_candidate_sets_for_context(
                     dependency_type,
                     floor,
                     versions,
+                    ecosystem=ecosystem,
                 )
             )
     except Exception as exc:  # noqa: BLE001

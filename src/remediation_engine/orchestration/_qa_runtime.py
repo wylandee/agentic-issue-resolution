@@ -8,16 +8,22 @@ ephemeral; helpers read them for evidence and never mutate the host baseline.
 
 from __future__ import annotations
 
+import configparser
 import hashlib
 import json
 import logging
 import re
 import shlex
+import tomllib
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+
+from packaging.markers import default_environment
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.version import InvalidVersion, Version
 
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
@@ -33,6 +39,7 @@ from remediation_engine.contracts.schemas import (
     ScanScope,
     VulnerabilityGroup,
 )
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.scan_identity import package_scan_occurrence_key
 from remediation_engine.orchestration.state import OrchestratorState
@@ -67,6 +74,7 @@ from remediation_engine.tools.maven_manifest_locator import (
 from remediation_engine.tools.maven_manifest_locator import (
     _text as _maven_text,
 )
+from remediation_engine.tools.package_identity import normalize_python_package_name
 
 from ._tool_support import _run_readonly
 from .qa_odc import (
@@ -339,6 +347,9 @@ class _TargetedPackageBatch:
     inventory_removals: tuple[str, ...]
     covered_input_paths: tuple[str, ...]
     non_npm_input_projects: tuple[_NonNpmInputProject, ...]
+    python_closures_by_task: Mapping[str, tuple[_PythonTargetedClosure, ...]] = field(
+        default_factory=dict
+    )
     fallback_reason: ScanFallbackReason | None = None
     fallback_detail: str | None = None
     skipped_task_ids: tuple[str, ...] = ()
@@ -359,6 +370,16 @@ class _TargetedArtifactManifest:
     maven_artifacts_by_project: Mapping[str, Mapping[str, tuple[str, str]]] = field(
         default_factory=dict
     )
+    ecosystem_by_project: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _PythonTargetedClosure:
+    """Exact installed Python distributions reachable from one QA task."""
+
+    task_id: str
+    package_specs: tuple[tuple[str, str], ...]
+    source_input_paths: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -530,6 +551,46 @@ def _generate_workspace_diff(
     return full_diff, changed_files
 
 
+def _workspace_remediation_fingerprint(
+    host_repo_root: str | None,
+    sandbox: DockerSandbox,
+    candidate_changed_files: Sequence[str],
+) -> str:
+    """Return a stable digest of candidate files changed inside the workspace.
+
+    Args:
+        host_repo_root: Optional repository baseline used for the file diff.
+        sandbox: Active remediation workspace volume.
+        candidate_changed_files: Repository-relative candidate paths reported by workers.
+
+    Returns:
+        SHA-256 digest of the changed-path list and bounded unified diff.
+
+    Side Effects:
+        Reads candidate files from the sandbox and host repository; neither is modified.
+    """
+    candidates = [path for path in candidate_changed_files if isinstance(path, str)]
+    if host_repo_root:
+        try:
+            diff_text, changed_files = _generate_workspace_diff(
+                host_repo_root,
+                sandbox,
+                candidates,
+            )
+        except Exception as exc:  # noqa: BLE001 - fingerprinting must not abort QA
+            logger.warning("qa_runtime: workspace fingerprint failed: %s", exc)
+            diff_text = ""
+            changed_files = sorted(set(candidates))
+    else:
+        diff_text = ""
+        changed_files = sorted(set(candidates))
+
+    payload = {"changed_files": sorted(set(changed_files)), "diff": diff_text}
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def _collect_target_identifiers(groups: list[VulnerabilityGroup]) -> set[str]:
     """Collect all CVE/GHSA identifiers from the valid vulnerability groups."""
     identifiers: set[str] = set()
@@ -580,8 +641,73 @@ def _collect_baseline_identifiers(
     return _collect_target_identifiers(groups)
 
 
+def _group_is_python(group: VulnerabilityGroup) -> bool:
+    """Return whether scanner or localized evidence identifies a Python package."""
+    issues = list(getattr(group, "issues", []) or [])
+    issues.extend(
+        localized.issue
+        for localized in (getattr(group, "localized_issues", []) or [])
+        if getattr(localized, "issue", None) is not None
+    )
+    for issue in issues:
+        ecosystem = str(getattr(issue, "ecosystem", "") or "").strip().casefold()
+        purl_type = str(getattr(issue, "purl", "") or "").partition(":")[2].partition("/")[0]
+        if ecosystem in {"pypi", "python"} or purl_type.casefold() == "pypi":
+            return True
+    for localized in getattr(group, "localized_issues", []) or []:
+        if str(getattr(localized, "package_manager", "") or "").casefold() in {"pip", "pipenv"}:
+            return True
+    candidates = [*(getattr(group, "file_paths", []) or []), getattr(group, "file_path", None)]
+    return any(
+        Path(str(path or "")).name.casefold()
+        in {"pipfile", "pipfile.lock", "pyproject.toml", "setup.cfg"}
+        or (
+            Path(str(path or "")).name.casefold().startswith("requirements")
+            and Path(str(path or "")).name.casefold().endswith(".txt")
+        )
+        for path in candidates
+    )
+
+
+def _python_manifest_paths_for_group(group: VulnerabilityGroup) -> tuple[str, ...]:
+    """Return safe Python manifest paths tied to scanner or localization evidence."""
+    localized_paths = [
+        getattr(issue, "manifest_file", None)
+        for issue in (getattr(group, "localized_issues", []) or [])
+        if getattr(issue, "manifest_file", None)
+    ]
+    candidates = localized_paths or [
+        *(getattr(group, "file_paths", []) or []),
+        getattr(group, "file_path", None),
+    ]
+    manifests: set[str] = set()
+    for raw_path in candidates:
+        path = str(raw_path or "").strip().split("?", 1)[0].split("#", 1)[0]
+        path = path.replace("\\", "/")
+        if not path or path.startswith("/") or ".." in Path(path).parts:
+            continue
+        path = path.lstrip("./")
+        name = Path(path).name.casefold()
+        if name == "pipfile.lock":
+            path = str(Path(path).with_name("Pipfile"))
+            name = "pipfile"
+        if name in {"pyproject.toml", "setup.cfg", "pipfile"} or (
+            name.startswith("requirements") and name.endswith(".txt")
+        ):
+            manifests.add(path)
+    return tuple(sorted(manifests))
+
+
 def _lockfile_paths_for_group(group: VulnerabilityGroup) -> tuple[str, ...]:
-    """Return normalized npm lockfile paths associated with an SCA group."""
+    """Return normalized package-manager lockfiles associated with an SCA group."""
+    if _group_is_python(group):
+        return tuple(
+            sorted(
+                str(Path(manifest).with_name("Pipfile.lock"))
+                for manifest in _python_manifest_paths_for_group(group)
+                if Path(manifest).name.casefold() == "pipfile"
+            )
+        )
     candidates: list[str] = []
     candidates.extend(group.file_paths or [])
     if group.file_path:
@@ -1458,7 +1584,11 @@ def _build_qa_scan_targets(
                 group_id=group.group_id,
                 target_package=target_package,
                 expected_version=expected_version,
-                manifest_paths=manifest_paths,
+                manifest_paths=(
+                    _manifest_paths_for_group(group)
+                    if _group_is_python(group)
+                    else manifest_paths
+                ),
                 dependency_ancestry=ancestry,
                 target_identifiers=frozenset(group_target_identifiers(group)),
                 package_manager=package_manager,
@@ -1675,7 +1805,9 @@ def _lockfile_versions(value: Any, package: str) -> set[str]:
 
 
 def _manifest_paths_for_group(group: VulnerabilityGroup) -> tuple[str, ...]:
-    """Return normalized package manifests authorized by one SCA group."""
+    """Return normalized package manifest paths associated with an SCA group."""
+    if _group_is_python(group):
+        return _python_manifest_paths_for_group(group)
     candidates = [
         *(getattr(group, "file_paths", []) or []),
         getattr(group, "file_path", None),
@@ -1740,6 +1872,486 @@ def _maven_target_manifest_paths(group: VulnerabilityGroup) -> tuple[str, ...]:
         if Path(path).name.casefold() == "pom.xml":
             manifests.add(path)
     return tuple(sorted(manifests))
+def _python_package_name(name: str) -> str:
+    """Normalize a Python distribution name according to PEP 503."""
+    return normalize_python_package_name(str(name or "").strip())
+
+
+def _python_version(value: Any) -> str | None:
+    """Return a canonical PEP 440 version, or ``None`` when it is invalid."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return str(Version(value.strip()))
+    except InvalidVersion:
+        return None
+
+
+def _python_requirement(value: str) -> Requirement | None:
+    """Parse one static requirement, omitting pip options and comments."""
+    text = value.strip()
+    if not text or text.startswith(("#", "-")):
+        return None
+    text = re.split(r"\s+#", text, maxsplit=1)[0].strip()
+    try:
+        return Requirement(text)
+    except InvalidRequirement:
+        return None
+
+
+def _matching_python_declarations(
+    sandbox: DockerSandbox,
+    manifest: str,
+    package: str,
+) -> tuple[list[tuple[str, str, Requirement | None]], str | None]:
+    """Read static declarations for a Python target from supported manifests."""
+    content = sandbox.read_file(manifest)
+    if not isinstance(content, str):
+        return [], f"Manifest '{manifest}' was unavailable."
+
+    target = _python_package_name(package)
+    matches: list[tuple[str, str, Requirement | None]] = []
+    name = Path(manifest).name.casefold()
+    if name.startswith("requirements") and name.endswith(".txt"):
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            candidate = _python_requirement(line)
+            match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+            candidate_name = (
+                candidate.name if candidate is not None else match.group(1) if match else ""
+            )
+            if _python_package_name(candidate_name) == target:
+                matches.append((f"{manifest}#L{line_number}", line.strip(), candidate))
+        return matches, None
+
+    def add_requirement(pointer: str, raw: Any) -> None:
+        if not isinstance(raw, str):
+            return
+        requirement = _python_requirement(raw)
+        match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", raw)
+        package_name = (
+            requirement.name if requirement is not None else match.group(1) if match else ""
+        )
+        if _python_package_name(package_name) == target:
+            matches.append((pointer, raw.strip(), requirement))
+
+    if name == "setup.cfg":
+        parser = configparser.RawConfigParser()
+        try:
+            parser.read_string(content)
+        except configparser.Error:
+            return [], f"Manifest '{manifest}' could not be parsed."
+        if parser.has_option("options", "install_requires"):
+            for raw in parser.get("options", "install_requires", raw=True).splitlines():
+                add_requirement(f"{manifest}#install_requires", raw)
+        if parser.has_section("options.extras_require"):
+            for extra, values in parser.items("options.extras_require", raw=True):
+                for raw in values.splitlines():
+                    add_requirement(f"{manifest}#extras_require/{extra}", raw)
+        return matches, None
+
+    try:
+        document = tomllib.loads(content)
+    except tomllib.TOMLDecodeError:
+        return [], f"Manifest '{manifest}' could not be parsed."
+    if not isinstance(document, Mapping):
+        return [], f"Manifest '{manifest}' did not contain a TOML table."
+    if name == "pyproject.toml":
+        project = document.get("project")
+        if not isinstance(project, Mapping):
+            return [], None
+        dependencies = project.get("dependencies")
+        if isinstance(dependencies, list):
+            for raw in dependencies:
+                add_requirement(f"{manifest}#dependencies", raw)
+        optional = project.get("optional-dependencies")
+        if isinstance(optional, Mapping):
+            for extra, values in optional.items():
+                if isinstance(values, list):
+                    for raw in values:
+                        add_requirement(f"{manifest}#optional-dependencies/{extra}", raw)
+        return matches, None
+    if name == "pipfile":
+        for section in ("packages", "dev-packages"):
+            packages = document.get(section)
+            if not isinstance(packages, Mapping):
+                continue
+            for declared_name, declaration in packages.items():
+                if (
+                    not isinstance(declared_name, str)
+                    or _python_package_name(declared_name) != target
+                ):
+                    continue
+                version_value = (
+                    declaration.get("version") if isinstance(declaration, Mapping) else declaration
+                )
+                raw = str(version_value or "*")
+                requirement = None
+                if raw.strip() not in {"", "*"}:
+                    specifier = raw.strip()
+                    if not specifier.startswith(("==", "!=", "~=", ">=", "<=", ">", "<", "===")):
+                        specifier = f"=={specifier}"
+                    requirement = _python_requirement(f"{declared_name}{specifier}")
+                matches.append((f"{manifest}#{section}/{declared_name}", raw, requirement))
+        return matches, None
+    return [], f"Manifest '{manifest}' is not a supported Python declaration."
+
+
+def _python_declaration_accepts(
+    requirement: Requirement | None,
+    raw_declaration: str,
+    expected: str,
+) -> bool | None:
+    """Return whether one static declaration permits the selected version."""
+    if raw_declaration.strip() in {"", "*"}:
+        return True
+    if requirement is None or requirement.marker is not None or requirement.url is not None:
+        return None
+    if requirement.extras:
+        return None
+    try:
+        return Version(expected) in requirement.specifier
+    except (InvalidVersion, ValueError):
+        return None
+
+
+def _read_python_lock_versions(
+    sandbox: DockerSandbox,
+    lockfiles: Sequence[str],
+    package: str,
+) -> tuple[set[str], list[str], list[str], list[str]]:
+    """Read exact versions from authorized Pipfile.lock files."""
+    versions: set[str] = set()
+    parsed: list[str] = []
+    missing: list[str] = []
+    errors: list[str] = []
+    target = _python_package_name(package)
+    for lockfile in lockfiles:
+        content = sandbox.read_file(lockfile)
+        if not isinstance(content, str):
+            missing.append(lockfile)
+            continue
+        try:
+            document = json.loads(content)
+        except json.JSONDecodeError:
+            errors.append(f"Lockfile '{lockfile}' was not valid JSON.")
+            continue
+        if not isinstance(document, Mapping):
+            errors.append(f"Lockfile '{lockfile}' did not contain a JSON object.")
+            continue
+        parsed.append(lockfile)
+        for category in ("default", "develop"):
+            packages = document.get(category)
+            if not isinstance(packages, Mapping):
+                continue
+            for locked_name, metadata in packages.items():
+                if not isinstance(locked_name, str) or _python_package_name(locked_name) != target:
+                    continue
+                raw_version = metadata.get("version") if isinstance(metadata, Mapping) else None
+                if isinstance(raw_version, str) and raw_version.startswith("=="):
+                    version = _python_version(raw_version[2:])
+                    if version:
+                        versions.add(version)
+    return versions, parsed, missing, errors
+
+
+def _installed_python_versions(
+    sandbox: DockerSandbox,
+    package: str,
+) -> tuple[set[str], str | None, bool]:
+    """Inspect an installed Python distribution through the workspace venv."""
+    command = f".venv/bin/python -m pip show {shlex.quote(package)}"
+    try:
+        result = _run_readonly(sandbox, command, timeout=_NPM_INSTALL_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 - unavailable workspace evidence is inconclusive
+        return set(), f"Installed Python distribution inspection failed: {exc}", False
+
+    exit_code = getattr(result, "exit_code", None)
+    stdout = getattr(result, "stdout", "")
+    stderr = getattr(result, "stderr", "")
+    text = "\n".join(
+        value
+        for value in (
+            stdout if isinstance(stdout, str) else "",
+            stderr if isinstance(stderr, str) else "",
+        )
+        if value
+    )
+    if isinstance(exit_code, int) and exit_code != 0:
+        if re.search(r"package\(s\) not found", text, re.IGNORECASE):
+            return set(), f"Installed distribution '{package}' is missing from .venv.", True
+        return set(), f"pip show could not verify '{package}' (exit code {exit_code}).", False
+    name_match = re.search(r"^Name:\s*(.+?)\s*$", text, re.MULTILINE | re.IGNORECASE)
+    version_match = re.search(r"^Version:\s*(.+?)\s*$", text, re.MULTILINE | re.IGNORECASE)
+    if not name_match or not version_match:
+        return set(), f"pip show returned incomplete evidence for '{package}'.", False
+    if _python_package_name(name_match.group(1)) != _python_package_name(package):
+        return set(), f"pip show returned a different distribution than '{package}'.", False
+    version = _python_version(version_match.group(1))
+    if version is None:
+        return set(), f"Installed version for '{package}' was not valid PEP 440.", False
+    return {version}, None, True
+
+
+def _python_versions_match(versions: set[str], expected: str) -> bool:
+    """Compare observed package versions using PEP 440 equivalence."""
+    if not versions:
+        return False
+    try:
+        expected_version = Version(expected)
+        return all(Version(value) == expected_version for value in versions)
+    except InvalidVersion:
+        return False
+
+
+def _collect_python_dependency_package_state(
+    sandbox: DockerSandbox,
+    group: VulnerabilityGroup,
+    task: RemediationTask | None,
+    manifests: Sequence[str],
+    expected_version: str | None,
+    *,
+    lockfiles: Sequence[str] | None,
+    version_evidence_inconclusive: bool,
+    inspect_resolved_graph: bool,
+    npm_ls_disabled: bool,
+) -> _QAPackageState:
+    """Collect Python declarations, installed-version, and Pipenv lock evidence."""
+    package = _python_package_name(
+        getattr(task, "target_package_name", None) or group.vulnerable_component or ""
+    )
+    expected = (
+        None
+        if version_evidence_inconclusive
+        else _python_version(expected_version or getattr(task, "selected_version", None))
+    )
+    manifest_paths = tuple(manifests)
+    python_lockfiles = tuple(
+        lockfiles if lockfiles is not None else _lockfile_paths_for_group(group)
+    )
+    diagnostics: list[str] = []
+    declarations: dict[str, str] = {}
+    parsed_manifests: list[str] = []
+    missing_declarations: list[str] = []
+    declaration_checks: list[bool | None] = []
+    for manifest in manifest_paths:
+        try:
+            entries, error = _matching_python_declarations(sandbox, manifest, package)
+        except Exception as exc:  # noqa: BLE001 - malformed manifests remain inconclusive
+            entries, error = [], f"Manifest '{manifest}' could not be inspected: {exc}"
+        if error:
+            diagnostics.append(error)
+            continue
+        parsed_manifests.append(manifest)
+        if not entries:
+            missing_declarations.append(manifest)
+        for reference, raw, requirement in entries:
+            declarations[reference] = raw
+            if expected is not None:
+                declaration_checks.append(_python_declaration_accepts(requirement, raw, expected))
+
+    if not package:
+        diagnostics.append("Target Python distribution name is unavailable.")
+    if not manifest_paths:
+        diagnostics.append("Authorized Python manifest paths are unavailable.")
+    if expected is None:
+        diagnostics.append("Supervisor-selected target version is unavailable or invalid.")
+
+    # npm_ls_disabled only disables npm's package-tree command. If Python
+    # installation succeeded, pip show remains valid independent evidence.
+    inspect_python_env = inspect_resolved_graph or npm_ls_disabled
+    installed_versions: set[str] = set()
+    installed_error: str | None = None
+    installed_known = False
+    if package and inspect_python_env:
+        installed_versions, installed_error, installed_known = _installed_python_versions(
+            sandbox, package
+        )
+        if installed_error:
+            diagnostics.append(installed_error)
+    elif not inspect_python_env:
+        diagnostics.append(
+            "Python installed-package inspection was skipped because installation failed."
+        )
+
+    pipfile_manifests = [
+        manifest for manifest in manifest_paths if Path(manifest).name.casefold() == "pipfile"
+    ]
+    relevant_lockfiles = python_lockfiles if pipfile_manifests else ()
+    locked_versions, parsed_lockfiles, missing_lockfiles, lock_errors = _read_python_lock_versions(
+        sandbox, relevant_lockfiles, package
+    )
+    diagnostics.extend(lock_errors)
+    if missing_lockfiles:
+        diagnostics.append(
+            "Authorized Pipfile.lock was unavailable: " + ", ".join(missing_lockfiles)
+        )
+
+    all_manifests_parsed = len(parsed_manifests) == len(manifest_paths)
+    all_locks_parsed = len(parsed_lockfiles) == len(relevant_lockfiles)
+    manifest_state = (
+        "unknown" if not all_manifests_parsed else "present" if declarations else "absent"
+    )
+    graph_state = "present" if installed_versions else "absent" if installed_known else "unknown"
+
+    if missing_declarations:
+        status = DependencyEvidenceStatus.MISMATCH
+        diagnostics.append(
+            "Target distribution has no authorized declaration in: "
+            + ", ".join(missing_declarations)
+        )
+    elif declaration_checks and False in declaration_checks:
+        status = DependencyEvidenceStatus.MISMATCH
+        diagnostics.append("A Python declaration does not permit the Supervisor-selected version.")
+    elif (
+        expected is not None
+        and installed_known
+        and not _python_versions_match(installed_versions, expected)
+    ):
+        status = DependencyEvidenceStatus.MISMATCH
+        diagnostics.append(
+            f"Installed distribution versions {sorted(installed_versions) or ['none']} "
+            f"do not exactly match Supervisor-selected version {expected}."
+        )
+    elif (
+        expected is not None
+        and relevant_lockfiles
+        and all_locks_parsed
+        and not _python_versions_match(locked_versions, expected)
+    ):
+        status = DependencyEvidenceStatus.MISMATCH
+        diagnostics.append(
+            f"Pipfile.lock versions {sorted(locked_versions) or ['none']} "
+            f"do not exactly match Supervisor-selected version {expected}."
+        )
+    elif (
+        not package
+        or not manifest_paths
+        or expected is None
+        or not all_manifests_parsed
+        or not installed_known
+        or any(check is None for check in declaration_checks)
+        or len(declaration_checks) < len(declarations)
+        or not all_locks_parsed
+        or bool(lock_errors)
+    ):
+        status = DependencyEvidenceStatus.INCONCLUSIVE
+    else:
+        status = DependencyEvidenceStatus.VERIFIED
+
+    evidence = QADependencyEvidence(
+        status=status,
+        target_package=package,
+        expected_version=expected,
+        manifest_paths=list(manifest_paths),
+        lockfile_paths=list(relevant_lockfiles),
+        declarations=declarations,
+        resolved_versions=sorted(installed_versions),
+        lockfile_versions=sorted(locked_versions),
+        evidence_refs=sorted(
+            {
+                *declarations,
+                *(f"{lockfile}#resolved/{package}" for lockfile in parsed_lockfiles),
+            }
+        ),
+        diagnostics=list(dict.fromkeys(diagnostics)),
+    )
+    return _QAPackageState(
+        manifest_state=manifest_state,
+        graph_state=graph_state,
+        diagnostics=tuple(evidence.diagnostics),
+        dependency_evidence=evidence,
+    )
+
+
+def _collect_python_package_presence_state(
+    sandbox: DockerSandbox,
+    group: VulnerabilityGroup,
+    package: str,
+    manifests: Sequence[str],
+    lockfiles: Sequence[str],
+    *,
+    expect_present: bool,
+) -> _QAPackageState:
+    """Collect Python declaration and installed-package presence evidence."""
+    package = _python_package_name(package)
+    diagnostics: list[str] = []
+    declarations: dict[str, str] = {}
+    parsed_manifests: list[str] = []
+    for manifest in manifests:
+        try:
+            entries, error = _matching_python_declarations(sandbox, manifest, package)
+        except Exception as exc:  # noqa: BLE001 - malformed manifests remain inconclusive
+            entries, error = [], f"Manifest '{manifest}' could not be inspected: {exc}"
+        if error:
+            diagnostics.append(error)
+            continue
+        parsed_manifests.append(manifest)
+        declarations.update({reference: raw for reference, raw, _requirement in entries})
+
+    installed_versions, installed_error, installed_known = _installed_python_versions(
+        sandbox, package
+    )
+    if installed_error:
+        diagnostics.append(installed_error)
+    locked_versions, parsed_lockfiles, missing_lockfiles, lock_errors = _read_python_lock_versions(
+        sandbox, lockfiles, package
+    )
+    diagnostics.extend(lock_errors)
+    if missing_lockfiles:
+        diagnostics.append(
+            "Authorized Pipfile.lock was unavailable: " + ", ".join(missing_lockfiles)
+        )
+
+    manifest_state = (
+        "unknown"
+        if not manifests or len(parsed_manifests) != len(manifests)
+        else "present"
+        if declarations
+        else "absent"
+    )
+    locks_parsed = len(parsed_lockfiles) == len(lockfiles) and not lock_errors
+    graph_state = (
+        "present"
+        if installed_versions or locked_versions
+        else "unknown"
+        if not installed_known or not locks_parsed
+        else "absent"
+    )
+    expected_state = "present" if expect_present else "absent"
+    if manifest_state == "unknown" or graph_state == "unknown":
+        status = DependencyEvidenceStatus.INCONCLUSIVE
+    elif manifest_state == expected_state and graph_state == expected_state:
+        status = DependencyEvidenceStatus.VERIFIED
+    else:
+        status = DependencyEvidenceStatus.MISMATCH
+        diagnostics.append(
+            f"Python package state was manifest={manifest_state}, graph={graph_state}; "
+            f"expected both to be {expected_state}."
+        )
+
+    evidence = QADependencyEvidence(
+        status=status,
+        target_package=package,
+        expected_version=None,
+        manifest_paths=list(manifests),
+        lockfile_paths=list(lockfiles),
+        declarations=declarations,
+        resolved_versions=sorted(installed_versions),
+        lockfile_versions=sorted(locked_versions),
+        evidence_refs=sorted(
+            {
+                *declarations,
+                *(f"{lockfile}#resolved/{package}" for lockfile in parsed_lockfiles),
+            }
+        ),
+        diagnostics=list(dict.fromkeys(diagnostics)),
+    )
+    return _QAPackageState(
+        manifest_state=manifest_state,
+        graph_state=graph_state,
+        diagnostics=tuple(evidence.diagnostics),
+        dependency_evidence=evidence,
+    )
 
 
 def _lockfile_paths_for_manifests(manifests: Sequence[str]) -> tuple[str, ...]:
@@ -1762,6 +2374,18 @@ def _collect_dependency_package_state(
     npm_ls_disabled: bool = False,
 ) -> _QAPackageState:
     """Collect compact deterministic dependency evidence for a version task."""
+    if _group_is_python(group):
+        return _collect_python_dependency_package_state(
+            sandbox,
+            group,
+            task,
+            manifests,
+            expected_version,
+            lockfiles=lockfiles,
+            version_evidence_inconclusive=version_evidence_inconclusive,
+            inspect_resolved_graph=inspect_resolved_graph,
+            npm_ls_disabled=npm_ls_disabled,
+        )
     package = str(
         getattr(task, "target_package_name", None) or group.vulnerable_component or ""
     ).strip()
@@ -2469,13 +3093,21 @@ def _collect_group_package_state(
                 expected_version,
                 version_evidence_inconclusive=version_evidence_inconclusive,
             )
-        if managers and managers != {"npm"}:
+        if _group_is_python(group):
+            unsupported_managers = managers - {"pip", "pipenv"}
+        else:
+            unsupported_managers = managers - {"npm"}
+        if managers and unsupported_managers:
             manager_text = ", ".join(sorted(managers))
             diagnostic = f"Unsupported or unknown package manager(s): {manager_text}."
             evidence = QADependencyEvidence(
                 status=DependencyEvidenceStatus.INCONCLUSIVE,
                 target_package=package,
-                expected_version=_normalise_dependency_version(expected_version),
+                expected_version=(
+                    _python_version(expected_version)
+                    if _group_is_python(group)
+                    else _normalise_dependency_version(expected_version)
+                ),
                 manifest_paths=manifests,
                 lockfile_paths=list(lockfiles),
                 diagnostics=[diagnostic],
@@ -2500,6 +3132,15 @@ def _collect_group_package_state(
 
     if managers == {"maven"}:
         return _collect_maven_group_package_state(sandbox, group, manifests, package)
+    if _group_is_python(group):
+        return _collect_python_package_presence_state(
+            sandbox,
+            group,
+            package,
+            manifests,
+            lockfiles,
+            expect_present=policy == QAPolicy.NO_FIX_CODE_REMOVAL,
+        )
     if managers != {"npm"}:
         manager_text = ", ".join(sorted(managers)) if managers else "unknown"
         return _QAPackageState(
@@ -3036,10 +3677,345 @@ def _target_resolution_fallback_reason(reason: str | None) -> ScanFallbackReason
     }.get(reason or "", ScanFallbackReason.TARGETED_SCAN_FAILED)
 
 
+def _python_targeted_closure_from_inspect(
+    report: Mapping[str, Any],
+    target: QAScanTarget,
+) -> tuple[_PythonTargetedClosure | None, ScanFallbackReason | None, str | None]:
+    """Resolve a task's exact installed Python closure from ``pip inspect``."""
+    if report.get("version") != "1":
+        return (
+            None,
+            ScanFallbackReason.INCOMPLETE_CLOSURE,
+            "pip inspect returned an unsupported report version.",
+        )
+    installed = report.get("installed")
+    environment = report.get("environment")
+    if not isinstance(installed, list) or not isinstance(environment, Mapping):
+        return (
+            None,
+            ScanFallbackReason.INCOMPLETE_CLOSURE,
+            "pip inspect omitted distributions or marker environment.",
+        )
+    if not {"python_version", "sys_platform"}.issubset(environment):
+        return (
+            None,
+            ScanFallbackReason.INCOMPLETE_CLOSURE,
+            "pip inspect omitted required environment markers.",
+        )
+
+    marker_environment = default_environment()
+    marker_environment.update(
+        {
+            key: value
+            for key, value in environment.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+    )
+    records: dict[str, dict[str, Any]] = {}
+    for item in installed:
+        metadata = item.get("metadata") if isinstance(item, Mapping) else None
+        if not isinstance(metadata, Mapping):
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                "pip inspect contained an invalid distribution record.",
+            )
+        raw_name = metadata.get("name")
+        version = _python_version(metadata.get("version"))
+        if not isinstance(raw_name, str) or not raw_name.strip() or version is None:
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                "pip inspect contained an invalid distribution name or version.",
+            )
+        name = raw_name.strip()
+        canonical_name = _python_package_name(name)
+        if not canonical_name:
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                "pip inspect contained an invalid distribution name.",
+            )
+        requirements = metadata.get("requires_dist") or []
+        extras = metadata.get("provides_extra") or []
+        if not isinstance(requirements, list) or any(
+            not isinstance(value, str) for value in requirements
+        ):
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                f"pip inspect returned invalid dependencies for {name!r}.",
+            )
+        if not isinstance(extras, list) or any(not isinstance(value, str) for value in extras):
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                f"pip inspect returned invalid extras for {name!r}.",
+            )
+        try:
+            Requirement(f"{name}=={version}")
+        except InvalidRequirement:
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                "pip inspect returned an unscannable distribution name.",
+            )
+        record = {
+            "name": name,
+            "version": version,
+            "requires_dist": tuple(requirements),
+            "provides_extra": tuple(extras),
+        }
+        previous = records.get(canonical_name)
+        if previous is not None:
+            if previous["version"] != version:
+                return (
+                    None,
+                    ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    f"Multiple installed versions of {name!r} make the Python closure ambiguous.",
+                )
+            record["requires_dist"] = tuple(
+                sorted(set(previous["requires_dist"]) | set(requirements))
+            )
+            record["provides_extra"] = tuple(sorted(set(previous["provides_extra"]) | set(extras)))
+        records[canonical_name] = record
+
+    target_name = _python_package_name(target.target_package)
+    if not target_name:
+        return (
+            None,
+            ScanFallbackReason.NO_MATCHING_TARGET,
+            f"Task {target.task_id} has no valid Python target package.",
+        )
+    root = records.get(target_name)
+    if root is None:
+        return (
+            None,
+            ScanFallbackReason.NO_MATCHING_TARGET,
+            f"Target distribution {target.target_package!r} was not installed in .venv.",
+        )
+    expected_version = _python_version(target.expected_version)
+    if target.expected_version and expected_version is None:
+        return (
+            None,
+            ScanFallbackReason.NO_MATCHING_TARGET,
+            f"Committed target version for {target.target_package!r} is not valid PEP 440.",
+        )
+    if expected_version is not None and root["version"] != expected_version:
+        return (
+            None,
+            ScanFallbackReason.NO_MATCHING_TARGET,
+            (
+                f"Installed {root['name']!r} version {root['version']} does not match committed target {expected_version}."
+            ),
+        )
+
+    resolved: set[str] = set()
+    pending = [target_name]
+    while pending:
+        package_name = pending.pop()
+        if package_name in resolved:
+            continue
+        record = records.get(package_name)
+        if record is None:
+            return (
+                None,
+                ScanFallbackReason.INCOMPLETE_CLOSURE,
+                f"Installed dependency {package_name!r} disappeared from pip inspect.",
+            )
+        resolved.add(package_name)
+        for raw_requirement in record["requires_dist"]:
+            try:
+                requirement = Requirement(raw_requirement)
+            except InvalidRequirement:
+                return (
+                    None,
+                    ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    f"Distribution {record['name']!r} has invalid dependency metadata.",
+                )
+            dependency_name = _python_package_name(requirement.name)
+            extra_marker = bool(requirement.marker and "extra" in str(requirement.marker))
+            marker_extras = ["", *record["provides_extra"]] if extra_marker else [""]
+            if requirement.marker is not None:
+                try:
+                    active = any(
+                        requirement.marker.evaluate({**marker_environment, "extra": extra})
+                        for extra in marker_extras
+                    )
+                except (KeyError, TypeError, ValueError):
+                    return (
+                        None,
+                        ScanFallbackReason.INCOMPLETE_CLOSURE,
+                        f"Could not evaluate a dependency marker for {record['name']!r}.",
+                    )
+                if not active:
+                    continue
+            dependency = records.get(dependency_name)
+            if dependency is None:
+                if extra_marker:
+                    continue
+                return (
+                    None,
+                    ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    (
+                        f"Required dependency {requirement.name!r} of {record['name']!r} was not present in pip inspect."
+                    ),
+                )
+            try:
+                dependency_version = Version(dependency["version"])
+            except InvalidVersion:
+                return (
+                    None,
+                    ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    f"Installed version for {dependency['name']!r} is not valid PEP 440.",
+                )
+            if requirement.specifier and not requirement.specifier.contains(
+                dependency_version, prereleases=True
+            ):
+                if extra_marker:
+                    continue
+                return (
+                    None,
+                    ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    (
+                        f"Installed {dependency['name']!r} version {dependency['version']} does not satisfy {raw_requirement!r}."
+                    ),
+                )
+            pending.append(dependency_name)
+
+    package_specs = tuple(
+        sorted(
+            ((records[name]["name"], records[name]["version"]) for name in resolved),
+            key=lambda item: item[0].casefold(),
+        )
+    )
+    return _PythonTargetedClosure(target.task_id, package_specs, target.manifest_paths), None, None
+
+
+def _resolve_python_targeted_packages(
+    sandbox: DockerSandbox,
+    targets: Sequence[QAScanTarget],
+    state: OrchestratorState | None,
+) -> _TargetedPackageBatch:
+    """Build task-scoped Python closures and retain changed-input coverage."""
+    active_task_ids = {target.task_id for target in targets} or set(
+        (state or {}).get("active_target_task_ids", []) or []
+    )
+    if not active_task_ids:
+        return _TargetedPackageBatch(
+            target_packages=(),
+            closures_by_task={},
+            covered_task_ids=(),
+            failures_by_task={},
+            inventory_updates={},
+            inventory_removals=(),
+            covered_input_paths=(),
+            non_npm_input_projects=(),
+            fallback_reason=ScanFallbackReason.MISSING_LOCKFILE,
+            fallback_detail="No active task scan targets were supplied.",
+        )
+
+    python_closures: dict[str, tuple[_PythonTargetedClosure, ...]] = {}
+    failures: dict[str, _TargetedPackageResolutionFailure] = {}
+    skipped: set[str] = set()
+    covered: set[str] = set()
+    covered_paths: set[str] = set()
+    for target in targets:
+        normalized_paths: list[str] = []
+        try:
+            normalized_paths = [_validate_qa_path(path) for path in target.manifest_paths]
+        except ValueError as exc:
+            failures[target.task_id] = _TargetedPackageResolutionFailure(
+                ScanFallbackReason.MISSING_LOCKFILE,
+                f"Task {target.task_id} has an invalid Python manifest path: {exc}",
+            )
+        else:
+            covered_paths.update(normalized_paths)
+
+    try:
+        result = _run_readonly(sandbox, ".venv/bin/python -m pip inspect --local", timeout=60)
+    except Exception as exc:  # noqa: BLE001 - the typed scan result preserves this boundary
+        report = None
+        inspect_error = f"pip inspect could not read the installed Python graph: {exc}"
+    else:
+        stdout = getattr(result, "stdout", None)
+        if getattr(result, "exit_code", None) != 0 or not isinstance(stdout, str):
+            report = None
+            inspect_error = "pip inspect did not return a successful JSON report."
+        else:
+            try:
+                parsed = json.loads(stdout)
+            except json.JSONDecodeError as exc:
+                report = None
+                inspect_error = f"pip inspect returned invalid JSON: {exc}"
+            else:
+                report = parsed if isinstance(parsed, Mapping) else None
+                inspect_error = (
+                    "pip inspect returned a non-object report." if report is None else ""
+                )
+
+    if report is None:
+        for target in targets:
+            if target.task_id not in failures:
+                failures[target.task_id] = _TargetedPackageResolutionFailure(
+                    ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
+                    inspect_error,
+                )
+    else:
+        for target in targets:
+            if target.task_id in failures:
+                continue
+            closure, reason, detail = _python_targeted_closure_from_inspect(report, target)
+            if reason == ScanFallbackReason.NO_MATCHING_TARGET:
+                skipped.add(target.task_id)
+                covered.add(target.task_id)
+            elif reason is not None or closure is None:
+                failures[target.task_id] = _TargetedPackageResolutionFailure(
+                    reason or ScanFallbackReason.INCOMPLETE_CLOSURE,
+                    detail or f"Task {target.task_id} did not produce a Python dependency closure.",
+                )
+            else:
+                python_closures[target.task_id] = (closure,)
+                covered.add(target.task_id)
+
+    non_npm_projects, input_failures, input_paths = _collect_non_npm_input_projects(
+        sandbox, state, targets
+    )
+    for task_id, failure in input_failures.items():
+        previous = failures.get(task_id)
+        if previous is None:
+            failures[task_id] = failure
+        elif failure.detail not in previous.detail:
+            failures[task_id] = _TargetedPackageResolutionFailure(
+                previous.reason, f"{previous.detail}; {failure.detail}"
+            )
+    for project in non_npm_projects:
+        covered.update(project.task_ids)
+    covered_paths.update(input_paths)
+    first_failure = next(iter(failures.values()), None)
+    return _TargetedPackageBatch(
+        target_packages=(),
+        closures_by_task={},
+        covered_task_ids=tuple(sorted(covered)),
+        failures_by_task=failures,
+        inventory_updates={},
+        inventory_removals=(),
+        covered_input_paths=tuple(sorted(covered_paths)),
+        non_npm_input_projects=non_npm_projects,
+        python_closures_by_task=python_closures,
+        fallback_reason=first_failure.reason if first_failure else None,
+        fallback_detail="; ".join(failure.detail for failure in failures.values())
+        if failures
+        else None,
+        skipped_task_ids=tuple(sorted(skipped)),
+    )
+
+
 def _resolve_targeted_packages(
     sandbox: DockerSandbox,
     targets: Sequence[QAScanTarget],
     state: OrchestratorState | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _TargetedPackageBatch:
     """Resolve active targets and every changed package-lock occurrence.
 
@@ -3047,6 +4023,8 @@ def _resolve_targeted_packages(
     delta closures are retained by task; unreadable or unrepresentable changed
     inputs remain task-scoped failures.
     """
+    if project_language == ProjectLanguage.PYTHON:
+        return _resolve_python_targeted_packages(sandbox, targets, state)
     active_task_ids = {target.task_id for target in targets} or set(
         (state or {}).get("active_target_task_ids", []) or []
     )
@@ -3473,9 +4451,12 @@ def _write_targeted_artifacts(
     sandbox: DockerSandbox,
     closures_by_task: Mapping[str, Sequence[DependencyClosure]],
     non_npm_input_projects: Sequence[_NonNpmInputProject] = (),
+    python_closures_by_task: Mapping[str, Sequence[_PythonTargetedClosure]] | None = None,
+    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> _TargetedArtifactManifest:
-    """Stage changed package inputs and Maven artifacts for scoped ODC scans."""
+    """Stage dependency closure artifacts for scoped language-specific ODC scans."""
     targeted_subdir = ".odc-targeted"
+    python_closures_by_task = python_closures_by_task or {}
     task_ids_by_lockfile: dict[str, set[str]] = {}
     for task_id, closures in sorted(closures_by_task.items()):
         for closure in closures:
@@ -3484,7 +4465,7 @@ def _write_targeted_artifacts(
             source_lockfile = _validate_qa_path(closure.source_lockfile)
             task_ids_by_lockfile.setdefault(source_lockfile, set()).add(task_id)
 
-    if not task_ids_by_lockfile and not non_npm_input_projects:
+    if not task_ids_by_lockfile and not non_npm_input_projects and not python_closures_by_task:
         raise ValueError("no_target_packages")
 
     expected_package_occurrences: list[tuple[str, str]] = []
@@ -3492,6 +4473,7 @@ def _write_targeted_artifacts(
     task_ids_by_project: dict[str, tuple[str, ...]] = {}
     input_paths_by_project: dict[str, tuple[str, ...]] = {}
     maven_artifacts_by_project: dict[str, dict[str, tuple[str, str]]] = {}
+    ecosystem_by_project: dict[str, str] = {}
     artifact_index = 0
     staged_npm_files: dict[str, str] = {}
 
@@ -3591,12 +4573,39 @@ def _write_targeted_artifacts(
         occurrences_by_project[project_path] = tuple(occurrences)
         task_ids_by_project[project_path] = tuple(sorted(task_ids))
         input_paths_by_project[project_path] = (source_lockfile,)
+        ecosystem_by_project[project_path] = "npm"
         expected_package_occurrences.extend(
             (occurrence.package_name, occurrence.version) for occurrence in occurrences
         )
 
     if staged_npm_files:
         sandbox.write_files(staged_npm_files)
+
+    for task_id, closures in sorted(python_closures_by_task.items()):
+        for closure in closures:
+            if closure.task_id != task_id or not closure.package_specs:
+                raise ValueError(f"Python targeted closure for {task_id} is empty or mismatched")
+            project_path = f"{targeted_subdir}/{artifact_index:03d}"
+            artifact_index += 1
+            requirements_path = _validate_qa_path(f"{project_path}/requirements.txt")
+            requirements = "\n".join(
+                f"{name}=={version}" for name, version in closure.package_specs
+            )
+            sandbox.write_file(requirements_path, requirements + "\n")
+            source_paths = closure.source_input_paths or (requirements_path,)
+            occurrences = tuple(
+                PackageScanOccurrence(
+                    source_input_path=source_paths[0],
+                    package_name=name,
+                    version=version,
+                )
+                for name, version in closure.package_specs
+            )
+            occurrences_by_project[project_path] = occurrences
+            task_ids_by_project[project_path] = (task_id,)
+            input_paths_by_project[project_path] = tuple(source_paths)
+            ecosystem_by_project[project_path] = "pypi"
+            expected_package_occurrences.extend(closure.package_specs)
 
     for project in sorted(non_npm_input_projects, key=lambda item: item.source_input_path):
         project_path = f"{targeted_subdir}/{artifact_index:03d}"
@@ -3654,6 +4663,13 @@ def _write_targeted_artifacts(
             project.source_input_path,
             *(path for path in project.staged_input_paths if path != project.source_input_path),
         )
+        ecosystem_by_project[project_path] = (
+            "maven"
+            if project.package_manager == "maven"
+            else "pypi"
+            if project_language == ProjectLanguage.PYTHON
+            else "npm"
+        )
 
     return _TargetedArtifactManifest(
         scan_subdir=targeted_subdir,
@@ -3667,6 +4683,7 @@ def _write_targeted_artifacts(
         task_ids_by_project=task_ids_by_project,
         input_paths_by_project=input_paths_by_project,
         maven_artifacts_by_project=maven_artifacts_by_project,
+        ecosystem_by_project=ecosystem_by_project,
     )
 
 
@@ -4000,6 +5017,13 @@ def _attribute_reported_occurrences(
             ] = {}
             for reported in project_reports:
                 ecosystem = str(_scan_result_value(reported, "ecosystem", "")).casefold()
+                expected_ecosystem = artifact_manifest.ecosystem_by_project.get(
+                    project_path,
+                    "npm",
+                )
+                if ecosystem != expected_ecosystem:
+                    mapping_complete = False
+                    continue
                 identity = (
                     ecosystem,
                     str(_scan_result_value(reported, "package_name", "")).casefold(),
@@ -4250,6 +5274,29 @@ def _scan_evidence(
     )
 
 
+def _closure_matches_task_target(closure: Any, target: QAScanTarget) -> bool:
+    """Return whether a closure is rooted at the exact task-owned target."""
+    root_keys = {
+        str(root_key)
+        for root_key in (getattr(closure, "root_keys", ()) or ())
+        if isinstance(root_key, str)
+    }
+    target_package = target.target_package.strip().casefold()
+    expected_version = target.expected_version
+    if not root_keys or not target_package:
+        return False
+    for node in getattr(closure, "nodes", ()) or ():
+        if str(getattr(node, "lockfile_key", "")) not in root_keys:
+            continue
+        package_name = str(getattr(node, "package_name", "")).strip().casefold()
+        version = str(getattr(node, "version", "")).strip()
+        if package_name == target_package and (
+            expected_version is None or version == expected_version
+        ):
+            return True
+    return False
+
+
 def _scan_evidence_by_task(
     evidence: ODCScanEvidence | None,
     *,
@@ -4281,6 +5328,7 @@ def _scan_evidence_by_task(
     result: dict[str, ODCScanEvidence] = {}
     for task_id in sorted(task_ids):
         target = targets_by_task.get(task_id)
+        task_target = target
         scoped_closures_by_task = (
             getattr(batch, "task_scoped_closures_by_task", None) if batch is not None else None
         )
@@ -4290,6 +5338,40 @@ def _scan_evidence_by_task(
         else:
             task_closures = batch.closures_by_task.get(task_id, ()) if batch is not None else ()
             has_task_closure_scope = bool(task_closures)
+
+        project_paths = sorted(set(projects_by_task.get(task_id, [])))
+        project_is_shared = bool(
+            artifact_manifest is not None
+            and any(
+                len(artifact_manifest.task_ids_by_project.get(project_path, ())) > 1
+                for project_path in project_paths
+            )
+        )
+        project_is_npm = bool(
+            artifact_manifest is not None
+            and any(
+                artifact_manifest.ecosystem_by_project.get(project_path) == "npm"
+                for project_path in project_paths
+            )
+        )
+        target_skipped = batch is not None and task_id in getattr(batch, "skipped_task_ids", ())
+        scope_to_npm_target = task_target is not None and (
+            bool(task_closures) or project_is_shared or project_is_npm
+        )
+        if scope_to_npm_target and not has_task_closure_scope:
+            # Shared npm projects are filtered to this task's exact dependency root.
+            target_closures = tuple(
+                closure
+                for closure in task_closures
+                if _closure_matches_task_target(closure, task_target)
+            )
+            if not target_closures and target_skipped:
+                target_closures = tuple(
+                    closure
+                    for closure in task_closures
+                    if "" in (getattr(closure, "root_keys", ()) or ())
+                )
+            task_closures = target_closures
         task_occurrence_keys = {
             _package_occurrence_key(
                 closure.source_lockfile,
@@ -4302,6 +5384,7 @@ def _scan_evidence_by_task(
         }
         project_paths = sorted(set(projects_by_task.get(task_id, [])))
         target_skipped = batch is not None and task_id in getattr(batch, "skipped_task_ids", ())
+        restrict_to_task_closure = bool(task_closures) or scope_to_npm_target
         occurrences_by_key: dict[str, PackageScanOccurrence] = {}
         covered_input_paths: set[str] = set()
         for project_path in project_paths:
@@ -4317,7 +5400,9 @@ def _scan_evidence_by_task(
                 Path(source_input_path).name.casefold() == "pom.xml"
                 for source_input_path in project_input_paths
             )
-            restrict_to_task_closure = has_task_closure_scope and project_is_npm_lockfile
+            restrict_to_task_closure = project_is_npm_lockfile and (
+                has_task_closure_scope or scope_to_npm_target
+            )
             restrict_to_maven_target = (
                 target is not None
                 and target.package_manager == "maven"

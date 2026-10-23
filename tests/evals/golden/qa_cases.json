@@ -4915,5 +4915,840 @@
         ]
       }
     }
+  },
+  {
+    "case_id": "python-qa-certifi-pass",
+    "eval_type": "qa_critic",
+    "golden_kind": "historical_replay",
+    "evidence_status": "complete",
+    "provenance": "Task task-1 reached qa_passed; install and tests passed; task-scoped scan evidence was complete and cleared CVE-2023-37920.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261016T075629Z_ba0b44c1-7a62-4523-b00e-7797df5e29c9.md",
+        "observation": "Task task-1 reached qa_passed; install and tests passed; task-scoped scan evidence was complete and cleared CVE-2023-37920."
+      }
+    ],
+    "completion_task": "Evaluate task-scoped Python QA for certifi; emit passed=true based on install, covered scan, and test evidence.",
+    "qa_policy": "version_bump",
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:certifi",
+      "vulnerable_component": "certifi",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "2022.12.7",
+      "fixed_version": "2024.7.4",
+      "cve_ids": [
+        "CVE-2023-37920"
+      ],
+      "ghsa_ids": []
+    },
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": true,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "python-qa-certifi-pass"
+      ],
+      "closure_package_names": [
+        "certifi"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
+    },
+    "execution_logs": {
+      "install_log": "pip dependency installation passed.",
+      "scan_summary": "Targeted Dependency-Check evidence is complete.",
+      "test_output": "pytest passed.",
+      "test_exit_code": 0,
+      "test_failure_count": 0
+    },
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "worker_action_summary": "Updated certifi to 2024.7.4.",
+    "expected_qa_verdict": {
+      "passed": true,
+      "failure_category": null
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete the QA audit and emit passed=true with failure_category=None.",
+    "input": "Check the Python remediation of certifi 2022.12.7 to 2024.7.4.",
+    "context": [
+      "Package: certifi",
+      "Scanner identifiers: ['CVE-2023-37920']",
+      "Target scan complete: True",
+      "Python tests passed: True"
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "python-qa-certifi-pass",
+          "passed": true,
+          "failure_category": null,
+          "retry_feedback": null,
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "python-qa-certifi-pass",
+        "passed": true,
+        "failure_category": null,
+        "retry_feedback": null
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "python-qa-certifi-pass",
+            "passed": true,
+            "failure_category": null,
+            "retry_feedback": null,
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "vulnerability_context": {
+          "group_id": "sca:requirements.txt:certifi",
+          "vulnerable_component": "certifi",
+          "file_path": "requirements.txt",
+          "ecosystem": "pypi",
+          "package_version": "2022.12.7",
+          "fixed_version": "2024.7.4",
+          "cve_ids": [
+            "CVE-2023-37920"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "python-qa-certifi-pass"
+          ],
+          "closure_package_names": [
+            "certifi"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
+        },
+        "execution_logs": {
+          "install_log": "pip passed.",
+          "scan_summary": "Dependency-Check passed.",
+          "test_output": "pytest passed.",
+          "test_exit_code": 0,
+          "test_failure_count": 0
+        },
+        "workspace_files": {
+          "requirements.txt": "certifi==2024.7.4\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_app():\n    assert True\n"
+        },
+        "allowed_target_versions": [
+          "2024.7.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "selected_version": "2024.7.4",
+    "dependency_type": "requirements",
+    "project_language": "python"
+  },
+  {
+    "case_id": "python-qa-batch-sqlparse-pass",
+    "eval_type": "qa_critic",
+    "golden_kind": "historical_replay",
+    "evidence_status": "complete",
+    "provenance": "The sqlparse task in the atomic certifi/sqlparse requirements batch reached qa_passed.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T165913Z_9ede9474-e210-431f-bb8b-4def9e00cca8.md",
+        "observation": "The PyGoat root input records sqlparse 0.3.1 with CVE-2023-30608 and GHSA-RRM6-WVJ7-CWH2; the atomic batch selected 0.4.4 and the task passed QA."
+      }
+    ],
+    "completion_task": "Evaluate task-scoped Python QA for sqlparse; emit passed=true based on install, covered scan, and test evidence.",
+    "qa_policy": "version_bump",
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:sqlparse",
+      "vulnerable_component": "sqlparse",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "0.3.1",
+      "fixed_version": "0.4.4",
+      "cve_ids": [
+        "CVE-2021-32839"
+      ],
+      "ghsa_ids": []
+    },
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": true,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "python-qa-batch-sqlparse-pass"
+      ],
+      "closure_package_names": [
+        "sqlparse"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
+    },
+    "execution_logs": {
+      "install_log": "pip dependency installation passed.",
+      "scan_summary": "Targeted Dependency-Check evidence is complete.",
+      "test_output": "pytest passed.",
+      "test_exit_code": 0,
+      "test_failure_count": 0
+    },
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "worker_action_summary": "Updated sqlparse to 0.4.4.",
+    "expected_qa_verdict": {
+      "passed": true,
+      "failure_category": null
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete the QA audit and emit passed=true with failure_category=None.",
+    "input": "Check the Python remediation of sqlparse 0.3.1 to 0.4.4.",
+    "context": [
+      "Package: sqlparse",
+      "Scanner identifiers: ['CVE-2021-32839']",
+      "Target scan complete: True",
+      "Python tests passed: True"
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "python-qa-batch-sqlparse-pass",
+          "passed": true,
+          "failure_category": null,
+          "retry_feedback": null,
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "python-qa-batch-sqlparse-pass",
+        "passed": true,
+        "failure_category": null,
+        "retry_feedback": null
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "python-qa-batch-sqlparse-pass",
+            "passed": true,
+            "failure_category": null,
+            "retry_feedback": null,
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "vulnerability_context": {
+          "group_id": "sca:requirements.txt:sqlparse",
+          "vulnerable_component": "sqlparse",
+          "file_path": "requirements.txt",
+          "ecosystem": "pypi",
+          "package_version": "0.3.1",
+          "fixed_version": "0.4.4",
+          "cve_ids": [
+            "CVE-2023-30608"
+          ],
+          "ghsa_ids": [
+            "GHSA-RRM6-WVJ7-CWH2"
+          ]
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "python-qa-batch-sqlparse-pass"
+          ],
+          "closure_package_names": [
+            "sqlparse"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
+        },
+        "execution_logs": {
+          "install_log": "pip passed.",
+          "scan_summary": "Dependency-Check passed.",
+          "test_output": "pytest passed.",
+          "test_exit_code": 0,
+          "test_failure_count": 0
+        },
+        "workspace_files": {
+          "requirements.txt": "sqlparse==0.4.4\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_app():\n    assert True\n"
+        },
+        "allowed_target_versions": [
+          "0.4.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "selected_version": "0.4.4",
+    "dependency_type": "requirements",
+    "project_language": "python"
+  },
+  {
+    "case_id": "python-qa-incomplete-target-coverage",
+    "eval_type": "qa_critic",
+    "golden_kind": "historical_replay",
+    "evidence_status": "incomplete",
+    "provenance": "Targeted ODC did not provide verifiable coverage for requirements.txt; QA returned inconclusive and did not consume a remediation retry.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261016T074329Z_2da20b0f-ee1b-4365-b63d-04000305773c.md",
+        "observation": "Targeted ODC did not provide verifiable coverage for requirements.txt; QA returned inconclusive and did not consume a remediation retry."
+      }
+    ],
+    "completion_task": "Evaluate task-scoped Python QA for certifi; emit passed=false based on install, covered scan, and test evidence.",
+    "qa_policy": "version_bump",
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:certifi",
+      "vulnerable_component": "certifi",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "2022.12.7",
+      "fixed_version": "2024.7.4",
+      "cve_ids": [
+        "CVE-2023-37920"
+      ],
+      "ghsa_ids": []
+    },
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "unparseable",
+      "target_scanner_cleared": null,
+      "target_remaining_identifiers": [
+        "CVE-2023-37920"
+      ],
+      "tests_passed": true,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": false,
+      "covered_task_ids": [
+        "python-qa-incomplete-target-coverage"
+      ],
+      "closure_package_names": [
+        "certifi"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": "targeted_report_unparseable"
+    },
+    "execution_logs": {
+      "install_log": "pip dependency installation passed.",
+      "scan_summary": "ODC did not cover the staged requirements.txt input.",
+      "test_output": "pytest passed.",
+      "test_exit_code": 0,
+      "test_failure_count": 0
+    },
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "worker_action_summary": "Updated certifi to 2024.7.4.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "security_flag"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete the QA audit and emit passed=false with failure_category=security_flag.",
+    "input": "Check the Python remediation of certifi 2022.12.7 to 2024.7.4.",
+    "context": [
+      "Package: certifi",
+      "Scanner identifiers: ['CVE-2023-37920']",
+      "Target scan complete: False",
+      "Python tests passed: True"
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "python-qa-incomplete-target-coverage",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "Targeted Python scan evidence is incomplete; do not claim clearance.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "python-qa-incomplete-target-coverage",
+        "passed": false,
+        "failure_category": "security_flag",
+        "retry_feedback": "Targeted Python scan evidence is incomplete; do not claim clearance."
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "python-qa-incomplete-target-coverage",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "Targeted Python scan evidence is incomplete; do not claim clearance.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "vulnerability_context": {
+          "group_id": "sca:requirements.txt:certifi",
+          "vulnerable_component": "certifi",
+          "file_path": "requirements.txt",
+          "ecosystem": "pypi",
+          "package_version": "2022.12.7",
+          "fixed_version": "2024.7.4",
+          "cve_ids": [
+            "CVE-2023-37920"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "unparseable",
+          "target_scanner_cleared": null,
+          "target_remaining_identifiers": [
+            "CVE-2023-37920"
+          ],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": false,
+          "covered_task_ids": [
+            "python-qa-incomplete-target-coverage"
+          ],
+          "closure_package_names": [
+            "certifi"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": "targeted_report_unparseable"
+        },
+        "execution_logs": {
+          "install_log": "pip passed.",
+          "scan_summary": "ODC coverage incomplete.",
+          "test_output": "pytest passed.",
+          "test_exit_code": 0,
+          "test_failure_count": 0
+        },
+        "workspace_files": {
+          "requirements.txt": "certifi==2024.7.4\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_app():\n    assert True\n"
+        },
+        "allowed_target_versions": [
+          "2024.7.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "selected_version": "2024.7.4",
+    "dependency_type": "requirements",
+    "project_language": "python"
+  },
+  {
+    "case_id": "python-qa-pyjwt-identifier-remains",
+    "eval_type": "qa_critic",
+    "golden_kind": "historical_replay",
+    "evidence_status": "complete",
+    "provenance": "The PyJWT QA attempt retained CVE-2025-45770 despite install and tests passing; the finding blocked remediation acceptance.",
+    "historical_evidence": [
+      {
+        "trajectory": "data/trajectories/phase5_20261019T155736Z_2f772cbc-204b-44b7-a1b5-3f2a0f177a25.md",
+        "observation": "The PyJWT QA attempt retained CVE-2025-45770 despite install and tests passing; the finding blocked remediation acceptance."
+      }
+    ],
+    "completion_task": "Evaluate task-scoped Python QA for pyjwt; emit passed=false based on install, covered scan, and test evidence.",
+    "qa_policy": "version_bump",
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:pyjwt",
+      "vulnerable_component": "pyjwt",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "2.4.0",
+      "fixed_version": "2.13.0",
+      "cve_ids": [
+        "CVE-2025-45770"
+      ],
+      "ghsa_ids": []
+    },
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": false,
+      "target_remaining_identifiers": [
+        "CVE-2025-45770"
+      ],
+      "tests_passed": true,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "python-qa-pyjwt-identifier-remains"
+      ],
+      "closure_package_names": [
+        "pyjwt"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
+    },
+    "execution_logs": {
+      "install_log": "pip dependency installation passed.",
+      "scan_summary": "Targeted Dependency-Check evidence is complete.",
+      "test_output": "pytest passed.",
+      "test_exit_code": 0,
+      "test_failure_count": 0
+    },
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "worker_action_summary": "Updated pyjwt to 2.13.0.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "security_flag"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete the QA audit and emit passed=false with failure_category=security_flag.",
+    "input": "Check the Python remediation of pyjwt 2.4.0 to 2.13.0.",
+    "context": [
+      "Package: pyjwt",
+      "Scanner identifiers: ['CVE-2025-45770']",
+      "Target scan complete: True",
+      "Python tests passed: True"
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "python-qa-pyjwt-identifier-remains",
+          "passed": false,
+          "failure_category": "security_flag",
+          "retry_feedback": "The assigned PyPI identifier remains after the update.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "python-qa-pyjwt-identifier-remains",
+        "passed": false,
+        "failure_category": "security_flag",
+        "retry_feedback": "The assigned PyPI identifier remains after the update."
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "python-qa-pyjwt-identifier-remains",
+            "passed": false,
+            "failure_category": "security_flag",
+            "retry_feedback": "The assigned PyPI identifier remains after the update.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "vulnerability_context": {
+          "group_id": "sca:requirements.txt:pyjwt",
+          "vulnerable_component": "pyjwt",
+          "file_path": "requirements.txt",
+          "ecosystem": "pypi",
+          "package_version": "2.4.0",
+          "fixed_version": "2.13.0",
+          "cve_ids": [
+            "CVE-2025-45770"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": false,
+          "target_remaining_identifiers": [
+            "CVE-2025-45770"
+          ],
+          "tests_passed": true,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "python-qa-pyjwt-identifier-remains"
+          ],
+          "closure_package_names": [
+            "pyjwt"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
+        },
+        "execution_logs": {
+          "install_log": "pip passed.",
+          "scan_summary": "Dependency-Check passed.",
+          "test_output": "pytest passed.",
+          "test_exit_code": 0,
+          "test_failure_count": 0
+        },
+        "workspace_files": {
+          "requirements.txt": "pyjwt==2.13.0\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_app():\n    assert True\n"
+        },
+        "allowed_target_versions": [
+          "2.13.0"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "selected_version": "2.13.0",
+    "dependency_type": "requirements",
+    "project_language": "python"
+  },
+  {
+    "case_id": "python-qa-tests-fail",
+    "eval_type": "qa_critic",
+    "golden_kind": "synthetic_policy_case",
+    "evidence_status": "complete",
+    "provenance": "Synthetic test failure case verifies the Python QA critic rejects a candidate with failed project tests.",
+    "historical_evidence": [
+      {
+        "source": "synthetic fixture",
+        "observation": "Synthetic test failure case verifies the Python QA critic rejects a candidate with failed project tests."
+      }
+    ],
+    "completion_task": "Evaluate task-scoped Python QA for certifi; emit passed=false based on install, covered scan, and test evidence.",
+    "qa_policy": "version_bump",
+    "vulnerability_context": {
+      "group_id": "sca:requirements.txt:certifi",
+      "vulnerable_component": "certifi",
+      "file_path": "requirements.txt",
+      "ecosystem": "pypi",
+      "package_version": "2022.12.7",
+      "fixed_version": "2024.7.4",
+      "cve_ids": [
+        "CVE-2023-37920"
+      ],
+      "ghsa_ids": []
+    },
+    "execution_context": {
+      "install_passed": true,
+      "scanner_execution_status": "success",
+      "target_scanner_cleared": true,
+      "target_remaining_identifiers": [],
+      "tests_passed": false,
+      "package_manifest_state": "present",
+      "package_graph_state": "present",
+      "requested_scope": "targeted",
+      "effective_scope": "targeted",
+      "scan_complete": true,
+      "covered_task_ids": [
+        "python-qa-tests-fail"
+      ],
+      "closure_package_names": [
+        "certifi"
+      ],
+      "closure_lockfile_keys": [],
+      "fallback_reason": null
+    },
+    "execution_logs": {
+      "install_log": "pip dependency installation passed.",
+      "scan_summary": "Targeted Dependency-Check evidence is complete.",
+      "test_output": "pytest reported one failing test.",
+      "test_exit_code": 1,
+      "test_failure_count": 1
+    },
+    "changed_files": [
+      "requirements.txt"
+    ],
+    "worker_action_summary": "Updated certifi to 2024.7.4.",
+    "expected_qa_verdict": {
+      "passed": false,
+      "failure_category": "breaking_change"
+    },
+    "expected_task_completion_pass": true,
+    "expected_tool_correctness_pass": true,
+    "expected_output": "Complete the QA audit and emit passed=false with failure_category=breaking_change.",
+    "input": "Check the Python remediation of certifi 2022.12.7 to 2024.7.4.",
+    "context": [
+      "Package: certifi",
+      "Scanner identifiers: ['CVE-2023-37920']",
+      "Target scan complete: True",
+      "Python tests passed: False"
+    ],
+    "expected_tools": [
+      {
+        "name": "emit_qa_evaluation",
+        "args": {
+          "task_id": "python-qa-tests-fail",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "Python unit tests failed after the update.",
+          "semantic_security_review": null,
+          "test_attribution": null
+        }
+      }
+    ],
+    "offline_fixture": {
+      "actual_output": {
+        "task_id": "python-qa-tests-fail",
+        "passed": false,
+        "failure_category": "breaking_change",
+        "retry_feedback": "Python unit tests failed after the update."
+      },
+      "actual_tools": [
+        {
+          "name": "emit_qa_evaluation",
+          "args": {
+            "task_id": "python-qa-tests-fail",
+            "passed": false,
+            "failure_category": "breaking_change",
+            "retry_feedback": "Python unit tests failed after the update.",
+            "semantic_security_review": null,
+            "test_attribution": null
+          },
+          "output": "SUCCESS: Recorded QA evaluation."
+        }
+      ]
+    },
+    "replay": {
+      "input": {
+        "project_language": "python",
+        "vulnerability_context": {
+          "group_id": "sca:requirements.txt:certifi",
+          "vulnerable_component": "certifi",
+          "file_path": "requirements.txt",
+          "ecosystem": "pypi",
+          "package_version": "2022.12.7",
+          "fixed_version": "2024.7.4",
+          "cve_ids": [
+            "CVE-2023-37920"
+          ],
+          "ghsa_ids": []
+        },
+        "execution_context": {
+          "install_passed": true,
+          "scanner_execution_status": "success",
+          "target_scanner_cleared": true,
+          "target_remaining_identifiers": [],
+          "tests_passed": false,
+          "package_manifest_state": "present",
+          "package_graph_state": "present",
+          "requested_scope": "targeted",
+          "effective_scope": "targeted",
+          "scan_complete": true,
+          "covered_task_ids": [
+            "python-qa-tests-fail"
+          ],
+          "closure_package_names": [
+            "certifi"
+          ],
+          "closure_lockfile_keys": [],
+          "fallback_reason": null
+        },
+        "execution_logs": {
+          "install_log": "pip passed.",
+          "scan_summary": "Dependency-Check passed.",
+          "test_output": "pytest failed.",
+          "test_exit_code": 1,
+          "test_failure_count": 1
+        },
+        "workspace_files": {
+          "requirements.txt": "certifi==2024.7.4\n",
+          "src/app.py": "def ready():\n    return True\n",
+          "tests/test_app.py": "def test_app():\n    assert True\n"
+        },
+        "allowed_target_versions": [
+          "2024.7.4"
+        ],
+        "allowed_dependency_types": [
+          "requirements"
+        ]
+      }
+    },
+    "selected_version": "2024.7.4",
+    "dependency_type": "requirements",
+    "project_language": "python"
   }
 ]

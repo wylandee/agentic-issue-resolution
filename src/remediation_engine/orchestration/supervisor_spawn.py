@@ -27,6 +27,7 @@ from remediation_engine.orchestration.supervisor_planner import (
 )
 from remediation_engine.orchestration.supervisor_policy import (
     _TERMINAL_STATUSES,
+    _latest_sca_stage,
     _parent_status_for_strategy_pivot,
 )
 from remediation_engine.orchestration.supervisor_routing import _build_consistency_event
@@ -125,7 +126,7 @@ def _terminalize_pivot_parents(
             component = group.vulnerable_component if group else parent_task.parent_group_id
             updates.update(
                 {
-                    "strategy_stage": SCARemediationStage.NPM_LATEST,
+                    "strategy_stage": _latest_sca_stage(parent_task, group),
                     "selected_version": None,
                     "exhausted_update_path": True,
                     "instruction": (

@@ -480,10 +480,10 @@ class OrchestratorState(TypedDict, total=False):
     # accepted only for development runs and limit synthetic dependency
     # discovery to the requested package closure.
     target_packages: list[str]
+    project_language: ProjectLanguage
 
     issues: list[VulnerabilityIssue]
     system_context: SystemContext
-    project_language: ProjectLanguage
 
     constraints_ledger: Annotated[list[str], operator.add]
     retry_counts: Annotated[dict[str, int], merge_dict_reducer]
@@ -628,6 +628,7 @@ def initial_orchestrator_state(
     issues: list[VulnerabilityIssue] | None = None,
     system_context: SystemContext | None = None,
     target_packages: Sequence[str] | None = None,
+    project_language: ProjectLanguage | str | None = None,
 ) -> dict[str, Any]:
     """Build a well-formed initial ``OrchestratorState`` dict.
 
@@ -639,9 +640,14 @@ def initial_orchestrator_state(
         target_packages,
         system_context,
     )
-    project_language = resolve_project_language(
-        Path(repo_root),
-        system_context.primary_language if system_context is not None else None,
+    resolved_project_language = (
+        project_language
+        if isinstance(project_language, ProjectLanguage)
+        else resolve_project_language(
+            Path(repo_root),
+            project_language
+            or (system_context.primary_language if system_context is not None else None),
+        )
     )
     valid_groups = normalize_group_paths(valid_groups, repo_root)
     baseline_scan_complete = issues is not None
@@ -660,6 +666,7 @@ def initial_orchestrator_state(
         "initial_valid_groups": list(valid_groups),
         "run_started_at": datetime.now(UTC).isoformat(),
         "target_packages": normalized_target_packages,
+        "project_language": resolved_project_language,
         "constraints_ledger": [],
         "retry_counts": {},
         "group_strategies": {},
@@ -693,7 +700,6 @@ def initial_orchestrator_state(
         "delta_isolation_by_cluster": {},
         "workspace_volume": None,
         "maven_cache_volume": None,
-        "project_language": project_language,
         "status": "pending",
         "next_routing_step": "",
         "feedback_by_group": {},
@@ -776,6 +782,7 @@ def initial_update_subagent_state(
     return {
         "repo_root": repo_root,
         "workspace_volume": workspace_volume,
+        "project_language": project_language,
         "target_tasks": target_tasks_list,
         "target_groups": target_groups_list,
         "feedback_by_group": feedback_by_group_dict,
@@ -790,7 +797,6 @@ def initial_update_subagent_state(
         "messages": list(messages or []),
         "changed_files": [],
         "errors": [],
-        "project_language": project_language,
         "maven_cache_volume": maven_cache_volume,
     }
 
@@ -811,13 +817,13 @@ def initial_workaround_subagent_state(
     return {
         "repo_root": repo_root,
         "workspace_volume": workspace_volume,
+        "project_language": project_language,
         "target_task": target_task,
         "target_group": target_group,
         "constraints_ledger": list(constraints_ledger or []),
         "previous_feedback": previous_feedback,
         "attempt_snapshot": attempt_snapshot,
         "current_replay_plan": current_replay_plan,
-        "project_language": project_language,
         "maven_cache_volume": maven_cache_volume,
         "messages": [],
         "changed_files": [],

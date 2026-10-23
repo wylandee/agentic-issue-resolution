@@ -65,6 +65,7 @@ class _SecurityScanResult:
     reported_packages: list[tuple[str, str]] | None = None
     reported_paths: list[str] | None = None
     reported_package_occurrences: list[_ODCReportedPackageOccurrence] | None = None
+    scanned_packages: set[tuple[str, str]] = field(default_factory=set)
 
 
 @dataclass

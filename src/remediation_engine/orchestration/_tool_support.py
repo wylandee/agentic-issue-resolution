@@ -29,6 +29,7 @@ from remediation_engine.contracts.schemas import (
     WorkaroundValidationResult,  # noqa: F401
     WorkaroundValidationStatus,  # noqa: F401
 )  # noqa: F401
+from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.runtime_context import get_runtime_settings  # noqa: F401
 from remediation_engine.runtime.path_policy import (
     normalize_workspace_path,
@@ -91,6 +92,19 @@ _READ_WEB_PAGE_MAX_CHARS = 16_000
 
 _SOURCE_MODULE_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"})
 _JAVA_SOURCE_SUFFIXES = frozenset({".java"})
+_PYTHON_SOURCE_MODULE_SUFFIXES = frozenset({".py"})
+_PYTHON_RUNTIME_BOOTSTRAP_MARKERS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"^\s*if\s+__name__\s*==\s*[\"']__main__[\"']\s*:", re.MULTILINE),
+        "contains an application entrypoint",
+    ),
+    (re.compile(r"\b(?:app|application)\.run\s*\("), "starts an application server"),
+    (re.compile(r"\buvicorn\.run\s*\("), "starts an application server"),
+    (
+        re.compile(r"\bmanage\.execute_from_command_line\s*\("),
+        "starts a Django management command",
+    ),
+)
 _TEST_DIRECTORY_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs"})
 
 # Runtime smoke must prove that the changed module can load.  Application
@@ -128,6 +142,18 @@ def _is_authoritative_evidence_source(source: str) -> bool:
         for untrusted in ("stackoverflow.com", "stackexchange.com", "reddit.com", "snippet-only")
     ):
         return False
+    source_url = candidate if "://" in candidate else f"https://{candidate}"
+    try:
+        source_host = (urlparse(source_url).hostname or "").lower()
+    except ValueError:
+        source_host = ""
+    if source_host in {
+        "pypi.org",
+        "www.pypi.org",
+        "packaging.python.org",
+        "docs.python.org",
+    }:
+        return True
 
     authoritative_markers = (
         "github.com/",
@@ -224,22 +250,40 @@ def _is_infrastructure_failure(error_text: str) -> bool:
     return any(marker in lowered for marker in infra_markers)
 
 
-def _runtime_smoke_bootstrap_reason(file_path: str, source_content: str) -> str | None:
-    """Return why a source module is unsafe for import-only runtime smoke.
-
-    Args:
-        file_path: Repository-relative source path being considered.
-        source_content: Current source contents for ``file_path``.
-
-    Returns:
-        A short reason when the module appears to bootstrap the application;
-        otherwise ``None``.
-    """
+def _runtime_smoke_bootstrap_reason(
+    file_path: str,
+    source_content: str,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> str | None:
+    """Return why a source module is unsafe for import-only runtime smoke."""
     normalized = _normalise_newlines(source_content)
+    if language == ProjectLanguage.PYTHON:
+        if Path(file_path).name == "manage.py":
+            return "is a Django management entrypoint"
+        if Path(file_path).name in {"setup.py", "conftest.py"}:
+            return "is a Python manifest or helper file, not an application source module"
+        for pattern, reason in _PYTHON_RUNTIME_BOOTSTRAP_MARKERS:
+            if pattern.search(normalized):
+                return reason
+        return None
     for pattern, reason in _RUNTIME_BOOTSTRAP_MARKERS:
         if pattern.search(normalized):
             return reason
     return None
+
+
+def _source_suffixes(language: ProjectLanguage) -> frozenset[str]:
+    """Return the source suffixes supported by workaround tooling."""
+    if language == ProjectLanguage.PYTHON:
+        return _PYTHON_SOURCE_MODULE_SUFFIXES
+    if language == ProjectLanguage.JAVA:
+        return _JAVA_SOURCE_SUFFIXES
+    return _SOURCE_MODULE_SUFFIXES
+
+
+def _test_suffixes(language: ProjectLanguage) -> frozenset[str]:
+    """Return source suffixes accepted for targeted test files."""
+    return _source_suffixes(language)
 
 
 def _select_lightweight_runtime_smoke_target(
@@ -248,31 +292,15 @@ def _select_lightweight_runtime_smoke_target(
     targeted_test_file: str | None,
     sandbox: DockerSandbox,
     *,
-    source_suffixes: frozenset[str] = _SOURCE_MODULE_SUFFIXES,
+    source_suffixes: frozenset[str] | None = None,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[str | None, str | None]:
-    """Select a safe source module for import-only runtime smoke.
-
-    An explicitly supplied test, compiled artifact, missing file, or invalid
-    path is rejected. If the requested source module bootstraps the
-    application, the selector considers changed source files in deterministic
-    order and records which safe module was selected.
-
-    Args:
-        requested_file: Agent-provided runtime smoke path.
-        candidate_files: Changed source files eligible for deterministic
-            selection.
-        targeted_test_file: Already selected targeted test path.
-        sandbox: Workspace sandbox used to read source contents.
-
-    Returns:
-        ``(selected_path, note)`` on success, where ``note`` describes a
-        deterministic alternate selection. On failure, returns
-        ``(None, diagnostic)``.
-    """
+    """Select a safe source module for import-only runtime smoke."""
     normalized_requested, path_error = _runtime_smoke_path_error(
         requested_file,
         targeted_test_file=targeted_test_file,
         source_suffixes=source_suffixes,
+        language=language,
     )
     if path_error:
         return None, path_error
@@ -288,6 +316,7 @@ def _select_lightweight_runtime_smoke_target(
     requested_reason = _runtime_smoke_bootstrap_reason(
         normalized_requested,
         requested_content,
+        language=language,
     )
     if requested_reason is None:
         return normalized_requested, None
@@ -298,18 +327,21 @@ def _select_lightweight_runtime_smoke_target(
             candidate = _validate_workspace_path(str(raw_path))
         except ValueError:
             continue
-        if candidate in normalized_candidates:
+        if candidate in normalized_candidates or candidate in (
+            normalized_requested,
+            targeted_test_file,
+        ):
             continue
-        if candidate in (normalized_requested, targeted_test_file):
+        if Path(candidate).suffix.lower() not in (source_suffixes or _source_suffixes(language)):
             continue
-        if Path(candidate).suffix.lower() not in source_suffixes:
+        if source_suffixes is not None and Path(candidate).suffix.lower() not in source_suffixes:
             continue
-        if _is_test_file_path(candidate):
+        if _is_test_file_path(candidate, language=language):
             continue
         content = sandbox.read_file(candidate)
         if content is None:
             continue
-        if _runtime_smoke_bootstrap_reason(candidate, content) is None:
+        if _runtime_smoke_bootstrap_reason(candidate, content, language=language) is None:
             normalized_candidates.append(candidate)
 
     if normalized_candidates:
@@ -325,7 +357,11 @@ def _select_lightweight_runtime_smoke_target(
     )
 
 
-def _is_test_file_path(file_path: str) -> bool:
+def _is_test_file_path(
+    file_path: str,
+    *,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
+) -> bool:
     """Return whether a repository-relative path identifies a test/spec file."""
     path = Path(file_path.replace("\\", "/"))
     lowered_parts = {part.lower() for part in path.parts[:-1]}
@@ -334,13 +370,19 @@ def _is_test_file_path(file_path: str) -> bool:
         filename.startswith("test")
         or filename.endswith(("test.java", "tests.java", "testcase.java"))
     )
-    return bool(
-        lowered_parts & _TEST_DIRECTORY_NAMES
-        or ".test." in filename
+    is_named_test = bool(
+        ".test." in filename
         or ".spec." in filename
         or filename.endswith((".test", ".spec"))
-        or is_java_test_class
     )
+    if language == ProjectLanguage.PYTHON:
+        is_named_test = (
+            is_named_test
+            or filename == "conftest.py"
+            or filename.startswith("test_")
+            or filename.endswith("_test.py")
+        )
+    return bool(lowered_parts & _TEST_DIRECTORY_NAMES or is_named_test or is_java_test_class)
 
 
 def _select_targeted_test_file(
@@ -349,7 +391,8 @@ def _select_targeted_test_file(
     accepted_alternative_test: str | None,
     sandbox: DockerSandbox,
     *,
-    source_suffixes: frozenset[str] = _SOURCE_MODULE_SUFFIXES,
+    source_suffixes: frozenset[str] | None = None,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[str | None, str | None, str | None]:
     """Resolve an agent test selection to one deterministic existing source test.
 
@@ -380,8 +423,9 @@ def _select_targeted_test_file(
             continue
         if (
             candidate in candidate_paths
-            or Path(candidate).suffix.lower() not in source_suffixes
-            or not _is_test_file_path(candidate)
+            or Path(candidate).suffix.lower()
+            not in (source_suffixes or _test_suffixes(language))
+            or not _is_test_file_path(candidate, language=language)
             or sandbox.read_file(candidate) is None
         ):
             continue
@@ -414,8 +458,9 @@ def _select_targeted_test_file(
 
         requested_content = sandbox.read_file(normalized_requested)
         requested_suffix = Path(normalized_requested).suffix.lower()
-        requested_is_source_module = requested_suffix in source_suffixes and not _is_test_file_path(
-            normalized_requested
+        requested_is_source_module = (
+            requested_suffix in (source_suffixes or _source_suffixes(language))
+            and not _is_test_file_path(normalized_requested, language=language)
         )
         requested_is_directory_hint = not requested_suffix or normalized_requested.endswith("/")
         requested_is_missing = requested_content is None
@@ -449,7 +494,8 @@ def _runtime_smoke_path_error(
     runtime_file: str,
     targeted_test_file: str | None = None,
     *,
-    source_suffixes: frozenset[str] = _SOURCE_MODULE_SUFFIXES,
+    source_suffixes: frozenset[str] | None = None,
+    language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[str | None, str | None]:
     """Validate and normalize a lightweight source-module smoke target."""
     try:
@@ -457,12 +503,14 @@ def _runtime_smoke_path_error(
     except ValueError as exc:
         return None, str(exc)
 
-    if Path(rel_path).suffix.lower() not in source_suffixes:
+    suffixes = source_suffixes or _source_suffixes(language)
+    if Path(rel_path).suffix.lower() not in suffixes:
+        accepted = ", ".join(sorted(suffixes))
         return None, (
             f"Runtime smoke target '{rel_path}' must use a supported source suffix: "
-            f"{', '.join(sorted(source_suffixes))}."
+            f"{accepted}."
         )
-    if _is_test_file_path(rel_path):
+    if _is_test_file_path(rel_path, language=language):
         return None, (
             f"Runtime smoke target '{rel_path}' is a test/spec file. "
             "Choose a lightweight source module; runtime smoke and targeted tests must be separate."

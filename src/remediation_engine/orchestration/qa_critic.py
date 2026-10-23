@@ -147,7 +147,12 @@ def _missing_targeted_input_paths(
         for input_path in input_paths:
             basename = input_path.replace("\\", "/").rsplit("/", 1)[-1]
             if not any(
-                report_file == basename or report_file.startswith(f"{basename}/")
+                report_file == basename
+                or report_file.startswith(f"{basename}/")
+                or (
+                    report_file.startswith(f"{basename}:")
+                    and "/" in report_file[len(basename) + 1 :]
+                )
                 for report_file in report_files
             ):
                 missing_paths.add(input_path)
@@ -256,11 +261,11 @@ def _run_global_execution(
     """
     results = _QAExecutionResults()
 
-    install_label = (
-        "npm install"
-        if project_language == ProjectLanguage.NODEJS
-        else "mvn -B -q -DskipTests clean package"
-    )
+    install_label = {
+        ProjectLanguage.NODEJS: "npm install",
+        ProjectLanguage.JAVA: "mvn -B -q -DskipTests clean package",
+        ProjectLanguage.PYTHON: "Python dependency install",
+    }[project_language]
     logger.info("qa_critic: [Step 0] running %s.", install_label)
     install_outcome = (
         _qa_test_parsing_module._run_install(sandbox)
@@ -275,11 +280,19 @@ def _run_global_execution(
     deletion_only_skip = False
     precomputed_resolution_batch = None
     if skip_scan and scan_skip_reason == "no_fix_package_removal" and scan_targets:
-        precomputed_resolution_batch = _resolve_targeted_packages(
-            sandbox,
-            scan_targets or (),
-            scan_state,
-        )
+        if project_language == ProjectLanguage.PYTHON:
+            precomputed_resolution_batch = _resolve_targeted_packages(
+                sandbox,
+                scan_targets or (),
+                scan_state,
+                project_language=project_language,
+            )
+        else:
+            precomputed_resolution_batch = _resolve_targeted_packages(
+                sandbox,
+                scan_targets or (),
+                scan_state,
+            )
         precomputed_resolution_batch = _clear_expected_removed_target_failures(
             precomputed_resolution_batch,
             scan_targets or (),
@@ -366,24 +379,39 @@ def _run_global_execution(
         and scan_skip_reason != "no_fix_package_removal"
     ):
         if baseline_identifiers is None:
-            _store_scan_outcome(
-                results,
+            full_scan = (
                 _qa_odc_module._run_security_scan(
                     sandbox,
                     workspace_volume,
                     target_identifiers,
-                ),
+                    project_language=project_language,
+                )
+                if project_language == ProjectLanguage.PYTHON
+                else _qa_odc_module._run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                )
             )
+            _store_scan_outcome(results, full_scan)
         else:
-            _store_scan_outcome(
-                results,
+            full_scan = (
                 _qa_odc_module._run_security_scan(
                     sandbox,
                     workspace_volume,
                     target_identifiers,
                     baseline_identifiers,
-                ),
+                    project_language=project_language,
+                )
+                if project_language == ProjectLanguage.PYTHON
+                else _qa_odc_module._run_security_scan(
+                    sandbox,
+                    workspace_volume,
+                    target_identifiers,
+                    baseline_identifiers,
+                )
             )
+            _store_scan_outcome(results, full_scan)
     elif not skip_scan:
         baseline = baseline_identifiers or target_identifiers
         active_scan_targets = scan_targets or ()
@@ -403,11 +431,21 @@ def _run_global_execution(
                 incomplete_reason = ScanFallbackReason.TARGETED_SCAN_FAILED
                 incomplete_detail = "ODC_EXTRA_ARGS conflicts with safe targeted scan scope."
             else:
-                resolution_batch = precomputed_resolution_batch or _resolve_targeted_packages(
-                    sandbox,
-                    active_scan_targets,
-                    scan_state,
-                )
+                if precomputed_resolution_batch is not None:
+                    resolution_batch = precomputed_resolution_batch
+                elif project_language == ProjectLanguage.PYTHON:
+                    resolution_batch = _resolve_targeted_packages(
+                        sandbox,
+                        active_scan_targets,
+                        scan_state,
+                        project_language=project_language,
+                    )
+                else:
+                    resolution_batch = _resolve_targeted_packages(
+                        sandbox,
+                        active_scan_targets,
+                        scan_state,
+                    )
                 target_packages = list(resolution_batch.target_packages)
                 results.scan_target_skipped_by_task = {
                     task_id: ScanFallbackReason.NO_MATCHING_TARGET.value
@@ -417,6 +455,7 @@ def _run_global_execution(
                     target_packages
                     or resolution_batch.non_npm_input_projects
                     or any(resolution_batch.closures_by_task.values())
+                    or any(resolution_batch.python_closures_by_task.values())
                 )
                 results.scan_target_failures_by_task = {
                     task_id: (failure.reason, failure.detail)
@@ -457,28 +496,56 @@ def _run_global_execution(
                         )
             if incomplete_reason is None and has_targeted_inputs:
                 targeted_subdir = ".odc-targeted"
-                artifact_manifest = _write_targeted_artifacts(
-                    sandbox,
-                    resolution_batch.closures_by_task,
-                    resolution_batch.non_npm_input_projects,
-                )
-                targeted_subdir = artifact_manifest.scan_subdir
-                if target_identifiers:
-                    targeted_result = _qa_odc_module._run_targeted_security_scan(
+                if project_language == ProjectLanguage.PYTHON:
+                    artifact_manifest = _write_targeted_artifacts(
                         sandbox,
-                        workspace_volume,
-                        target_identifiers,
-                        baseline,
-                        targeted_subdir,
+                        resolution_batch.closures_by_task,
+                        resolution_batch.non_npm_input_projects,
+                        python_closures_by_task=resolution_batch.python_closures_by_task,
+                        project_language=project_language,
                     )
                 else:
-                    targeted_scan_label = "odc:incremental"
-                    targeted_result = _qa_odc_module._run_incremental_security_scan(
+                    artifact_manifest = _write_targeted_artifacts(
                         sandbox,
-                        workspace_volume,
-                        targeted_subdir,
-                        baseline,
+                        resolution_batch.closures_by_task,
+                        resolution_batch.non_npm_input_projects,
                     )
+                targeted_subdir = artifact_manifest.scan_subdir
+                if target_identifiers:
+                    if project_language == ProjectLanguage.PYTHON:
+                        targeted_result = _qa_odc_module._run_targeted_security_scan(
+                            sandbox,
+                            workspace_volume,
+                            target_identifiers,
+                            baseline,
+                            targeted_subdir,
+                            project_language=project_language,
+                        )
+                    else:
+                        targeted_result = _qa_odc_module._run_targeted_security_scan(
+                            sandbox,
+                            workspace_volume,
+                            target_identifiers,
+                            baseline,
+                            targeted_subdir,
+                        )
+                else:
+                    targeted_scan_label = "odc:incremental"
+                    if project_language == ProjectLanguage.PYTHON:
+                        targeted_result = _qa_odc_module._run_incremental_security_scan(
+                            sandbox,
+                            workspace_volume,
+                            targeted_subdir,
+                            baseline,
+                            project_language=project_language,
+                        )
+                    else:
+                        targeted_result = _qa_odc_module._run_incremental_security_scan(
+                            sandbox,
+                            workspace_volume,
+                            targeted_subdir,
+                            baseline,
+                        )
                 if targeted_result.execution_status != ScannerExecutionStatus.SUCCESS:
                     incomplete_reason = (
                         ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
@@ -582,6 +649,25 @@ def _run_global_execution(
                             )
                             unexpected_packages[identity] += 1
                             continue
+                        expected_ecosystem = artifact_manifest.ecosystem_by_project.get(
+                            project_path,
+                            "npm",
+                        )
+                        reported_ecosystem = str(
+                            _scan_result_value(occurrence, "ecosystem", "")
+                        ).casefold()
+                        identity = (
+                            reported_ecosystem,
+                            str(_scan_result_value(occurrence, "package_name", "")).casefold(),
+                            str(_scan_result_value(occurrence, "version", "")),
+                        )
+                        if not artifact_manifest.occurrences_by_project.get(project_path):
+                            if expected_ecosystem != "pypi" and reported_ecosystem == "npm":
+                                unexpected_packages[identity] += 1
+                            continue
+                        if reported_ecosystem != expected_ecosystem:
+                            unexpected_packages[identity] += 1
+                            continue
                         evidence_source = str(
                             _scan_result_value(occurrence, "evidence_source", "odc_package_url")
                         )
@@ -590,14 +676,8 @@ def _run_global_execution(
                             and evidence_source == "embedded_maven_pom"
                         ):
                             # Embedded POM rows are validated against their exact
-                            # staged archive owner above. Their nested metadata is
-                            # not a separate dependency-tree occurrence.
+                            # staged archive owner above, not as separate tree entries.
                             continue
-                        identity = (
-                            ecosystem,
-                            str(_scan_result_value(occurrence, "package_name", "")).casefold(),
-                            str(_scan_result_value(occurrence, "version", "")),
-                        )
                         reported_by_project[project_path].add(identity)
                         if project_path not in authoritative_occurrence_projects:
                             continue
@@ -797,7 +877,11 @@ def _run_global_execution(
             time.monotonic() - scan_started,
         )
 
-    test_label = "npm test" if project_language == ProjectLanguage.NODEJS else "mvn test"
+    test_label = {
+        ProjectLanguage.NODEJS: "npm test",
+        ProjectLanguage.JAVA: "mvn test",
+        ProjectLanguage.PYTHON: "pytest",
+    }[project_language]
     logger.info("qa_critic: [Step 0] running %s.", test_label)
     test_outcome = (
         _qa_test_parsing_module._run_unit_tests(sandbox)
@@ -1029,7 +1113,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 expected_version=expected_version,
                 version_evidence_inconclusive=version_evidence_inconclusive,
                 inspect_resolved_graph=install_ok
-                and (project_language == ProjectLanguage.JAVA or _QA_NPM_LS_ENABLED),
+                and (project_language != ProjectLanguage.NODEJS or _QA_NPM_LS_ENABLED),
                 npm_ls_disabled=(
                     project_language == ProjectLanguage.NODEJS
                     and install_ok
@@ -1040,15 +1124,11 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
 
     raw_language = state.get("project_language")
     try:
-        project_language = (
-            raw_language
-            if isinstance(raw_language, ProjectLanguage)
-            else ProjectLanguage(str(raw_language))
+        project_language = resolve_project_language(
+            Path(str(repo_root or ".")),
+            str(raw_language)
             if raw_language is not None
-            else resolve_project_language(
-                Path(str(repo_root or ".")),
-                getattr(state.get("system_context"), "primary_language", None),
-            )
+            else getattr(state.get("system_context"), "primary_language", None),
         )
     except ValueError as exc:
         err = f"qa_critic: unsupported project language: {exc}"
@@ -1288,6 +1368,7 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 results=results,
                 task_policies=task_policies,
                 singleton_scope=singleton_scope,
+                project_language=project_language,
             )
 
     except RuntimeError as exc:

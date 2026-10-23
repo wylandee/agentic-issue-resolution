@@ -12,6 +12,8 @@ import hashlib
 import re
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 from remediation_engine.contracts.schemas import (
     FailureCategory,
     FixPlanStatus,
@@ -52,20 +54,73 @@ def _normalise_security_floor(
     *,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
     maven_mode: bool = False,
+    ecosystem: str | None = None,
 ) -> tuple[str | None, Any]:
-    """Normalize one authoritative floor using the active ecosystem policy."""
+    """Normalize a stable security floor with ecosystem-specific semantics."""
     if value is None:
         return None, None
-    if project_language == ProjectLanguage.JAVA and maven_mode:
-        normalized = str(value).strip()
-        if not is_stable_maven_version(normalized):
+    raw = str(value).strip()
+    normalized_ecosystem = str(
+        ecosystem
+        or (
+            "maven"
+            if project_language == ProjectLanguage.JAVA and maven_mode
+            else "pypi"
+            if project_language == ProjectLanguage.PYTHON
+            else "npm"
+        )
+    ).strip().casefold()
+    if normalized_ecosystem == "maven":
+        if not is_stable_maven_version(raw):
             return None, None
-        return normalized, normalized
-    normalized = str(value).strip().lstrip("vV")
+        return raw, raw
+    if normalized_ecosystem == "pypi":
+        try:
+            version = Version(raw)
+        except InvalidVersion:
+            return None, None
+        if version.is_prerelease or version.is_devrelease:
+            return None, None
+        return str(version), version
+    normalized = raw.lstrip("vV")
     match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", normalized)
     if match is None:
         return None, None
     return normalized, tuple(int(part) for part in match.groups())
+
+
+def _group_uses_pypi(group: VulnerabilityGroup) -> bool:
+    """Identify Python package findings from their issue ecosystem or PURL."""
+    for issue in group.issues or []:
+        if str(getattr(issue, "ecosystem", "") or "").strip().casefold() in {"pypi", "python"}:
+            return True
+        purl = str(getattr(issue, "purl", "") or "").strip().casefold()
+        if purl.startswith("pkg:pypi/"):
+            return True
+    return False
+
+
+def _task_uses_pypi(
+    task: RemediationTask | None,
+    group: VulnerabilityGroup | None,
+) -> bool:
+    """Resolve the package ecosystem from finding evidence or committed stage."""
+    if group is not None and _group_uses_pypi(group):
+        return True
+    return task is not None and task.strategy_stage in {
+        SCARemediationStage.PYPI_SAME_MAJOR,
+        SCARemediationStage.PYPI_LATEST,
+    }
+
+
+def _latest_sca_stage(
+    task: RemediationTask | None,
+    group: VulnerabilityGroup | None,
+) -> SCARemediationStage:
+    """Return the latest bounded update stage for a task's package ecosystem."""
+    if _task_uses_pypi(task, group):
+        return SCARemediationStage.PYPI_LATEST
+    return SCARemediationStage.NPM_LATEST
 
 
 def _canonical_security_floor(
@@ -96,14 +151,25 @@ def _canonical_security_floor(
         return None, "the fix plan does not provide an authoritative fixed version"
 
     maven_mode = is_maven_group(group, project_language)
+    ecosystem = (
+        "maven"
+        if maven_mode
+        else "pypi"
+        if project_language == ProjectLanguage.PYTHON or _group_uses_pypi(group)
+        else "npm"
+    )
     plan_floor, plan_key = _normalise_security_floor(
         fix_plan.fixed_version if fix_plan is not None else None,
         project_language=project_language,
         maven_mode=maven_mode,
+        ecosystem=ecosystem,
     )
     if fix_plan is not None and fix_plan.fixed_version is not None and plan_floor is None:
-        expected = "stable Maven version" if maven_mode else "complete stable semver"
-        return None, f"the fix-plan fixed version is not a {expected}"
+        if ecosystem == "maven":
+            return None, "the fix-plan fixed version is not a stable Maven version"
+        if ecosystem == "pypi":
+            return None, "the fix-plan fixed version is not a complete stable PEP 440 version"
+        return None, "the fix-plan fixed version is not a complete stable semver"
 
     member_values: list[tuple[str, Any]] = []
     for issue in group.issues or []:
@@ -111,13 +177,20 @@ def _canonical_security_floor(
             getattr(issue, "fixed_version", None),
             project_language=project_language,
             maven_mode=maven_mode,
+            ecosystem=ecosystem,
         )
         raw = getattr(issue, "fixed_version", None)
         if raw is None:
             continue
         if value is None or key is None:
-            expected = "stable Maven version" if maven_mode else "complete stable semver"
-            return None, f"a vulnerability fixed version is not a {expected}"
+            if ecosystem == "maven":
+                return None, "a vulnerability fixed version is not a stable Maven version"
+            if ecosystem == "pypi":
+                return (
+                    None,
+                    "a vulnerability fixed version is not a complete stable PEP 440 version",
+                )
+            return None, "a vulnerability fixed version is not a complete stable semver"
         member_values.append((value, key))
 
     def compare_keys(left: Any, right: Any) -> int:
@@ -230,9 +303,12 @@ def _is_exhausted_update_pivot_candidate(
     diagnostics: UpdateRetryDiagnostics | None,
 ) -> bool:
     """Return whether a retry update task must pivot instead of retrying."""
-    if task.parent_package_name and task.strategy_stage != SCARemediationStage.CODE_WORKAROUND:
-        # A transitive task may only pivot after its explicit child-override
-        # stage has also failed. Parent registry exhaustion is not terminal.
+    if task.parent_package_name and task.strategy_stage not in {
+        SCARemediationStage.CODE_WORKAROUND,
+        SCARemediationStage.PYPI_LATEST,
+    }:
+        # npm transitive updates retain the parent-first override stage. PyPI
+        # has no override stage, so exhaustion at PYPI_LATEST may pivot.
         return False
     return (
         task.strategy == RoutingStrategy.VERSION_BUMP
@@ -265,11 +341,28 @@ def _next_sca_stage(
     *,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
     maven_mode: bool = False,
+    ecosystem: str | None = None,
 ) -> SCARemediationStage:
     """Advance one ordered SCA stage without changing the Node ladder."""
-    if project_language == ProjectLanguage.JAVA and maven_mode:
+    resolved_ecosystem = str(
+        ecosystem
+        or (
+            "maven"
+            if project_language == ProjectLanguage.JAVA and maven_mode
+            else "pypi"
+            if project_language == ProjectLanguage.PYTHON
+            else "npm"
+        )
+    ).strip().casefold()
+    if resolved_ecosystem == "maven":
         if stage == SCARemediationStage.OSV_MINIMUM:
             return SCARemediationStage.MAVEN_LATEST
+        return SCARemediationStage.CODE_WORKAROUND
+    if resolved_ecosystem == "pypi":
+        if stage == SCARemediationStage.OSV_MINIMUM:
+            return SCARemediationStage.PYPI_SAME_MAJOR
+        if stage == SCARemediationStage.PYPI_SAME_MAJOR:
+            return SCARemediationStage.PYPI_LATEST
         return SCARemediationStage.CODE_WORKAROUND
     if stage == SCARemediationStage.OSV_MINIMUM:
         return SCARemediationStage.NPM_SAME_MAJOR
@@ -284,9 +377,9 @@ def _next_sca_stage(
 
 def _selection_for_stage(stage: SCARemediationStage) -> str | None:
     """Return the registry selection mode for a strategy stage."""
-    if stage == SCARemediationStage.NPM_SAME_MAJOR:
+    if stage in {SCARemediationStage.NPM_SAME_MAJOR, SCARemediationStage.PYPI_SAME_MAJOR}:
         return "same_major"
-    if stage == SCARemediationStage.NPM_LATEST:
+    if stage in {SCARemediationStage.NPM_LATEST, SCARemediationStage.PYPI_LATEST}:
         return "latest"
     if stage == SCARemediationStage.MAVEN_LATEST:
         return "maven_latest"

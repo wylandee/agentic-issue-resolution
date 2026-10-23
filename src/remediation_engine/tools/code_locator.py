@@ -24,16 +24,17 @@ Design constraints
 * Graceful degradation at every step â€” a ``LocalizedIssue`` is always returned,
   even when tree-sitter is unavailable or the file cannot be read.
 
-Language support (v1)
+Language support
 ---------------------
-JavaScript (.js, .jsx), TypeScript (.ts, .tsx), and their module variants.
-Other languages will produce a text-only fallback localization.
+JavaScript (.js, .jsx), TypeScript (.ts, .tsx), and Python (.py) use
+tree-sitter. Other languages use text-only fallback localization.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 
 from remediation_engine.contracts.schemas import (
     ASTNodeType,
@@ -265,7 +266,7 @@ def locate_sast(
     # Step 6: Data-flow hints
     # ------------------------------------------------------------------
     data_flow_hints: list[str] = []
-    if snippet:
+    if snippet and Path(issue.file_path).suffix.casefold() != ".py":
         try:
             data_flow_hints = _extract_data_flow_hints(snippet)
         except Exception as exc:

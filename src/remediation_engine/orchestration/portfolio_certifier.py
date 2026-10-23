@@ -11,10 +11,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import shlex
 import time
 import uuid
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -22,7 +23,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from remediation_engine.contracts.schemas import (
-    IssueType,
     MavenTargetOperation,
     PackageMutation,
     PortfolioPlan,
@@ -45,22 +45,30 @@ from remediation_engine.contracts.solver_models import (
     SolverCandidateRejectionReason,
     SolverFindingRequirement,
     SolverMutation,
+    SolverPythonRuntimeFingerprint,
     SolverRemediationPlan,
     SolverRuntimeFingerprint,
     SolverStatus,
     SolverVersionCandidate,
 )
 from remediation_engine.contracts.version_policy import compare_maven_versions
-from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
+from remediation_engine.language import (
+    LANGUAGE_CONFIGS,
+    ProjectLanguage,
+    resolve_project_language,
+)
 from remediation_engine.orchestration._tool_support import _workspace_dir_for_manifest
 from remediation_engine.orchestration.portfolio_solver import (
     _digest,
-    _group_manager,
     _issue_identity,
+    _locked_python_version,
     _prepare_portfolio_problem,
     _PreparedPortfolioProblem,
+    _PreparedPythonPortfolioProblem,
     _project_prepared_portfolio_plan,
     maven_repository_fingerprint,
+    build_python_portfolio_plan,
+    prepare_python_portfolio_problem,
 )
 from remediation_engine.orchestration.qa_test_parsing import (
     _install_error_category,
@@ -90,6 +98,7 @@ from remediation_engine.tools.npm_graph import (
     load_npm_graph_snapshot_from_documents,
     resolve_lockfile_dependency_package,
 )
+from remediation_engine.tools.pypi_registry_tools import fetch_pypi_registry_candidates
 from remediation_engine.tools.registry_cache import PackumentFetcher
 
 _NPM_INSTALL = (
@@ -100,6 +109,10 @@ _NPM_INSTALL = (
 
 class _CertificationUnknown(RuntimeError):
     """Raised when resolver evidence is missing or cannot be trusted."""
+
+
+class _PythonCandidateBuildFailure(RuntimeError):
+    """A selected Python candidate could not be built by package tooling."""
 
 
 class _AssignmentRejected(RuntimeError):
@@ -151,7 +164,7 @@ def _new_certification_metrics() -> dict[str, Any]:
 
 
 def _certification_statistics(
-    prepared: _PreparedPortfolioProblem,
+    prepared: _PreparedPortfolioProblem | _PreparedPythonPortfolioProblem,
     metrics: Mapping[str, Any],
     started: float,
 ) -> CertificationStatistics:
@@ -339,6 +352,8 @@ def _certification_artifact_scope(
     scratch_root: str,
     archive_path: str,
     deadline: float,
+    *,
+    image: str | None = None,
 ) -> Iterator[None]:
     """Remove one run's archive and scratch root on every exit path."""
     try:
@@ -359,7 +374,9 @@ def _certification_artifact_scope(
         if cleanup_failed:
             try:
                 with sandbox_factory(
-                    repo_root=None, workspace_volume=workspace_volume
+                    repo_root=None,
+                    workspace_volume=workspace_volume,
+                    **({"image": image} if image else {}),
                 ) as cleanup_sandbox:
                     cleanup_result = cleanup_sandbox.run(
                         cleanup_command,
@@ -380,6 +397,658 @@ def _unknown_runtime_fingerprint() -> SolverRuntimeFingerprint:
         platform="unknown",
         architecture="unknown",
     )
+
+
+def _unknown_python_runtime_fingerprint() -> SolverPythonRuntimeFingerprint:
+    """Return an explicit missing-runtime marker for Python UNKNOWN certificates."""
+    return SolverPythonRuntimeFingerprint(
+        python_version="unknown",
+        pip_version="unknown",
+        platform="unknown",
+        architecture="unknown",
+    )
+
+
+def _read_python_runtime_fingerprint(
+    sandbox: DockerSandbox,
+    deadline: float,
+) -> SolverPythonRuntimeFingerprint:
+    """Capture Python, pip, platform, and architecture from the certifier image."""
+    command = (
+        "python --version && python -m pip --version && "
+        "python -c 'import json,platform,sys; "
+        'print(json.dumps({"platform":sys.platform,"architecture":platform.machine()}))\''
+    )
+    result = _run_command(sandbox, command, deadline, "Python runtime fingerprint")
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) < 3 or not lines[0].startswith("Python "):
+        raise _CertificationUnknown("Python runtime fingerprint output is incomplete")
+    pip_match = re.search(r"\bpip\s+([0-9][^\s]*)", lines[1])
+    if pip_match is None:
+        raise _CertificationUnknown("pip runtime fingerprint is invalid")
+    try:
+        platform_values = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise _CertificationUnknown("Python runtime platform output is invalid JSON") from exc
+    if not isinstance(platform_values, Mapping):
+        raise _CertificationUnknown("Python runtime platform output is not an object")
+    try:
+        return SolverPythonRuntimeFingerprint(
+            python_version=lines[0].removeprefix("Python "),
+            pip_version=pip_match.group(1),
+            platform=platform_values.get("platform"),
+            architecture=platform_values.get("architecture"),
+        )
+    except Exception as exc:  # noqa: BLE001 - malformed runtime evidence is unknown
+        raise _CertificationUnknown(f"Python runtime fingerprint is incomplete: {exc}") from exc
+
+
+def _python_fingerprint(contents: Mapping[str, str]) -> str:
+    """Hash a stable path-to-content-digest map for Python manifest evidence."""
+    return _digest(
+        {
+            path: hashlib.sha256(content.encode("utf-8")).hexdigest()
+            for path, content in sorted(contents.items())
+        }
+    )
+
+
+def _python_report_proves_assignment(
+    report: Mapping[str, Any],
+    targets_by_occurrence: Mapping[str, Any],
+    assignment: Mapping[str, str],
+) -> bool:
+    """Require pip's structured dry-run report to prove every exact assignment."""
+    from packaging.version import InvalidVersion, Version
+
+    from remediation_engine.tools.package_identity import normalize_python_package_name
+
+    install = report.get("install")
+    if not isinstance(install, list):
+        return False
+    resolved: dict[str, set[str]] = defaultdict(set)
+    for record in install:
+        if not isinstance(record, Mapping):
+            return False
+        metadata = record.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return False
+        name = normalize_python_package_name(str(metadata.get("name") or ""))
+        version = str(metadata.get("version") or "").strip()
+        if name and version:
+            try:
+                resolved[name].add(str(Version(version)))
+            except InvalidVersion:
+                return False
+    for occurrence_id, expected in assignment.items():
+        target = targets_by_occurrence.get(occurrence_id)
+        if target is None:
+            return False
+        name = normalize_python_package_name(target.target_package_name)
+        try:
+            normalized_expected = str(Version(expected))
+        except InvalidVersion:
+            return False
+        if resolved.get(name) != {normalized_expected}:
+            return False
+    return True
+
+
+def _is_python_candidate_build_failure(result: Any) -> bool:
+    """Return whether pip failed while preparing or building a candidate package."""
+    output = f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}".casefold()
+    build_markers = (
+        "getting requirements to build wheel did not run successfully",
+        "preparing metadata (pyproject.toml) did not run successfully",
+        "metadata-generation-failed",
+        "failed building wheel for",
+        "could not build wheels for",
+        "attributeerror: 'build_ext' object has no attribute 'cython_sources'",
+    )
+    return any(marker in output for marker in build_markers)
+
+
+def _python_pipfile_lock_proves_assignment(
+    lock_text: str,
+    selected_version: str,
+    parent_context: Mapping[str, str],
+) -> bool:
+    """Prove Pipenv locked the selected direct parent and fixed child floor."""
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        lock_data = json.loads(lock_text)
+        if not isinstance(lock_data, Mapping):
+            return False
+        category = lock_data.get(str(parent_context.get("lock_category") or ""))
+        locked_parent = _locked_python_version(
+            category, str(parent_context.get("parent_name") or "")
+        )
+        locked_child = _locked_python_version(category, str(parent_context.get("child_name") or ""))
+        if locked_parent is None or locked_child is None:
+            return False
+        return Version(locked_parent) == Version(selected_version) and Version(
+            locked_child
+        ) >= Version(str(parent_context.get("child_floor") or ""))
+    except (InvalidVersion, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _python_unknown_plan(
+    prepared: _PreparedPythonPortfolioProblem,
+    *,
+    runtime: SolverPythonRuntimeFingerprint,
+    portfolio_iteration: int,
+    diagnostics: Sequence[str],
+    started: float,
+    metrics: Mapping[str, Any],
+) -> PortfolioPlan:
+    """Return a typed, non-dispatchable UNKNOWN Python plan and certificate."""
+    messages = sorted(set([*prepared.diagnostics, *diagnostics]))
+    solver_plan = _unknown_solver_plan(prepared, messages)
+    plan = _project_prepared_portfolio_plan(
+        prepared, solver_plan, portfolio_iteration=portfolio_iteration
+    )
+    certificate = _make_certificate(
+        plan,
+        prepared,
+        runtime,
+        status=PackageResolutionStatus.UNKNOWN,
+        diagnostics=messages,
+        certification_statistics=_certification_statistics(prepared, metrics, started),
+    )
+    return _attach_resolution_certificate(plan, certificate)
+
+
+def _certify_python_candidate(
+    sandbox: DockerSandbox,
+    prepared: _PreparedPythonPortfolioProblem,
+    solver_plan: SolverRemediationPlan,
+    selected: SolverCandidatePlan,
+    plan: PortfolioPlan,
+    *,
+    archive_path: str,
+    scratch_root: str,
+    deadline: float,
+    runtime: SolverPythonRuntimeFingerprint,
+    settings: AppSettings,
+    metrics: dict[str, Any],
+    started: float,
+) -> PortfolioPlan:
+    """Certify one solver-authorized Python assignment in an isolated copy.
+
+    Raises:
+        _PythonCandidateBuildFailure: The selected package build failed in the
+            certification toolchain, so another solver candidate may be tried.
+        _CertificationUnknown: The assignment could not be proven safe.
+    """
+    from remediation_engine.orchestration.tools_manifest_python import (
+        _pipenv_command,
+        _update_python_manifest,
+    )
+
+    assignment = dict(sorted(selected.selected_candidate_versions.items()))
+    eligible_ids = {
+        target.occurrence_id for target in prepared.targets if target.eligible_for_atomic_update
+    }
+    if set(assignment) != eligible_ids:
+        raise _CertificationUnknown("Python candidate plan lacks a complete task-backed assignment")
+
+    assignment_digest = _digest(assignment)
+    scratch_prefix = _validate_workspace_path(
+        f"{scratch_root}/{selected.candidate_plan_id}/{assignment_digest}"
+    )
+    scratch_absolute = f"/workspace/{scratch_prefix}"
+    _run_command(
+        sandbox,
+        f"mkdir -p -- {shlex.quote(scratch_absolute)}",
+        deadline,
+        "Python certification scratch creation",
+    )
+    extraction_started = time.monotonic()
+    try:
+        _run_command(
+            sandbox,
+            f"tar -xf {shlex.quote(archive_path)} -C {shlex.quote(scratch_absolute)}",
+            deadline,
+            "Python workspace archive extraction",
+        )
+    finally:
+        metrics["extraction_time_seconds"] += max(0.0, time.monotonic() - extraction_started)
+
+    targets_by_occurrence = {target.occurrence_id: target for target in prepared.targets}
+    touched_manifests: set[str] = set()
+    pipfile_manifests: set[str] = set()
+    for occurrence_id, version in assignment.items():
+        target = targets_by_occurrence[occurrence_id]
+        scratch_manifest = _validate_workspace_path(f"{scratch_prefix}/{target.manifest_path}")
+        current = sandbox.read_file(scratch_manifest)
+        if not isinstance(current, str):
+            raise _CertificationUnknown(
+                f"Python scratch manifest {target.manifest_path!r} is missing"
+            )
+        edited = _update_python_manifest(
+            target.manifest_path,
+            current,
+            target.target_package_name,
+            version,
+            target.dependency_type,
+        )
+        sandbox.write_file(scratch_manifest, edited)
+        touched_manifests.add(target.manifest_path)
+        if Path(target.manifest_path).name.casefold() == "pipfile":
+            pipfile_manifests.add(target.manifest_path)
+
+    lock_evidence: dict[str, str] = {}
+    for manifest_path in sorted(pipfile_manifests):
+        scratch_manifest_path = f"{scratch_prefix}/{manifest_path}"
+        for action in ("lock", "sync --dev"):
+            result = _run_command(
+                sandbox,
+                _pipenv_command(scratch_manifest_path, action),
+                deadline,
+                f"Pipenv {action}",
+                allow_nonzero=True,
+            )
+            metrics["strict_install_invocations"] += 1
+            metrics["candidate_attempts"] += 1
+            if result.exit_code != 0:
+                detail = str(result.stderr or result.stdout or "no diagnostic output")[:500]
+                message = (
+                    f"Pipenv {action} could not certify the complete Python assignment: {detail}"
+                )
+                if _is_python_candidate_build_failure(result):
+                    raise _PythonCandidateBuildFailure(
+                        f"candidate {selected.candidate_plan_id}: {message}"
+                    )
+                raise _CertificationUnknown(message)
+        lock_path = _validate_workspace_path(
+            f"{scratch_prefix}/{Path(manifest_path).with_name('Pipfile.lock').as_posix()}"
+        )
+        lock_text = sandbox.read_file(lock_path)
+        if not isinstance(lock_text, str):
+            raise _CertificationUnknown("Pipenv did not produce a structured lockfile")
+        lock_evidence[manifest_path] = hashlib.sha256(lock_text.encode("utf-8")).hexdigest()
+        pipfile_occurrences = {
+            occurrence_id: version
+            for occurrence_id, version in assignment.items()
+            if targets_by_occurrence[occurrence_id].manifest_path == manifest_path
+        }
+        if not pipfile_occurrences:
+            raise _CertificationUnknown("Pipfile context has no selected parent assignment")
+        for occurrence_id, version in pipfile_occurrences.items():
+            context = prepared.parent_contexts.get(occurrence_id)
+            if context is None or not _python_pipfile_lock_proves_assignment(
+                lock_text, version, context
+            ):
+                raise _CertificationUnknown(
+                    "Pipenv lock did not prove the exact selected parent and vulnerable "
+                    "child fix floor"
+                )
+
+    report: Mapping[str, Any] | None = None
+    requirements_manifests = sorted(
+        path for path in touched_manifests if Path(path).name.casefold() != "pipfile"
+    )
+    if requirements_manifests:
+        report_path = _validate_workspace_path(f"{scratch_prefix}/pip-report.json")
+        report_absolute = f"/workspace/{report_path}"
+        requirement_args = " ".join(
+            f"-r {shlex.quote(f'{scratch_absolute}/{path}')}" for path in requirements_manifests
+        )
+        command = (
+            f"python -m pip install --dry-run --ignore-installed --disable-pip-version-check "
+            f"--report {shlex.quote(report_absolute)} {requirement_args}"
+        )
+        metrics["strict_install_invocations"] += 1
+        metrics["candidate_attempts"] += 1
+        pip_result = _run_command(
+            sandbox, command, deadline, "combined pip resolution", allow_nonzero=True
+        )
+        if pip_result.exit_code != 0:
+            detail = str(pip_result.stderr or pip_result.stdout or "no diagnostic output")[:500]
+            message = f"pip could not certify the complete Python assignment: {detail}"
+            if _is_python_candidate_build_failure(pip_result):
+                raise _PythonCandidateBuildFailure(
+                    f"candidate {selected.candidate_plan_id}: {message}"
+                )
+            raise _CertificationUnknown(message)
+        report_text = sandbox.read_file(report_path)
+        if not isinstance(report_text, str):
+            raise _CertificationUnknown("pip did not produce its structured report")
+        try:
+            report = json.loads(report_text)
+        except json.JSONDecodeError as exc:
+            raise _CertificationUnknown("pip report is not valid JSON") from exc
+        requirements_assignment = {
+            occurrence_id: version
+            for occurrence_id, version in assignment.items()
+            if targets_by_occurrence[occurrence_id].manifest_path in requirements_manifests
+        }
+        if not isinstance(report, Mapping) or not _python_report_proves_assignment(
+            report, targets_by_occurrence, requirements_assignment
+        ):
+            raise _CertificationUnknown(
+                "pip report did not prove each exact selected package version"
+            )
+
+    final_host = prepare_python_portfolio_problem(
+        prepared.repo_root,
+        prepared.groups,
+        prepared.task_queue,
+        settings=settings,
+    )
+    if final_host.host_repository_fingerprint != prepared.host_repository_fingerprint:
+        raise _CertificationUnknown(
+            "host Python manifests changed while assignment was being certified"
+        )
+    selected_batch_coverage = {
+        "covered": sorted(
+            coverage_id for batch in selected.batches for coverage_id in batch.resolved_coverage_ids
+        ),
+        "workaround": sorted(
+            coverage_id
+            for batch in selected.batches
+            for coverage_id in batch.workaround_coverage_ids
+        ),
+        "unresolved": sorted(
+            coverage_id
+            for batch in selected.batches
+            for coverage_id in batch.unresolved_coverage_ids
+        ),
+    }
+    no_fix_occurrences = {
+        target.occurrence_id for target in prepared.targets if target.strategy == "no_fix"
+    }
+    authorized_no_fix_unresolved = {
+        finding.coverage_id
+        for finding in prepared.findings
+        if finding.target_occurrence_id in no_fix_occurrences
+    }
+    unexpected_unresolved = (
+        set(selected_batch_coverage["unresolved"]) - authorized_no_fix_unresolved
+    )
+    if unexpected_unresolved or selected_batch_coverage["workaround"]:
+        raise _CertificationUnknown(
+            "Python assignment left finding coverage unresolved or workaround-only"
+        )
+    certificate = PackageResolutionCertificate(
+        status=PackageResolutionStatus.CERTIFIED,
+        portfolio_plan_id=plan.portfolio_plan_id,
+        candidate_plan_id=selected.candidate_plan_id,
+        solver_input_digest=plan.solver_input_digest or solver_plan.input_digest,
+        repository_fingerprint=plan.repository_fingerprint,
+        task_revisions=plan.task_revisions,
+        workspace_graph_digest=plan.workspace_graph_digest
+        or prepared.workspace_repository_fingerprint,
+        candidate_catalog_digest=solver_plan.candidate_catalog_digest,
+        candidate_assignment_digest=_digest(assignment),
+        resolved_graph_digest=_digest(
+            {
+                "assignment": assignment,
+                "pip_report": report,
+                "pipfile_locks": lock_evidence,
+            }
+        ),
+        runtime_fingerprint=runtime,
+        covered_coverage_ids=selected_batch_coverage["covered"],
+        workaround_coverage_ids=selected_batch_coverage["workaround"],
+        unresolved_coverage_ids=selected_batch_coverage["unresolved"],
+        certification_statistics=_certification_statistics(prepared, metrics, started),
+        diagnostics=[],
+    )
+    return _attach_resolution_certificate(plan, certificate)
+
+
+def _build_certified_python_portfolio_plan(
+    repo_root: str | Path,
+    workspace_volume: str,
+    groups: Iterable[VulnerabilityGroup],
+    task_queue: Mapping[str, RemediationTask],
+    *,
+    settings: AppSettings,
+    portfolio_iteration: int,
+    sandbox_factory: Callable[..., DockerSandbox],
+    registry_fetcher: Callable[[str, str, set[str]], Sequence[Any]] | None,
+    parent_requires_dist_fetcher: Callable[[str, str], Sequence[str]] | None,
+    retry_diagnostics_by_task: Mapping[str, Any] | None,
+) -> PortfolioPlan:
+    """Certify Python assignments through the common solver and ecosystem verifier."""
+
+    started = time.monotonic()
+    metrics = _new_certification_metrics()
+    deadline = started + settings.solver_certification_timeout_seconds
+    root = Path(repo_root).resolve()
+    group_list = [group.model_copy(deep=True) for group in groups]
+    queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
+    prepared_without_candidates = prepare_python_portfolio_problem(
+        root, group_list, queue, settings=settings
+    )
+    parent_proof_pending = any(
+        "Pipfile parent proof is pending workspace validation" in diagnostic
+        for diagnostic in prepared_without_candidates.diagnostics
+    )
+    if not prepared_without_candidates.targets and not parent_proof_pending:
+        raise ValueError(
+            "Python certification supports requirements*.txt only, except a proven Pipfile parent; "
+            + " | ".join(prepared_without_candidates.diagnostics)
+        )
+    if not workspace_volume or not str(workspace_volume).strip():
+        raise ValueError(
+            "Python workspace volume is missing; PyPI and Pipfile proof lookups were skipped"
+        )
+
+    python_image = LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image
+    run_id = uuid.uuid4().hex
+    archive_path = f"/tmp/remedy-plan-cert-{run_id}.tar"
+    scratch_root = f".remedy-plan-cert/{run_id}"
+    runtime = _unknown_python_runtime_fingerprint()
+    prepared = prepared_without_candidates
+    try:
+        with (
+            sandbox_factory(
+                repo_root=None,
+                workspace_volume=workspace_volume,
+                image=python_image,
+            ) as sandbox,
+            _certification_artifact_scope(
+                sandbox,
+                workspace_volume,
+                sandbox_factory,
+                scratch_root,
+                archive_path,
+                deadline,
+                image=python_image,
+            ),
+        ):
+            runtime = _read_python_runtime_fingerprint(sandbox, deadline)
+            live_contents: dict[str, str] = {}
+            for manifest_path in prepared_without_candidates.manifest_fingerprints:
+                content = sandbox.read_file(manifest_path)
+                if not isinstance(content, str):
+                    raise _CertificationUnknown(
+                        f"Python manifest {manifest_path!r} is missing from the workspace"
+                    )
+                live_contents[manifest_path] = content
+            if (
+                _python_fingerprint(live_contents)
+                != prepared_without_candidates.host_repository_fingerprint
+            ):
+                raise _CertificationUnknown(
+                    "Python workspace manifests do not match the Supervisor planning snapshot"
+                )
+
+            fetch_candidates = registry_fetcher or fetch_pypi_registry_candidates
+            fetch_parent_requires = parent_requires_dist_fetcher
+            if fetch_parent_requires is None:
+                from remediation_engine.tools.pypi_registry_tools import (
+                    get_pypi_release_requires_dist,
+                )
+
+                fetch_parent_requires = get_pypi_release_requires_dist
+
+            def timed_fetch(package_name: str, floor: str, attempted: set[str]):
+                if _remaining_seconds(deadline) < 1.0:
+                    raise _CertificationUnknown("certification deadline expired before PyPI lookup")
+                result = fetch_candidates(package_name, floor, attempted)
+                if time.monotonic() >= deadline:
+                    raise _CertificationUnknown("certification deadline expired during PyPI lookup")
+                return result
+
+            def timed_parent_requires(package_name: str, version: str):
+                if _remaining_seconds(deadline) < 1.0:
+                    raise _CertificationUnknown(
+                        "certification deadline expired before PyPI parent metadata lookup"
+                    )
+                result = fetch_parent_requires(package_name, version)
+                if time.monotonic() >= deadline:
+                    raise _CertificationUnknown(
+                        "certification deadline expired during PyPI parent metadata lookup"
+                    )
+                return result
+
+            prepared, solver_plan, _ = build_python_portfolio_plan(
+                root,
+                group_list,
+                queue,
+                settings=settings,
+                registry_fetcher=timed_fetch,
+                parent_requires_dist_fetcher=timed_parent_requires,
+                runtime_fingerprint=runtime,
+                retry_diagnostics_by_task=retry_diagnostics_by_task,
+                portfolio_iteration=portfolio_iteration,
+            )
+            metrics["solver_calls"] += 1
+            if not prepared.targets:
+                metrics["unknown_count"] += 1
+                return _python_unknown_plan(
+                    prepared,
+                    runtime=runtime,
+                    portfolio_iteration=portfolio_iteration,
+                    diagnostics=["Python portfolio has no proven supported target"],
+                    started=started,
+                    metrics=metrics,
+                )
+            if not prepared.candidate_catalog_complete:
+                metrics["unknown_count"] += 1
+                return _python_unknown_plan(
+                    prepared,
+                    runtime=runtime,
+                    portfolio_iteration=portfolio_iteration,
+                    diagnostics=["PyPI candidate catalog is incomplete"],
+                    started=started,
+                    metrics=metrics,
+                )
+            selected = solver_plan.selected_plan
+            accepted_statuses = {SolverStatus.OPTIMAL}
+            if settings.solver_accept_feasible:
+                accepted_statuses.add(SolverStatus.FEASIBLE)
+            if selected is None or solver_plan.status not in accepted_statuses:
+                metrics["unknown_count"] += 1
+                return _python_unknown_plan(
+                    prepared,
+                    runtime=runtime,
+                    portfolio_iteration=portfolio_iteration,
+                    diagnostics=[
+                        *solver_plan.diagnostics,
+                        "Python resolver certification requires an accepted shared solver assignment",
+                    ],
+                    started=started,
+                    metrics=metrics,
+                )
+            candidate_plans: list[SolverCandidatePlan] = []
+            seen_candidate_plan_ids: set[str] = set()
+            for candidate in [selected, *solver_plan.candidate_plans]:
+                if candidate.candidate_plan_id in seen_candidate_plan_ids:
+                    continue
+                seen_candidate_plan_ids.add(candidate.candidate_plan_id)
+                if candidate.status in accepted_statuses:
+                    candidate_plans.append(candidate)
+            if not candidate_plans:
+                metrics["unknown_count"] += 1
+                return _python_unknown_plan(
+                    prepared,
+                    runtime=runtime,
+                    portfolio_iteration=portfolio_iteration,
+                    diagnostics=["Python portfolio has no accepted solver candidates"],
+                    started=started,
+                    metrics=metrics,
+                )
+
+            archive_bytes, archive_time = _build_workspace_archive(sandbox, archive_path, deadline)
+            metrics["archive_bytes"] = archive_bytes
+            metrics["archive_build_time_seconds"] = archive_time
+            build_failures: list[str] = []
+            for candidate in candidate_plans:
+                unprojected_solver_plan = solver_plan.model_copy(
+                    update={"selected_plan": candidate}
+                )
+                candidate_portfolio_plan = _project_prepared_portfolio_plan(
+                    prepared,
+                    unprojected_solver_plan,
+                    portfolio_iteration=portfolio_iteration,
+                )
+                candidate_solver_plan = candidate_portfolio_plan.solver_plan
+                if candidate_solver_plan is None or candidate_solver_plan.selected_plan is None:
+                    raise _CertificationUnknown(
+                        "Python candidate projection lost its selected assignment"
+                    )
+                try:
+                    return _certify_python_candidate(
+                        sandbox,
+                        prepared,
+                        candidate_solver_plan,
+                        candidate_solver_plan.selected_plan,
+                        candidate_portfolio_plan,
+                        archive_path=archive_path,
+                        scratch_root=scratch_root,
+                        deadline=deadline,
+                        runtime=runtime,
+                        settings=settings,
+                        metrics=metrics,
+                        started=started,
+                    )
+                except _PythonCandidateBuildFailure as exc:
+                    build_failures.append(str(exc))
+                    rejection_counts = metrics["rejection_counts_by_reason"]
+                    rejection_counts[SolverCandidateRejectionReason.BUILD_TOOLCHAIN.value] = (
+                        int(
+                            rejection_counts.get(
+                                SolverCandidateRejectionReason.BUILD_TOOLCHAIN.value, 0
+                            )
+                        )
+                        + 1
+                    )
+                except _CertificationUnknown as exc:
+                    if not build_failures:
+                        raise
+                    raise _CertificationUnknown(
+                        "Python candidate certification stopped after a build-tool failure: "
+                        + " | ".join([*build_failures, str(exc)])
+                    ) from exc
+
+            metrics["unknown_count"] += 1
+            return _python_unknown_plan(
+                prepared,
+                runtime=runtime,
+                portfolio_iteration=portfolio_iteration,
+                diagnostics=[
+                    "No authorized Python candidate passed package-build certification.",
+                    *build_failures,
+                ],
+                started=started,
+                metrics=metrics,
+            )
+    except _CertificationUnknown as exc:
+        metrics["unknown_count"] += 1
+        return _python_unknown_plan(
+            prepared,
+            runtime=runtime,
+            portfolio_iteration=portfolio_iteration,
+            diagnostics=[str(exc)],
+            started=started,
+            metrics=metrics,
+        )
 
 
 def _read_runtime_fingerprint(
@@ -1578,13 +2247,8 @@ def _validate_final_coverage(
     original_occurrences = {
         occurrence.occurrence_id: occurrence for occurrence in prepared.npm_snapshot.occurrences
     }
-    original_versions_by_package: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+    original_occurrence_ids = set(original_occurrences)
     floors_by_package: dict[tuple[str, str], list[str]] = {}
-    for occurrence in prepared.npm_snapshot.occurrences:
-        if occurrence.installed_version:
-            original_versions_by_package[(occurrence.manifest_path, occurrence.package_name)][
-                occurrence.installed_version.strip().lstrip("vV")
-            ] += 1
     for finding in prepared.findings:
         floor = _vulnerable_fixed_version(prepared, finding)
         if floor:
@@ -1596,14 +2260,9 @@ def _validate_final_coverage(
             floors_by_package.setdefault(
                 (target.manifest_path, finding.vulnerable_package), []
             ).append(floor)
-    resolved_versions_by_package: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
     for occurrence in snapshot.occurrences:
         key = (occurrence.manifest_path, occurrence.package_name)
-        version = str(occurrence.installed_version or "").strip().lstrip("vV")
-        resolved_versions_by_package[key][version] += 1
-        if resolved_versions_by_package[key][version] <= original_versions_by_package.get(
-            key, Counter()
-        ).get(version, 0):
+        if occurrence.occurrence_id in original_occurrence_ids:
             continue
         floors = floors_by_package.get(key, ())
         if not floors:
@@ -1687,6 +2346,29 @@ def _validate_final_coverage(
             workaround.append(finding.coverage_id)
         else:
             unresolved.append(finding.coverage_id)
+    unresolved_ids = set(unresolved)
+    targets_by_occurrence = {target.occurrence_id: target for target in prepared.targets}
+    active_unresolved = sorted(
+        finding.coverage_id
+        for finding in prepared.findings
+        if finding.coverage_id in unresolved_ids
+        and (target := targets_by_occurrence.get(finding.target_occurrence_id)) is not None
+        and target.eligible_for_atomic_update
+        and not target.is_terminal
+    )
+    if active_unresolved:
+        raise _reject_assignment(
+            assignment,
+            SolverCandidateRejectionReason.COVERAGE_UNRESOLVED,
+            evidence={
+                "kind": "coverage_unresolved",
+                "coverage_ids": active_unresolved,
+            },
+            summary=(
+                "resolved package graph left active finding coverage unresolved: "
+                + ", ".join(active_unresolved)
+            ),
+        )
     return sorted(covered), sorted(workaround), sorted(unresolved)
 
 
@@ -2371,7 +3053,7 @@ def _certify_maven_assignment(
 
 
 def _unknown_solver_plan(
-    prepared: _PreparedPortfolioProblem,
+    prepared: _PreparedPortfolioProblem | _PreparedPythonPortfolioProblem,
     diagnostics: Sequence[str],
 ) -> SolverRemediationPlan:
     """Build a no-selection UNKNOWN plan for a failed certification prerequisite."""
@@ -2405,8 +3087,8 @@ def _unknown_solver_plan(
 
 def _make_certificate(
     plan: PortfolioPlan,
-    prepared: _PreparedPortfolioProblem,
-    runtime: SolverRuntimeFingerprint,
+    prepared: _PreparedPortfolioProblem | _PreparedPythonPortfolioProblem,
+    runtime: SolverRuntimeFingerprint | SolverPythonRuntimeFingerprint,
     *,
     status: PackageResolutionStatus,
     assignment: Mapping[str, str] | None = None,
@@ -3155,7 +3837,11 @@ def build_certified_portfolio_plan(
     qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None = None,
     registry_fetcher: PackumentFetcher | None = None,
     maven_registry_fetcher: Callable[[str, str, set[str]], Sequence[Any]] | None = None,
+    python_registry_fetcher: Callable[[str, str, set[str]], Sequence[Any]] | None = None,
+    python_parent_requires_dist_fetcher: Callable[[str, str], Sequence[str]] | None = None,
+    retry_diagnostics_by_task: Mapping[str, Any] | None = None,
     sandbox_factory: Callable[..., DockerSandbox] = DockerSandbox,
+    project_language: ProjectLanguage | str | None = None,
 ) -> PortfolioPlan:
     """Build and certify one complete package assignment in the live workspace.
 
@@ -3177,7 +3863,11 @@ def build_certified_portfolio_plan(
         qa_passed_workspace_prefix: Latest cumulative QA-passed workspace checkpoint.
         registry_fetcher: Injectable fresh raw-packument fetcher for deterministic tests.
         maven_registry_fetcher: Injectable Maven Central candidate lookup for deterministic tests.
+        python_registry_fetcher: Injectable bounded PyPI candidate provider for tests.
+        python_parent_requires_dist_fetcher: Injectable PyPI release metadata provider.
+        retry_diagnostics_by_task: Supervisor-recorded attempted/executed versions by task.
         sandbox_factory: Injectable DockerSandbox-compatible context manager.
+        project_language: Language selected by workspace setup, if already resolved.
 
     Returns:
         A solver-backed plan with a matching package-resolution certificate. Any
@@ -3193,10 +3883,13 @@ def build_certified_portfolio_plan(
     root = Path(repo_root).resolve()
     group_list = [group.model_copy(deep=True) for group in groups]
     queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
-    if any(
-        group.issue_type == IssueType.SCA and _group_manager(group) == "maven"
-        for group in group_list
-    ):
+    language = resolve_project_language(
+        root,
+        project_language.value
+        if isinstance(project_language, ProjectLanguage)
+        else project_language,
+    )
+    if language == ProjectLanguage.JAVA:
         host_fingerprint = maven_repository_fingerprint(root)
         prefix_diagnostics: list[str] = []
         qa_passed_prefix_provenance = _last_qa_passed_prefix_provenance(
@@ -3226,6 +3919,19 @@ def build_certified_portfolio_plan(
             qa_passed_prefix_provenance=qa_passed_prefix_provenance,
             prefix_diagnostics=prefix_diagnostics,
             host_repository_fingerprint=host_fingerprint,
+        )
+    if language == ProjectLanguage.PYTHON:
+        return _build_certified_python_portfolio_plan(
+            root,
+            workspace_volume,
+            group_list,
+            queue,
+            settings=resolved_settings,
+            portfolio_iteration=portfolio_iteration,
+            sandbox_factory=sandbox_factory,
+            registry_fetcher=python_registry_fetcher,
+            parent_requires_dist_fetcher=python_parent_requires_dist_fetcher,
+            retry_diagnostics_by_task=retry_diagnostics_by_task,
         )
     host_snapshot = load_npm_graph_snapshot(root)
     host_fingerprint = host_snapshot.repository_fingerprint

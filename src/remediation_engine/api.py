@@ -172,6 +172,10 @@ def run_remediation(
     """
     resolved_settings = settings or AppSettings.from_env()
     context = _effective_system_context(request.system_context, request.repo_root)
+    project_language = resolve_project_language(
+        request.repo_root,
+        context.primary_language,
+    )
     groups = list(request.valid_groups)
     orchestrator_kwargs: dict[str, Any] = {
         "repo_root": str(request.repo_root),
@@ -180,6 +184,7 @@ def run_remediation(
         "system_context": context,
         "target_packages": request.target_packages,
         "settings": resolved_settings,
+        "project_language": project_language,
     }
     state = run_orchestrator(**orchestrator_kwargs)
     errors = list(state.get("errors", []) or [])

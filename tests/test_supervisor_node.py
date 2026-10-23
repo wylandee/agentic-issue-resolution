@@ -66,6 +66,7 @@ from remediation_engine.orchestration.supervisor_node import (
     MAX_RETRIES,
     _authorize_update_dispatch,
     _build_consistency_event,
+    _build_multi_package_action,
     _calculate_cumulative_scan_metrics,
     _create_attempt_snapshot,
     _deterministic_routing,
@@ -73,6 +74,7 @@ from remediation_engine.orchestration.supervisor_node import (
     _materialize_spawn_requests,
     _maven_attempt_target_operation,
     _maven_attempt_target_paths,
+    _nonterminal_sca_task_ids,
     _normalize_target_task_ids_for_node,
     _ordered_update_candidates,
     _peer_conflict_escalation,
@@ -927,6 +929,63 @@ class TestRunSupervisorNodeNormalization:
 
 
 class TestRunSupervisorNodeVersionBump:
+    def test_python_requirements_atomic_cluster_builds_pypi_action(self):
+        task_specs = [
+            ("task-1", "group-certifi", "certifi", "2024.7.4"),
+            ("task-2", "group-sqlparse", "sqlparse", "0.4.4"),
+        ]
+        groups = {}
+        tasks = {}
+        for task_id, group_id, package_name, selected_version in task_specs:
+            issue = _issue().model_copy(
+                update={
+                    "source": IssueSource.ODC,
+                    "issue_type": IssueType.SCA,
+                    "ecosystem": "pypi",
+                    "package_name": package_name,
+                }
+            )
+            group = _sca_group(group_id).model_copy(
+                update={
+                    "vulnerable_component": package_name,
+                    "file_path": "requirements.txt",
+                    "file_paths": ["requirements.txt"],
+                    "sources": [IssueSource.ODC],
+                    "issues": [issue],
+                }
+            )
+            groups[group_id] = group
+            tasks[task_id] = _make_task(task_id, group_id).model_copy(
+                update={
+                    "target_package_name": package_name,
+                    "target_dependency_type": "requirements",
+                    "selected_version": selected_version,
+                }
+            )
+
+        action = _build_multi_package_action(
+            "batch-python",
+            ["task-1", "task-2"],
+            tasks,
+            groups,
+        )
+
+        assert action is not None
+        assert action.cluster_id == "batch-python"
+        assert [
+            (
+                mutation.manifest_path,
+                mutation.package_name,
+                mutation.target_version,
+                mutation.dependency_type,
+                mutation.ecosystem,
+            )
+            for mutation in action.package_mutations
+        ] == [
+            ("requirements.txt", "certifi", "2024.7.4", "requirements", "pypi"),
+            ("requirements.txt", "sqlparse", "0.4.4", "requirements", "pypi"),
+        ]
+
     def test_first_active_update_task_is_the_only_registry_target(self, monkeypatch):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND).model_copy(
@@ -3401,6 +3460,91 @@ def test_unfixable_replan_clears_without_remaining_nonterminal_sca(monkeypatch):
     assert result["portfolio_replan_request"] is None
     assert result["portfolio_dirty"] is False
     assert result["next_routing_step"] != "portfolio"
+
+
+def test_pending_unfixable_replan_ignores_committed_workaround_child(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _keep_portfolio_current(monkeypatch)
+    group = _sca_group("g1")
+    parent = _make_task(
+        "task-1",
+        group.group_id,
+        status=TaskStatus.UNFIXABLE,
+    ).model_copy(
+        update={
+            "exhausted_update_path": True,
+            "portfolio_plan_id": "portfolio-current",
+            "strategy_stage": SCARemediationStage.PYPI_LATEST,
+        }
+    )
+    child = _make_task(
+        "task-2",
+        group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+    ).model_copy(
+        update={
+            "parent_task_id": parent.task_id,
+            "strategy_stage": SCARemediationStage.CODE_WORKAROUND,
+            "instruction": "Apply the committed code workaround.",
+        }
+    )
+    plan = _portfolio_stub()
+    plan.task_ids = [parent.task_id]
+    request = PortfolioReplanRequest(
+        reason="UNFIXABLE_REPLAN",
+        source_portfolio_plan_id=plan.portfolio_plan_id,
+    )
+    state = _base_state(
+        [group],
+        task_queue={parent.task_id: parent, child.task_id: child},
+        portfolio_plan=plan,
+        portfolio_replan_request=request,
+        portfolio_dirty=True,
+    )
+    portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
+
+    result = run_supervisor_node(state)
+
+    portfolio_tool.assert_not_called()
+    assert result["portfolio_replan_request"] is None
+    assert result["portfolio_dirty"] is False
+    assert result["next_routing_step"] == "workaround_subagent"
+    assert result["active_target_task_ids"] == [child.task_id]
+    attempt_id = result["task_queue"][child.task_id].current_attempt_id
+    assert attempt_id is not None
+    assert result["attempt_snapshots_by_id"][attempt_id].dispatch_node == "workaround_subagent"
+
+
+def test_nonterminal_sca_replan_excludes_only_committed_workaround_children():
+    group = _sca_group("g1")
+    sibling_group = _sca_group("g2")
+    parent = _make_task(
+        "task-1",
+        group.group_id,
+        status=TaskStatus.UNFIXABLE,
+    ).model_copy(update={"exhausted_update_path": True})
+    child = _make_task(
+        "task-2",
+        group.group_id,
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+    ).model_copy(update={"parent_task_id": parent.task_id})
+    sibling = _make_task("task-3", sibling_group.group_id)
+    plan = _portfolio_stub()
+    plan.task_ids = [parent.task_id, sibling.task_id]
+    task_queue = {
+        parent.task_id: parent,
+        child.task_id: child,
+        sibling.task_id: sibling,
+    }
+
+    remaining = _nonterminal_sca_task_ids(
+        task_queue,
+        {group.group_id: group, sibling_group.group_id: sibling_group},
+        plan,
+    )
+
+    assert remaining == [sibling.task_id]
 
 
 def test_early_stale_plan_route_preserves_typed_pending_request(monkeypatch):
@@ -5945,3 +6089,231 @@ def test_later_clean_task_scan_clears_prior_incremental_vulnerability():
     assert later_metrics[0] == []
     assert later_metrics[1] == []
     assert later_metrics[3] == []
+
+# Stage-2 behavior retained during the architecture merge.
+class TestSupervisorDecisionSchemaStage2Parity:
+    def test_update_subagent_rejects_more_than_ten_targets(self):
+        with pytest.raises(ValidationError):
+            SupervisorDecision(
+                next_node="update_subagent",
+                target_task_ids=[f"t{i}" for i in range(11)],
+                instructions="test",
+                decision_reason="test",
+            )
+
+class TestRunSupervisorNodeToQAStage2Parity:
+    def test_all_optimistically_fixed_tasks_route_to_qa_one_at_a_time(self):
+        g1 = _sca_group("g1")
+        g2 = _sca_group("g2")
+        task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
+        task2 = _make_task("task-2", "g2", status=TaskStatus.OPTIMISTICALLY_FIXED)
+        state = _base_state(
+            [g1, g2],
+            task_queue={"task-1": task1, "task-2": task2},
+            # No active_target_task_ids â€” all tasks are already optimistically fixed
+            active_target_task_ids=[],
+        )
+
+        result = run_supervisor_node(state)
+        assert result["next_routing_step"] == "qa_critic"
+        assert result["active_target_task_ids"] == ["task-1"]
+
+class TestRunSupervisorNodeQAUpdatesStage2Parity:
+    @pytest.mark.parametrize(
+        ("qa_status", "evaluation_kwargs"),
+        [
+            pytest.param(
+                "qa_completed",
+                {
+                    "failure_category": FailureCategory.SECURITY_FLAG,
+                    "retry_feedback": "Dependency evidence was unavailable.",
+                    "evidence_inconclusive": True,
+                },
+                id="inconclusive-evidence",
+            ),
+            pytest.param(
+                "qa_failed",
+                {
+                    "failure_category": FailureCategory.SECURITY_FLAG,
+                    "retry_feedback": "QA could not establish an outcome.",
+                    "contract_error": True,
+                    "contract_error_reason": "Structured evaluator output was missing.",
+                },
+                id="qa-contract-error",
+            ),
+        ],
+    )
+    def test_qa_recheck_limit_terminalizes_same_attempt(self, qa_status, evaluation_kwargs):
+        group = _sca_group("g1")
+        attempt_id = "attempt-qa-bounded"
+        instruction = "Pin test-pkg through the package manager."
+        snapshot = TaskAttemptSnapshot(
+            attempt_id=attempt_id,
+            task_id="task-1",
+            task_revision=1,
+            strategy_stage=SCARemediationStage.NPM_LATEST,
+            selected_version="1.2.3",
+            target_package_name="test-pkg",
+            instruction=instruction,
+            instruction_digest=instruction_digest(instruction),
+            dispatch_node="update_subagent",
+            qa_policy=QAPolicy.VERSION_BUMP,
+        )
+        task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": attempt_id,
+                "strategy_stage": snapshot.strategy_stage,
+                "selected_version": snapshot.selected_version,
+                "target_package_name": snapshot.target_package_name,
+                "instruction": instruction,
+                "qa_policy": QAPolicy.VERSION_BUMP,
+            }
+        )
+        evaluation = QAEvaluation(
+            task_id="task-1",
+            passed=False,
+            **evaluation_kwargs,
+        )
+
+        def attempt_result():
+            return QAAttemptResult(
+                attempt_id=attempt_id,
+                task_id="task-1",
+                task_revision=1,
+                qa_policy=QAPolicy.VERSION_BUMP,
+                qa_policy_source="attempt_snapshot",
+                evaluation=evaluation,
+            )
+
+        initial = _base_state(
+            [group],
+            status=qa_status,
+            task_queue={"task-1": task},
+            active_target_task_ids=["task-1"],
+            attempt_snapshots_by_id={attempt_id: snapshot},
+            qa_results_by_attempt={attempt_id: attempt_result()},
+        )
+
+        first = run_supervisor_node(initial)
+        assert first["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+        assert first["qa_rechecks_by_attempt"] == {attempt_id: 1}
+        assert first["processed_qa_attempt_ids"] == []
+
+        second = run_supervisor_node(
+            {
+                **initial,
+                **first,
+                "status": qa_status,
+                "qa_results_by_attempt": {attempt_id: attempt_result()},
+            }
+        )
+
+        terminal = second["task_queue"]["task-1"]
+        assert terminal.status == TaskStatus.INCONCLUSIVE
+        assert terminal.current_attempt_id is None
+        assert terminal.retry_count == 0
+        assert second["processed_qa_attempt_ids"] == [attempt_id]
+        assert second["next_routing_step"] != "qa_critic"
+        assert any("recheck limit reached" in error for error in second["errors"])
+
+class TestBugFixesStage2Parity:
+    @patch("langchain_openai.ChatOpenAI")
+    def test_replayed_pivot_with_terminal_child_routes_to_final_scan(self, mock_chat):
+        """A completed workaround child must not produce an empty worker route."""
+        group = _sca_group("g1")
+        parent_task = _make_task(
+            "task-1",
+            "g1",
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.NEEDS_RETRY,
+        )
+        existing_child = _make_task(
+            "task-2",
+            "g1",
+            strategy=RoutingStrategy.CODE_WORKAROUND,
+            status=TaskStatus.UNFIXABLE,
+        ).model_copy(update={"parent_task_id": "task-1"})
+        state = _base_state(
+            [group],
+            task_queue={"task-1": parent_task, "task-2": existing_child},
+            qa_evaluations={
+                "task-1": QAEvaluation(
+                    task_id="task-1",
+                    passed=False,
+                    failure_category=FailureCategory.BREAKING_CHANGE,
+                    retry_feedback="The update introduced a breaking runtime regression.",
+                )
+            },
+            active_target_task_ids=["task-1"],
+            retry_diagnostics_by_task={
+                "task-1": UpdateRetryDiagnostics(
+                    task_id="task-1",
+                    exhausted_update_path=True,
+                )
+            },
+            workspace_volume="workspace-volume",
+            final_full_scan_completed=False,
+        )
+        mock_chat.side_effect = ImportError("No module named langchain_openai")
+
+        result = run_supervisor_node(state)
+
+        assert result["task_queue"]["task-1"].status == TaskStatus.PIVOTED
+        assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
+        assert result["next_routing_step"] == "final_full_scan"
+        assert result["active_target_task_ids"] == []
+        assert not any(
+            error.startswith("supervisor: routing fell back to teardown")
+            for error in result.get("errors", [])
+        )
+
+def test_pypi_dispatch_uses_canonical_attempts_and_immutable_snapshot_pool():
+    task = _make_task("task-pypi", "pypi-group").model_copy(
+        update={
+            "strategy_stage": SCARemediationStage.PYPI_SAME_MAJOR,
+            "selected_version": "1.2.0",
+            "target_package_name": "requests",
+            "target_dependency_type": "requirements",
+            "instruction": "Update requests to exact version 1.2.0.",
+        }
+    )
+    plan = SupervisorRetryPlan(
+        task_id=task.task_id,
+        source_task_revision=task.task_revision,
+        strategy_stage=SCARemediationStage.PYPI_SAME_MAJOR,
+        selected_version="1.2.0",
+        target_package_name="requests",
+        target_dependency_type="requirements",
+        candidate_versions_considered=["1.2.0", "1.10.0"],
+        candidate_dependency_types=["requirements"],
+    )
+    diagnostics = UpdateRetryDiagnostics(
+        task_id=task.task_id,
+        target_package_name="REQUESTS",
+        target_dependency_type="requirements",
+        attempted_versions_by_target={"ReQuests": ["1.10.0"]},
+    )
+
+    authorization = _authorize_update_dispatch(
+        task,
+        plan=plan,
+        diagnostics=diagnostics,
+        ecosystem="pypi",
+    )
+    assert authorization is not None
+    assert authorization.selected_version == "1.2.0"
+    assert authorization.allowed_target_versions == ("1.2.0",)
+    assert authorization.allowed_dependency_types == ("requirements",)
+
+    _updated_task, snapshot = _create_attempt_snapshot(
+        task,
+        dispatch_node="update_subagent",
+        snapshots_by_id={},
+        state_revision=9,
+        allowed_target_versions=authorization.allowed_target_versions,
+        allowed_dependency_types=authorization.allowed_dependency_types,
+    )
+    assert snapshot.allowed_target_versions == ["1.2.0"]
+    assert snapshot.selected_version == "1.2.0"
+    assert snapshot.target_package_name == "requests"

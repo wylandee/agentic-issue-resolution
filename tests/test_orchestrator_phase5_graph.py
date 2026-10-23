@@ -4380,3 +4380,288 @@ def test_socket_stack_fixture_rejects_mutation_id_mismatch_before_snapshot(
     canaries.assert_not_called()
     apply_action.assert_not_called()
     sandbox.create_workspace_snapshot.assert_not_called()
+
+# Stage-2 behavior retained during the architecture merge.
+from remediation_engine.language import ProjectLanguage
+
+class TestPhase5RoutingStage2Parity:
+    def test_route_after_workspace_builder_routes_to_supervisor(self):
+        assert route_after_workspace_builder({"status": "workspace_ready"}) == "supervisor"
+
+class TestPhase5RunOrchestratorStage2Parity:
+    def test_keyboard_interrupt_preserves_partial_state_and_writes_follow_up_report(
+        self, tmp_path, monkeypatch
+    ):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        trajectory_dir = tmp_path / "trajectories"
+        report_dir = tmp_path / "reports"
+        monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
+        monkeypatch.setenv("REMEDIATION_REPORT_DIR", str(report_dir))
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={"status": TaskStatus.INCONCLUSIVE}
+        )
+        partial_state = {
+            **_initial_state(tmp_path, groups),
+            "initial_valid_groups": groups,
+            "task_queue": {"task-1": task},
+            "workspace_volume": "agent_workspace_interrupted",
+            "status": "qa_completed",
+            "active_target_task_ids": ["task-1"],
+        }
+
+        def interrupted_stream(*_args, **_kwargs):
+            yield partial_state
+            raise KeyboardInterrupt()
+
+        mock_engine = MagicMock()
+        mock_engine.stream.side_effect = interrupted_stream
+        teardown_update = {
+            "status": "completed_with_errors",
+            "workspace_volume": None,
+            "changed_files": [],
+            "diff": "",
+        }
+
+        with (
+            patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
+            patch(
+                "remediation_engine.orchestration.graph.build_phase5_runnable_config",
+                return_value=(None, None),
+            ),
+            patch(
+                "remediation_engine.orchestration.graph.run_teardown_node",
+                return_value=teardown_update,
+            ) as mock_teardown,
+            pytest.raises(KeyboardInterrupt),
+        ):
+            run_orchestrator(str(tmp_path), groups)
+
+        mock_engine.stream.assert_called_once()
+        assert mock_engine.stream.call_args.kwargs["stream_mode"] == "values"
+        mock_teardown.assert_called_once()
+        assert mock_teardown.call_args.args[0]["task_queue"]["task-1"].status == (
+            TaskStatus.INCONCLUSIVE
+        )
+
+        report_files = list(report_dir.glob("*.md"))
+        assert len(report_files) == 1
+        report_text = report_files[0].read_text(encoding="utf-8")
+        assert "Vulnerability groups requiring follow-up" in report_text
+        assert "lodash" in report_text
+
+        trajectory_files = list(trajectory_dir.glob("*.md"))
+        assert len(trajectory_files) == 1
+        trajectory_text = trajectory_files[0].read_text(encoding="utf-8")
+        assert "task-1" in trajectory_text
+        assert "orchestrator interrupted by KeyboardInterrupt" in trajectory_text
+        assert "inconclusive" in trajectory_text
+
+class TestPhase5GraphIntegrationStage2Parity:
+    def test_update_wrapper_preserves_exact_task_instruction_python_stage2(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1")
+        task.instruction = 'Update "lodash" in package.json to version "4.17.22".'
+        task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
+        state = _initial_state(tmp_path, groups)
+        state["project_language"] = ProjectLanguage.PYTHON
+        state["workspace_volume"] = "agent_workspace_deadbeef"
+        state["task_queue"] = {"task-1": task}
+        state["active_target_task_ids"] = ["task-1"]
+        state["attempt_snapshots_by_id"] = {snapshot.attempt_id: snapshot}
+        state["supervisor_instructions"] = (
+            "Use registry lookup to find a safe compatible remediation."
+        )
+        state["action_summaries"] = [
+            AgentActionSummary(
+                task_id="task-1",
+                status=AgentActionStatus.SURRENDER,
+                summary="Previous version bump failed manifest validation.",
+                attempt_id=snapshot.attempt_id,
+                task_revision=snapshot.task_revision,
+                instruction_digest=snapshot.instruction_digest,
+            )
+        ]
+
+        update_subagent = MagicMock(return_value={"errors": [], "action_summaries": []})
+
+        with patch(
+            "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
+        ):
+            run_update_subagent_from_orchestrator(state)
+
+        subagent_state = update_subagent.call_args[0][0]
+        assert (
+            subagent_state["target_tasks"][0].instruction
+            == 'Update "lodash" in package.json to version "4.17.22".'
+        )
+        assert subagent_state["project_language"] is ProjectLanguage.PYTHON
+        assert (
+            subagent_state["previous_action_summaries_by_task"]["task-1"]
+            == "Previous version bump failed manifest validation."
+        )
+        assert "supervisor_instruction" not in subagent_state
+
+    def test_update_wrapper_recovers_matching_worker_result_and_rejects_stale_summary(
+        self, tmp_path
+    ):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1").model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": "attempt-task-1",
+                "selected_version": "4.17.21",
+                "target_package_name": "lodash",
+                "target_dependency_type": "dependencies",
+            }
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-task-1",
+            task_id=task.task_id,
+            state_revision=1,
+            task_revision=task.task_revision,
+            strategy_stage=task.strategy_stage,
+            qa_policy=task.qa_policy,
+            selected_version=task.selected_version,
+            allowed_target_versions=["4.17.21"],
+            target_package_name="lodash",
+            target_dependency_type="dependencies",
+            allowed_dependency_types=["dependencies"],
+            instruction=task.instruction,
+            instruction_digest=instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        state = _initial_state(tmp_path, groups)
+        state.update(
+            {
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            }
+        )
+        summary = AgentActionSummary(
+            task_id="task-1",
+            attempt_id=snapshot.attempt_id,
+            task_revision=snapshot.task_revision,
+            instruction_digest=snapshot.instruction_digest,
+            status=AgentActionStatus.SUCCESS,
+            summary="Validated update to lodash 4.17.21.",
+        )
+        retry_diagnostics = UpdateRetryDiagnostics(
+            task_id="task-1",
+            committed_attempt_id=snapshot.attempt_id,
+            attempted_versions=["4.17.21"],
+            executed_versions=["4.17.21"],
+            effective_target_version="4.17.21",
+            effective_dependency_type="dependencies",
+        )
+        worker_output = {
+            "errors": [],
+            "action_summaries": [summary],
+            "changed_files": ["package.json"],
+            "retry_diagnostics_by_task": {"task-1": retry_diagnostics},
+        }
+
+        with patch(
+            "remediation_engine.orchestration.graph.run_update_subagent_node",
+            return_value=worker_output,
+        ):
+            result = run_update_subagent_from_orchestrator(state)
+
+        worker_result = result["worker_results_by_attempt"][snapshot.attempt_id]
+        assert worker_result.task_id == "task-1"
+        assert worker_result.task_revision == snapshot.task_revision
+        assert worker_result.status is AgentActionStatus.SUCCESS
+        assert worker_result.executed_versions == ["4.17.21"]
+        assert worker_result.changed_files == ["package.json"]
+        assert worker_result.execution_diagnostics.validation_passed is True
+        assert any(
+            event.error_code == "UPDATE_WORKER_RESULT_RECOVERED"
+            for event in result["consistency_events"]
+        )
+
+        supervisor_result = run_supervisor_node({**state, **result})
+        assert supervisor_result["next_routing_step"] == "qa_critic"
+        assert supervisor_result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
+
+        stale_summary = summary.model_copy(update={"attempt_id": "attempt-stale"})
+        stale_output = {
+            **worker_output,
+            "action_summaries": [stale_summary],
+        }
+        with patch(
+            "remediation_engine.orchestration.graph.run_update_subagent_node",
+            return_value=stale_output,
+        ):
+            stale_result = run_update_subagent_from_orchestrator(state)
+
+        assert "worker_results_by_attempt" not in stale_result
+        assert not any(
+            event.error_code == "UPDATE_WORKER_RESULT_RECOVERED"
+            for event in stale_result.get("consistency_events", [])
+        )
+
+    def test_workaround_wrapper_preserves_typed_attempt_result_python_stage2(self, tmp_path):
+        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.WORKAROUND_FOUND))]
+        task = build_initial_remediation_task(groups[0], "task-1")
+        task.instruction = "Apply the source workaround."
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-workaround",
+            task_id="task-1",
+            state_revision=1,
+            task_revision=1,
+            strategy_stage=SCARemediationStage.CODE_WORKAROUND,
+            qa_policy=task.qa_policy,
+            selected_version=None,
+            instruction=task.instruction,
+            instruction_digest=instruction_digest(task.instruction),
+            dispatch_node="workaround_subagent",
+        )
+        task = task.model_copy(
+            update={
+                "task_revision": 1,
+                "current_attempt_id": snapshot.attempt_id,
+            }
+        )
+        summary = AgentActionSummary(
+            task_id="task-1",
+            attempt_id=snapshot.attempt_id,
+            task_revision=snapshot.task_revision,
+            instruction_digest=snapshot.instruction_digest,
+            status=AgentActionStatus.SURRENDER,
+            summary="workaround bypassed",
+        )
+        worker_result = WorkerAttemptResult(
+            attempt_id=snapshot.attempt_id,
+            task_id=task.task_id,
+            task_revision=snapshot.task_revision,
+            status=summary.status,
+            action_summary=summary,
+            instruction_digest=snapshot.instruction_digest,
+        )
+        state = _initial_state(tmp_path, groups)
+        state["project_language"] = ProjectLanguage.PYTHON
+        state.update(
+            {
+                "task_queue": {"task-1": task},
+                "active_target_task_ids": ["task-1"],
+                "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+            }
+        )
+        workaround_subagent = MagicMock(
+            return_value={
+                "action_summaries": [summary],
+                "action_summary": summary,
+                "worker_results_by_attempt": {snapshot.attempt_id: worker_result},
+                "errors": [],
+            }
+        )
+        with patch(
+            "remediation_engine.orchestration.graph.run_workaround_subagent_node",
+            workaround_subagent,
+        ):
+            result = run_workaround_subagent_from_orchestrator(state)
+
+        returned_summary = result["action_summaries"][0]
+        assert returned_summary == summary
+        assert result["worker_results_by_attempt"][snapshot.attempt_id] == worker_result
+        assert workaround_subagent.call_args[0][0]["project_language"] is ProjectLanguage.PYTHON

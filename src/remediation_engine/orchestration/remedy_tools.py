@@ -54,9 +54,21 @@ from .tools_validation import (
     _make_record_plan_tool,
     _make_record_targeted_test_substitution_tool,
     _make_run_targeted_test_tool,
+    _make_run_targeted_python_test_tool,
     _make_validate_code_syntax_tool,
+    _make_validate_python_syntax_tool,
+    _make_validate_python_workaround_tool,
     _make_validate_workaround_tool,
 )
+from remediation_engine.language import ProjectLanguage
+
+from .tools_manifest_python import (
+    _make_modify_batch_python_dependencies_tool,
+    _make_modify_and_validate_python_dependency_tool,
+    _make_remove_no_fix_python_dependency_tool,
+    _normalize_python_package_manifest_targets,
+)
+from .tools_manifest import _normalize_python_manifest_targets
 from .tools_web import (
     _make_read_web_page_tool,
     _make_search_web_tool,
@@ -80,17 +92,68 @@ def build_update_toolbelt(
     allowed_dependency_types_by_package: Mapping[str, Iterable[str]] | None = None,
     execution_state: dict[str, Any] | None = None,
     package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    project_language: ProjectLanguage | str = ProjectLanguage.NODEJS,
     maven_target_operations_by_package: Mapping[str, Iterable[str]] | None = None,
+    *,
+    language: ProjectLanguage | str | None = None,
+    package_ecosystem: str | None = None,
 ) -> list:
     """Build the strict update-only toolbelt for the resolved run language."""
+    if language is not None:
+        project_language = language
+    if not isinstance(project_language, ProjectLanguage):
+        project_language = ProjectLanguage(project_language)
+    expected_ecosystem = {
+        ProjectLanguage.NODEJS: "npm",
+        ProjectLanguage.JAVA: "maven",
+        ProjectLanguage.PYTHON: "pypi",
+    }[project_language]
+    if (
+        package_ecosystem is not None
+        and package_ecosystem.strip().casefold() != expected_ecosystem
+    ):
+        raise ValueError("Unsupported project-language/package-ecosystem pairing.")
+
+    if project_language == ProjectLanguage.PYTHON:
+        allowed_manifests = set(_normalize_python_manifest_targets(target_manifest_paths))
+        normalized_package_manifest_paths = _normalize_python_package_manifest_targets(
+            package_manifest_paths
+        )
+        outside_targets = sorted(
+            {
+                path
+                for paths in normalized_package_manifest_paths.values()
+                for path in paths
+                if path not in allowed_manifests
+            }
+        )
+        if outside_targets:
+            raise ValueError(
+                "Python package manifest targets must be included in target_manifest_paths. "
+                f"Unauthorized values: {outside_targets}"
+            )
+        return [
+            _make_modify_and_validate_python_dependency_tool(
+                sandbox,
+                touched_files,
+                normalized_package_manifest_paths,
+                allowed_target_versions_by_package=allowed_target_versions_by_package,
+                allowed_dependency_types_by_package=allowed_dependency_types_by_package,
+                execution_state=execution_state,
+                package_checkpoints=package_checkpoints,
+            )
+        ]
+
     allowed_manifest_names = (
         ("pom.xml",) if project_language == ProjectLanguage.JAVA else ("package.json",)
     )
-    _normalize_manifest_targets(target_manifest_paths, allowed_manifest_names)
+    _normalize_manifest_targets(
+        target_manifest_paths,
+        allowed_manifest_names=allowed_manifest_names,
+    )
     normalized_package_manifest_paths = _normalize_package_manifest_targets(
         package_manifest_paths,
-        allowed_manifest_names,
+        allowed_manifest_names=allowed_manifest_names,
     )
     if package_checkpoints is None:
         package_checkpoints = {}
@@ -126,7 +189,7 @@ def build_multi_package_update_toolbelt(
     action: Any,
     execution_state: dict[str, Any] | None = None,
     package_checkpoints: dict[str, _PackageCheckpoint] | None = None,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    project_language: ProjectLanguage | str = ProjectLanguage.NODEJS,
 ) -> list:
     """Build the single committed-action toolbelt for a package cluster.
 
@@ -145,10 +208,13 @@ def build_multi_package_update_toolbelt(
     Returns:
         A one-tool list for the bounded update-subagent loop.
     """
+    if not isinstance(project_language, ProjectLanguage):
+        project_language = ProjectLanguage(project_language)
+    mutations = list(getattr(action, "package_mutations", ()) or ())
+    if not mutations:
+        raise ValueError("Multi-package actions must contain at least one mutation.")
     if project_language == ProjectLanguage.JAVA:
-        if any(
-            getattr(mutation, "ecosystem", "") != "maven" for mutation in action.package_mutations
-        ):
+        if any(getattr(mutation, "ecosystem", "") != "maven" for mutation in mutations):
             raise ValueError("Java multi-package actions must contain only Maven mutations.")
         return [
             _make_modify_batch_maven_dependencies_tool(
@@ -159,17 +225,32 @@ def build_multi_package_update_toolbelt(
                 package_checkpoints=package_checkpoints,
             )
         ]
-    if any(getattr(mutation, "ecosystem", "npm") != "npm" for mutation in action.package_mutations):
-        raise ValueError("Node multi-package actions must contain only npm mutations.")
-    return [
-        _make_modify_batch_npm_dependencies_tool(
-            sandbox,
-            action,
-            touched_files,
-            execution_state=execution_state,
-            package_checkpoints=package_checkpoints,
+    expected_ecosystem = "pypi" if project_language == ProjectLanguage.PYTHON else "npm"
+    if any(
+        getattr(mutation, "ecosystem", "npm") != expected_ecosystem
+        for mutation in mutations
+    ):
+        raise ValueError(
+            f"{project_language.value} batch toolbelt requires a non-empty "
+            f"{expected_ecosystem} action."
         )
-    ]
+    if project_language == ProjectLanguage.PYTHON:
+        return [
+            _make_modify_batch_python_dependencies_tool(
+                sandbox,
+                action,
+                touched_files,
+                execution_state=execution_state,
+                package_checkpoints=package_checkpoints,
+            )
+        ]
+    return [_make_modify_batch_npm_dependencies_tool(
+        sandbox,
+        action,
+        touched_files,
+        execution_state=execution_state,
+        package_checkpoints=package_checkpoints,
+    )]
 
 
 def build_workaround_toolbelt(
@@ -183,7 +264,9 @@ def build_workaround_toolbelt(
     no_fix_package_name: str | None = None,
     no_fix_manifest_paths: Sequence[str] | None = None,
     no_fix_package_manager: str | None = None,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    project_language: ProjectLanguage | str = ProjectLanguage.NODEJS,
+    *,
+    language: ProjectLanguage | str | None = None,
 ) -> list:
     """Build the strict workaround-only toolbelt.
 
@@ -194,6 +277,10 @@ def build_workaround_toolbelt(
     """
     if plan_state is None:
         plan_state = {}
+    language = project_language if language is None else language
+    if not isinstance(language, ProjectLanguage):
+        language = ProjectLanguage(language)
+    project_language = language
 
     if plan_state.get("recorded") and not plan_state.get("phase"):
         plan_state["phase"] = WorkaroundExecutionPhase.EXECUTE.value
@@ -238,25 +325,53 @@ def build_workaround_toolbelt(
             plan_state["targeted_test_required"] = bool(preferred_test_files)
 
     if no_fix_package_manager:
-        package_manager = str(no_fix_package_manager).strip().lower()
+        package_manager = str(no_fix_package_manager).strip().casefold()
+    elif language == ProjectLanguage.JAVA:
+        package_manager = "maven"
+    elif language == ProjectLanguage.PYTHON:
+        package_manager = (
+            "pipenv"
+            if any(Path(path).name.casefold() == "pipfile" for path in no_fix_manifest_paths or [])
+            else "pip"
+        )
     else:
-        package_manager = "npm" if project_language != ProjectLanguage.JAVA else ""
-    if package_manager == "maven" and project_language != ProjectLanguage.JAVA:
+        package_manager = "npm"
+
+    if package_manager == "maven" and language != ProjectLanguage.JAVA:
         raise ValueError("Maven package removal requires a Java project run.")
+    if package_manager in {"pip", "pipenv"} and language != ProjectLanguage.PYTHON:
+        raise ValueError("Python package removal requires a Python project run.")
+    if language == ProjectLanguage.PYTHON and package_manager not in {"pip", "pipenv"}:
+        raise ValueError("Python package removal requires pip or pipenv metadata.")
+    if language == ProjectLanguage.JAVA and package_manager != "maven":
+        raise ValueError("Java package removal requires the Maven package manager.")
+
     plan_state["no_fix_package_manager"] = package_manager
-    if package_manager == "maven":
-        allowed_manifest_names = ("pom.xml",)
+    if language == ProjectLanguage.PYTHON:
+        normalized_no_fix_manifests = _normalize_python_manifest_targets(
+            no_fix_manifest_paths or []
+        )
+        related_package_files = {
+            path
+            for manifest in normalized_no_fix_manifests
+            for path in _package_checkpoint_paths([manifest], package_ecosystem="pypi")
+            if Path(path).name.casefold() == "pipfile.lock"
+        }
+        plan_state["no_fix_manifest_paths"] = normalized_no_fix_manifests
+        plan_state["no_fix_package_files"] = sorted(
+            set(normalized_no_fix_manifests) | related_package_files
+        )
+    elif language == ProjectLanguage.JAVA:
         normalized_no_fix_manifests = _normalize_manifest_targets(
             no_fix_manifest_paths or [],
-            allowed_manifest_names=allowed_manifest_names,
+            allowed_manifest_names=("pom.xml",),
         )
         plan_state["no_fix_manifest_paths"] = normalized_no_fix_manifests
         plan_state["no_fix_package_files"] = normalized_no_fix_manifests.copy()
-    elif package_manager in {"npm", "yarn", "pnpm"}:
-        allowed_manifest_names = ("package.json",)
+    elif language == ProjectLanguage.NODEJS:
         normalized_no_fix_manifests = _normalize_manifest_targets(
             no_fix_manifest_paths or [],
-            allowed_manifest_names=allowed_manifest_names,
+            allowed_manifest_names=("package.json",),
         )
         plan_state.setdefault("no_fix_manifest_paths", normalized_no_fix_manifests)
         package_files = set(normalized_no_fix_manifests)
@@ -272,33 +387,55 @@ def build_workaround_toolbelt(
         plan_state["no_fix_manifest_paths"] = []
         plan_state["no_fix_package_files"] = []
 
+    if language == ProjectLanguage.PYTHON:
+        validation_tools = [
+            _make_validate_python_syntax_tool(sandbox),
+            _make_run_targeted_python_test_tool(sandbox, preferred_test_files, plan_state),
+            _make_validate_python_workaround_tool(
+                sandbox, touched_files, plan_state, preferred_test_files
+            ),
+        ]
+    else:
+        validation_tools = [
+            _make_validate_workaround_tool(
+                sandbox,
+                touched_files,
+                plan_state,
+                preferred_test_files,
+                project_language=language,
+            )
+        ]
+
     toolbelt = [
-        _make_record_plan_tool(plan_state),
-        _make_record_targeted_test_substitution_tool(sandbox, plan_state),
+        _make_record_plan_tool(plan_state, language=language),
+        _make_record_targeted_test_substitution_tool(sandbox, plan_state, language=language),
         _make_search_web_tool(plan_state=plan_state),
-        _make_read_web_page_tool(plan_state),
+        _make_read_web_page_tool(plan_state, language=language),
         _make_read_repository_map_tool(sandbox),
         _make_read_workspace_file_tool(sandbox, plan_state),
-        _make_search_codebase_pattern_tool(sandbox, plan_state),
+        _make_search_codebase_pattern_tool(sandbox, plan_state, language=language),
         _make_inspect_ast_symbol_tool(sandbox, plan_state),
         _make_deterministic_apply_edit_set_tool(sandbox, touched_files, plan_state),
         _make_revert_workspace_file_tool(sandbox, touched_files, host_repo_root),
-        _make_validate_workaround_tool(
-            sandbox,
-            touched_files,
-            plan_state,
-            preferred_test_files,
-            project_language=project_language,
-        ),
+        *validation_tools,
     ]
     if (
         effective_no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL.value
         and no_fix_package_name
         and normalized_no_fix_manifests
+        and language in {
+            ProjectLanguage.NODEJS,
+            ProjectLanguage.JAVA,
+            ProjectLanguage.PYTHON,
+        }
     ):
         toolbelt.insert(
             1,
-            _make_remove_no_fix_dependency_tool(
+            (
+                _make_remove_no_fix_python_dependency_tool
+                if language == ProjectLanguage.PYTHON
+                else _make_remove_no_fix_dependency_tool
+            )(
                 sandbox,
                 touched_files,
                 plan_state,

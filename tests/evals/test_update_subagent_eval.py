@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from remediation_engine.contracts.schemas import AgentActionStatus
+from remediation_engine.language import ProjectLanguage
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,
@@ -25,6 +26,7 @@ from tests.evals.replay_adapters import replay_update_case
 from tests.evals.replay_harness import (
     ReplayCapture,
     ScriptedReplayModel,
+    _case_project_language,
     cached_replay,
     format_tool_trace,
 )
@@ -118,22 +120,26 @@ def build_update_test_case(
 
 def _measure_expected(
     metric: Any,
-    test_case: LLMTestCase,
+    test_case: Any,
     *,
     expected_pass: bool,
     case_id: str,
     label: str,
 ) -> None:
-    """Measure an expected-positive or expected-negative metric."""
-    if expected_pass:
-        if assert_test is not None:
-            assert_test(test_case, [metric], run_async=False)
-        else:
-            metric.measure(test_case)
-            assert metric.is_successful(), f"Case {case_id!r} failed {label}."
-    else:
+    """Measure and register an expected-positive or expected-negative metric."""
+    if assert_test is None:
         metric.measure(test_case)
-        assert not metric.is_successful(), f"Case {case_id!r} unexpectedly passed {label}."
+    else:
+        try:
+            assert_test(test_case, [metric], run_async=False)
+        except AssertionError:
+            if expected_pass or metric.is_successful() or getattr(metric, "error", None):
+                raise
+
+    actual_pass = bool(metric.is_successful())
+    assert actual_pass is expected_pass, (
+        f"Case {case_id!r} expected {label} to {'pass' if expected_pass else 'fail'}."
+    )
 
 
 def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
@@ -321,20 +327,35 @@ def test_update_subagent_offline_production_replay(
             assert "<dependencyManagement>" in capture.final_files["pom.xml"]
         return
 
-    if case_id == "update-retry-limit-surrender":
+    if case_id == "update-retry-limit-surrender" or case.get("action_status") == "SURRENDER":
         assert summary.status == AgentActionStatus.SURRENDER
-        assert "RETRY_LIMIT_REACHED" in (capture.actual_output + "\n" + "\n".join(capture.errors))
-        baseline = json.loads(str(case["replay"]["input"]["workspace_files"]["package.json"]))
-        final_manifest = json.loads(capture.final_files["package.json"])
-        assert final_manifest == baseline
+        if case_id == "update-retry-limit-surrender" or case.get("expected_failure_marker"):
+            marker = str(case.get("expected_failure_marker", "RETRY_LIMIT_REACHED"))
+            assert marker in (capture.actual_output + "\n" + "\n".join(capture.errors))
+        if _case_project_language(case) == ProjectLanguage.PYTHON:
+            manifest_path = str(case.get("manifest_path", "requirements.txt"))
+            assert (
+                capture.final_files[manifest_path]
+                == case["replay"]["input"]["workspace_files"][manifest_path]
+            )
+        else:
+            baseline = json.loads(str(case["replay"]["input"]["workspace_files"]["package.json"]))
+            final_manifest = json.loads(capture.final_files["package.json"])
+            assert final_manifest == baseline
         return
 
     assert summary.status == AgentActionStatus.SUCCESS
     assert capture.changed_files
-    manifest = json.loads(capture.final_files["package.json"])
-    dependency_section = str(case["dependency_type"])
     package_name = str(case["target_package_name"])
-    assert manifest[dependency_section][package_name] == case["selected_version"]
+    if _case_project_language(case) == ProjectLanguage.PYTHON:
+        manifest_path = str(case.get("manifest_path", "requirements.txt"))
+        requirements = capture.final_files[manifest_path].splitlines()
+        assert f"{package_name}=={case['selected_version']}" in requirements
+        assert "package.json" not in capture.final_files
+    else:
+        manifest = json.loads(capture.final_files["package.json"])
+        dependency_section = str(case["dependency_type"])
+        assert manifest[dependency_section][package_name] == case["selected_version"]
 
 
 def test_maven_target_recovery_separates_live_and_offline_tool_contracts() -> None:

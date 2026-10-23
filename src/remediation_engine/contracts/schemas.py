@@ -191,6 +191,8 @@ class SCARemediationStage(StrEnum):
     NPM_SAME_MAJOR = "npm_same_major"
     NPM_LATEST = "npm_latest"
     MAVEN_LATEST = "maven_latest"
+    PYPI_SAME_MAJOR = "pypi_same_major"
+    PYPI_LATEST = "pypi_latest"
     PACKAGE_OVERRIDE = "package_override"
     CODE_WORKAROUND = "code_workaround"
 
@@ -1700,6 +1702,13 @@ class QADeterministicGates(BaseModel):
     scanner_execution_status: ScannerExecutionStatus
     target_remaining_identifiers: list[str] = Field(default_factory=list)
     target_scanner_cleared: bool | None = None
+    scan_evidence_complete: bool | None = Field(
+        default=None,
+        description=(
+            "Whether scanner evidence covered the requested task-owned dependency scope. "
+            "False means an empty report cannot clear the target."
+        ),
+    )
     target_package_absent: bool = Field(
         default=False,
         description="Complete task-owned lockfile evidence proves the SCA target is absent.",
@@ -2678,7 +2687,7 @@ class PackageMutation(BaseModel):
 
     task_id: str = Field(..., min_length=1)
     package_name: str = Field(..., min_length=1)
-    ecosystem: Literal["npm", "maven"] = "npm"
+    ecosystem: Literal["npm", "maven", "pypi"] = "npm"
     manifest_path: str = Field(
         default="package.json",
         min_length=1,
@@ -2693,16 +2702,7 @@ class PackageMutation(BaseModel):
         description="Committed Maven declaration operation; required for Maven mutations.",
     )
     target_version: str = Field(..., min_length=1)
-    dependency_type: Literal[
-        "dependencies",
-        "dependencyManagement",
-        "devDependencies",
-        "peerDependencies",
-        "optionalDependencies",
-        "overrides",
-        "resolutions",
-        "pnpm_overrides",
-    ]
+    dependency_type: str = Field(..., min_length=1)
 
     @field_validator("task_id", "package_name", "manifest_path", "target_version", mode="before")
     @classmethod
@@ -2758,7 +2758,26 @@ class PackageMutation(BaseModel):
 
     @model_validator(mode="after")
     def _validate_ecosystem_targets(self) -> PackageMutation:
-        """Require a complete native authorization for Maven mutations."""
+        """Validate declaration labels and ecosystem-specific authorization."""
+        npm_types = {
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+            "overrides",
+            "resolutions",
+            "pnpm_overrides",
+        }
+        python_types = {
+            "requirements",
+            "dependencies",
+            "optional-dependencies",
+            "install_requires",
+            "extras_require",
+            "packages",
+            "dev-packages",
+        }
+
         if self.ecosystem == "maven":
             if self.dependency_type not in {"dependencies", "dependencyManagement"}:
                 raise ValueError("Maven mutations require a Maven declaration type.")
@@ -2778,10 +2797,19 @@ class PackageMutation(BaseModel):
                 raise ValueError(
                     "Maven dependency-management insertion requires its exact target type."
                 )
-        elif self.dependency_type == "dependencyManagement" or self.maven_target_operation:
-            raise ValueError("Maven-only target fields cannot be used for an npm mutation.")
-        elif self.target_manifest_paths:
-            raise ValueError("target_manifest_paths are only valid for Maven mutations.")
+            return self
+
+        if self.maven_target_operation is not None or self.target_manifest_paths:
+            raise ValueError("Maven-only target fields cannot be used for this ecosystem.")
+        if self.dependency_type == "dependencyManagement":
+            raise ValueError("dependencyManagement is only valid for Maven mutations.")
+
+        allowed = python_types if self.ecosystem == "pypi" else npm_types
+        if self.dependency_type not in allowed:
+            raise ValueError(
+                f"dependency_type {self.dependency_type!r} is not valid for {self.ecosystem}."
+            )
+        return self
         return self
 
 
