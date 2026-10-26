@@ -9,6 +9,7 @@ export interface FindingModel {
   package_version?: string | null;
   severity: SeverityLevel;
   file_path?: string | null;
+  aliases?: string[] | null;
   cwes: string[];
   description?: string | null;
   status: FindingStatus;
@@ -37,11 +38,15 @@ export interface ConsoleEvent {
   category: ConsoleCategory;
   title: string;
   details?: string | null;
+  status?: "running" | "success" | "error" | "incomplete" | null;
+  duration_seconds?: number | null;
+  outcome?: string | null;
+  task_label?: string | null;
   data?: Record<string, unknown> | null;
 }
 
 export interface DashboardUpdate {
-  type: "finding_removed" | "finding_added" | "finding_status_change" | "full_refresh";
+  type: "finding_removed" | "finding_added" | "finding_status_change" | "finding_updated" | "full_refresh";
   finding_id?: string | null;
   finding?: FindingModel | null;
   active_findings: FindingModel[];

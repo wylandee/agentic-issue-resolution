@@ -242,8 +242,9 @@ class TestSeverityExtraction:
                 {"highestSeverity": "CRITICAL", "cvssv3": {"baseSeverity": "HIGH"}},
                 Severity.CRITICAL,
             ),
-            # Unknown garbage â†’ UNKNOWN
-            ({"severity": "moderate"}, Severity.UNKNOWN),  # ODC moderate is not a valid Severity
+            # NPM advisories use "moderate" where the engine uses "MEDIUM".
+            ({"severity": "moderate"}, Severity.MEDIUM),
+            ({"severity": "moderate", "unscored": "true"}, Severity.MEDIUM),
             ({}, Severity.UNKNOWN),
         ],
     )

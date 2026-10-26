@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -16,7 +17,10 @@ class FindingModel(BaseModel):
     severity: str = Field(default="UNKNOWN", description="Severity label (CRITICAL, HIGH, etc.).")
     file_path: str | None = Field(default=None, description="Repository-relative file path.")
     cwes: list[str] = Field(default_factory=list, description="Associated CWE identifier strings.")
-    description: str | None = Field(default=None, description="Vulnerability description or finding message.")
+    aliases: list[str] = Field(default_factory=list, description="Linked CVE or GHSA identifiers.")
+    description: str | None = Field(
+        default=None, description="Vulnerability description or finding message."
+    )
     status: Literal["flagged", "remediating", "remediated", "newly_detected", "unresolved"] = Field(
         default="flagged",
         description="Display status of the finding.",
@@ -46,13 +50,23 @@ class ConsoleEvent(BaseModel):
     category: Literal["NODE_TRANSITION", "TOOL_CALL", "DETERMINISTIC_FN", "KEY_RESULT"]
     title: str
     details: str | None = None
+    status: Literal["running", "success", "error", "incomplete"] | None = None
+    duration_seconds: float | None = None
+    outcome: str | None = None
+    task_label: str | None = None
     data: dict[str, Any] | None = None
 
 
 class DashboardUpdate(BaseModel):
     """Real-time update payload informing the frontend of finding changes."""
 
-    type: Literal["finding_removed", "finding_added", "finding_status_change", "full_refresh"]
+    type: Literal[
+        "finding_removed",
+        "finding_added",
+        "finding_status_change",
+        "finding_updated",
+        "full_refresh",
+    ]
     finding_id: str | None = None
     finding: FindingModel | None = None
     active_findings: list[FindingModel] = Field(default_factory=list)

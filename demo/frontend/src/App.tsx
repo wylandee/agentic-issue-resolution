@@ -94,7 +94,13 @@ export const App: React.FC = () => {
           setReportAvailable(state.report_available);
         },
         onConsoleEvent: (event) => {
-          setLogs((prev) => [...prev, event]);
+          setLogs((previous) => {
+            const existingIndex = previous.findIndex((entry) => entry.id === event.id);
+            if (existingIndex < 0) return [...previous, event];
+            const updated = previous.slice();
+            updated[existingIndex] = event;
+            return updated;
+          });
         },
         onDashboardUpdate: (update) => {
           setActiveFindings(update.active_findings);

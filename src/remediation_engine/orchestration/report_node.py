@@ -1991,7 +1991,7 @@ def _render_summary(context: ReportContext) -> str:
     )
     metrics = [
         ("Run ID", context.run_id),
-        ("Total findings (CVEs and GHSAs)", context.original_scanner_findings),
+        ("Total findings (CVEs and GHSAs)", context.canonical_finding_count),
         ("Total vulnerability groups", total_vulnerability_groups),
         ("Successfully remediated vulnerability groups", fixed),
         ("Vulnerability groups requiring follow-up", follow_up),

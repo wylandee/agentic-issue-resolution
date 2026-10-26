@@ -5,14 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import shutil
 import uuid
 from pathlib import Path
 from typing import Any
 
-from remediation_engine.contracts.schemas import IssueSource, Severity, VulnerabilityIssue
-from remediation_engine.orchestration.issue_identity import stable_issue_fingerprint
+from remediation_engine.contracts.schemas import VulnerabilityIssue
+from remediation_engine.orchestration.issue_identity import (
+    canonical_issue_components,
+    finding_occurrence_key,
+)
 from remediation_engine.tools.odc_parser import load_report, parse_vulnerabilities
 
 from .models import FindingModel, WorkspaceInfo
@@ -27,36 +28,125 @@ WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
 _WORKSPACES: dict[str, dict[str, Any]] = {}
 
 
-def _generate_finding_id(issue: VulnerabilityIssue) -> str:
-    """Generate a clean, stable deterministic identifier for a finding."""
-    identifier = issue.cve_id or issue.ghsa_id or issue.rule_id or str(issue.id)
-    pkg = (issue.package_name or "unknown").strip().lower()
-    ver = (issue.package_version or "").strip()
-    path = (issue.file_path or "").strip().lower()
-    seed = f"{identifier}:{pkg}:{ver}:{path}"
-    h = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
-    clean_id = f"{identifier}_{pkg}_{h}"
+_SEVERITY_RANK = {
+    "UNKNOWN": 0,
+    "INFO": 1,
+    "LOW": 2,
+    "MEDIUM": 3,
+    "HIGH": 4,
+    "CRITICAL": 5,
+}
+
+
+def _generate_finding_id(issue: VulnerabilityIssue, identifier: str | None = None) -> str:
+    """Generate a stable identifier for one vulnerability package occurrence."""
+    vuln_id = identifier or issue.cve_id or issue.ghsa_id or issue.rule_id or str(issue.id)
+    package_name, package_version, package_path = finding_occurrence_key(issue)
+    seed = json.dumps(
+        [vuln_id, package_name, package_version, package_path],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
+    clean_id = f"{vuln_id}_{package_name}_{digest}"
     return clean_id.replace("/", "_").replace("\\", "_")
 
 
-def issue_to_finding_model(issue: VulnerabilityIssue, status: str = "flagged", is_new: bool = False) -> FindingModel:
-    """Convert a contracts VulnerabilityIssue to an API FindingModel."""
-    vuln_id = issue.cve_id or issue.ghsa_id or issue.rule_id or str(issue.id)
-    cwes = [c.id for c in issue.cwe if c.id]
-    severity_str = str(getattr(issue.severity, "value", issue.severity)).upper()
-    
+def _finding_from_linked_issues(
+    issues: list[VulnerabilityIssue],
+    *,
+    status: str,
+    is_new: bool,
+) -> FindingModel:
+    """Project one linked issue component into a dashboard finding."""
+    cve_ids = sorted({issue.cve_id.strip().upper() for issue in issues if issue.cve_id})
+    ghsa_ids = sorted({issue.ghsa_id.strip().upper() for issue in issues if issue.ghsa_id})
+    primary_id = (
+        cve_ids[0]
+        if cve_ids
+        else ghsa_ids[0]
+        if ghsa_ids
+        else (issues[0].rule_id or str(issues[0].id))
+    )
+    aliases = sorted((set(cve_ids) | set(ghsa_ids)) - {primary_id})
+
+    representative = next(
+        (issue for issue in issues if issue.cve_id and issue.cve_id.strip().upper() == primary_id),
+        None,
+    )
+    if representative is None:
+        representative = next(
+            (
+                issue
+                for issue in issues
+                if issue.ghsa_id and issue.ghsa_id.strip().upper() == primary_id
+            ),
+            issues[0],
+        )
+
+    severities = [str(getattr(issue.severity, "value", issue.severity)).upper() for issue in issues]
+    severity = max(severities, key=lambda value: _SEVERITY_RANK.get(value, 0), default="UNKNOWN")
+    cwes = sorted({cwe.id for issue in issues for cwe in issue.cwe if cwe.id})
+    description = next(
+        (
+            issue.message
+            for issue in [representative, *issues]
+            if issue.message and issue.message.strip()
+        ),
+        None,
+    )
+
     return FindingModel(
-        id=_generate_finding_id(issue),
-        vuln_id=vuln_id,
-        package_name=issue.package_name or "Unknown package",
-        package_version=issue.package_version,
-        severity=severity_str,
-        file_path=issue.file_path,
+        id=_generate_finding_id(representative, primary_id),
+        vuln_id=primary_id,
+        package_name=(representative.package_name or "").strip() or "Unknown package",
+        package_version=(
+            representative.package_version.strip() if representative.package_version else None
+        ),
+        severity=severity,
+        file_path=representative.file_path,
+        aliases=aliases,
         cwes=cwes,
-        description=issue.message,
-        status=status,
+        description=description,
+        status=status,  # type: ignore[arg-type]
         is_new=is_new,
     )
+
+
+def normalize_findings(
+    issues: list[VulnerabilityIssue],
+    *,
+    status: str = "flagged",
+    is_new: bool = False,
+) -> list[FindingModel]:
+    """Canonicalize scanner records into one row per linked vulnerability occurrence.
+
+    Records are linked by shared CVE/GHSA identifiers, including transitive
+    links through an issue that carries both identifiers. Identifier links are
+    scoped to the same package, installed version, and repository location.
+    The input issues are only read and are never modified.
+
+    Args:
+        issues: Original scanner issue records.
+        status: Dashboard status assigned to each canonical row.
+        is_new: Whether the rows were discovered after the baseline scan.
+
+    Returns:
+        Canonical findings in the order of their first source record.
+    """
+    return [
+        _finding_from_linked_issues(group, status=status, is_new=is_new)
+        for group in canonical_issue_components(issues)
+    ]
+
+
+def issue_to_finding_model(
+    issue: VulnerabilityIssue,
+    status: str = "flagged",
+    is_new: bool = False,
+) -> FindingModel:
+    """Convert one contracts issue to its canonical API finding representation."""
+    return normalize_findings([issue], status=status, is_new=is_new)[0]
 
 
 def find_odc_report(repo_root: Path) -> Path | None:
@@ -76,7 +166,11 @@ def find_odc_report(repo_root: Path) -> Path | None:
         """Return estimated finding count if file is a valid ODC report, else None."""
         if p.suffix.lower() in {".jsonl", ".ndjson"}:
             try:
-                lines = [line for line in p.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+                lines = [
+                    line
+                    for line in p.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if line.strip()
+                ]
                 return len(lines)
             except Exception:
                 return None
@@ -86,7 +180,9 @@ def find_odc_report(repo_root: Path) -> Path | None:
                 if isinstance(content, dict) and "dependencies" in content:
                     deps = content.get("dependencies") or []
                     vuln_count = sum(
-                        len(d.get("vulnerabilities", [])) for d in deps if isinstance(d, dict) and "vulnerabilities" in d
+                        len(d.get("vulnerabilities", []))
+                        for d in deps
+                        if isinstance(d, dict) and "vulnerabilities" in d
                     )
                     return vuln_count
             except Exception:
@@ -97,7 +193,9 @@ def find_odc_report(repo_root: Path) -> Path | None:
         for match in sorted(repo_root.rglob(pattern)):
             if match.is_file():
                 rel_parts = match.relative_to(repo_root).parts
-                if any(part in {".git", "node_modules", ".venv", "dist", "build"} for part in rel_parts):
+                if any(
+                    part in {".git", "node_modules", ".venv", "dist", "build"} for part in rel_parts
+                ):
                     continue
                 score = evaluate_candidate(match)
                 if score is not None:
@@ -107,7 +205,9 @@ def find_odc_report(repo_root: Path) -> Path | None:
         # General JSON scan looking for ODC schema
         for json_file in sorted(repo_root.rglob("*.json")):
             rel_parts = json_file.relative_to(repo_root).parts
-            if any(part in {".git", "node_modules", ".venv", "dist", "build"} for part in rel_parts):
+            if any(
+                part in {".git", "node_modules", ".venv", "dist", "build"} for part in rel_parts
+            ):
                 continue
             score = evaluate_candidate(json_file)
             if score is not None:
@@ -169,7 +269,7 @@ def create_workspace_from_local_path(local_path_str: str) -> WorkspaceInfo:
         )
 
     issues = parse_findings_from_file(odc_path)
-    findings = [issue_to_finding_model(issue, status="flagged") for issue in issues]
+    findings = normalize_findings(issues, status="flagged")
     workspace_id = f"ws_{uuid.uuid4().hex[:10]}"
 
     info = WorkspaceInfo(
@@ -210,7 +310,7 @@ def finalize_uploaded_workspace(workspace_id: str, repo_path: Path) -> Workspace
         )
 
     issues = parse_findings_from_file(odc_path)
-    findings = [issue_to_finding_model(issue, status="flagged") for issue in issues]
+    findings = normalize_findings(issues, status="flagged")
 
     info = WorkspaceInfo(
         workspace_id=workspace_id,

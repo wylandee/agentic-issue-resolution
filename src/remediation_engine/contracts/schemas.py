@@ -53,6 +53,26 @@ class Severity(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+def normalize_severity_value(value: Any) -> Severity:
+    """Normalize scanner severity labels to the canonical severity enum.
+
+    Args:
+        value: Severity enum member or scanner-provided label.
+
+    Returns:
+        A canonical severity; unrecognized or absent labels become UNKNOWN.
+    """
+    if isinstance(value, Severity):
+        return value
+    normalized = str(value).strip().upper()
+    if normalized == "MODERATE":
+        normalized = "MEDIUM"
+    try:
+        return Severity(normalized)
+    except ValueError:
+        return Severity.UNKNOWN
+
+
 class IssueSource(StrEnum):
     """The originating scanner / data source."""
 
@@ -628,13 +648,8 @@ class VulnerabilityIssue(BaseModel):
 
     @field_validator("severity", mode="before")
     @classmethod
-    def _coerce_severity(cls, v: Any) -> Severity:
-        if isinstance(v, Severity):
-            return v
-        try:
-            return Severity(str(v).strip().upper())
-        except ValueError:
-            return Severity.UNKNOWN
+    def _coerce_severity(cls, value: Any) -> Severity:
+        return normalize_severity_value(value)
 
     @field_validator("file_path", mode="before")
     @classmethod

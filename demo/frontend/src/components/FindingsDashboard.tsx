@@ -29,6 +29,24 @@ const SEVERITY_COLORS: Record<SeverityLevel, { bg: string; text: string; border:
   INFO: { bg: "bg-slate-800", text: "text-slate-300", border: "border-slate-700" },
   UNKNOWN: { bg: "bg-slate-800", text: "text-slate-400", border: "border-slate-700" },
 };
+const SEVERITY_LEVELS: SeverityLevel[] = [
+  "CRITICAL",
+  "HIGH",
+  "MEDIUM",
+  "LOW",
+  "INFO",
+  "UNKNOWN",
+];
+const SEVERITY_FILTERS: Array<"ALL" | SeverityLevel> = ["ALL", ...SEVERITY_LEVELS];
+const SEVERITY_LABELS: Record<SeverityLevel, string> = {
+  CRITICAL: "Crit",
+  HIGH: "High",
+  MEDIUM: "Med",
+  LOW: "Low",
+  INFO: "Info",
+  UNKNOWN: "Unknown",
+};
+
 
 export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
   findings,
@@ -38,7 +56,7 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
   attachedWorkspace,
 }) => {
   const [searchTerm, setSearchTerm] = useState("");
-  const [selectedSeverity, setSelectedSeverity] = useState<string>("ALL");
+  const [selectedSeverity, setSelectedSeverity] = useState<"ALL" | SeverityLevel>("ALL");
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   const toggleExpand = (id: string) => {
@@ -50,21 +68,27 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
     });
   };
 
+  const normalizedSearchTerm = searchTerm.toLowerCase();
   const filteredFindings = findings.filter((f) => {
     const matchesSearch =
-      f.vuln_id.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      f.package_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (f.file_path && f.file_path.toLowerCase().includes(searchTerm.toLowerCase())) ||
-      f.cwes.some((c) => c.toLowerCase().includes(searchTerm.toLowerCase()));
+      f.vuln_id.toLowerCase().includes(normalizedSearchTerm) ||
+      (f.aliases ?? []).some((alias) => alias.toLowerCase().includes(normalizedSearchTerm)) ||
+      f.package_name.toLowerCase().includes(normalizedSearchTerm) ||
+      (f.file_path && f.file_path.toLowerCase().includes(normalizedSearchTerm)) ||
+      f.cwes.some((c) => c.toLowerCase().includes(normalizedSearchTerm));
 
     const matchesSeverity = selectedSeverity === "ALL" || f.severity === selectedSeverity;
     return matchesSearch && matchesSeverity;
   });
 
-  const criticalCount = findings.filter((f) => f.severity === "CRITICAL").length;
-  const highCount = findings.filter((f) => f.severity === "HIGH").length;
-  const mediumCount = findings.filter((f) => f.severity === "MEDIUM").length;
-  const lowCount = findings.filter((f) => f.severity === "LOW").length;
+  const severityCounts = findings.reduce<Record<SeverityLevel, number>>(
+    (counts, finding) => {
+      const severity = SEVERITY_COLORS[finding.severity] ? finding.severity : "UNKNOWN";
+      counts[severity] += 1;
+      return counts;
+    },
+    { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0, UNKNOWN: 0 }
+  );
 
   return (
     <div className="flex flex-col h-full bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-lg">
@@ -76,11 +100,15 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
             <ShieldAlert className="w-4 h-4 text-rose-400" />
           </div>
           <div className="text-2xl font-bold text-slate-100">{findings.length}</div>
-          <div className="flex items-center gap-1 mt-1 text-[11px] text-slate-400">
-            <span className="text-red-400 font-semibold">{criticalCount} Crit</span> ·{" "}
-            <span className="text-orange-400 font-semibold">{highCount} High</span> ·{" "}
-            <span className="text-amber-400 font-semibold">{mediumCount} Med</span> ·{" "}
-            <span className="text-blue-400 font-semibold">{lowCount} Low</span>
+          <div className="flex flex-wrap items-center gap-x-1 mt-1 text-[10px] text-slate-400">
+            {SEVERITY_LEVELS.map((severity, index) => (
+              <React.Fragment key={severity}>
+                {index > 0 && <span>·</span>}
+                <span className={`font-semibold ${SEVERITY_COLORS[severity].text}`}>
+                  {severityCounts[severity]} {SEVERITY_LABELS[severity]}
+                </span>
+              </React.Fragment>
+            ))}
           </div>
         </div>
 
@@ -133,17 +161,16 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
           <Search className="w-4 h-4 text-slate-500 absolute left-2.5 top-2.5" />
           <input
             type="text"
-            placeholder="Search CVE, package, or file..."
-            value={searchTerm}
+            placeholder="Search CVE, GHSA, package, or file..."
             onChange={(e) => setSearchTerm(e.target.value)}
             className="w-full pl-8 pr-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
           />
         </div>
 
-        <div className="flex items-center gap-1.5 text-xs text-slate-400">
+        <div className="flex flex-wrap items-center gap-1.5 text-xs text-slate-400">
           <Filter className="w-3.5 h-3.5 text-slate-500" />
           <span>Severity:</span>
-          {["ALL", "CRITICAL", "HIGH", "MEDIUM", "LOW"].map((sev) => (
+          {SEVERITY_FILTERS.map((sev) => (
             <button
               key={sev}
               onClick={() => setSelectedSeverity(sev)}
@@ -270,6 +297,19 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
                   <div className="px-3 pb-3 pt-1 border-t border-slate-900 bg-slate-950/40 text-xs text-slate-300 space-y-2">
                     {finding.description && (
                       <p className="text-slate-400 leading-relaxed">{finding.description}</p>
+                    )}
+                    {(finding.aliases?.length ?? 0) > 0 && (
+                      <div className="flex flex-wrap items-center gap-1 text-[11px] text-slate-400">
+                        <span className="text-slate-500">Aliases: </span>
+                        {finding.aliases?.map((alias) => (
+                          <span
+                            key={alias}
+                            className="px-1.5 py-0.2 bg-slate-800 text-slate-300 rounded font-mono"
+                          >
+                            {alias}
+                          </span>
+                        ))}
+                      </div>
                     )}
 
                     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-400 pt-1">

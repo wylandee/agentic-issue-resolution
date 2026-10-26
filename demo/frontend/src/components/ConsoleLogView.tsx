@@ -132,10 +132,40 @@ export const ConsoleLogView: React.FC<ConsoleLogViewProps> = ({ logs, currentNod
 
                 {/* Log Content */}
                 <div className="flex-1 min-w-0">
-                  <div className={`font-semibold ${style.text} truncate`}>{log.title}</div>
+                  <div className="flex items-center gap-2">
+                    <div className={`font-semibold ${style.text} truncate`}>{log.title}</div>
+                    {log.status && (
+                      <span
+                        className={`text-[9px] uppercase tracking-wide flex-shrink-0 ${
+                          log.status === "error"
+                            ? "text-rose-400"
+                            : log.status === "success"
+                            ? "text-emerald-400"
+                            : log.status === "incomplete"
+                            ? "text-slate-400"
+                            : "text-amber-300"
+                        }`}
+                      >
+                        {log.status}
+                      </span>
+                    )}
+                  </div>
+                  {log.task_label && (
+                    <div className="text-cyan-300 text-[10px] mt-0.5">{log.task_label}</div>
+                  )}
                   {log.details && (
                     <div className="text-slate-400 text-[11px] whitespace-pre-wrap break-all mt-0.5">
                       {log.details}
+                    </div>
+                  )}
+                  {log.outcome && (
+                    <div className="text-slate-400 text-[11px] whitespace-pre-wrap break-all mt-0.5">
+                      Outcome: {log.outcome}
+                    </div>
+                  )}
+                  {log.duration_seconds != null && (
+                    <div className="text-slate-500 text-[10px] mt-0.5">
+                      Duration: {log.duration_seconds.toFixed(3)}s
                     </div>
                   )}
                 </div>

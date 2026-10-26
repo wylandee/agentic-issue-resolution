@@ -33,6 +33,7 @@ from remediation_engine.contracts import (
     Severity,
     VulnerabilityIssue,
 )
+from remediation_engine.contracts.schemas import normalize_severity_value
 from remediation_engine.tools.package_identity import package_name_from_purl
 
 try:
@@ -75,10 +76,9 @@ def _extract_severity(vulnerability: dict[str, Any]) -> Severity:
     ]
     for raw in candidates:
         if raw:
-            try:
-                return Severity(str(raw).strip().upper())
-            except ValueError:
-                pass
+            severity = normalize_severity_value(raw)
+            if severity != Severity.UNKNOWN:
+                return severity
     return Severity.UNKNOWN
 
 
