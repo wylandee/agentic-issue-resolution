@@ -984,7 +984,7 @@
     "eval_type": "workaround_subagent",
     "golden_kind": "historical_notevil_no_fix_pivot_with_validation_recovery",
     "provenance": "Historical trajectory phase5_20260819T052618Z_bc2db34f-0eca-4492-ba6e-4dd2bd4293a8, task-4 initial no_fix_package_removal attempt 88ee0e54-9807-5c50-96a8-017815a12aee (revision 1) pivoted to no_fix_code_removal attempt fd151bb4-674d-597d-945c-c5e16d027308 (revision 4). The source-only worker chain is documented in spans 190-258, including tool spans 202, 205, 207, 210, 217, 219, 222, 224, 230, 232, 234, and 258. The exporter recorded empty inputs/outputs for §222 record_plan, so its plan arguments are reconstructed from the exact edit set in §224.",
-    "evaluation_note": "This replaces the synthetic swig example with the real notevil pivot. The historical trace keeps notevil installed and removes its vulnerable VM execution path from routes/b2bOrder.ts. It also preserves the observed guard and recovery errors: premature web search, compiled-file inspection, compiled test input, phase violation, and wrong test hint. The §222 record_plan payload was not captured by the exporter; this golden reconstructs it from the observed exact §224 edit set and marks the observed erroneous calls separately from the expected correct trace.",
+    "evaluation_note": "This replaces the synthetic swig example with the real notevil pivot. The historical trace keeps notevil installed and removes its vulnerable VM execution path from routes/b2bOrder.ts. It also preserves the observed guard and recovery errors: premature web search, compiled-file inspection, compiled test input, phase violation, and wrong test hint. The §222 record_plan payload was not captured by the exporter; this golden reconstructs it from the observed exact §224 edit set and marks the observed erroneous calls separately from the expected correct trace.\nThe negative tool trace is a recorded historical failure. Live worker replays are allowed to recover; deterministic replay tests enforce that historical trace separately.",
     "supervisor_instruction": "After the notevil package-removal attempt, pivot to NO_FIX VULNERABLE-CODE REMOVAL. Keep notevil installed; remove the vulnerable execution path from routes/b2bOrder.ts without editing manifests or tests.",
     "completion_task": "Execute the committed source-only notevil pivot, recover from validation-input and phase errors, remove the vulnerable route path, and finish with validation PASS.",
     "target_package_name": "notevil",
@@ -1324,14 +1324,15 @@
         "allowed_target_versions": [],
         "allowed_dependency_types": []
       }
-    }
+    },
+    "tool_correctness_applicable": false
   },
   {
     "case_id": "workaround-retry-after-local-inspection-first-error",
     "eval_type": "workaround_subagent",
     "golden_kind": "search_web_before_local_inspection_then_recovery",
     "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §194, span 197 returned [INVESTIGATION_REQUIRED] before spans 199, 202, and 205 completed local inspection.",
-    "evaluation_note": "The correct express-jwt workaround has two atomic source replacements: migrate the legacy default import to the named expressjwt export, then pass algorithms: ['RS256']. Web evidence remains optional and must follow local inspection.",
+    "evaluation_note": "The correct express-jwt workaround has two atomic source replacements: migrate the legacy default import to the named expressjwt export, then pass algorithms: ['RS256']. Web evidence remains optional and must follow local inspection.\nThe negative tool trace is a recorded historical failure. Live worker replays are allowed to recover; deterministic replay tests enforce that historical trace separately.",
     "supervisor_instruction": "Migrate the legacy express-jwt default import to the named expressjwt export and configure the middleware with an explicit RS256 algorithm allowlist in lib/insecurity.ts.",
     "completion_task": "Inspect the express-jwt import and authorization call, record an evidence-backed plan with both source replacements, apply the atomic edit, and follow the committed validation path.",
     "target_package_name": "express-jwt",
@@ -1615,14 +1616,15 @@
         "allowed_target_versions": [],
         "allowed_dependency_types": []
       }
-    }
+    },
+    "tool_correctness_applicable": false
   },
   {
     "case_id": "workaround-retry-after-plan-exact-match-error",
     "eval_type": "workaround_subagent",
     "golden_kind": "invalid_record_plan_then_correct_plan",
     "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run 1171, spans 1197, 1199, 1203, 1211, and accepted plan span 1216. The historical failures required authoritative evidence before a QA repair plan was accepted.",
-    "evaluation_note": "This case tests invalid record_plan arguments. A deterministic edit PLAN_MISMATCH is a separate error class and is not conflated here.",
+    "evaluation_note": "This case tests invalid record_plan arguments. A deterministic edit PLAN_MISMATCH is a separate error class and is not conflated here.\nThe negative tool trace is a recorded historical failure. Live worker replays are allowed to recover; deterministic replay tests enforce that historical trace separately.",
     "supervisor_instruction": "Implement the committed workaround for the verification handler in routes/verify.ts and validate it.",
     "completion_task": "Recover from an invalid evidence-backed plan request, record the corrected plan, apply it, and pass validation.",
     "target_package_name": "jsonwebtoken",
@@ -1871,14 +1873,15 @@
         "allowed_target_versions": [],
         "allowed_dependency_types": []
       }
-    }
+    },
+    "tool_correctness_applicable": false
   },
   {
     "case_id": "workaround-retry-after-no-validate-after-edit-error",
     "eval_type": "workaround_subagent",
     "golden_kind": "phase_violation_after_edit_then_validation",
     "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §412, spans 430, 442, and eventual successful validation span 481. The same guard appears in run §104 after span 131.",
-    "evaluation_note": "The generic non-validation command is made concrete as search_codebase_pattern. After an edit, the worker must call validate_workaround before further investigation.",
+    "evaluation_note": "The generic non-validation command is made concrete as search_codebase_pattern. After an edit, the worker must call validate_workaround before further investigation.\nThe negative tool trace is a recorded historical failure. Live worker replays are allowed to recover; deterministic replay tests enforce that historical trace separately.",
     "supervisor_instruction": "Apply the committed Hono CORS workaround in server.ts and validate it.",
     "completion_task": "Recover from a phase violation caused by investigating after an edit, then validate the pending edit and report the completed workaround.",
     "target_package_name": "hono",
@@ -2112,7 +2115,8 @@
         "allowed_target_versions": [],
         "allowed_dependency_types": []
       }
-    }
+    },
+    "tool_correctness_applicable": false
   },
   {
     "case_id": "workaround-retry-after-validation-failure",
@@ -2485,7 +2489,7 @@
     "eval_type": "workaround_subagent",
     "golden_kind": "unsafe_runtime_smoke_then_correct_source_module",
     "provenance": "Historical trajectory phase5_20260825T101244Z_81a7782a-e964-464e-ae71-7fc2774c0d92, workaround run §412, span 437 rejected app.ts as an unsafe runtime smoke target; later validation used lib/utils.ts and passed at span 481.",
-    "evaluation_note": "This case is specifically an invalid runtime smoke file. Compiled or source-module targeted-test errors are separate validation-input variants.",
+    "evaluation_note": "This case is specifically an invalid runtime smoke file. Compiled or source-module targeted-test errors are separate validation-input variants.\nThe negative tool trace is a recorded historical failure. Live worker replays are allowed to recover; deterministic replay tests enforce that historical trace separately.",
     "supervisor_instruction": "Apply the Hono CORS workaround in server.ts and validate it with a lightweight source-module smoke target.",
     "completion_task": "Recover from an unsafe application-starting smoke target, select a lightweight source module, and complete validation.",
     "target_package_name": "hono",
@@ -2723,7 +2727,8 @@
         "allowed_target_versions": [],
         "allowed_dependency_types": []
       }
-    }
+    },
+    "tool_correctness_applicable": false
   },
   {
     "case_id": "workaround-retry-after-validation-infra-failure",
@@ -3050,7 +3055,7 @@
     "eval_type": "workaround_subagent",
     "golden_kind": "prohibited_plan_target_then_source_only_recovery",
     "provenance": "Historical trajectory phase5_20260825T072131Z_a4625065-b5a0-4a38-8c64-e39bb1be0afd, workaround run §256, rejected a plan targeting package.json with [PROHIBITED_TARGET]. The current record_plan guard rejects prohibited replacement targets before deterministic_apply_edit_set can run.",
-    "evaluation_note": "The requested prohibited-file behavior is modeled at the actual current guard location: an invalid record_plan targeting package.json, followed by a valid source-only plan/edit/validate. An edit-level prohibited-target fixture would require bypassing record_plan and is not a production trace.",
+    "evaluation_note": "The requested prohibited-file behavior is modeled at the actual current guard location: an invalid record_plan targeting package.json, followed by a valid source-only plan/edit/validate. An edit-level prohibited-target fixture would require bypassing record_plan and is not a production trace.\nThe negative tool trace is a recorded historical failure. Live worker replays are allowed to recover; deterministic replay tests enforce that historical trace separately.",
     "supervisor_instruction": "Implement the notevil source workaround in routes/b2bOrder.ts without modifying package manifests or test files.",
     "completion_task": "Recover from a prohibited package-manifest target, record a source-only plan, apply it, and pass validation.",
     "target_package_name": "notevil",
@@ -3300,14 +3305,15 @@
         "allowed_target_versions": [],
         "allowed_dependency_types": []
       }
-    }
+    },
+    "tool_correctness_applicable": false
   },
   {
     "case_id": "workaround-retry-after-stagnation",
     "eval_type": "workaround_subagent",
     "golden_kind": "repeated_identical_failed_edit_call_then_recovery",
     "provenance": "Historical trajectory phase5_20260805T072103Z_60de8d6e-e6ca-494e-95b4-fd5d518a2d43, span 175192 emitted [REPEATED_INVALID_CALL] after the same deterministic_apply_edit_set PLAN_MISMATCH was repeated.",
-    "evaluation_note": "The current stagnation threshold is two identical failed call signatures. The repeated invalid calls remain observable and are omitted from expected_tool_calls.",
+    "evaluation_note": "The current stagnation threshold is two identical failed call signatures. The repeated invalid calls remain observable and are omitted from expected_tool_calls.\nThe negative tool trace is a recorded historical failure. Live worker replays are allowed to recover; deterministic replay tests enforce that historical trace separately.",
     "supervisor_instruction": "Apply the planned JWT verification workaround in routes/verify.ts and validate it.",
     "completion_task": "Recover from a repeated identical invalid edit call, use the corrected planned replacement, and pass validation.",
     "target_package_name": "jsonwebtoken",
@@ -3561,14 +3567,15 @@
         "allowed_target_versions": [],
         "allowed_dependency_types": []
       }
-    }
+    },
+    "tool_correctness_applicable": false
   },
   {
     "case_id": "workaround-surrender-after-max-validation-input-limit",
     "eval_type": "workaround_subagent",
     "golden_kind": "three_distinct_invalid_validation_requests",
     "provenance": "Historical trajectory phase5_20260825T091340Z_153e9f01-a422-4ec9-a3c9-b9d8598b487a, workaround run §104, attempt 724996d4-4aa8-5e1d-84f9-2f38cece098c. Spans 138, 160, and 179 show invalid validation inputs before VALIDATION_INPUT_LIMIT_REACHED.",
-    "evaluation_note": "The three invalid validation signatures are distinct and need not be consecutive. Repeating the same signature would test the separate VALIDATION_INPUT_RETRY_LOOP guard.",
+    "evaluation_note": "The three invalid validation signatures are distinct and need not be consecutive. Repeating the same signature would test the separate VALIDATION_INPUT_RETRY_LOOP guard.\nThe negative tool trace is a recorded historical failure. Live worker replays are allowed to recover; deterministic replay tests enforce that historical trace separately.",
     "supervisor_instruction": "Apply the committed Angular workaround in lib/angular.ts and validate it using a safe source smoke module and a source targeted test.",
     "completion_task": "Attempt the requested remediation, but do not claim completion after the runtime rejects three distinct invalid validation inputs; report the bounded surrender reason.",
     "target_package_name": "@angular/common",
@@ -3814,7 +3821,8 @@
         "allowed_target_versions": [],
         "allowed_dependency_types": []
       }
-    }
+    },
+    "tool_correctness_applicable": false
   },
   {
     "case_id": "workaround-surrender-after-max-validation-gate-limit",

@@ -567,7 +567,16 @@ class ReplaySandbox:
         for path, content in sorted(self.files.items()):
             if target and target != "." and not (path == target or path.startswith(target + "/")):
                 continue
-            if Path(path).suffix.lower() not in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}:
+            if Path(path).suffix.lower() not in {
+                ".js",
+                ".mjs",
+                ".cjs",
+                ".ts",
+                ".tsx",
+                ".jsx",
+                ".py",
+                ".java",
+            }:
                 continue
             for line_number, line in enumerate(content.splitlines(), start=1):
                 if compiled.search(line):
@@ -682,7 +691,6 @@ def build_system_context(case: Mapping[str, Any]) -> SystemContext:
     replay = case.get("replay", {}) if isinstance(case.get("replay"), Mapping) else {}
     raw = replay.get("input", {}).get("system_context", {}) if isinstance(replay, Mapping) else {}
     raw = raw if isinstance(raw, Mapping) else {}
-    replay_input = replay.get("input", {}) if isinstance(replay, Mapping) else {}
     scenario = str(case.get("scenario", case.get("input", "")))
     scenario_lower = scenario.lower()
     completion = str(case.get("completion_task", ""))

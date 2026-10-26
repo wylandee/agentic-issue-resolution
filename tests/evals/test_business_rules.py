@@ -6,10 +6,11 @@ import logging
 
 import pytest
 
-from tests.evals.adapters import (
+from remediation_engine.evals.trajectories import (
     LLMTestCase,
     ToolCall,
     TrajectoryDocument,
+    extract_loop_rounds,
     extract_token_usage,
     extract_tool_calls,
 )
@@ -19,11 +20,6 @@ from tests.evals.custom_metrics import (
     TokenBudgetMetric,
     ToolCallBudgetMetric,
 )
-
-try:
-    from deepeval import assert_test
-except ImportError:
-    assert_test = None
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +43,10 @@ class TestTokenBudgetMetricUnit:
             actual_output="valid triage",
             additional_metadata={"prompt_tokens": 3000, "completion_tokens": 400},
         )
-        if assert_test:
-            assert_test(tc, [metric], run_async=False)
-        else:
-            score = metric.measure(tc)
-            assert score == 1.0
-            assert metric.is_successful() is True
-            assert "within token budget" in (metric.reason or "")
+        score = metric.measure(tc)
+        assert score == 1.0
+        assert metric.is_successful() is True
+        assert "within token budget" in (metric.reason or "")
 
     def test_prompt_budget_exceeded(self) -> None:
         """Metric fails with score 0.0 when prompt tokens exceed ceiling."""
@@ -110,13 +103,10 @@ class TestLatencySLAMetricUnit:
             actual_output="done",
             completion_time=25.4,
         )
-        if assert_test:
-            assert_test(tc, [metric], run_async=False)
-        else:
-            score = metric.measure(tc)
-            assert score == 1.0
-            assert metric.is_successful() is True
-            assert "satisfied latency SLA" in (metric.reason or "")
+        score = metric.measure(tc)
+        assert score == 1.0
+        assert metric.is_successful() is True
+        assert "satisfied latency SLA" in (metric.reason or "")
 
     def test_sla_breached_fails(self) -> None:
         """Metric fails with score 0.0 when completion time breaches ceiling."""
@@ -152,14 +142,12 @@ class TestToolCallBudgetMetricUnit:
             input="run",
             actual_output="done",
             tools_called=tools,
+            additional_metadata={"loop_rounds": len(tools)},
         )
-        if assert_test:
-            assert_test(tc, [metric], run_async=False)
-        else:
-            score = metric.measure(tc)
-            assert score == 1.0
-            assert metric.is_successful() is True
-            assert "satisfied" in (metric.reason or "")
+        score = metric.measure(tc)
+        assert score == 1.0
+        assert metric.is_successful() is True
+        assert "satisfied" in (metric.reason or "")
 
     def test_warning_threshold_triggers_score_penalty(self) -> None:
         """75% - 100% budget used yields a score penalty of 0.75 (warning)."""
@@ -170,20 +158,23 @@ class TestToolCallBudgetMetricUnit:
             input="run",
             actual_output="done",
             tools_called=tools,
+            additional_metadata={"loop_rounds": len(tools)},
         )
-        if assert_test:
-            assert_test(tc, [metric], run_async=False)
-        else:
-            score = metric.measure(tc)
-            assert score == 0.75
-            assert metric.is_successful() is True
-            assert "Score penalty applied" in (metric.reason or "")
+        score = metric.measure(tc)
+        assert score == 0.75
+        assert metric.is_successful() is True
+        assert "Score penalty applied" in (metric.reason or "")
 
     def test_exceeding_max_budget_fails(self) -> None:
         """> 100% budget used yields score 0.0 (hard budget failure)."""
         metric = ToolCallBudgetMetric(max_tool_rounds=24, warning_percentage=0.75)
         tools = [ToolCall(name=f"tool_{i}") for i in range(26)]
-        tc = LLMTestCase(input="run", actual_output="done", tools_called=tools)
+        tc = LLMTestCase(
+            input="run",
+            actual_output="done",
+            tools_called=tools,
+            additional_metadata={"loop_rounds": 26},
+        )
         score = metric.measure(tc)
         assert score == 0.0
         assert metric.is_successful() is False
@@ -225,15 +216,17 @@ class TestBusinessRules:
             pytest.skip("No trajectory files discovered in data/trajectories.")
 
         metric = TokenBudgetMetric(agent_type=agent_type)
+        eligible_spans = 0
         evaluated_spans = 0
         passed_spans = 0
         violations: list[str] = []
 
         for doc in trajectories:
             agent_spans = doc.spans_for_agent(agent_type)
+            eligible_spans += len(agent_spans)
             for span in agent_spans:
                 p_tok, c_tok = extract_token_usage(span)
-                if p_tok == 0 and c_tok == 0 and not span.is_llm:
+                if p_tok is None or c_tok is None:
                     continue
 
                 evaluated_spans += 1
@@ -257,15 +250,21 @@ class TestBusinessRules:
                     )
 
         if evaluated_spans == 0:
-            pytest.skip(f"No evaluated token spans found for agent '{agent_type}'.")
+            pytest.skip(
+                f"No token evidence for agent '{agent_type}' (coverage 0/{eligible_spans} spans)."
+            )
 
         pass_rate = passed_spans / evaluated_spans
+        coverage_rate = evaluated_spans / eligible_spans if eligible_spans else 0.0
         logger.info(
-            "Token Budget Evaluation [%s]: %d/%d passed (%.1f%%)",
+            "Token Budget Evaluation [%s]: %d/%d passed (%.1f%%); evidence coverage %d/%d (%.1f%%)",
             agent_type,
             passed_spans,
             evaluated_spans,
             pass_rate * 100,
+            evaluated_spans,
+            eligible_spans,
+            coverage_rate * 100,
         )
 
         assert pass_rate >= 0.80, (
@@ -287,14 +286,16 @@ class TestBusinessRules:
             pytest.skip("No trajectory files discovered in data/trajectories.")
 
         metric = LatencySLAMetric(agent_type=agent_type)
+        eligible_spans = 0
         evaluated_spans = 0
         passed_spans = 0
         violations: list[str] = []
 
         for doc in trajectories:
             agent_spans = doc.spans_for_agent(agent_type)
+            eligible_spans += len(agent_spans)
             for span in agent_spans:
-                if span.duration_seconds is None or span.duration_seconds <= 0:
+                if span.duration_seconds is None or span.duration_seconds < 0:
                     continue
 
                 evaluated_spans += 1
@@ -318,15 +319,21 @@ class TestBusinessRules:
                     )
 
         if evaluated_spans == 0:
-            pytest.skip(f"No evaluated latency spans found for agent '{agent_type}'.")
+            pytest.skip(
+                f"No latency evidence for agent '{agent_type}' (coverage 0/{eligible_spans} spans)."
+            )
 
         pass_rate = passed_spans / evaluated_spans
+        coverage_rate = evaluated_spans / eligible_spans if eligible_spans else 0.0
         logger.info(
-            "Latency SLA Evaluation [%s]: %d/%d passed (%.1f%%)",
+            "Latency SLA Evaluation [%s]: %d/%d passed (%.1f%%); evidence coverage %d/%d (%.1f%%)",
             agent_type,
             passed_spans,
             evaluated_spans,
             pass_rate * 100,
+            evaluated_spans,
+            eligible_spans,
+            coverage_rate * 100,
         )
 
         assert pass_rate >= 0.80, (
@@ -343,6 +350,7 @@ class TestBusinessRules:
             pytest.skip("No trajectory files discovered in data/trajectories.")
 
         metric = ToolCallBudgetMetric(max_tool_rounds=24, warning_percentage=0.75)
+        eligible_workers = 0
         evaluated_workers = 0
         passed_workers = 0
         penalized_workers = 0
@@ -355,10 +363,12 @@ class TestBusinessRules:
                 if ("update_subagent" in s.name.lower() or "workaround_subagent" in s.name.lower())
                 and s.run_type == "chain"
             ]
+            eligible_workers += len(worker_spans)
 
             for span in worker_spans:
                 child_tools = extract_tool_calls(doc.spans, parent_span_id=span.run_id)
-                if not child_tools:
+                rounds = extract_loop_rounds(doc.spans, span.run_id)
+                if rounds is None:
                     continue
 
                 evaluated_workers += 1
@@ -366,7 +376,11 @@ class TestBusinessRules:
                     input=f"Worker run: {span.name}",
                     actual_output=str(span.outputs or ""),
                     tools_called=child_tools,
-                    additional_metadata={"trace_id": doc.trace_id, "run_id": span.run_id},
+                    additional_metadata={
+                        "trace_id": doc.trace_id,
+                        "run_id": span.run_id,
+                        "loop_rounds": rounds,
+                    },
                 )
                 score = metric.measure(tc)
                 if score >= metric.threshold:
@@ -375,19 +389,27 @@ class TestBusinessRules:
                         penalized_workers += 1
                 else:
                     violations.append(
-                        f"[{doc.trace_id[:8]}/{span.name}] Rounds={len(child_tools)} -> {metric.reason}"
+                        f"[{doc.trace_id[:8]}/{span.name}] Rounds={rounds} -> {metric.reason}"
                     )
 
         if evaluated_workers == 0:
-            pytest.skip("No worker execution chains with child tools discovered.")
+            pytest.skip(
+                "No worker execution chains with loop-round evidence "
+                f"(coverage 0/{eligible_workers} workers)."
+            )
 
         pass_rate = passed_workers / evaluated_workers
+        coverage_rate = evaluated_workers / eligible_workers if eligible_workers else 0.0
         logger.info(
-            "Tool Call Budget Evaluation: %d/%d passed (%.1f%%), %d penalized with warnings",
+            "Tool Call Budget Evaluation: %d/%d passed (%.1f%%), %d penalized with warnings; "
+            "evidence coverage %d/%d (%.1f%%)",
             passed_workers,
             evaluated_workers,
             pass_rate * 100,
             penalized_workers,
+            evaluated_workers,
+            eligible_workers,
+            coverage_rate * 100,
         )
 
         assert pass_rate >= 0.85, (

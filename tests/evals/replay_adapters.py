@@ -903,11 +903,24 @@ def _qa_files(case: Mapping[str, Any]) -> dict[str, str]:
     files = seed_replay_files(case)
     if _project_language(case) in {ProjectLanguage.JAVA, ProjectLanguage.PYTHON}:
         return files
-    cid = str(case.get("case_id", ""))
+    vulnerability = case.get("vulnerability_context", {})
+    vulnerability = vulnerability if isinstance(vulnerability, Mapping) else {}
+    component = str(vulnerability.get("vulnerable_component", "")).casefold()
+    policy = str(case.get("qa_policy", ""))
+    expected = case.get("expected_qa_verdict", {})
+    expected = expected if isinstance(expected, Mapping) else {}
+    expected_semantic = str(expected.get("semantic_security_review", "")).casefold()
     changed = list(case.get("changed_files", []) or [])
 
     if "lib/insecurity.ts" in changed and "lib/insecurity.ts" not in files:
-        if "fail_semantic" in cid:
+        if component == "sanitize-html":
+            files["lib/insecurity.ts"] = (
+                "import sanitizeHtml from 'sanitize-html';\n\n"
+                "export function sanitizeSecure(value: string): string {\n"
+                "  return sanitizeHtml(value, { allowedTags: [] });\n"
+                "}\n"
+            )
+        elif component == "express-jwt" and expected_semantic != "pass":
             files["lib/insecurity.ts"] = (
                 "import expressJwt from 'express-jwt'\n\n"
                 "expressJwt({ secret: publicKey })\n\n"
@@ -921,10 +934,12 @@ def _qa_files(case: Mapping[str, Any]) -> dict[str, str]:
             )
 
     if "routes/b2bOrder.ts" in changed and "routes/b2bOrder.ts" not in files:
-        if "fail_semantic" in cid:
+        if component == "notevil" and policy == "no_fix_package_removal":
             files["routes/b2bOrder.ts"] = (
                 "const notevil = require('notevil');\n\nexport function replay() { return true; }\n"
             )
+        elif component == "notevil" and policy == "no_fix_code_removal":
+            files["routes/b2bOrder.ts"] = "export function replay() { return true; }\n"
         else:
             files["routes/b2bOrder.ts"] = "export function replay() { return true; }\n"
 
@@ -1048,6 +1063,11 @@ def replay_qa_case(
             },
         )
     sandbox = ReplaySandbox(files, command_responses=command_responses)
+    # A QA replay begins after the worker has already committed its workspace
+    # candidate. The production QA wrapper may restore this attempt snapshot
+    # when it rejects that candidate, so seed the same archive the preceding
+    # worker dispatch would have created in a complete graph run.
+    sandbox.create_workspace_snapshot(f"attempt-{snapshot.attempt_id}")
     results = _qa_results(case, group, task.task_id)
     worker_summary = None
     raw_worker_summary = case.get("worker_action_summary")
@@ -1309,7 +1329,8 @@ def replay_update_case(
         if not isinstance(raw_snapshots, list):
             raise TypeError("Batch replay requires serialized attempt_snapshots list.")
         snapshots = {
-            item.task_id: item for item in (TaskAttemptSnapshot.model_validate(raw) for raw in raw_snapshots)
+            item.task_id: item
+            for item in (TaskAttemptSnapshot.model_validate(raw) for raw in raw_snapshots)
         }
         raw_action = replay.get("multi_package_action")
         if not isinstance(raw_action, Mapping):
@@ -1327,7 +1348,9 @@ def replay_update_case(
         batch_cases = replay.get("batch_tasks")
         if isinstance(batch_cases, list) and len(batch_cases) > 1:
             if project_language != ProjectLanguage.PYTHON:
-                raise ValueError("Generated replay batches are currently supported only for Python cases.")
+                raise ValueError(
+                    "Generated replay batches are currently supported only for Python cases."
+                )
             tasks, groups, snapshots = [], [], {}
             cluster_id = f"cluster-{case['case_id']}"
             dispatch_batch_id = f"batch-{case['case_id']}"
@@ -1905,8 +1928,9 @@ def replay_supervisor_case(
     if verification is None:
         status = "NO_CALL"
         reason = (
-            "QA evidence is inconclusive; tactical reasoning was suppressed before "
-            "model or registry resolution."
+            "Python tactical reasoning is disabled; deterministic planning remains authoritative."
+            if _project_language(case) == ProjectLanguage.PYTHON
+            else "QA evidence is inconclusive; tactical reasoning was suppressed before model or registry resolution."
             if counters["model_invocations"] == 0 and counters["registry_resolution_calls"] == 0
             else "No tactical proposal was produced."
         )

@@ -12,7 +12,7 @@ from .report_context import PackageChange, _inline_code_text, _items, _text, _un
 
 _PACKAGE_FILE_RE = re.compile(
     r"(?:^|/)(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|"
-    r"pnpm-lock\.yaml|pom\.xml)$",
+    r"pnpm-lock\.yaml|pom\.xml|requirements\.txt)$",
     re.IGNORECASE,
 )
 
@@ -441,6 +441,13 @@ def _package_changes(diff: str) -> list[PackageChange]:
             continue
         prefix = line[:1]
         content = _diff_content(line)
+        if current_file.casefold().endswith("requirements.txt"):
+            match = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*==\s*([^\s;#]+)", content)
+            if prefix in {"+", "-"} and match:
+                _record_package_change(
+                    manifest_records, match[1], match[2], prefix, current_file, "requirements"
+                )
+            continue
         indent = _line_indent(content)
 
         if current_file.lower().endswith("package.json") and not current_file.lower().endswith(

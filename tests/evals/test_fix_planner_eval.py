@@ -16,6 +16,7 @@ import remediation_engine.tools.fix_planner as fix_planner
 from remediation_engine.settings import AppSettings
 from remediation_engine.tools.fix_planner import SerperLLMResult
 from tests.evals.conftest import EvalSettings
+from tests.evals.eval_case_helpers import measure_and_record_metric, set_pytest_item_identity
 from tests.evals.golden_schema import load_golden_dataset, offline_fixture
 
 try:
@@ -121,11 +122,50 @@ def _faithfulness_projection(result: dict[str, Any]) -> dict[str, Any]:
         if result.get(field) not in (None, [])
     }
 
+
+def _faithfulness_evidence(
+    result: dict[str, Any], source_content: str, *, limit: int = 12_000
+) -> tuple[str, int]:
+    """Keep source passages that support extracted claims and report omissions."""
+    claims: list[str] = []
+    fixed_version = result.get("fixed_version")
+    if isinstance(fixed_version, str) and fixed_version.strip():
+        claims.append(fixed_version)
+    snippets = result.get("workaround_snippets")
+    if isinstance(snippets, list):
+        claims.extend(value for value in snippets if isinstance(value, str) and value.strip())
+
+    ranges: list[tuple[int, int]] = []
+    source_folded = source_content.casefold()
+    for claim in claims:
+        start = source_folded.find(claim.casefold())
+        if start >= 0:
+            end = start + len(claim)
+            ranges.append((max(0, start - 350), min(len(source_content), end + 350)))
+    if not ranges:
+        excerpt = source_content[:limit]
+        return excerpt, max(0, len(source_content) - len(excerpt))
+
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    selected = "\n[… unrelated source omitted …]\n".join(
+        source_content[start:end] for start, end in merged
+    )
+    if len(selected) > limit:
+        selected = (
+            selected[: limit // 2] + "\n[… evidence excerpt omitted …]\n" + selected[-limit // 2 :]
+        )
+    return selected, max(0, len(source_content) - len(selected))
+
+
 def _judge_extraction_output(result: dict[str, Any]) -> dict[str, Any]:
     """Keep non-contract reasoning text out of structured extraction judgments."""
     return {
-        field: result.get(field)
-        for field in ("strategy", "fixed_version", "workaround_snippets")
+        field: result.get(field) for field in ("strategy", "fixed_version", "workaround_snippets")
     }
 
 
@@ -513,7 +553,10 @@ class TestFixPlannerEval:
                 criteria=(
                     "Given web page content about a vulnerable package, evaluate whether "
                     "the extracted strategy (VERSION_BUMP, CODE_WORKAROUND, NO_FIX) and "
-                    "fixed_version are correct and directly supported by the text."
+                    "fixed_version are correct and directly supported by the text. A null "
+                    "fixed_version is a valid schema value for non-version strategies and "
+                    "does not assert that the source contains a version. Judge only the "
+                    "strategy and non-null extracted values."
                 ),
                 evaluation_params=[
                     LLMTestCaseParams.INPUT,
@@ -521,10 +564,11 @@ class TestFixPlannerEval:
                     LLMTestCaseParams.EXPECTED_OUTPUT,
                 ],
                 threshold=0.70,
-                model=eval_settings.judge_model,
+                model=eval_settings.judge_llm or eval_settings.judge_model,
                 verbose_mode=True,
             )
 
+            set_pytest_item_identity(test_case)
             assert_test(test_case, [extraction_geval])
 
     @pytest.mark.parametrize(
@@ -582,7 +626,9 @@ class TestFixPlannerEval:
                     "captures actionable guidance supported by the supplied page and matches "
                     "the expected extraction. Do not infer that an extracted proposal was "
                     "accepted or validated, and do not judge the proposal's implementation "
-                    "success; those are separate remediation outcomes."
+                    "success; those are separate remediation outcomes. A null fixed_version "
+                    "is an allowed schema value for a code workaround and is not an extra "
+                    "unsupported remediation claim."
                 ),
                 evaluation_params=[
                     LLMTestCaseParams.INPUT,
@@ -590,10 +636,11 @@ class TestFixPlannerEval:
                     LLMTestCaseParams.EXPECTED_OUTPUT,
                 ],
                 threshold=0.70,
-                model=eval_settings.judge_model,
+                model=eval_settings.judge_llm or eval_settings.judge_model,
                 verbose_mode=True,
             )
 
+            set_pytest_item_identity(test_case)
             assert_test(test_case, [workaround_geval])
 
     @pytest.mark.parametrize(
@@ -643,14 +690,15 @@ class TestFixPlannerEval:
 
         # 2. Live evaluation with DeepEval FaithfulnessMetric
         if eval_settings.is_live and result.get("strategy") != "NO_FIX":
-            if not HAS_DEEPEVAL or assert_test is None or FaithfulnessMetric is None:
+            if not HAS_DEEPEVAL or FaithfulnessMetric is None:
                 pytest.skip("deepeval package is required for live evaluations")
             if not eval_settings.openai_api_key and not os.environ.get("OPENAI_API_KEY"):
                 pytest.skip("OPENAI_API_KEY environment variable is required for live evaluations")
 
             package_name, vuln_id, pages = _case_prompt_inputs(case)
             prompt = build_fix_planner_production_prompt(package_name, vuln_id, pages)
-            faithfulness_context = [source_content]
+            faithfulness_source, omitted_chars = _faithfulness_evidence(result, source_content)
+            faithfulness_context = [faithfulness_source]
             if str(project_language or "").casefold() in {"python", "python3"}:
                 faithfulness_context.append(
                     "Interpret dotted numeric strings such as 2024.7.4 as PEP 440 package "
@@ -673,16 +721,34 @@ class TestFixPlannerEval:
                 ),
                 context=faithfulness_context,
                 retrieval_context=faithfulness_context,
+                additional_metadata={
+                    "case_id": case_id,
+                    "source_characters_omitted": omitted_chars,
+                    "source_character_count": len(source_content),
+                },
             )
 
             faithfulness = FaithfulnessMetric(
                 threshold=0.85,
-                model=eval_settings.judge_model,
+                model=eval_settings.judge_llm or eval_settings.judge_model,
+                async_mode=False,
                 include_reason=True,
                 verbose_mode=True,
+                truths_extraction_limit=5,
             )
 
-            assert_test(test_case, [faithfulness])
+            set_pytest_item_identity(test_case)
+            successful = measure_and_record_metric(
+                faithfulness,
+                test_case,
+                case_id=str(case_id),
+                suite="fix_planner",
+                judge_model=eval_settings.judge_model,
+            )
+            assert successful, (
+                f"Case {case_id!r} Faithfulness score {faithfulness.score:.3f} "
+                f"is below threshold {faithfulness.threshold:.3f}: {faithfulness.reason}"
+            )
 
 
 def test_fix_planner_dataset_has_realistic_structured_pages() -> None:
@@ -732,6 +798,29 @@ def test_fix_planner_faithfulness_projection_omits_null_and_unscored_fields() ->
         }
     )
     assert projected == {"fixed_version": "1.2.3"}
+
+
+def test_faithfulness_context_keeps_claim_evidence_and_reports_omissions() -> None:
+    source = (
+        "irrelevant changelog details " * 100
+        + "The vulnerable package is fixed in version 4.5.6. "
+        + "unrelated release text " * 100
+    )
+    context, omitted = _faithfulness_evidence({"fixed_version": "4.5.6"}, source)
+    assert "fixed in version 4.5.6" in context
+    assert len(context) < len(source)
+    assert omitted > 0
+
+
+def test_null_version_is_not_an_extracted_version_claim() -> None:
+    assert (
+        _faithfulness_projection(
+            {"strategy": "CODE_WORKAROUND", "fixed_version": None, "workaround_snippets": []}
+        )
+        == {}
+    )
+
+
 def test_pyyaml_golden_expected_version_matches_its_page_evidence() -> None:
     """The historical PyYAML page, output, and target must describe one version."""
     case = next(

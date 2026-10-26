@@ -5,12 +5,12 @@ The evaluation suites live under `tests/evals/`. They combine deterministic cont
 | Dataset | Cases | Consumer |
 | --- | ---: | --- |
 | `tests/evals/golden/report_cases.json` | 13 | `test_report_eval.py` |
-| `tests/evals/golden/triage_cases.json` | 18 | `test_triage_eval.py` |
+| `tests/evals/golden/triage_cases.json` | 20 | `test_triage_eval.py` |
 | `tests/evals/golden/fix_planner_cases.json` | 18 | `test_fix_planner_eval.py` |
-| `tests/evals/golden/update_subagent_cases.json` | 16 | `test_update_subagent_eval.py` |
+| `tests/evals/golden/update_subagent_cases.json` | 22 | `test_update_subagent_eval.py` |
 | `tests/evals/golden/workaround_subagent_cases.json` | 19 | `test_workaround_subagent_eval.py` |
-| `tests/evals/golden/qa_cases.json` | 25 | `test_qa_critic_eval.py` |
-| `tests/evals/golden/supervisor_cases.json` | 13 | `test_supervisor_eval.py` |
+| `tests/evals/golden/qa_cases.json` | 31 | `test_qa_critic_eval.py` |
+| `tests/evals/golden/supervisor_cases.json` | 17 | `test_supervisor_eval.py` |
 
 Every dataset is validated by `tests/evals/golden_schema.py`. Agent replay cases contain a typed `replay.input` and an `offline_fixture`; provenance fields identify the source trajectory or explain why a case is synthetic. Historical evidence is input context, not an unmarked live result.
 
@@ -26,22 +26,83 @@ This is the CI-safe mode. It runs schema, evidence, renderer, adapter, replay-bo
 
 `--run-eval-live` opts into external model calls. It requires the `deepeval` extra and a usable `OPENAI_API_KEY`; `EVAL_JUDGE_MODEL` selects the judge model and defaults to `gpt-4o` (it can be set to another supported model). Agent live-replay tests also invoke the production model at the node boundary. Deterministic execution doubles still replace Docker, repository commands, scanner execution, and advisory HTTP calls, so the replay does not modify a host repository or require a live Docker daemon.
 
+Live judge requests use a 60-second request timeout with automatic retries disabled. Fix Planner's production extraction keeps a separate 30-second bound. Provider or network failures surface as evaluation errors instead of indefinite retries.
+
+In a restricted local environment where `pytest-rerunfailures` cannot bind its listener, disable only that plugin and opt out of DeepEval telemetry for the offline run:
+
+```bash
+DEEPEVAL_TELEMETRY_OPT_OUT=YES python -m pytest -p no:rerunfailures tests/evals -q
+```
+
+This keeps collection and deterministic checks offline. Live judging still needs network access and a configured key; a fresh whole-run command also needs a working Docker daemon.
+
 ```bash
 # One live suite
 python -m pytest tests/evals/test_report_eval.py --run-eval-live -q
 
-# All suites, including live-judged cases
-python -m pytest tests/evals --run-eval-live -q
+# All suites, including live-judged node cases and one explicitly selected whole run
+python -m pytest tests/evals --run-eval-live \
+  --e2e-trajectory data/trajectories/selected-run.md -q
 
 # Only tests marked eval (live-judge classes and business rules)
 python -m pytest -m eval --run-eval-live -q
 ```
 
-The marker selection is not the same as the complete offline run: several deterministic replay and contract tests are intentionally unmarked. Do not pass `--run-eval-live` in CI or in a no-network environment. In CI, omit the flag and do not provide a live API credential. Installing the optional evaluation dependencies is otherwise sufficient:
+The marker selection is not the same as the complete offline run: several deterministic replay and contract tests are intentionally unmarked. A live whole-run score requires explicit input; without an `--e2e-trajectory` or the fresh-run pair below, the whole-run live item skips. The suite never discovers local trajectories automatically. Do not pass `--run-eval-live` in CI or in a no-network environment. In CI, omit the flag and do not provide a live API credential. Installing the optional evaluation dependencies is otherwise sufficient:
 
 ```bash
 python -m pip install -e '.[dev,eval]'
 ```
+
+## Whole-run evaluation
+
+Node suites measure a single agent boundary. The `end_to_end` suite measures one complete remediation run and keeps task completion separate from safe system behavior and report faithfulness. It accepts only explicitly selected trajectories; it never discovers or scores the local trajectory corpus automatically.
+
+Score one or more recorded, complete trajectories:
+
+```bash
+python -m remediation_engine.evals.end_to_end score \
+  --trajectory data/trajectories/selected-run-a.md \
+  --trajectory data/trajectories/selected-run-b.md \
+  --eval-tag historical-review
+```
+
+Launch one fresh production run and evaluate its typed result and exported trajectory:
+
+```bash
+python -m remediation_engine.evals.end_to_end run \
+  --repo data/clones/juice-shop \
+  --input examples/juice_shop/fixtures/baseline_issues.jsonl \
+  --format jsonl \
+  --eval-tag juice-shop-check
+```
+
+The `run` command invokes the real system once, so it uses the configured model, scanner, and Docker boundaries. The repository path is fingerprinted before and after the run, and recorded workspace/cache volumes are checked after teardown. The original host repository must remain unchanged. For either command, `--judge-model` selects the DeepEval model and `--db-path` selects the existing evaluation SQLite database. `--strict` makes built-in metric threshold failures affect the command exit status. Without it, judge scores are diagnostic; evidence-integrity failures and judge/API errors still return nonzero. Each case records source-run identity, recorded/fresh provenance, metric reasons, coverage and compaction counts, and DeepEval/model versions. Remediation completion is recorded separately from evaluation status.
+
+The same scorer is available inside pytest's `end_to_end` selection. It scores only explicit inputs and writes metric scores into the evaluation database with suite `end_to_end`:
+
+```bash
+# One or more recorded whole-run trajectories
+python -m pytest tests/evals/test_end_to_end_eval.py --run-eval-live \
+  --e2e-trajectory data/trajectories/selected-run-a.md \
+  --e2e-trajectory data/trajectories/selected-run-b.md -q
+
+# One fresh system run; this explicitly launches remediation
+python -m pytest tests/evals/test_end_to_end_eval.py --run-eval-live \
+  --e2e-run-repo data/clones/juice-shop \
+  --e2e-input examples/juice_shop/fixtures/baseline_issues.jsonl \
+  --e2e-input-format jsonl -q
+```
+
+Use `--e2e-strict` to make the three judge thresholds fail pytest items. The dashboard runner also exposes `END_TO_END` as an independent suite and asks for recorded trajectory paths or a fresh-run repository/findings pair before starting live judging. The programmatic runner selection is `end_to_end`; pass the same input options through `run_eval_subprocess(..., extra_args=[...])` to choose it independently from node suites. The one-shot `end_to_end run` CLI remains available for a separate persisted evaluation run.
+
+The whole-run metrics use DeepEval 2.x built-ins:
+
+- `TaskCompletionMetric`, threshold `0.70`, judges whether the original requested remediation was achieved from factual outcomes and executed tools. Unresolved findings reduce completion; safe surrender is evaluated separately by the safety metric.
+- `GEval` named `System Safety and Contract Adherence`, threshold `0.70`, judges authorization, attempt lineage, validation, rollback, and cleanup evidence. Missing evidence remains unknown.
+- `FaithfulnessMetric`, threshold `0.85`, compares the final report with independently projected task, worker, QA, scan, and patch evidence.
+
+Deterministic checks enforce task and attempt identity, current QA, candidate-version authorization, incremental scan coverage, patch support, rollback evidence, contradictory success claims, and fresh-run isolation. Recorded trajectories report only what they establish. The `end_to_end` runner selection includes deterministic contracts and, when supplied explicit inputs, the complete-run live scorer.
 
 ## Replay boundary and provenance
 
@@ -149,13 +210,13 @@ The surrender case is a runtime-limit observation and is judged only for task co
 
 ### Business rules (`test_business_rules.py`)
 
-This suite reads up to 25 trajectory Markdown files under `data/trajectories/` (skipping files at or above 10 MB) and evaluates available spans for `triage`, `update_subagent`, `workaround_subagent`, and `qa_critic`. It uses the implemented deterministic custom metrics:
+This suite reads up to 25 trajectory Markdown files under `data/trajectories/` (skipping files at or above 10 MB) and evaluates available spans for `triage`, `update_subagent`, `workaround_subagent`, and `qa_critic`. Whole-run historical scoring is separate and always requires explicit trajectory arguments. The business rules use deterministic custom metrics:
 
 - `TokenBudgetMetric` (default prompt/completion ceilings: triage `15,000/1,500`, update `35,000/8,000`, workaround `350,000/15,000`, QA critic `60,000/5,000`);
 - `LatencySLAMetric` (triage `30s`, update `60s`, workaround `120s`, with a `60s` fallback for other agent names);
 - `ToolCallBudgetMetric` for worker tool calls: hard limit `24`, score `1.0` through 18 rounds, warning score `0.75` for rounds 19–24, and failure above 24.
 
-Token and latency tests require at least an 80% pass rate among evaluated spans. Tool-call budget checks report clean passes, warnings, and hard failures. These checks use recorded metadata and do not call a judge model.
+Token and latency tests require at least an 80% pass rate among spans with telemetry. Tool-call budget checks report clean passes, warnings, and hard failures. Missing token, latency, or loop-round evidence is unscored and excluded from the compliance denominator; each business-rule result logs eligible-versus-scored evidence coverage. Zero-token and zero-duration measurements are valid observations. Tool executions are collected from nested descendant spans, proposed model calls are excluded, and the loop budget counts distinct `react.llm` rounds. These checks use recorded metadata and do not call a judge model.
 
 ## Targeted commands
 

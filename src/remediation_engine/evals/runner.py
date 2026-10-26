@@ -31,6 +31,7 @@ class EvalProcessOutcome:
 
 SUITE_PATHS: dict[str, list[str]] = {
     "all": ["tests/evals"],
+    "end_to_end": ["tests/evals/test_end_to_end_eval.py"],
     "subagent": [
         "tests/evals/test_update_subagent_eval.py",
         "tests/evals/test_workaround_subagent_eval.py",
@@ -57,7 +58,7 @@ def run_eval_subprocess(
     """Execute pytest evaluation suite as a subprocess, yielding stdout lines in real-time.
 
     Args:
-        suite_key: Target evaluation suite name (e.g. 'all', 'report', 'triage', 'fix_planner').
+        suite_key: Target evaluation suite name (e.g. 'all', 'report', 'triage', 'fix_planner', 'end_to_end').
         is_live: Whether to pass --run-eval-live for live LLM judge evaluations.
         judge_model: Judge model identifier to export in EVAL_JUDGE_MODEL.
         extra_args: Additional pytest CLI arguments.

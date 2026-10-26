@@ -10,18 +10,20 @@ from typing import Any
 
 import pytest
 
-from tests.evals.adapters import ToolCall
+from remediation_engine.evals.trajectories import ToolCall
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,
     case_metadata,
+    collect_metric_assertions,
     context_strings,
     expected_tools,
     make_tool_calls,
+    measure_expected,
     observations,
 )
 from tests.evals.golden_schema import load_golden_dataset
-from tests.evals.replay_adapters import replay_qa_case
+from tests.evals.replay_adapters import _qa_files, replay_qa_case
 from tests.evals.replay_harness import (
     ReplayCapture,
     ScriptedReplayModel,
@@ -37,7 +39,9 @@ try:
 
     HAS_DEEPEVAL = True
 except ImportError:
-    from tests.evals.adapters import DeepEvalLLMTestCase as LLMTestCase  # type: ignore[assignment]
+    from remediation_engine.evals.trajectories import (
+        DeepEvalLLMTestCase as LLMTestCase,  # type: ignore[assignment]
+    )
 
     HAS_DEEPEVAL = False
     assert_test = None  # type: ignore[assignment]
@@ -326,15 +330,14 @@ def _measure_expected(
     label: str,
 ) -> None:
     """Measure an expected-positive or expected-negative metric result."""
-    if expected_pass:
-        if assert_test is not None:
-            assert_test(test_case, [metric], run_async=False)
-        else:
-            metric.measure(test_case)
-            assert metric.is_successful(), f"Case {case_id!r} failed {label}."
-    else:
-        metric.measure(test_case)
-        assert not metric.is_successful(), f"Case {case_id!r} unexpectedly passed {label}."
+    measure_expected(
+        metric,
+        test_case,
+        expected_pass=expected_pass,
+        case_id=case_id,
+        label=label,
+        register=assert_test,
+    )
 
 
 def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
@@ -382,47 +385,56 @@ class TestQACriticEval:
             replay_source="production_live",
             capture=capture,
         )
-        _assert_live_qa_verdict_matches_golden(case, capture)
-        tool_contract_applicable = bool(case.get("tool_correctness_applicable", True))
-        expected_qa_tools = expected_tools(case, component="QA")
-        if tool_contract_applicable and not expected_qa_tools:
-            assert not capture.actual_tools, (
-                f"Case {case['case_id']!r} expected no QA tool calls, but observed "
-                f"{[event.get('name') for event in capture.actual_tools]!r}."
-            )
-        elif tool_contract_applicable and DeepEvalToolCorrectnessMetric is not None:
-            tool_metric = DeepEvalToolCorrectnessMetric(
-                threshold=0.50,
-                evaluation_params=[],
-                should_consider_ordering=True,
-                should_exact_match=False,
-            )
-            if bool(case.get("expected_tool_correctness_pass", True)):
-                _measure_expected(
-                    tool_metric,
-                    test_case,
-                    expected_pass=True,
-                    case_id=str(case["case_id"]),
-                    label="QA tool correctness",
+        with collect_metric_assertions():
+            tool_contract_applicable = bool(case.get("tool_correctness_applicable", True))
+            expected_qa_tools = expected_tools(case, component="QA")
+            if tool_contract_applicable and not expected_qa_tools:
+                assert not capture.actual_tools, (
+                    f"Case {case['case_id']!r} expected no QA tool calls, but observed "
+                    f"{[event.get('name') for event in capture.actual_tools]!r}."
                 )
-            else:
-                tool_metric.measure(test_case)
-        if (
-            DeepEvalTaskCompletionMetric is not None
-            and _qa_task_completion_metric_applicable(case)
-        ):
-            task_metric = DeepEvalTaskCompletionMetric(
-                threshold=0.70,
-                model=eval_settings.judge_model,
-                async_mode=False,
-            )
-            _measure_expected(
-                task_metric,
-                _build_qa_audit_completion_case(case, test_case, capture.typed_result),
-                expected_pass=bool(case.get("expected_task_completion_pass", True)),
-                case_id=str(case["case_id"]),
-                label="QA task completion",
-            )
+            elif tool_contract_applicable and DeepEvalToolCorrectnessMetric is not None:
+                tool_metric = DeepEvalToolCorrectnessMetric(
+                    threshold=0.50,
+                    evaluation_params=[],
+                    should_consider_ordering=True,
+                    should_exact_match=False,
+                )
+                if bool(case.get("expected_tool_correctness_pass", True)):
+                    _measure_expected(
+                        tool_metric,
+                        test_case,
+                        expected_pass=True,
+                        case_id=str(case["case_id"]),
+                        label="QA tool correctness",
+                    )
+                else:
+                    _measure_expected(
+                        tool_metric,
+                        test_case,
+                        expected_pass=False,
+                        case_id=str(case["case_id"]),
+                        label="QA tool correctness",
+                    )
+            if DeepEvalTaskCompletionMetric is not None and _qa_task_completion_metric_applicable(
+                case
+            ):
+                task_metric = DeepEvalTaskCompletionMetric(
+                    threshold=0.70,
+                    model=eval_settings.judge_llm or eval_settings.judge_model,
+                    async_mode=False,
+                )
+                _measure_expected(
+                    task_metric,
+                    _build_qa_audit_completion_case(case, test_case, capture.typed_result),
+                    expected_pass=bool(case.get("expected_task_completion_pass", True)),
+                    case_id=str(case["case_id"]),
+                    label="QA task completion",
+                )
+        # Register judged evidence before enforcing a deterministic verdict
+        # mismatch so failed audits still retain their captured result and
+        # metric diagnostics in the evaluation database.
+        _assert_live_qa_verdict_matches_golden(case, capture)
 
 
 def test_qa_test_case_preserves_empty_expected_tool_contract() -> None:
@@ -435,6 +447,27 @@ def test_qa_test_case_preserves_empty_expected_tool_contract() -> None:
         replay_source="offline_fixture",
     )
     assert test_case.expected_tools == []
+
+
+def test_qa_replay_files_follow_the_declared_package_and_failure_evidence() -> None:
+    """Seed source the case actually describes instead of inferring it from IDs."""
+    sanitize = next(
+        case for case in _QA_CASES if case["case_id"] == "qa_workaround_initial_fail_unit_tests"
+    )
+    removal = next(
+        case
+        for case in _QA_CASES
+        if case["case_id"] == "qa_workaround_nofix_package_removal_fail_unit_tests"
+    )
+    assert "sanitizeHtml" in _qa_files(sanitize)["lib/insecurity.ts"]
+    assert "notevil" in _qa_files(removal)["routes/b2bOrder.ts"]
+
+
+def test_compile_failure_does_not_require_an_exact_live_audit_tool_trace() -> None:
+    """A valid QA audit may query evidence before emitting the required rejection."""
+    case = next(case for case in _QA_CASES if case["case_id"] == "qa_maven_compile_failure")
+    assert case["tool_correctness_applicable"] is False
+    assert case["expected_tools"] == []
 
 
 def test_qa_completion_projection_uses_typed_verdict_not_tool_trace() -> None:
@@ -504,6 +537,7 @@ def test_qa_critic_offline_production_replay(
 
     assert _tool_signature(capture.actual_tools) == _tool_signature(scripted_tools)
     assert model.invocation_count == len(scripted_tools)
+    assert not any("workspace snapshot" in error for error in capture.errors)
     if case_id == "qa_surrender_max_tool_call_rounds":
         assert len(model.invocation_messages) >= 4
         fourth_messages = model.invocation_messages[3]

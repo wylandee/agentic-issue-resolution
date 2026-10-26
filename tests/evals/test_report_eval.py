@@ -12,6 +12,7 @@ import pytest
 
 from remediation_engine.orchestration.report_node import generate_report
 from tests.evals.conftest import EvalSettings
+from tests.evals.eval_case_helpers import set_pytest_item_identity
 
 try:
     from deepeval import assert_test
@@ -1017,19 +1018,19 @@ def _build_metrics(eval_settings: EvalSettings, case: dict[str, Any]) -> list[An
     return [
         HallucinationMetric(
             threshold=0.30,
-            model=eval_settings.judge_model,
+            model=eval_settings.judge_llm or eval_settings.judge_model,
             include_reason=True,
             verbose_mode=True,
         ),
         FaithfulnessMetric(
             threshold=0.85,
-            model=eval_settings.judge_model,
+            model=eval_settings.judge_llm or eval_settings.judge_model,
             include_reason=True,
             verbose_mode=True,
         ),
         SummarizationMetric(
             threshold=0.80,
-            model=eval_settings.judge_model,
+            model=eval_settings.judge_llm or eval_settings.judge_model,
             assessment_questions=_report_summarization_questions(case),
             include_reason=True,
             verbose_mode=True,
@@ -1044,7 +1045,7 @@ def _build_metrics(eval_settings: EvalSettings, case: dict[str, Any]) -> list[An
                 LLMTestCaseParams.CONTEXT,
             ],
             threshold=0.70,
-            model=eval_settings.judge_model,
+            model=eval_settings.judge_llm or eval_settings.judge_model,
             verbose_mode=True,
         ),
     ]
@@ -1058,6 +1059,7 @@ def _record_live_report_metrics(
         raise RuntimeError("DeepEval is required for live report metrics.")
     failures: list[str] = []
     for group_name, metric_case, selected_metrics in metric_groups:
+        set_pytest_item_identity(metric_case)
         try:
             assert_test(metric_case, selected_metrics)
         except AssertionError as exc:
@@ -1107,7 +1109,7 @@ class TestReportNodeEval:
         self,
         case: dict[str, Any],
         eval_settings: EvalSettings,
-        request: pytest.FixtureRequest,
+        request: pytest.FixtureRequest | None = None,
     ) -> None:
         """Persist four live judge metrics as diagnostics after deterministic checks."""
         report = render_report(case)
@@ -1139,7 +1141,7 @@ class TestReportNodeEval:
             ("constraint metric", policy_case, metrics[3:]),
         )
         failures = _record_live_report_metrics(metric_groups)
-        if failures:
+        if failures and request is not None:
             request.node.user_properties.append(("live_metric_diagnostics", "\n".join(failures)))
 
 
