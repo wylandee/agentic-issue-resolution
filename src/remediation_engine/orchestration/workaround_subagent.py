@@ -35,11 +35,9 @@ from remediation_engine.orchestration._tool_support import (
     _restore_newlines,
 )
 from remediation_engine.orchestration.context_manager import ContextManager
+from remediation_engine.orchestration.llm_client import create_chat_model
 from remediation_engine.orchestration.remedy_tools import build_workaround_toolbelt
-from remediation_engine.orchestration.runtime_context import (
-    get_runtime_settings,
-    openai_api_key_kwargs,
-)
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import SubagentState
 from remediation_engine.orchestration.subagent_runtime import (
     has_successful_validation_gate,
@@ -1136,10 +1134,11 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
     settings = get_runtime_settings()
     model_name = settings.workaround_llm_model
     try:
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=0,
-            **openai_api_key_kwargs(settings),
+        llm = create_chat_model(
+            model_name,
+            settings=settings,
+            reasoning_effort=settings.workaround_llm_reasoning_effort,
+            chat_openai_class=ChatOpenAI,
         )
     except Exception as exc:  # noqa: BLE001
         summaries = _build_surrender_summaries(

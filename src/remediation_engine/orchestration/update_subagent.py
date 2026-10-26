@@ -29,14 +29,12 @@ from remediation_engine.contracts.schemas import (
     WorkerAttemptResult,
     WorkerExecutionDiagnostics,
 )
+from remediation_engine.orchestration.llm_client import create_chat_model
 from remediation_engine.orchestration.remedy_tools import (
     build_multi_package_update_toolbelt,
     build_update_toolbelt,
 )
-from remediation_engine.orchestration.runtime_context import (
-    get_runtime_settings,
-    openai_api_key_kwargs,
-)
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import SubagentState
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
 from remediation_engine.orchestration.supervisor_planner import instruction_digest
@@ -1196,10 +1194,11 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
         settings = get_runtime_settings()
         model_name = settings.update_llm_model
         try:
-            llm = ChatOpenAI(
-                model=model_name,
-                temperature=0,
-                **openai_api_key_kwargs(settings),
+            llm = create_chat_model(
+                model_name,
+                settings=settings,
+                reasoning_effort=settings.update_llm_reasoning_effort,
+                chat_openai_class=ChatOpenAI,
             )
         except Exception as exc:  # noqa: BLE001
             msg = f"Update Subagent: failed to initialize LLM - {exc}."
@@ -1409,10 +1408,11 @@ def run_update_subagent_node(state: SubagentState) -> dict[str, Any]:
     settings = get_runtime_settings()
     model_name = settings.update_llm_model
     try:
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=0,
-            **openai_api_key_kwargs(settings),
+        llm = create_chat_model(
+            model_name,
+            settings=settings,
+            reasoning_effort=settings.update_llm_reasoning_effort,
+            chat_openai_class=ChatOpenAI,
         )
     except Exception as exc:  # noqa: BLE001
         msg = f"Update Subagent: failed to initialize LLM - {exc}."

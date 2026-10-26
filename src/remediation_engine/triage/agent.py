@@ -36,9 +36,9 @@ from remediation_engine.contracts.schemas import (
     TriageResult,
     VulnerabilityGroup,
 )
+from remediation_engine.orchestration.llm_client import create_chat_model
 from remediation_engine.orchestration.runtime_context import (
     get_runtime_settings,
-    openai_api_key_kwargs,
 )
 from remediation_engine.orchestration.trajectory_exporter import invoke_with_trajectory
 from remediation_engine.settings import AppSettings
@@ -404,10 +404,11 @@ def _llm_triage(
     resolved_settings = settings or get_runtime_settings()
     model_name = resolved_settings.triage_llm_model
     try:
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=0,
-            **openai_api_key_kwargs(resolved_settings),
+        llm = create_chat_model(
+            model_name,
+            settings=resolved_settings,
+            reasoning_effort=resolved_settings.triage_llm_reasoning_effort,
+            chat_openai_class=ChatOpenAI,
         )
         structured_llm = llm.with_structured_output(TriageResult)
         prompt_text = _build_triage_prompt(group, context)

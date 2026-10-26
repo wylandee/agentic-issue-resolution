@@ -40,6 +40,7 @@ import requests
 from pydantic import BaseModel
 
 from remediation_engine.contracts import FixPlanStatus, LocalizedIssue
+from remediation_engine.orchestration.llm_client import create_chat_model
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.tools.package_identity import package_name_from_purl
 
@@ -686,7 +687,12 @@ def _llm_extract_remediation(
     )
 
     try:
-        llm = ChatOpenAI(model=model_name, temperature=0, api_key=api_key)
+        llm = create_chat_model(
+            model_name,
+            settings=settings,
+            reasoning_effort=settings.triage_llm_reasoning_effort,
+            chat_openai_class=ChatOpenAI,
+        )
         structured_llm = llm.with_structured_output(SerperLLMResult)
         result: SerperLLMResult = structured_llm.invoke(prompt_text)
         return result.model_dump()

@@ -5,6 +5,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+
+LunaReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
+_LUNA_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -83,6 +87,41 @@ class AppSettings:
     remedy_retriage_limit_enabled: bool = False
     remedy_retriage_limit: int = DEFAULT_REMEDY_RETRIAGE_LIMIT
     max_delta_canary_probes: int = DEFAULT_MAX_DELTA_CANARY_PROBES
+    remedy_llm_reasoning_effort: LunaReasoningEffort | None = None
+    triage_llm_reasoning_effort: LunaReasoningEffort | None = None
+    update_llm_reasoning_effort: LunaReasoningEffort | None = None
+    workaround_llm_reasoning_effort: LunaReasoningEffort | None = None
+    qa_llm_reasoning_effort: LunaReasoningEffort | None = None
+
+    def __post_init__(self) -> None:
+        """Validate optional per-agent Luna reasoning effort settings.
+
+        Effort values are normalized to lowercase. A configured effort is only
+        valid when the corresponding model is GPT-6 Luna; invalid settings raise
+        ``ValueError`` before an agent constructs an OpenAI client.
+        """
+        model_effort_pairs = (
+            ("REMEDY_LLM_REASONING_EFFORT", self.remedy_llm_model, "remedy_llm_reasoning_effort"),
+            ("TRIAGE_LLM_REASONING_EFFORT", self.triage_llm_model, "triage_llm_reasoning_effort"),
+            ("UPDATE_LLM_REASONING_EFFORT", self.update_llm_model, "update_llm_reasoning_effort"),
+            (
+                "WORKAROUND_LLM_REASONING_EFFORT",
+                self.workaround_llm_model,
+                "workaround_llm_reasoning_effort",
+            ),
+            ("QA_LLM_REASONING_EFFORT", self.qa_llm_model, "qa_llm_reasoning_effort"),
+        )
+        for env_name, model_name, field_name in model_effort_pairs:
+            effort = getattr(self, field_name)
+            if effort is None:
+                continue
+            normalized = str(effort).strip().lower()
+            if normalized not in _LUNA_REASONING_EFFORTS:
+                choices = ", ".join(sorted(_LUNA_REASONING_EFFORTS))
+                raise ValueError(f"{env_name} must be one of: {choices}")
+            if model_name.strip().lower() != "gpt-6-luna":
+                raise ValueError(f"{env_name} only applies when its model is gpt-6-luna")
+            object.__setattr__(self, field_name, normalized)
 
     @classmethod
     def from_env(cls) -> AppSettings:
@@ -106,11 +145,22 @@ class AppSettings:
         return cls(
             openai_api_key=os.environ.get("OPENAI_API_KEY", "").strip(),
             remedy_llm_model=default_model,
+            remedy_llm_reasoning_effort=os.environ.get("REMEDY_LLM_REASONING_EFFORT", "").strip()
+            or None,
             triage_llm_enabled=_env_bool("TRIAGE_LLM_ENABLED"),
             triage_llm_model=model_override("TRIAGE_LLM_MODEL"),
+            triage_llm_reasoning_effort=os.environ.get("TRIAGE_LLM_REASONING_EFFORT", "").strip()
+            or None,
             update_llm_model=model_override("UPDATE_LLM_MODEL"),
+            update_llm_reasoning_effort=os.environ.get("UPDATE_LLM_REASONING_EFFORT", "").strip()
+            or None,
             workaround_llm_model=model_override("WORKAROUND_LLM_MODEL"),
+            workaround_llm_reasoning_effort=os.environ.get(
+                "WORKAROUND_LLM_REASONING_EFFORT", ""
+            ).strip()
+            or None,
             qa_llm_model=model_override("QA_LLM_MODEL"),
+            qa_llm_reasoning_effort=os.environ.get("QA_LLM_REASONING_EFFORT", "").strip() or None,
             serper_api_key=os.environ.get("SERPER_API_KEY", "").strip(),
             github_token=os.environ.get("GITHUB_TOKEN", "").strip(),
             odc_extra_args=os.environ.get("ODC_EXTRA_ARGS", "").strip(),
