@@ -1,23 +1,29 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.4.xsd">
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for @angular/common (npm)</notes>
+        <notes>Keep @angular/common as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/%40angular%2Fcommon@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for @angular/compiler (npm)</notes>
+        <notes>Keep @angular/compiler as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/%40angular%2Fcompiler@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for @angular/core (npm)</notes>
+        <notes>Keep @angular/core as a selected Juice Shop fixture</notes>
         <packageUrl regex="true">^pkg:npm/%40angular%2Fcore@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
+-->
 
     <suppress>
         <notes>Suppress all vulnerabilities for @babel/core (npm)</notes>

@@ -11,6 +11,7 @@ from typing import Any
 
 from remediation_engine.contracts.accessors import model_or_dict_value
 
+from .issue_identity import canonical_issue_components
 from .task_utils import effective_group_status, task_group_lineage, terminal_outcome_issues
 from .trajectory_exporter import TrajectoryRecorder
 
@@ -33,7 +34,7 @@ class ReportContext:
     targeted_qa_passed: int
     recorded_qa_total: int
     has_patch: bool
-    original_scanner_findings: int
+    canonical_finding_count: int
     actionable_groups: int
     groups_fixed: int
     groups_unresolved: int
@@ -797,7 +798,7 @@ def _build_context(
         ),
         recorded_qa_total=recorded_qa_total,
         has_patch=bool(_text(state.get("diff"))),
-        original_scanner_findings=len(issues),
+        canonical_finding_count=len(canonical_issue_components(issues)),
         actionable_groups=len(all_groups),
         groups_fixed=counts["fixed"],
         groups_unresolved=counts["unresolved"],

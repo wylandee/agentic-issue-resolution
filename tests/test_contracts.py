@@ -169,6 +169,7 @@ class TestSeverityCoercion:
             ("HIGH", Severity.HIGH),
             ("critical", Severity.CRITICAL),
             ("medium", Severity.MEDIUM),
+            ("moderate", Severity.MEDIUM),
             ("low", Severity.LOW),
             ("info", Severity.INFO),
             ("garbage", Severity.UNKNOWN),

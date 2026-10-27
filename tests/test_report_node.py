@@ -122,6 +122,39 @@ def test_preliminary_report_marks_final_metrics_pending():
     assert "| Patch status | Available (1 file changed) |" in report
 
 
+def test_report_total_uses_canonical_occurrence_rows():
+    state = _state()
+    ghsa = "GHSA-22JQ-VG5J-6VGG"
+    state["issues"] = [
+        {
+            "id": "issue-cve",
+            "cve_id": "CVE-2026-54272",
+            "ghsa_id": ghsa,
+            "package_name": "ip-address",
+            "package_version": "10.2.0",
+            "file_path": "package-lock.json",
+        },
+        {
+            "id": "issue-ghsa",
+            "ghsa_id": ghsa,
+            "package_name": "ip-address",
+            "package_version": "10.2.0",
+            "file_path": "package-lock.json",
+        },
+        {
+            "id": "distinct-occurrence",
+            "cve_id": "CVE-2026-54272",
+            "package_name": "another-package",
+            "package_version": "10.2.0",
+            "file_path": "package-lock.json",
+        },
+    ]
+
+    report = generate_report(state)
+
+    assert "| Total findings (CVEs and GHSAs) | 2 |" in report
+
+
 def test_non_authoritative_scan_does_not_change_the_four_section_contract():
     """Internal post-scan state does not add diagnostic sections to the report."""
     state = _state()

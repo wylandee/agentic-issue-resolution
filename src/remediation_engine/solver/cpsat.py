@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from functools import cmp_to_key
+from functools import cmp_to_key, lru_cache
 from typing import Any
 
 from langsmith import traceable
@@ -38,6 +39,7 @@ from remediation_engine.settings import DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET
 
 _MAX_DIAGNOSTICS = 64
 _MAX_DIAGNOSTIC_LENGTH = 500
+_MAX_RANGE_MASK_CACHE_SIZE = 65_536
 
 
 def _trace_field(value: Any, name: str, default: Any = None) -> Any:
@@ -278,6 +280,7 @@ def _distance_above(version: str, floor: str | None, version_scheme: str = "semv
     )
 
 
+@lru_cache(maxsize=65_536)
 def _range_matches(version_range: str | None, version: str) -> bool | None:
     """Check an npm range without turning malformed ranges into compatibility."""
     if not version_range or version_range.strip() in {"*", "latest"}:
@@ -288,6 +291,46 @@ def _range_matches(version_range: str | None, version: str) -> bool | None:
         return npm_range_contains(version_range, version)
     except (ImportError, TypeError, ValueError):
         return None
+
+
+def _range_candidate_masks(
+    version_range: str | None,
+    versions: tuple[str, ...],
+    cache: dict[tuple[str | None, tuple[str, ...]], tuple[int, int]],
+    cache_stats: dict[str, int],
+) -> tuple[int, int]:
+    """Return bitmasks for matching and malformed candidates in one version domain.
+
+    The first mask contains candidates that satisfy the range. The second marks
+    candidates for which the range check was invalid. Keeping these results as
+    masks lets model construction combine constraints without reparsing ranges
+    for every source/target candidate pair.
+    """
+    key = (version_range, versions)
+    if key in cache:
+        cache_stats["hits"] += 1
+        return cache[key]
+    cache_stats["misses"] += 1
+
+    all_candidates = (1 << len(versions)) - 1
+    if not version_range or version_range.strip() in {"*", "latest"}:
+        result = (all_candidates, 0)
+        if len(cache) < _MAX_RANGE_MASK_CACHE_SIZE:
+            cache[key] = result
+        return result
+
+    matching = 0
+    invalid = 0
+    for index, version in enumerate(versions):
+        matched = _range_matches(version_range, version)
+        if matched is True:
+            matching |= 1 << index
+        elif matched is None:
+            invalid |= 1 << index
+    result = (matching, invalid)
+    if len(cache) < _MAX_RANGE_MASK_CACHE_SIZE:
+        cache[key] = result
+    return result
 
 
 def _setting(settings: Any, name: str, default: Any) -> Any:
@@ -591,33 +634,166 @@ def _constraint_pairs(
     target: SolverTarget,
     source_candidates: Sequence[SolverVersionCandidate],
     target_candidates: Sequence[SolverVersionCandidate],
+    source_versions: tuple[str, ...],
+    target_versions: tuple[str, ...],
     *,
     edge_range: str | None,
     peer: SolverPeerConstraint | None,
     diagnostics: list[str],
     candidate_relations: Mapping[tuple[str, str, str], tuple[SolverCandidateRelation, ...]],
-) -> list[tuple[int, int]]:
-    """Precompute the integer allowed-pair table for one graph relation."""
-    pairs: list[tuple[int, int]] = []
-    for left_index, left in enumerate(source_candidates):
-        for right_index, right in enumerate(target_candidates):
-            allowed = _pair_allowed(
-                source,
-                target,
-                left,
-                right,
-                edge_range=edge_range,
-                peer=peer,
-                candidate_relations=candidate_relations,
+    range_mask_cache: dict[tuple[str | None, tuple[str, ...]], tuple[int, int]],
+    range_mask_cache_stats: dict[str, int],
+) -> dict[int, int]:
+    """Build allowed target-index masks without materializing candidate pairs."""
+    if peer is not None and peer.is_optional:
+        all_targets = (1 << len(target_candidates)) - 1
+        return {index: all_targets for index in range(len(source_candidates))}
+    if (
+        peer is not None
+        and peer.candidate_specific_source_version
+        and not any(
+            candidate.version == peer.candidate_specific_source_version
+            for candidate in source_candidates
+        )
+    ):
+        return {}
+
+    all_sources = (1 << len(source_candidates)) - 1
+    all_targets = (1 << len(target_candidates)) - 1
+    source_package_names = tuple(dict.fromkeys((source.package_name, source.target_package_name)))
+    target_package_names = tuple(dict.fromkeys((target.package_name, target.target_package_name)))
+
+    source_requirement_found: list[bool] = []
+    source_allowed_targets: list[int] = []
+    invalid_range_found = False
+    for source_candidate in source_candidates:
+        if (
+            peer is not None
+            and peer.candidate_specific_source_version
+            and source_candidate.version != peer.candidate_specific_source_version
+        ):
+            source_requirement_found.append(False)
+            source_allowed_targets.append(0)
+            continue
+
+        requirement_found = False
+        allowed_targets = all_targets
+        for package_name in target_package_names:
+            relations = candidate_relations.get(
+                (source.occurrence_id, source_candidate.version, package_name), ()
             )
-            if allowed is None:
-                _diagnostic(
-                    diagnostics,
-                    f"invalid range in constraint {source.occurrence_id}->{target.occurrence_id}",
+            if relations:
+                requirement_found = True
+            for relation in relations:
+                if (
+                    not relation.is_modelled
+                    or not relation.is_range_supported
+                    or relation.target_occurrence_id != target.occurrence_id
+                ):
+                    continue
+                matched, invalid = _range_candidate_masks(
+                    relation.version_range,
+                    target_versions,
+                    range_mask_cache,
+                    range_mask_cache_stats,
                 )
-            elif allowed:
-                pairs.append((left_index, right_index))
-    return pairs
+                allowed_targets &= matched
+                invalid_range_found = invalid_range_found or bool(invalid)
+        source_requirement_found.append(requirement_found)
+        source_allowed_targets.append(allowed_targets)
+
+    target_requirement_found = 0
+    target_allowed_sources: list[int] = []
+    for target_index, target_candidate in enumerate(target_candidates):
+        requirement_found = False
+        allowed_sources = all_sources
+        for package_name in source_package_names:
+            relations = candidate_relations.get(
+                (target.occurrence_id, target_candidate.version, package_name), ()
+            )
+            if relations:
+                requirement_found = True
+            for relation in relations:
+                if (
+                    not relation.is_modelled
+                    or not relation.is_range_supported
+                    or relation.target_occurrence_id != source.occurrence_id
+                ):
+                    continue
+                matched, invalid = _range_candidate_masks(
+                    relation.version_range,
+                    source_versions,
+                    range_mask_cache,
+                    range_mask_cache_stats,
+                )
+                allowed_sources &= matched
+                invalid_range_found = invalid_range_found or bool(invalid)
+        if requirement_found:
+            target_requirement_found |= 1 << target_index
+        target_allowed_sources.append(allowed_sources)
+
+    override_target = peer is None and target.dependency_type.strip().lower() in {
+        "overrides",
+        "resolutions",
+        "pnpm_overrides",
+    }
+    static_allowed_targets = all_targets
+    static_requirement_applies = target_requirement_found != all_targets and any(
+        not requirement_found
+        and (
+            peer is None
+            or not peer.candidate_specific_source_version
+            or source_candidate.version == peer.candidate_specific_source_version
+        )
+        for source_candidate, requirement_found in zip(
+            source_candidates, source_requirement_found, strict=True
+        )
+    )
+    if static_requirement_applies:
+        if edge_range and not override_target:
+            matched, invalid = _range_candidate_masks(
+                edge_range, target_versions, range_mask_cache, range_mask_cache_stats
+            )
+            static_allowed_targets &= matched
+            invalid_range_found = invalid_range_found or bool(invalid)
+        if peer is not None:
+            matched, invalid = _range_candidate_masks(
+                peer.version_range, target_versions, range_mask_cache, range_mask_cache_stats
+            )
+            static_allowed_targets &= matched
+            invalid_range_found = invalid_range_found or bool(invalid)
+
+    rows: dict[int, int] = {}
+    for source_index in range(len(source_candidates)):
+        if (
+            peer is not None
+            and peer.candidate_specific_source_version
+            and source_candidates[source_index].version != peer.candidate_specific_source_version
+        ):
+            continue
+
+        source_bit = 1 << source_index
+        reverse_allowed_targets = 0
+        for target_index, allowed_sources in enumerate(target_allowed_sources):
+            if allowed_sources & source_bit:
+                reverse_allowed_targets |= 1 << target_index
+
+        if source_requirement_found[source_index]:
+            allowed_targets = source_allowed_targets[source_index] & reverse_allowed_targets
+        else:
+            unconstrained_targets = all_targets ^ target_requirement_found
+            allowed_targets = (reverse_allowed_targets & target_requirement_found) | (
+                unconstrained_targets & static_allowed_targets
+            )
+        if allowed_targets:
+            rows[source_index] = allowed_targets
+
+    if invalid_range_found:
+        _diagnostic(
+            diagnostics,
+            f"invalid range in constraint {source.occurrence_id}->{target.occurrence_id}",
+        )
+    return rows
 
 
 def _index_candidate_relations(
@@ -1561,6 +1737,18 @@ def solve_portfolio(
         status. Native solver errors and model guards return ``FALLBACK`` and
         never include a dispatchable selected plan.
     """
+    solver_started_at = time.perf_counter()
+    timing_phase_started_at = solver_started_at
+    timing_phases: list[tuple[str, float]] = []
+    range_cache_start = _range_matches.cache_info()
+
+    def mark_timing_phase(name: str) -> None:
+        """Record elapsed time since the prior solver stage checkpoint."""
+        nonlocal timing_phase_started_at
+        now = time.perf_counter()
+        timing_phases.append((name, now - timing_phase_started_at))
+        timing_phase_started_at = now
+
     diagnostics = list(subgraph.diagnostics)
     targets = sorted(subgraph.targets, key=lambda item: item.occurrence_id)
     findings = {finding.coverage_id: finding for finding in subgraph.findings}
@@ -1606,6 +1794,19 @@ def solve_portfolio(
         removed_versions = raw_versions - {candidate.version for candidate in domain}
         if removed_versions:
             pruned_candidate_versions[target.occurrence_id] = removed_versions
+    versions_by_id = {
+        occurrence_id: tuple(candidate.version for candidate in values)
+        for occurrence_id, values in domains.items()
+    }
+    version_indices_by_id = {
+        occurrence_id: {version: index for index, version in enumerate(versions)}
+        for occurrence_id, versions in versions_by_id.items()
+    }
+    evidence_versions_by_id = {
+        domain.variable_id: tuple(domain.candidate_versions) for domain in subgraph.evidence_domains
+    }
+    range_mask_cache: dict[tuple[str | None, tuple[str, ...]], tuple[int, int]] = {}
+    range_mask_cache_stats = {"hits": 0, "misses": 0}
     validated_conflicts, exact_conflict_assignments, conflict_diagnostics = (
         _validate_forbidden_conflicts(forbidden_conflicts, eligible, domains)
     )
@@ -1613,12 +1814,14 @@ def solve_portfolio(
         [*forbidden_assignments, *exact_conflict_assignments], eligible, domains
     )
     diagnostics.extend([*forbidden_diagnostics, *conflict_diagnostics])
+    mark_timing_phase("domain_and_conflict_normalization")
     candidate_relations_complete = _candidate_relations_complete(
         subgraph,
         domains,
         diagnostics,
         pruned_candidate_versions=pruned_candidate_versions,
     )
+    mark_timing_phase("candidate_relation_validation")
     candidate_catalog_complete = bool(candidate_catalog_complete) and not (
         candidate_resource_guard_exceeded
     )
@@ -1685,10 +1888,30 @@ def solve_portfolio(
             ],
         }
     )
+    mark_timing_phase("input_digest_construction")
     revisions = {target.task_id: 0 for target in targets}
 
     def make_plan(**values: Any) -> SolverRemediationPlan:
         """Attach immutable candidate-catalog evidence to every solver result."""
+        now = time.perf_counter()
+        timing_parts = [f"{name}={duration:.3f}s" for name, duration in timing_phases]
+        timing_parts.append(f"current_stage={now - timing_phase_started_at:.3f}s")
+        timing_diagnostic = (
+            f"solver stage timings total={now - solver_started_at:.3f}s " + " ".join(timing_parts)
+        )
+        range_cache_end = _range_matches.cache_info()
+        timing_diagnostic += (
+            f" range_cache_hits={range_cache_end.hits - range_cache_start.hits}"
+            f" range_cache_misses={range_cache_end.misses - range_cache_start.misses}"
+            f" range_cache_size={range_cache_end.currsize}"
+            f" range_mask_cache_hits={range_mask_cache_stats['hits']}"
+            f" range_mask_cache_misses={range_mask_cache_stats['misses']}"
+            f" range_mask_cache_size={len(range_mask_cache)}"
+        )
+        logging.getLogger(__name__).info(timing_diagnostic)
+        plan_diagnostics = list(values.get("diagnostics") or ())
+        _diagnostic(plan_diagnostics, timing_diagnostic)
+        values["diagnostics"] = plan_diagnostics
         return SolverRemediationPlan(
             candidate_catalog_complete=candidate_catalog_complete,
             candidate_catalog_digest=candidate_catalog_digest,
@@ -1817,20 +2040,20 @@ def solve_portfolio(
         finding_by_target.setdefault(finding.target_occurrence_id, []).append(finding)
     model = cp_model.CpModel()
 
+    installed_indices: dict[str, int | None] = {}
+
     def installed_index(occurrence_id: str) -> int | None:
         """Return the status-quo candidate index for one mutation target."""
+        if occurrence_id in installed_indices:
+            return installed_indices[occurrence_id]
         target = target_by_id.get(occurrence_id)
         if target is None or not target.installed_version:
+            installed_indices[occurrence_id] = None
             return None
         installed_version = target.installed_version.strip().lstrip("vV")
-        return next(
-            (
-                index
-                for index, candidate in enumerate(domains.get(occurrence_id, ()))
-                if candidate.version == installed_version
-            ),
-            None,
-        )
+        result = version_indices_by_id.get(occurrence_id, {}).get(installed_version)
+        installed_indices[occurrence_id] = result
+        return result
 
     for target in eligible:
         values = domains[target.occurrence_id]
@@ -1905,44 +2128,76 @@ def solve_portfolio(
             cp_model.Domain.FromValues(allowed), f"occurrence_{len(vars_by_id):04d}"
         )
 
+    source_choice_literals: dict[tuple[str, int], Any] = {}
+
+    def source_choice_literal(occurrence_id: str, candidate_index: int) -> Any:
+        """Return a cached Boolean equivalent to one candidate assignment."""
+        key = (occurrence_id, candidate_index)
+        literal = source_choice_literals.get(key)
+        if literal is None:
+            literal = model.NewBoolVar(f"candidate_{len(source_choice_literals):04d}")
+            variable = vars_by_id[occurrence_id]
+            model.Add(variable == candidate_index).OnlyEnforceIf(literal)
+            model.Add(variable != candidate_index).OnlyEnforceIf(literal.Not())
+            source_choice_literals[key] = literal
+        return literal
+
     def add_resilient_pair_constraint(
         left_id: str,
         right_id: str,
-        pairs: Sequence[tuple[int, int]],
+        row_masks: Mapping[int, int],
         diagnostic: str,
     ) -> None:
-        """Constrain compatible candidates while preserving the baseline pair."""
-        normalized_pairs = set(pairs)
+        """Constrain candidate rows compactly while retaining the baseline pair."""
+        has_pairs = any(row_masks.values())
+        normalized_rows = {index: mask for index, mask in row_masks.items() if mask}
         left_baseline = installed_index(left_id)
         right_baseline = installed_index(right_id)
-        if not pairs and (left_baseline is None or right_baseline is None):
+        if not has_pairs and (left_baseline is None or right_baseline is None):
             _diagnostic(
                 diagnostics,
                 f"{diagnostic}; baseline unavailable, leaving peer relation relaxed",
             )
             return
         if left_baseline is not None and right_baseline is not None:
-            normalized_pairs.add((left_baseline, right_baseline))
-        if not pairs:
+            normalized_rows[left_baseline] = normalized_rows.get(left_baseline, 0) | (
+                1 << right_baseline
+            )
+        if not has_pairs:
             _diagnostic(diagnostics, diagnostic)
 
-        allowed_left = {left for left, _right in pairs}
-        allowed_right = {right for _left, right in pairs}
-        if left_baseline is not None:
-            allowed_left.add(left_baseline)
-        if right_baseline is not None:
-            allowed_right.add(right_baseline)
-        for index, _candidate in enumerate(domains[left_id]):
-            if index not in allowed_left:
-                model.Add(vars_by_id[left_id] != index)
-        for index, _candidate in enumerate(domains[right_id]):
-            if index not in allowed_right:
-                model.Add(vars_by_id[right_id] != index)
-
-        if normalized_pairs:
-            model.AddAllowedAssignments(
-                [vars_by_id[left_id], vars_by_id[right_id]], sorted(normalized_pairs)
+        allowed_left = set(normalized_rows)
+        allowed_right_mask = 0
+        for mask in normalized_rows.values():
+            allowed_right_mask |= mask
+        if len(allowed_left) < len(domains[left_id]):
+            model.add_linear_expression_in_domain(
+                vars_by_id[left_id], cp_model.Domain.FromValues(sorted(allowed_left))
             )
+        all_rights_mask = (1 << len(domains[right_id])) - 1
+        if allowed_right_mask != all_rights_mask:
+            allowed_right_indices: list[int] = []
+            remaining = allowed_right_mask
+            while remaining:
+                least_significant_bit = remaining & -remaining
+                allowed_right_indices.append(least_significant_bit.bit_length() - 1)
+                remaining ^= least_significant_bit
+            model.add_linear_expression_in_domain(
+                vars_by_id[right_id], cp_model.Domain.FromValues(allowed_right_indices)
+            )
+
+        for left_index, target_mask in normalized_rows.items():
+            if target_mask == all_rights_mask:
+                continue
+            right_indices: list[int] = []
+            remaining = target_mask
+            while remaining:
+                least_significant_bit = remaining & -remaining
+                right_indices.append(least_significant_bit.bit_length() - 1)
+                remaining ^= least_significant_bit
+            model.add_linear_expression_in_domain(
+                vars_by_id[right_id], cp_model.Domain.FromValues(right_indices)
+            ).OnlyEnforceIf(source_choice_literal(left_id, left_index))
 
     evidence_vars_by_id: dict[str, Any] = {}
     if evidence_model_enabled:
@@ -1956,6 +2211,7 @@ def solve_portfolio(
                 len(evidence_domain.candidate_versions) - 1,
                 f"evidence_{evidence_index:04d}",
             )
+    mark_timing_phase("variable_creation")
     ordered_occurrences = sorted(vars_by_id)
     for assignment in normalized_forbidden:
         if ordered_occurrences:
@@ -2039,10 +2295,14 @@ def solve_portfolio(
             target,
             domains[source_id],
             domains[target_id],
+            versions_by_id[source_id],
+            versions_by_id[target_id],
             edge_range=edge_range,
             peer=peer,
             diagnostics=diagnostics,
             candidate_relations=candidate_relation_index,
+            range_mask_cache=range_mask_cache,
+            range_mask_cache_stats=range_mask_cache_stats,
         )
         add_resilient_pair_constraint(
             source_id,
@@ -2051,6 +2311,8 @@ def solve_portfolio(
             f"no compatible candidate pair for {source_id}->{target_id}; "
             "retaining installed baseline",
         )
+    mark_timing_phase("graph_pair_constraints")
+    fixed_peer_allowed_masks: dict[str, int] = {}
     for peer in subgraph.peer_constraints:
         if (
             peer.is_optional
@@ -2080,30 +2342,51 @@ def solve_portfolio(
             continue
         target_id = peer.target_occurrence_id
         baseline_index = installed_index(target_id)
-        for candidate_index, candidate in enumerate(domains[target_id]):
-            matched = _range_matches(peer.version_range, candidate.version)
-            if matched is None:
-                return make_plan(
-                    status=SolverStatus.UNKNOWN,
-                    input_digest=input_digest,
-                    domain_digest=domain_digest,
-                    repository_digest=repository_digest,
-                    task_revisions=revisions,
-                    unresolved_finding_ids=issue_finding_ids,
-                    diagnostics=[
-                        *diagnostics,
-                        f"invalid fixed peer range {peer.version_range!r} for {target_id!r}",
-                    ],
-                )
-            if matched or candidate_index == baseline_index:
-                if not matched and candidate_index == baseline_index:
-                    _diagnostic(
-                        diagnostics,
-                        f"installed baseline {candidate.version!r} conflicts with fixed peer "
-                        f"{peer.source_occurrence_id!r}; retaining baseline fallback",
-                    )
-                continue
-            model.Add(vars_by_id[target_id] != candidate_index)
+        matched, invalid = _range_candidate_masks(
+            peer.version_range,
+            versions_by_id[target_id],
+            range_mask_cache,
+            range_mask_cache_stats,
+        )
+        if invalid:
+            return make_plan(
+                status=SolverStatus.UNKNOWN,
+                input_digest=input_digest,
+                domain_digest=domain_digest,
+                repository_digest=repository_digest,
+                task_revisions=revisions,
+                unresolved_finding_ids=issue_finding_ids,
+                diagnostics=[
+                    *diagnostics,
+                    f"invalid fixed peer range {peer.version_range!r} for {target_id!r}",
+                ],
+            )
+        if baseline_index is not None and not matched & (1 << baseline_index):
+            _diagnostic(
+                diagnostics,
+                f"installed baseline {domains[target_id][baseline_index].version!r} conflicts "
+                f"with fixed peer {peer.source_occurrence_id!r}; retaining baseline fallback",
+            )
+        allowed_mask = matched | ((1 << baseline_index) if baseline_index is not None else 0)
+        all_candidates = (1 << len(domains[target_id])) - 1
+        fixed_peer_allowed_masks[target_id] = (
+            fixed_peer_allowed_masks.get(target_id, all_candidates) & allowed_mask
+        )
+    for target_id, allowed_mask in fixed_peer_allowed_masks.items():
+        if not allowed_mask:
+            model.Add(vars_by_id[target_id] == len(domains[target_id]))
+            continue
+        allowed_indices: list[int] = []
+        remaining = allowed_mask
+        while remaining:
+            least_significant_bit = remaining & -remaining
+            allowed_indices.append(least_significant_bit.bit_length() - 1)
+            remaining ^= least_significant_bit
+        model.add_linear_expression_in_domain(
+            vars_by_id[target_id], cp_model.Domain.FromValues(allowed_indices)
+        )
+
+    candidate_relation_allowed_masks: dict[tuple[str, str, int], int] = {}
     for relation in subgraph.candidate_relations:
         if (
             relation.is_optional
@@ -2116,14 +2399,7 @@ def solve_portfolio(
             continue
         source_id = relation.source_occurrence_id
         target_id = relation.target_occurrence_id
-        source_index = next(
-            (
-                index
-                for index, candidate in enumerate(domains[source_id])
-                if candidate.version == relation.source_candidate_version
-            ),
-            None,
-        )
+        source_index = version_indices_by_id[source_id].get(relation.source_candidate_version)
         if source_index is None:
             _diagnostic(
                 diagnostics,
@@ -2141,18 +2417,13 @@ def solve_portfolio(
             )
         source_baseline = installed_index(source_id)
         target_baseline = installed_index(target_id)
-        forbidden_pairs: list[tuple[int, int]] = []
-        invalid_range = False
-        for target_index, target_candidate in enumerate(domains[target_id]):
-            matched = _range_matches(relation.version_range, target_candidate.version)
-            if matched is None:
-                invalid_range = True
-                break
-            if not matched and not (
-                source_index == source_baseline and target_index == target_baseline
-            ):
-                forbidden_pairs.append((source_index, target_index))
-        if invalid_range:
+        matched, invalid = _range_candidate_masks(
+            relation.version_range,
+            versions_by_id[target_id],
+            range_mask_cache,
+            range_mask_cache_stats,
+        )
+        if invalid:
             _diagnostic(
                 diagnostics,
                 f"invalid candidate range {relation.version_range!r} in relation "
@@ -2167,12 +2438,35 @@ def solve_portfolio(
                 unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
-        if len(forbidden_pairs) == len(domains[target_id]):
+        allowed_mask = matched
+        if source_index == source_baseline and target_baseline is not None:
+            allowed_mask |= 1 << target_baseline
+        all_targets = (1 << len(domains[target_id])) - 1
+        key = (source_id, target_id, source_index)
+        candidate_relation_allowed_masks[key] = (
+            candidate_relation_allowed_masks.get(key, all_targets) & allowed_mask
+        )
+    for (
+        source_id,
+        target_id,
+        source_index,
+    ), allowed_mask in candidate_relation_allowed_masks.items():
+        all_targets = (1 << len(domains[target_id])) - 1
+        if allowed_mask == all_targets:
+            continue
+        if not allowed_mask:
             model.Add(vars_by_id[source_id] != source_index)
-        elif forbidden_pairs:
-            model.AddForbiddenAssignments(
-                [vars_by_id[source_id], vars_by_id[target_id]], forbidden_pairs
-            )
+            continue
+        allowed_indices: list[int] = []
+        remaining = allowed_mask
+        while remaining:
+            least_significant_bit = remaining & -remaining
+            allowed_indices.append(least_significant_bit.bit_length() - 1)
+            remaining ^= least_significant_bit
+        model.add_linear_expression_in_domain(
+            vars_by_id[target_id], cp_model.Domain.FromValues(allowed_indices)
+        ).OnlyEnforceIf(source_choice_literal(source_id, source_index))
+    mark_timing_phase("target_candidate_relations")
     for relation in subgraph.candidate_relations:
         if (
             relation.is_optional
@@ -2207,14 +2501,7 @@ def solve_portfolio(
                 unresolved_finding_ids=issue_finding_ids,
                 diagnostics=[*diagnostics, "evidence variable map is incomplete"],
             )
-        source_index = next(
-            (
-                index
-                for index, candidate in enumerate(domains[source_id])
-                if candidate.version == relation.source_candidate_version
-            ),
-            None,
-        )
+        source_index = version_indices_by_id[source_id].get(relation.source_candidate_version)
         if source_index is None:
             _diagnostic(
                 diagnostics,
@@ -2230,16 +2517,14 @@ def solve_portfolio(
                 unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
-        forbidden_pairs: list[tuple[int, int]] = []
-        invalid_range = False
-        for evidence_index, version in enumerate(evidence_domain.candidate_versions):
-            matched = _range_matches(relation.version_range, version)
-            if matched is None:
-                invalid_range = True
-                break
-            if not matched:
-                forbidden_pairs.append((source_index, evidence_index))
-        if invalid_range:
+        evidence_versions = evidence_versions_by_id[relation.evidence_variable_id]
+        matched, invalid = _range_candidate_masks(
+            relation.version_range,
+            evidence_versions,
+            range_mask_cache,
+            range_mask_cache_stats,
+        )
+        if invalid:
             _diagnostic(
                 diagnostics,
                 f"invalid modeled evidence range {relation.version_range!r} for "
@@ -2254,10 +2539,19 @@ def solve_portfolio(
                 unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
-        if len(forbidden_pairs) == len(evidence_domain.candidate_versions):
+        if not matched:
             model.Add(source_variable != source_index)
-        elif forbidden_pairs:
-            model.AddForbiddenAssignments([source_variable, evidence_variable], forbidden_pairs)
+        elif matched != (1 << len(evidence_versions)) - 1:
+            allowed_indices: list[int] = []
+            remaining = matched
+            while remaining:
+                least_significant_bit = remaining & -remaining
+                allowed_indices.append(least_significant_bit.bit_length() - 1)
+                remaining ^= least_significant_bit
+            model.add_linear_expression_in_domain(
+                evidence_variable, cp_model.Domain.FromValues(allowed_indices)
+            ).OnlyEnforceIf(source_choice_literal(source_id, source_index))
+    mark_timing_phase("evidence_candidate_relations")
 
     for relation in subgraph.candidate_relations:
         if (
@@ -2287,33 +2581,36 @@ def solve_portfolio(
                 f"physical peer {relation.package_name!r} left unmodeled",
             )
             continue
-        for source_index, source_candidate in enumerate(domains[relation.source_occurrence_id]):
-            if source_candidate.version != relation.source_candidate_version:
-                continue
-            matched = _range_matches(relation.version_range, physical_peer.installed_version)
-            if matched is None:
-                return make_plan(
-                    status=SolverStatus.UNKNOWN,
-                    input_digest=input_digest,
-                    domain_digest=domain_digest,
-                    repository_digest=repository_digest,
-                    task_revisions=revisions,
-                    unresolved_finding_ids=issue_finding_ids,
-                    diagnostics=[
-                        *diagnostics,
-                        f"invalid modeled peer range {relation.version_range!r}",
-                    ],
-                )
-            if matched:
-                continue
-            if source_candidate.version == installed_version:
-                _diagnostic(
-                    diagnostics,
-                    f"installed baseline {installed_version!r} conflicts with physical peer "
-                    f"{relation.package_name!r}; retaining baseline fallback",
-                )
-                continue
-            model.Add(vars_by_id[relation.source_occurrence_id] != source_index)
+        source_id = relation.source_occurrence_id
+        source_index = version_indices_by_id[source_id].get(relation.source_candidate_version)
+        if source_index is None:
+            continue
+        source_candidate = domains[source_id][source_index]
+        matched = _range_matches(relation.version_range, physical_peer.installed_version)
+        if matched is None:
+            return make_plan(
+                status=SolverStatus.UNKNOWN,
+                input_digest=input_digest,
+                domain_digest=domain_digest,
+                repository_digest=repository_digest,
+                task_revisions=revisions,
+                unresolved_finding_ids=issue_finding_ids,
+                diagnostics=[
+                    *diagnostics,
+                    f"invalid modeled peer range {relation.version_range!r}",
+                ],
+            )
+        if matched:
+            continue
+        if source_candidate.version == installed_version:
+            _diagnostic(
+                diagnostics,
+                f"installed baseline {installed_version!r} conflicts with physical peer "
+                f"{relation.package_name!r}; retaining baseline fallback",
+            )
+            continue
+        model.Add(vars_by_id[source_id] != source_index)
+    mark_timing_phase("fixed_peer_constraints")
 
     findings_covered: dict[str, Any] = {}
     findings_version: dict[str, Any] = {}
@@ -2485,6 +2782,7 @@ def solve_portfolio(
     weighted_deadline = time.monotonic() + max(
         0.001, float(_setting(settings, "solver_timeout_seconds", 10))
     )
+    mark_timing_phase("finding_objective_and_model_finalization")
 
     def project(
         solver_instance: Any,
@@ -2580,6 +2878,7 @@ def solve_portfolio(
                     [vars_by_id[occurrence_id] for occurrence_id in sorted(vars_by_id)],
                     [[selected_indices[occurrence_id] for occurrence_id in sorted(vars_by_id)]],
                 )
+        mark_timing_phase("cp_sat_search_and_projection")
     except Exception as exc:  # pragma: no cover - native CP-SAT failures are environment-specific
         _diagnostic(diagnostics, f"native CP-SAT error: {exc}")
         solver_statistics = _build_solver_statistics(observations)

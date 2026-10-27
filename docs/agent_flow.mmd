@@ -1,49 +1,51 @@
-flowchart TB
+flowchart TD
     Start(["START"]):::boundary --> Triage
 
     subgraph BulkPhase ["Phase 1: Bulk Triage (Processes All Tasks)"]
-        direction LR
+        direction TB
         ODCSemgrep["ODC / Semgrep"]:::gate
         Triage["Triage Agent"]:::triage
-        TriageDB[("Scanner Findings")]:::db
+        TriageDB[("🗄️ Scanner Findings")]:::db
         WebTriage[("OSV, EPSS and CISA-KEV DBs")]:::db
 
-        ODCSemgrep -->|"Parse Scanner Report"| TriageDB
+        ODCSemgrep -->|"Parse scanner report"| TriageDB
         Triage <--> TriageDB
-        Triage -.->|"API Query"| WebTriage
+        Triage -.->|"Advisory API queries"| WebTriage
     end
 
-    Triage -->|"Triage Done"| Supervisor
+    Triage -->|"Triage Done (All Tasks Queued)"| Supervisor
     Triage -.->|"No Actionable Work"| Report["Report Agent"]:::report
 
     subgraph BatchLoop ["Phase 2: Iterative Execution (1 Batch of Tasks at a Time)"]
-        direction LR
+        direction TB
         Supervisor["SUPERVISOR"]:::supervisor
-        Solver["CP-SAT Solver"]:::gate
-        WebSolver[("Package Registry")]:::db
+        SupDB[("🗄️ State & Task DB")]:::db
+        Solver["🧮 CP-SAT Solver"]:::gate
+        WebSolver[("📦 Package Registry")]:::db
 
-        Supervisor ---- Solver
-        Supervisor -.->|"API Query"| WebSolver
+        Supervisor <--> SupDB
+        Supervisor <--> Solver
+        Supervisor -.->|"Registry API queries"| WebSolver
 
-        Supervisor -.->|"Update Task"| Update["Update Agent"]:::worker
+        Supervisor -.->|"Update Task (1 Batch)"| Update["Update Agent"]:::worker
         Update -->|"Update Result"| Supervisor
-        Update --- UpdateTools["Update and Validate Tools"]:::tool
+        Update --- UpdateTools["🔧 Update and Validate Tools"]:::tool
 
-        Supervisor -.->|"Workaround Task"| Workaround["Code Workaround Agent"]:::worker
+        Supervisor -.->|"Code Workaround Task (1 Batch)"| Workaround["Code Workaround Agent"]:::worker
         Workaround -->|"Workaround Result"| Supervisor
 
-        Workaround --- WT_Inv["Investigative Tools"]:::tool
-        WT_Inv --> WT_Plan["Plan Tools"]:::tool
-        WT_Plan --> WT_Exec["Execute Tools"]:::tool
-        WT_Exec --> WT_Val["Validate Tools"]:::tool
+        Workaround --- WT_Inv["🔍 Investigative Tools"]:::tool
+        WT_Inv --> WT_Plan["📋 Plan Tools"]:::tool
+        WT_Plan --> WT_Exec["⚡ Execute Tools"]:::tool
+        WT_Exec --> WT_Val["✅ Validate Tools"]:::tool
         WT_Inv -.->|"Web Search"| WebWorkaround["🌐 Internet"]:::external
 
-        Supervisor -.->|"Validate Attempt"| QA["QA Agent"]:::qa
+        Supervisor -.->|"Validate Attempt (1 Batch)"| QA["QA Agent"]:::qa
         QA -->|"Attempt Evaluation"| Supervisor
-        QA --- QA_Inspect["Inspection Tools"]:::tool
-        QA --- QA_Install["Install and Build"]:::gate
-        QA --- QA_Scanner["ODC Scanner"]:::gate
-        QA --- QA_Test["Unit Tests"]:::gate
+        QA --- QA_Inspect["🔎 Inspection Tools"]:::tool
+        QA --- QA_Install["📦 Install and Build"]:::gate
+        QA --- QA_Scanner["🛡️ Scanner"]:::gate
+        QA --- QA_Test["🧪 Unit Test"]:::gate
     end
 
     Supervisor -.->|"Post-QA Re-Triage"| Triage

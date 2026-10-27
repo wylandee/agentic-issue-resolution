@@ -411,7 +411,12 @@ class DockerSandbox:
             if self._repo_root is not None:
                 logger.info("DockerSandbox: copying %s into container /workspace.", self._repo_root)
                 archive = _make_tar_archive(self._repo_root, self._archive_excluded_dirs)
-                self._container.put_archive("/workspace", archive)
+                copied = self._container.put_archive("/workspace", archive)
+                if not copied:
+                    raise RuntimeError(
+                        "DockerSandbox: Docker did not confirm copying the repository "
+                        "archive into /workspace."
+                    )
                 logger.info("DockerSandbox: repository copied; sandbox ready.")
             else:
                 logger.info("DockerSandbox: no repo_root provided; skipping archive copy.")
