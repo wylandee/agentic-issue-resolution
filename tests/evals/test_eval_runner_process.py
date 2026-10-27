@@ -63,6 +63,43 @@ def test_offline_runner_overrides_ambient_live_mode(monkeypatch) -> None:
     assert "--run-eval-live" not in captured_command
 
 
+def test_runner_exposes_curated_end_to_end_suite(monkeypatch) -> None:
+    process = FakeProcess("done\n", exit_code=0)
+    captured_command: list[str] = []
+
+    def popen(*args, **kwargs):
+        captured_command.extend(args[0])
+        return process
+
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+    list(runner.run_eval_subprocess("end_to_end", is_live=False))
+
+    assert captured_command[-1] == "tests/evals/test_end_to_end_eval.py"
+    assert "--run-eval-live" not in captured_command
+
+
+def test_live_runner_can_score_an_explicit_end_to_end_trajectory(monkeypatch) -> None:
+    process = FakeProcess("done\n", exit_code=0)
+    captured_command: list[str] = []
+
+    def popen(*args, **kwargs):
+        captured_command.extend(args[0])
+        return process
+
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+    list(
+        runner.run_eval_subprocess(
+            "end_to_end",
+            is_live=True,
+            extra_args=["--e2e-trajectory", "/tmp/complete-run.md"],
+        )
+    )
+
+    assert "--run-eval-live" in captured_command
+    assert "--e2e-trajectory" in captured_command
+    assert captured_command[-1] == "tests/evals/test_end_to_end_eval.py"
+
+
 def test_closing_runner_stream_terminates_process_and_closes_pipe(monkeypatch) -> None:
     process = FakeProcess("first line\n")
     monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: process)

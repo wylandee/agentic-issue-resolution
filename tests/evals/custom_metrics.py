@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 try:
@@ -86,14 +87,19 @@ class TokenBudgetMetric(BaseMetric):
         """Metric display name."""
         return f"Token Budget ({self.agent_type})"
 
-    def measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
+    def measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float | None:
         """Measure token budget compliance for the provided test case.
 
         Reads 'prompt_tokens' and 'completion_tokens' from test_case.additional_metadata.
         """
         meta = getattr(test_case, "additional_metadata", {}) or {}
-        prompt_tokens = int(meta.get("prompt_tokens") or 0)
-        completion_tokens = int(meta.get("completion_tokens") or 0)
+        if meta.get("prompt_tokens") is None or meta.get("completion_tokens") is None:
+            self.score, self.success, self.reason = None, None, "Token usage unavailable; unscored."
+            return None
+        prompt_tokens = int(meta["prompt_tokens"])
+        completion_tokens = int(meta["completion_tokens"])
+        if prompt_tokens < 0 or completion_tokens < 0:
+            raise ValueError("Token counts must be non-negative")
 
         violations: list[str] = []
         if prompt_tokens > self.max_prompt_tokens:
@@ -119,7 +125,7 @@ class TokenBudgetMetric(BaseMetric):
         self.success = self.score >= self.threshold
         return self.score
 
-    async def a_measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
+    async def a_measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float | None:
         """Async implementation delegating to synchronous measure."""
         return self.measure(test_case, *args, **kwargs)
 
@@ -177,16 +183,27 @@ class LatencySLAMetric(BaseMetric):
         """Metric display name."""
         return f"Latency SLA ({self.agent_type})"
 
-    def measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
+    def measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float | None:
         """Measure wall-clock latency against the SLA ceiling for the test case."""
         meta = getattr(test_case, "additional_metadata", {}) or {}
-        latency = (
-            getattr(test_case, "completion_time", None)
-            or meta.get("duration_seconds")
-            or meta.get("latency_seconds")
-            or 0.0
+        latency = next(
+            (
+                value
+                for value in (
+                    getattr(test_case, "completion_time", None),
+                    meta.get("duration_seconds"),
+                    meta.get("latency_seconds"),
+                )
+                if value is not None
+            ),
+            None,
         )
+        if latency is None:
+            self.score, self.success, self.reason = None, None, "Latency unavailable; unscored."
+            return None
         latency = float(latency)
+        if not math.isfinite(latency) or latency < 0:
+            raise ValueError("Latency must be finite and non-negative")
 
         if latency > self.max_latency_seconds:
             self.score = 0.0
@@ -204,7 +221,7 @@ class LatencySLAMetric(BaseMetric):
         self.success = self.score >= self.threshold
         return self.score
 
-    async def a_measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
+    async def a_measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float | None:
         """Async implementation delegating to synchronous measure."""
         return self.measure(test_case, *args, **kwargs)
 
@@ -252,10 +269,18 @@ class ToolCallBudgetMetric(BaseMetric):
         """Metric display name."""
         return "Tool Call Round Budget"
 
-    def measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
+    def measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float | None:
         """Measure tool call round consumption for the test case."""
-        tools_called = getattr(test_case, "tools_called", []) or []
-        rounds_used = len(tools_called)
+        rounds_used = (getattr(test_case, "additional_metadata", None) or {}).get("loop_rounds")
+        if rounds_used is None:
+            self.score, self.success, self.reason = (
+                None,
+                None,
+                "Loop-round evidence unavailable; unscored.",
+            )
+            return None
+        if isinstance(rounds_used, bool) or not isinstance(rounds_used, int) or rounds_used < 0:
+            raise ValueError("loop_rounds must be a non-negative integer")
 
         if rounds_used > self.max_tool_rounds:
             self.score = 0.0
@@ -280,7 +305,7 @@ class ToolCallBudgetMetric(BaseMetric):
         self.success = self.score >= self.threshold
         return self.score
 
-    async def a_measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float:
+    async def a_measure(self, test_case: LLMTestCase, *args: Any, **kwargs: Any) -> float | None:
         """Async implementation delegating to synchronous measure."""
         return self.measure(test_case, *args, **kwargs)
 

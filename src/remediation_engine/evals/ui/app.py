@@ -532,7 +532,58 @@ with tab_runner:
     with col_s3:
         live_eval = st.checkbox("Enable Live LLM Judge (--run-eval-live)", value=False)
 
+    e2e_extra_args: list[str] = []
+    if suite_choice == "end_to_end":
+        st.caption(
+            "Whole-run judging uses only the complete runs you select here. It never scans "
+            "the local trajectory folder automatically."
+        )
+        trajectory_text = st.text_area(
+            "Recorded trajectory paths (one per line)",
+            placeholder="data/trajectories/selected-run.md",
+            disabled=not live_eval,
+        )
+        e2e_repo_col, e2e_input_col = st.columns(2)
+        with e2e_repo_col:
+            fresh_repo = st.text_input("Fresh run repository path", disabled=not live_eval)
+        with e2e_input_col:
+            fresh_input = st.text_input("Fresh run findings file", disabled=not live_eval)
+        fresh_format = st.selectbox(
+            "Fresh run input format",
+            options=("auto", "odc-json", "semgrep-json", "jsonl"),
+            disabled=not live_eval or not fresh_input,
+        )
+        e2e_strict = st.checkbox(
+            "Fail on whole-run metric threshold misses (--e2e-strict)",
+            value=False,
+            disabled=not live_eval,
+        )
+        for trajectory in trajectory_text.splitlines():
+            if trajectory.strip():
+                e2e_extra_args.extend(["--e2e-trajectory", trajectory.strip()])
+        if bool(fresh_repo.strip()) != bool(fresh_input.strip()):
+            st.warning(
+                "Enter both a fresh run repository and a findings file, or leave both blank."
+            )
+        elif fresh_repo.strip() and fresh_input.strip():
+            e2e_extra_args.extend(
+                ["--e2e-run-repo", fresh_repo.strip(), "--e2e-input", fresh_input.strip()]
+            )
+            if fresh_format != "auto":
+                e2e_extra_args.extend(["--e2e-input-format", fresh_format])
+        if e2e_strict:
+            e2e_extra_args.append("--e2e-strict")
+
     if st.button("▶ Start Evaluation Run", type="primary"):
+        if suite_choice == "end_to_end" and live_eval:
+            has_fresh_pair = bool(fresh_repo.strip() and fresh_input.strip())
+            has_partial_pair = bool(fresh_repo.strip()) != bool(fresh_input.strip())
+            if has_partial_pair:
+                st.error("Provide both fresh run paths or leave both blank.")
+                st.stop()
+            if not trajectory_text.strip() and not has_fresh_pair:
+                st.error("Select at least one complete trajectory or a fresh run input pair.")
+                st.stop()
         output_placeholder = st.empty()
         log_lines: list[str] = []
         terminal_outcomes: list[EvalProcessOutcome] = []
@@ -546,6 +597,7 @@ with tab_runner:
                 suite_key=suite_choice,
                 is_live=live_eval,
                 judge_model=judge_choice,
+                extra_args=e2e_extra_args,
                 on_complete=record_outcome,
             )
             for line in runner_gen:

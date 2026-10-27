@@ -3984,7 +3984,7 @@
     },
     "expected_task_completion_pass": true,
     "expected_tool_correctness_pass": true,
-    "tool_correctness_applicable": true,
+    "tool_correctness_applicable": false,
     "expected_output": "Emit passed=false with security_flag because the Maven evidence fails the required gate.",
     "input": "Review Maven QA for org.postgresql:postgresql at committed version 42.7.11; separate task-owned evidence from cumulative findings.",
     "context": [
@@ -4072,7 +4072,8 @@
           "dependencies"
         ]
       }
-    }
+    },
+    "evaluation_note": "Compile failure requires evidence queries and a typed verdict; the exact live audit-tool trace is intentionally not treated as a golden contract."
   },
   {
     "case_id": "qa_maven_test_regression",

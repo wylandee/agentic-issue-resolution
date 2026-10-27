@@ -15,9 +15,12 @@ from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,
     case_metadata,
+    collect_metric_assertions,
     context_strings,
     expected_tools,
     make_tool_calls,
+    measure_diagnostic,
+    measure_expected,
     observations,
 )
 from tests.evals.golden_schema import load_golden_dataset
@@ -38,7 +41,9 @@ try:
 
     HAS_DEEPEVAL = True
 except ImportError:
-    from tests.evals.adapters import DeepEvalLLMTestCase as LLMTestCase  # type: ignore[assignment]
+    from remediation_engine.evals.trajectories import (
+        DeepEvalLLMTestCase as LLMTestCase,  # type: ignore[assignment]
+    )
 
     HAS_DEEPEVAL = False
     assert_test = None  # type: ignore[assignment]
@@ -124,18 +129,13 @@ def _measure_expected(
     label: str,
 ) -> None:
     """Measure and register an expected-positive or expected-negative metric."""
-    if assert_test is None:
-        metric.measure(test_case)
-    else:
-        try:
-            assert_test(test_case, [metric], run_async=False)
-        except AssertionError:
-            if expected_pass or metric.is_successful() or getattr(metric, "error", None):
-                raise
-
-    actual_pass = bool(metric.is_successful())
-    assert actual_pass is expected_pass, (
-        f"Case {case_id!r} expected {label} to {'pass' if expected_pass else 'fail'}."
+    measure_expected(
+        metric,
+        test_case,
+        expected_pass=expected_pass,
+        case_id=case_id,
+        label=label,
+        register=assert_test,
     )
 
 
@@ -198,6 +198,14 @@ def test_python_validation_failure_cases_require_successful_validation_for_compl
         assert case.get("task_completion_applicable") is False
 
 
+def test_historical_negative_tool_traces_allow_live_recovery() -> None:
+    cases = [
+        case for case in _WORKAROUND_CASES if case.get("expected_tool_correctness_pass") is False
+    ]
+    assert len(cases) == 8
+    assert all(case.get("tool_correctness_applicable") is False for case in cases)
+
+
 def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
     """Run one real workaround worker replay per process."""
     return cached_replay(
@@ -240,37 +248,42 @@ class TestWorkaroundSubagentEval:
             replay_source="production_live",
             capture=capture,
         )
-        if DeepEvalToolCorrectnessMetric is not None and bool(
-            case.get("tool_correctness_applicable", True)
-        ):
-            tool_metric = DeepEvalToolCorrectnessMetric(
-                threshold=0.50,
-                evaluation_params=[],
-                should_consider_ordering=True,
-                should_exact_match=False,
-            )
-            _measure_expected(
-                tool_metric,
-                test_case,
-                expected_pass=bool(case.get("expected_tool_correctness_pass", True)),
-                case_id=str(case["case_id"]),
-                label="workaround tool correctness",
-            )
-        if DeepEvalTaskCompletionMetric is not None and bool(
-            case.get("task_completion_applicable", True)
-        ):
-            task_metric = DeepEvalTaskCompletionMetric(
-                threshold=0.70,
-                model=eval_settings.judge_model,
-                async_mode=False,
-            )
-            _measure_expected(
-                task_metric,
-                test_case,
-                expected_pass=bool(case.get("expected_completion_pass", True)),
-                case_id=str(case["case_id"]),
-                label="workaround task completion",
-            )
+        with collect_metric_assertions():
+            historical_negative_trace = case.get("expected_tool_correctness_pass") is False
+            if DeepEvalToolCorrectnessMetric is not None and (
+                bool(case.get("tool_correctness_applicable", True)) or historical_negative_trace
+            ):
+                tool_metric = DeepEvalToolCorrectnessMetric(
+                    threshold=0.50,
+                    evaluation_params=[],
+                    should_consider_ordering=True,
+                    should_exact_match=False,
+                )
+                if historical_negative_trace:
+                    measure_diagnostic(tool_metric, test_case, register=assert_test)
+                else:
+                    _measure_expected(
+                        tool_metric,
+                        test_case,
+                        expected_pass=True,
+                        case_id=str(case["case_id"]),
+                        label="workaround tool correctness",
+                    )
+            if DeepEvalTaskCompletionMetric is not None and bool(
+                case.get("task_completion_applicable", True)
+            ):
+                task_metric = DeepEvalTaskCompletionMetric(
+                    threshold=0.70,
+                    model=eval_settings.judge_llm or eval_settings.judge_model,
+                    async_mode=False,
+                )
+                _measure_expected(
+                    task_metric,
+                    test_case,
+                    expected_pass=bool(case.get("expected_completion_pass", True)),
+                    case_id=str(case["case_id"]),
+                    label="workaround task completion",
+                )
 
 
 def _tool_signature(tool_events: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:

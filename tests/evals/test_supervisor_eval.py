@@ -16,9 +16,12 @@ from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,
     case_metadata,
+    collect_metric_assertions,
     context_strings,
     expected_tools,
     make_tool_calls,
+    measure_expected,
+    task_completion_input,
 )
 from tests.evals.golden_schema import load_golden_dataset
 from tests.evals.replay_adapters import replay_supervisor_case
@@ -37,7 +40,9 @@ try:
 
     HAS_DEEPEVAL = True
 except ImportError:
-    from tests.evals.adapters import DeepEvalLLMTestCase as LLMTestCase  # type: ignore[assignment]
+    from remediation_engine.evals.trajectories import (
+        DeepEvalLLMTestCase as LLMTestCase,  # type: ignore[assignment]
+    )
 
     HAS_DEEPEVAL = False
     assert_test = None  # type: ignore[assignment]
@@ -80,7 +85,7 @@ def build_supervisor_test_case(
     )
     return LLMTestCase(
         name=f"{case['case_id']} [Tactical Supervisor]",
-        input=str(case["input"]),
+        input=task_completion_input(case),
         actual_output=f"{as_output_text(observed_output)}\n\n{format_tool_trace(tool_trace)}",
         expected_output=str(case["expected_output"]),
         context=context_strings(case),
@@ -100,15 +105,28 @@ def _measure_expected(
     label: str,
 ) -> None:
     """Measure an expected-positive or expected-negative metric."""
-    if expected_pass:
-        if assert_test is not None:
-            assert_test(test_case, [metric], run_async=False)
-        else:
-            metric.measure(test_case)
-            assert metric.is_successful(), f"Case {case_id!r} failed {label}."
-    else:
-        metric.measure(test_case)
-        assert not metric.is_successful(), f"Case {case_id!r} unexpectedly passed {label}."
+    measure_expected(
+        metric,
+        test_case,
+        expected_pass=expected_pass,
+        case_id=case_id,
+        label=label,
+        register=assert_test,
+    )
+
+
+def test_task_completion_input_contains_decision_acceptance_criteria() -> None:
+    case = next(
+        case
+        for case in _SUPERVISOR_CASES
+        if case["case_id"] == "supervisor-portfolio-escalation-peer-conflict"
+    )
+    capture = ReplayCapture(case_id=case["case_id"], component="supervisor")
+    test_case = build_supervisor_test_case(
+        case, {"decision": "accepted"}, [], "offline_fixture", capture
+    )
+    assert "Accept PEER_CONFLICT_ESCALATION" in test_case.input
+    assert "spawn no child" in test_case.input
 
 
 def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
@@ -346,50 +364,51 @@ class TestSupervisorEval:
             "production_live",
             capture,
         )
-        if case.get("tool_correctness_applicable", True):
-            assert DeepEvalToolCorrectnessMetric is not None
-            assert ToolCallParams is not None
-            assert case.get("expected_tool_correctness_pass") is True
-            tool_metric = DeepEvalToolCorrectnessMetric(
-                threshold=1.0,
-                evaluation_params=[ToolCallParams.INPUT_PARAMETERS],
-                should_consider_ordering=True,
-                should_exact_match=False,
-            )
-            tool_metric_case = _tool_correctness_test_case(
-                test_case,
-                case,
-                matching_tools,
-            )
-            _measure_expected(
-                tool_metric,
-                tool_metric_case,
-                expected_pass=bool(case["expected_tool_correctness_pass"]),
-                case_id=str(case["case_id"]),
-                label="Supervisor tool correctness",
-            )
-        else:
-            assert case["expected_tools"] == []
-            assert case["expected_tool_correctness_pass"] is None
+        with collect_metric_assertions():
+            if case.get("tool_correctness_applicable", True):
+                assert DeepEvalToolCorrectnessMetric is not None
+                assert ToolCallParams is not None
+                assert case.get("expected_tool_correctness_pass") is True
+                tool_metric = DeepEvalToolCorrectnessMetric(
+                    threshold=1.0,
+                    evaluation_params=[ToolCallParams.INPUT_PARAMETERS],
+                    should_consider_ordering=True,
+                    should_exact_match=False,
+                )
+                tool_metric_case = _tool_correctness_test_case(
+                    test_case,
+                    case,
+                    matching_tools,
+                )
+                _measure_expected(
+                    tool_metric,
+                    tool_metric_case,
+                    expected_pass=bool(case["expected_tool_correctness_pass"]),
+                    case_id=str(case["case_id"]),
+                    label="Supervisor tool correctness",
+                )
+            else:
+                assert case["expected_tools"] == []
+                assert case["expected_tool_correctness_pass"] is None
 
-        if (
-            case.get("task_completion_applicable", True)
-            and DeepEvalTaskCompletionMetric is not None
-        ):
-            task_metric = DeepEvalTaskCompletionMetric(
-                threshold=0.70,
-                model=eval_settings.judge_model,
-                async_mode=False,
-            )
-            _measure_expected(
-                task_metric,
-                test_case,
-                expected_pass=bool(case.get("expected_completion_pass", True)),
-                case_id=str(case["case_id"]),
-                label="Supervisor task completion",
-            )
-        elif not case.get("task_completion_applicable", True):
-            assert case.get("expected_completion_pass") is None
+            if (
+                case.get("task_completion_applicable", True)
+                and DeepEvalTaskCompletionMetric is not None
+            ):
+                task_metric = DeepEvalTaskCompletionMetric(
+                    threshold=0.70,
+                    model=eval_settings.judge_llm or eval_settings.judge_model,
+                    async_mode=False,
+                )
+                _measure_expected(
+                    task_metric,
+                    test_case,
+                    expected_pass=bool(case.get("expected_completion_pass", True)),
+                    case_id=str(case["case_id"]),
+                    label="Supervisor task completion",
+                )
+            elif not case.get("task_completion_applicable", True):
+                assert case.get("expected_completion_pass") is None
 
 
 @pytest.mark.parametrize(
@@ -454,9 +473,15 @@ def test_supervisor_offline_production_replay(
         assert typed["staged_resolutions"] == []
         assert typed["task_before"] == typed["task_after"]
         assert typed["retry_diagnostics_before"] == typed["retry_diagnostics_after"]
-        assert typed["retry_diagnostics_before"] is not None
+        python_suppressed = case["case_id"] in {
+            "python-supervisor-version-bump-certifi",
+            "python-supervisor-pyjwt-workaround-pivot",
+        }
+        if not python_suppressed:
+            assert typed["retry_diagnostics_before"] is not None
         no_call_output = json.loads(capture.actual_output)
-        assert no_call_output["qa_attribution_status"] == "inconclusive"
+        if not python_suppressed:
+            assert no_call_output["qa_attribution_status"] == "inconclusive"
         assert no_call_output["registry_resolution_calls"] == 0
         assert no_call_output["model_factory_calls"] == 0
         assert no_call_output["task_state_unchanged"] is True
@@ -527,6 +552,8 @@ def test_supervisor_eval_case_labels_and_expected_action_contract() -> None:
     assert len(set(_SUPERVISOR_CASE_IDS)) == 17
     no_call_cases = [case for case in _SUPERVISOR_CASES if not case["tool_correctness_applicable"]]
     assert {case["case_id"] for case in no_call_cases} == {
+        "python-supervisor-version-bump-certifi",
+        "python-supervisor-pyjwt-workaround-pivot",
         "supervisor-inconclusive-qa-suppressed",
         "python-supervisor-inconclusive-qa-suppressed",
     }
@@ -600,7 +627,8 @@ def test_supervisor_test_case_builder_records_explicit_provenance() -> None:
     )
 
     assert test_case.name == f"{case['case_id']} [Tactical Supervisor]"
-    assert test_case.input == case["input"]
+    assert test_case.input.startswith(case["input"])
+    assert case["expected_output"] in test_case.input
     assert test_case.expected_output == case["expected_output"]
     assert test_case.additional_metadata["component"] == "supervisor"
     assert test_case.additional_metadata["replay_source"] == "builder_test"

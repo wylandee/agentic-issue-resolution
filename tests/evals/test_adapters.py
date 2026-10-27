@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from tests.evals.adapters import (
+from remediation_engine.evals.trajectories import (
     AttemptSnapshotRow,
     TrajectoryDocument,
     TrajectorySpan,

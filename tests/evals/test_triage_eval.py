@@ -21,7 +21,9 @@ from tests.evals.eval_case_helpers import (
     as_output_text,
     case_metadata,
     context_strings,
+    measure_expected,
     observations,
+    task_completion_input,
 )
 from tests.evals.golden_schema import load_golden_dataset
 from tests.evals.replay_adapters import replay_triage_case
@@ -41,7 +43,9 @@ try:
 
     HAS_DEEPEVAL = True
 except ImportError:
-    from tests.evals.adapters import DeepEvalLLMTestCase as LLMTestCase  # type: ignore[assignment]
+    from remediation_engine.evals.trajectories import (
+        DeepEvalLLMTestCase as LLMTestCase,  # type: ignore[assignment]
+    )
 
     HAS_DEEPEVAL = False
     assert_test = None  # type: ignore[assignment]
@@ -121,7 +125,7 @@ def build_triage_test_case(
     )
     return LLMTestCase(
         name=f"{case_id} [Triage Task Completion]",
-        input=str(case["input"]),
+        input=task_completion_input(case),
         actual_output=str(actual_output),
         expected_output=str(case["expected_output"]),
         context=context,
@@ -139,6 +143,15 @@ def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture
         str(case["case_id"]),
         lambda: replay_triage_case(case, settings),
     )
+
+
+def test_triage_task_completion_input_contains_acceptance_criteria() -> None:
+    case = next(
+        case for case in _TRIAGE_CASES if case["case_id"] == "triage-python-certifi-actionable"
+    )
+    test_case = build_triage_test_case(case, {"revised_priority": "HIGH"}, [])
+    assert "prioritized HIGH" in test_case.input
+    assert "Preserve the scanner identity" in test_case.input
 
 
 @pytest.mark.eval
@@ -173,21 +186,18 @@ class TestTriageEval:
         )
         metric = DeepEvalTaskCompletionMetric(
             threshold=0.70,
-            model=eval_settings.judge_model,
+            model=eval_settings.judge_llm or eval_settings.judge_model,
             async_mode=False,
         )
         expected_pass = bool(case.get("expected_completion_pass", True))
-        if expected_pass:
-            if assert_test is not None:
-                assert_test(test_case, [metric], run_async=False)
-            else:
-                metric.measure(test_case)
-                assert metric.is_successful(), f"Case {case['case_id']!r} did not complete triage."
-        else:
-            metric.measure(test_case)
-            assert not metric.is_successful(), (
-                f"Case {case['case_id']!r} was expected to remain incomplete after guardrails."
-            )
+        measure_expected(
+            metric,
+            test_case,
+            expected_pass=expected_pass,
+            case_id=str(case["case_id"]),
+            label="triage task completion",
+            register=assert_test,
+        )
 
     @pytest.mark.parametrize(
         "case",

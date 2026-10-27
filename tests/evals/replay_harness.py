@@ -567,7 +567,16 @@ class ReplaySandbox:
         for path, content in sorted(self.files.items()):
             if target and target != "." and not (path == target or path.startswith(target + "/")):
                 continue
-            if Path(path).suffix.lower() not in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}:
+            if Path(path).suffix.lower() not in {
+                ".js",
+                ".mjs",
+                ".cjs",
+                ".ts",
+                ".tsx",
+                ".jsx",
+                ".py",
+                ".java",
+            }:
                 continue
             for line_number, line in enumerate(content.splitlines(), start=1):
                 if compiled.search(line):

@@ -68,6 +68,7 @@ except ImportError:
             additional_metadata: dict[str, Any] | None = None,
             **kwargs: Any,
         ) -> None:
+            """Initialize an offline case without importing the optional evaluator."""
             self.input = input
             self.actual_output = actual_output
             self.name = name
@@ -724,55 +725,75 @@ def parse_trajectory_dict(data: dict[str, Any]) -> TrajectoryDocument:
 # ---------------------------------------------------------------------------
 
 
+def descendant_spans(spans: list[TrajectorySpan], parent_span_id: str) -> list[TrajectorySpan]:
+    """Return descendants in recorded order, excluding the root and breaking cycles.
+
+    Args:
+        spans: Recorded spans, possibly containing missing parents or cycles.
+        parent_span_id: Root identifier whose descendants are requested.
+
+    Returns:
+        Each descendant span once in sequence order.
+    """
+    parents = {span.run_id: span.parent_run_id for span in spans}
+    result = []
+    for span in sorted(spans, key=lambda item: item.sequence):
+        current = span.parent_run_id
+        seen = {span.run_id}
+        while current and current not in seen:
+            if current == parent_span_id:
+                result.append(span)
+                break
+            seen.add(current)
+            current = parents.get(current)
+    return result
+
+
 def extract_tool_calls(
     spans: list[TrajectorySpan],
     parent_span_id: str | None = None,
 ) -> list[ToolCall]:
-    """Extract tool invocations from a sequence of spans.
+    """Return observed tool executions once, retaining repeated executions.
 
     Args:
-        spans: List of TrajectorySpan objects.
-        parent_span_id: Optional parent span ID to constrain tool extraction.
+        spans: Execution spans. Model-proposed calls are deliberately excluded.
+        parent_span_id: Optional ancestor used to restrict execution scope.
 
     Returns:
-        List of ToolCall objects representing tool executions.
+        Executed calls in recorded order, with their arguments and outcomes.
     """
-    tool_calls: list[ToolCall] = []
-
-    for span in spans:
-        if parent_span_id is not None and span.parent_run_id != parent_span_id:
+    selected = descendant_spans(spans, parent_span_id) if parent_span_id else spans
+    calls = []
+    seen = set()
+    for span in sorted(selected, key=lambda item: item.sequence):
+        if not span.is_tool or span.run_id in seen:
             continue
-
-        if span.is_tool:
-            clean_name = span.name.removeprefix("tool.")
-            params: dict[str, Any] = {}
-            if isinstance(span.inputs, dict):
-                params = span.inputs
-            elif span.inputs is not None:
-                params = {"input": span.inputs}
-
-            tool_calls.append(
-                ToolCall(
-                    name=clean_name,
-                    input_parameters=params,
-                    output=span.outputs,
-                )
+        seen.add(span.run_id)
+        params = span.inputs if isinstance(span.inputs, dict) else {"input": span.inputs}
+        calls.append(
+            ToolCall(
+                name=span.name.removeprefix("tool."),
+                input_parameters=params if span.inputs is not None else {},
+                output=span.outputs,
             )
-        elif span.is_llm and isinstance(span.outputs, dict):
-            # Check for embedded tool calls in chat model output messages
-            embedded_calls = span.outputs.get("tool_calls")
-            if isinstance(embedded_calls, list):
-                for tc in embedded_calls:
-                    if isinstance(tc, dict) and "name" in tc:
-                        tool_calls.append(
-                            ToolCall(
-                                name=tc.get("name", ""),
-                                input_parameters=tc.get("args") or {},
-                                output=None,
-                            )
-                        )
+        )
+    return calls
 
-    return tool_calls
+
+def extract_loop_rounds(spans: list[TrajectorySpan], parent_span_id: str) -> int | None:
+    """Count distinct worker model rounds; return None when tracing is unavailable.
+
+    Args:
+        spans: Recorded execution spans.
+        parent_span_id: Worker chain identifier.
+
+    Returns:
+        Count of distinct explicit ``react.llm`` spans, or None without evidence.
+    """
+    rounds = {
+        span.run_id for span in descendant_spans(spans, parent_span_id) if span.name == "react.llm"
+    }
+    return len(rounds) if rounds else None
 
 
 def _serialize_for_test_case(value: Any) -> str:
@@ -924,7 +945,7 @@ def spans_to_test_cases(
     return test_cases
 
 
-def extract_token_usage(span: TrajectorySpan) -> tuple[int, int]:
+def extract_token_usage(span: TrajectorySpan) -> tuple[int | None, int | None]:
     """Extract prompt and completion token counts from a TrajectorySpan.
 
     Args:
@@ -945,7 +966,7 @@ def extract_token_usage(span: TrajectorySpan) -> tuple[int, int]:
                 p = tu.get("prompt_tokens")
                 c = tu.get("completion_tokens")
                 if p is not None or c is not None:
-                    return (int(p or 0), int(c or 0))
+                    return (int(p) if p is not None else None, int(c) if c is not None else None)
 
             # 2. usage_metadata dict
             um = obj.get("usage_metadata")
@@ -953,7 +974,7 @@ def extract_token_usage(span: TrajectorySpan) -> tuple[int, int]:
                 p = um.get("input_tokens")
                 c = um.get("output_tokens")
                 if p is not None or c is not None:
-                    return (int(p or 0), int(c or 0))
+                    return (int(p) if p is not None else None, int(c) if c is not None else None)
 
             # 3. llm_output dict
             llm_out = obj.get("llm_output")
@@ -992,8 +1013,5 @@ def extract_token_usage(span: TrajectorySpan) -> tuple[int, int]:
         if p is not None and c is not None:
             return p, c
 
-    # Fallback to total_tokens if available
-    if span.total_tokens is not None and span.total_tokens > 0:
-        return span.total_tokens, 0
-
-    return 0, 0
+    # A total alone cannot establish either independent budget.
+    return span.prompt_tokens, span.completion_tokens

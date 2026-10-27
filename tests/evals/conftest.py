@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from tests.evals.adapters import (
+from remediation_engine.evals.trajectories import (
     TrajectoryDocument,
     TrajectorySpan,
     parse_trajectory_markdown,
@@ -37,6 +37,7 @@ _EVAL_TEST_FILE_NAMES = {
     "test_update_subagent_eval.py",
     "test_workaround_subagent_eval.py",
     "test_supervisor_eval.py",
+    "test_end_to_end_eval.py",
 }
 
 # Pytest reports include every item that ran, while DeepEval only registers
@@ -44,6 +45,7 @@ _EVAL_TEST_FILE_NAMES = {
 # session-finish hook can make pytest's item set authoritative for the UI.
 _EVAL_NODE_IDS: set[str] = set()
 _EVAL_TEST_REPORTS: dict[str, dict[str, pytest.TestReport]] = {}
+_EVAL_DIRECT_RECORDS: dict[str, Any] = {}
 
 # Load .env values if present in repository root
 _DOTENV_PATH = _PROJECT_ROOT / ".env"
@@ -96,6 +98,72 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help="Compare the run with a previous run ID, tag, or the reserved 'latest' reference.",
     )
+    parser.addoption(
+        "--e2e-trajectory",
+        action="append",
+        default=[],
+        type=Path,
+        help="Explicit complete trajectory to score in the end-to-end live suite; repeatable.",
+    )
+    parser.addoption(
+        "--e2e-run-repo",
+        type=Path,
+        default=None,
+        help="Explicit repository for one fresh end-to-end run (requires --e2e-input).",
+    )
+    parser.addoption(
+        "--e2e-input",
+        type=Path,
+        default=None,
+        help="Explicit findings file for one fresh end-to-end run (requires --e2e-run-repo).",
+    )
+    parser.addoption(
+        "--e2e-input-format",
+        choices=("auto", "odc-json", "semgrep-json", "jsonl"),
+        default="auto",
+        help="Input format for --e2e-input.",
+    )
+    parser.addoption(
+        "--e2e-strict",
+        action="store_true",
+        default=False,
+        help="Fail end-to-end eval items when a built-in metric misses its threshold.",
+    )
+
+
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    """Parameterize live whole-run tests from explicit recorded or fresh inputs."""
+    if "e2e_source" not in metafunc.fixturenames:
+        return
+
+    trajectories = list(metafunc.config.getoption("--e2e-trajectory", default=[]))
+    repo = metafunc.config.getoption("--e2e-run-repo", default=None)
+    findings = metafunc.config.getoption("--e2e-input", default=None)
+    if (repo is None) != (findings is None):
+        raise pytest.UsageError("--e2e-run-repo and --e2e-input must be supplied together")
+    sources: list[dict[str, Any] | None] = [
+        {"source": "recorded", "path": path} for path in trajectories
+    ]
+    if repo is not None and findings is not None:
+        sources.append(
+            {
+                "source": "fresh",
+                "repo": repo,
+                "input": findings,
+                "format": metafunc.config.getoption("--e2e-input-format", default="auto"),
+            }
+        )
+    if not sources:
+        sources = [None]
+    ids = [
+        "no-explicit-run"
+        if source is None
+        else Path(source["path"]).stem
+        if source["source"] == "recorded"
+        else "fresh-run"
+        for source in sources
+    ]
+    metafunc.parametrize("e2e_source", sources, ids=ids)
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -161,6 +229,25 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     del session
     _EVAL_NODE_IDS.clear()
     _EVAL_TEST_REPORTS.clear()
+    _EVAL_DIRECT_RECORDS.clear()
+
+
+def record_eval_result(record: Any) -> None:
+    """Add an already measured whole-run record to session persistence.
+
+    Args:
+        record: ``EvalTestCaseRecord`` produced by the whole-run scorer.
+
+    Raises:
+        ValueError: The current pytest item identity is unavailable.
+    """
+    nodeid = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+    if not nodeid:
+        raise ValueError("Cannot associate end-to-end result with a pytest item")
+    metadata = dict(record.additional_metadata or {})
+    metadata["pytest_nodeid"] = nodeid
+    record.additional_metadata = metadata
+    _EVAL_DIRECT_RECORDS[nodeid] = record
 
 
 def pytest_collection_modifyitems(
@@ -242,6 +329,7 @@ def _suite_from_nodeid(nodeid: str) -> str:
     """Derive the dashboard suite name from a pytest node ID."""
     normalized = _normalise_nodeid(nodeid)
     suite_by_file = (
+        ("test_end_to_end_eval.py", "end_to_end"),
         ("test_supervisor_eval.py", "supervisor"),
         ("test_workaround_subagent_eval.py", "subagent"),
         ("test_update_subagent_eval.py", "subagent"),
@@ -415,6 +503,10 @@ def _match_deep_eval_case_to_nodeid(
     if not candidates:
         return None
 
+    explicit_nodeid = _test_case_metadata(tc).get("pytest_nodeid")
+    if explicit_nodeid in candidates:
+        return str(explicit_nodeid)
+
     case_id = _case_id_from_test_case(tc)
 
     def is_same_case(nodeid: str) -> bool:
@@ -430,9 +522,6 @@ def _match_deep_eval_case_to_nodeid(
         )
 
     unassigned = [nodeid for nodeid in candidates if nodeid not in assigned_nodeids]
-    if not unassigned:
-        return None
-
     unassigned_scored = [(_deep_eval_node_score(tc, nodeid), nodeid) for nodeid in unassigned]
     same_case_assigned = [
         (_deep_eval_node_score(tc, nodeid), nodeid)
@@ -441,9 +530,12 @@ def _match_deep_eval_case_to_nodeid(
     ]
     if same_case_assigned:
         assigned_score, assigned_nodeid = max(same_case_assigned)
-        unassigned_score = max(score for score, _ in unassigned_scored)
+        unassigned_score = max((score for score, _ in unassigned_scored), default=-1)
         if assigned_score >= unassigned_score:
             return assigned_nodeid
+
+    if not unassigned:
+        return None
 
     best_score = max(score for score, _ in unassigned_scored)
     if best_score <= 0:
@@ -480,10 +572,18 @@ def _record_from_deep_eval_case(
             "latency_seconds": 0.0,
         }
     )
+    raw_metrics = list(getattr(tc, "metrics_data", None) or [])
+    unscored_metrics = [
+        str(getattr(metric, "name", "unnamed_metric"))
+        for metric in raw_metrics
+        if getattr(metric, "score", None) is None
+    ]
+    if unscored_metrics:
+        metadata["unscored_metrics"] = unscored_metrics
     metrics = [
         MetricRecord(
             metric_name=str(metric.name),
-            score=_safe_float(getattr(metric, "score", 0.0)),
+            score=_safe_float(metric.score),
             threshold=_safe_float(getattr(metric, "threshold", 0.70), 0.70),
             success=bool(getattr(metric, "success", False)),
             reason=(
@@ -498,7 +598,8 @@ def _record_from_deep_eval_case(
                 else None
             ),
         )
-        for metric in (getattr(tc, "metrics_data", None) or [])
+        for metric in raw_metrics
+        if getattr(metric, "score", None) is not None
     ]
 
     raw_context = getattr(tc, "context", None)
@@ -609,6 +710,10 @@ def _build_eval_test_case_records(
     assigned_nodeids: set[str] = set()
     records_by_nodeid: dict[str, Any] = {}
 
+    for nodeid, record in _EVAL_DIRECT_RECORDS.items():
+        if nodeid in nodeids:
+            records_by_nodeid[nodeid] = record
+
     for tc in deep_eval_cases:
         nodeid = _match_deep_eval_case_to_nodeid(tc, nodeids, assigned_nodeids)
         if nodeid is None:
@@ -672,7 +777,19 @@ def _write_session_message(session: pytest.Session, message: str) -> None:
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    """Persist one SQLite record for every selected eval pytest item."""
+    """Persist results without replacing pytest's original exit status."""
+    if session.config.option.collectonly:
+        return
+    if not any(_is_eval_item(item) for item in getattr(session, "items", [])):
+        return
+    try:
+        _persist_eval_session(session, exitstatus)
+    except Exception:
+        logger.warning("Could not persist evaluation results", exc_info=True)
+
+
+def _persist_eval_session(session: pytest.Session, exitstatus: int) -> None:
+    """Build and save evaluation observations for the completed session."""
     del exitstatus
     if session.config.option.collectonly:
         return
@@ -730,7 +847,12 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     run_id = (
         getattr(test_run, "identifier", None) if test_run else None
     ) or f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-    suite_name = (getattr(test_run, "test_file", None) if test_run else None) or "tests/evals"
+    recorded_suites = {str(record.suite) for record in test_case_records if record.suite}
+    suite_name = (
+        next(iter(recorded_suites))
+        if len(recorded_suites) == 1
+        else (getattr(test_run, "test_file", None) if test_run else None) or "tests/evals"
+    )
     eval_tag = session.config.getoption("--eval-tag", default=None)
     eval_tag = eval_tag.strip() if isinstance(eval_tag, str) else None
     eval_tag = eval_tag or None
@@ -827,6 +949,23 @@ class EvalSettings:
     openai_api_key: str = field(repr=False)
     trajectory_dir: Path
     golden_dir: Path
+    judge_llm: Any = field(default=None, repr=False, compare=False)
+
+
+_EVAL_LLM_REQUEST_TIMEOUT_SECONDS = 60
+
+
+def _build_bounded_judge_model(model_name: str, api_key: str, *, timeout: int = 60) -> Any:
+    """Build DeepEval's GPT model with a finite request timeout and no retries.
+
+    DeepEval 2.9.7's native GPT methods use Tenacity retry decorators without a
+    stop condition. Calling the wrapped method body directly preserves its
+    response parsing and cost accounting while ensuring a failed request ends
+    the current test instead of retrying indefinitely.
+    """
+    from remediation_engine.evals.judge import build_bounded_judge_model
+
+    return build_bounded_judge_model(model_name, api_key, timeout=timeout)
 
 
 @pytest.fixture(autouse=True)
@@ -865,6 +1004,15 @@ def eval_settings(request: pytest.FixtureRequest) -> EvalSettings:
         openai_api_key=api_key,
         trajectory_dir=trajectory_dir,
         golden_dir=_DEFAULT_GOLDEN_DIR,
+        judge_llm=(
+            _build_bounded_judge_model(
+                judge_model,
+                api_key,
+                timeout=_EVAL_LLM_REQUEST_TIMEOUT_SECONDS,
+            )
+            if is_live and api_key
+            else None
+        ),
     )
 
 

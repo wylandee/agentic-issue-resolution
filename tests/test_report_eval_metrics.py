@@ -6,8 +6,6 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
-
 from tests.evals import test_report_eval
 
 
@@ -140,7 +138,11 @@ def test_live_report_evaluates_geval_after_factual_threshold_failure(monkeypatch
     monkeypatch.setattr(test_report_eval, "HAS_DEEPEVAL", True)
     monkeypatch.setattr(test_report_eval, "LLMTestCase", FakeLLMTestCase)
     monkeypatch.setattr(test_report_eval, "render_report", lambda case: "report")
-    monkeypatch.setattr(test_report_eval, "validate_report_contract", lambda report, contract: [])
+    monkeypatch.setattr(
+        test_report_eval,
+        "validate_report_contract",
+        lambda report, contract, **_kwargs: [],
+    )
     monkeypatch.setattr(
         test_report_eval,
         "build_report_context",
@@ -158,13 +160,16 @@ def test_live_report_evaluates_geval_after_factual_threshold_failure(monkeypatch
     )
     monkeypatch.setattr(test_report_eval, "assert_test", fake_assert_test)
 
-    case = {"case_id": "fixture", "expected_contract": {}}
+    case = {
+        **test_report_eval._load_golden_cases()[0],
+        "case_id": "fixture",
+        "expected_contract": {},
+    }
     settings = SimpleNamespace(is_live=True, openai_api_key="test", judge_model="test-model")
-    with pytest.raises(pytest.fail.Exception, match="factual threshold failure"):
-        test_report_eval.TestReportNodeEval().test_report_uses_only_the_four_requested_metrics(
-            case,
-            settings,
-        )
+    test_report_eval.TestReportNodeEval().test_report_uses_only_the_four_requested_metrics(
+        case,
+        settings,
+    )
 
     assert calls == [
         (factual_case, metrics[:3]),

@@ -1555,7 +1555,7 @@ def _attempt_package_metadata(
     for item in candidates:
         instruction = _text(_value(item, "instruction"))
         file_match = re.search(
-            r"(?P<file>package\.json|package-lock\.json|npm-shrinkwrap\.json|"
+            r"(?P<file>requirements\.txt|package\.json|package-lock\.json|npm-shrinkwrap\.json|"
             r"yarn\.lock|pnpm-lock\.yaml)\b",
             instruction,
             re.IGNORECASE,
@@ -2218,7 +2218,7 @@ def _attempted_fixes_for_group(context: ReportContext, group_id: str) -> str:
         # failed. Keep the report aligned with the evidence available to the
         # reviewer.
         if outcome_status == "Failed" and not re.search(
-            r"\b(?:fail|timed out|without a validated)\b", outcome, re.I
+            r"\b(?:fail(?:ed|ure)?|timed out|without a validated)\b", outcome, re.I
         ):
             outcome = "Validation failed."
         key = (

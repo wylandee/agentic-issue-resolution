@@ -572,10 +572,13 @@ class TestLLMExtractRemediation:
             reasoning="Upgrade recommended",
         )
 
-        with patch("langchain_openai.ChatOpenAI", return_value=mock_llm):
+        with patch("langchain_openai.ChatOpenAI", return_value=mock_llm) as chat_openai:
             pages = [{"url": "https://example.com", "content": "Update lodash to 4.17.21"}]
             result = _llm_extract_remediation(pages, "lodash", "CVE-2021-23337")
 
+        request_options = chat_openai.call_args.kwargs
+        assert request_options["request_timeout"] == 30
+        assert request_options["max_retries"] == 0
         assert result is not None
         assert result["strategy"] == "VERSION_BUMP"
         assert result["fixed_version"] == "4.17.21"

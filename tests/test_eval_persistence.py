@@ -157,6 +157,27 @@ def test_duplicate_deepeval_metrics_share_one_pytest_record(monkeypatch) -> None
     ]
 
 
+def test_direct_end_to_end_scores_are_persisted_with_their_pytest_item(monkeypatch) -> None:
+    nodeid = "tests/evals/test_end_to_end_eval.py::test_end_to_end_live_selected_run[run-1]"
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", f"{nodeid} (call)")
+    monkeypatch.setattr(eval_conftest, "_EVAL_DIRECT_RECORDS", {})
+    record = EvalTestCaseRecord(
+        case_id="run-1",
+        test_name="end_to_end[run-1]",
+        suite="end_to_end",
+        status="PASSED",
+    )
+
+    eval_conftest.record_eval_result(record)
+    saved = eval_conftest._build_eval_test_case_records(
+        SimpleNamespace(items=[_eval_item(nodeid)]), [], "test-model"
+    )
+
+    assert len(saved) == 1
+    assert saved[0].suite == "end_to_end"
+    assert saved[0].additional_metadata["pytest_nodeid"] == nodeid
+
+
 class _OptionParser:
     """Minimal pytest parser double for option-registration tests."""
 
@@ -177,6 +198,41 @@ def test_eval_cli_options_are_registered() -> None:
     assert parser.options["--run-eval-live"]["default"] is False
     assert parser.options["--eval-tag"]["default"] is None
     assert parser.options["--eval-baseline"]["default"] is None
+    assert parser.options["--e2e-trajectory"]["action"] == "append"
+    assert parser.options["--e2e-run-repo"]["default"] is None
+    assert parser.options["--e2e-input"]["default"] is None
+
+
+def test_end_to_end_pytest_inputs_are_explicit_and_repeatable(tmp_path) -> None:
+    class Config:
+        def __init__(self, values):
+            self.values = values
+
+        def getoption(self, name, default=None):
+            return self.values.get(name, default)
+
+    class Metafunc:
+        fixturenames = ["e2e_source"]
+
+        def __init__(self, values):
+            self.config = Config(values)
+            self.parameters = None
+
+        def parametrize(self, name, values, ids):
+            self.parameters = (name, values, ids)
+
+    trajectory_one = tmp_path / "one.md"
+    trajectory_two = tmp_path / "two.md"
+    metafunc = Metafunc({"--e2e-trajectory": [trajectory_one, trajectory_two]})
+    eval_conftest.pytest_generate_tests(metafunc)
+    assert metafunc.parameters[0] == "e2e_source"
+    assert [item["path"] for item in metafunc.parameters[1]] == [trajectory_one, trajectory_two]
+
+    missing_half = Metafunc({"--e2e-run-repo": tmp_path})
+    import pytest
+
+    with pytest.raises(pytest.UsageError, match="must be supplied together"):
+        eval_conftest.pytest_generate_tests(missing_half)
 
 
 def test_git_metadata_collects_branch_commit_and_dirty_state(monkeypatch) -> None:
@@ -213,10 +269,13 @@ def test_git_metadata_uses_none_when_git_is_unavailable(monkeypatch) -> None:
 def _session_with_options(options: dict[str, object], reporter: object) -> SimpleNamespace:
     """Build a minimal pytest session for session-finish hook tests."""
     config = SimpleNamespace(
+        option=SimpleNamespace(collectonly=False),
         pluginmanager=SimpleNamespace(get_plugin=lambda name: reporter),
         getoption=lambda name, default=None: options.get(name, default),
     )
-    return SimpleNamespace(config=config, items=[])
+    return SimpleNamespace(
+        config=config, items=[_eval_item("tests/evals/test_report_eval.py::test_session")]
+    )
 
 
 def test_session_finish_saves_tag_and_resolves_baseline_before_save(monkeypatch) -> None:
@@ -370,3 +429,75 @@ def test_session_finish_warns_for_missing_baseline_without_raising(monkeypatch) 
 
     assert events == ["resolve", "save"]
     assert any("was not found" in line for line in reporter.lines)
+
+
+def test_single_selected_item_keeps_all_metrics(monkeypatch):
+    nodeid = "tests/evals/test_update_subagent_eval.py::test_live_replay[single]"
+    monkeypatch.setattr(
+        eval_conftest, "_EVAL_TEST_REPORTS", {nodeid: {"call": _report(nodeid, "passed")}}
+    )
+    records = eval_conftest._build_eval_test_case_records(
+        SimpleNamespace(items=[_eval_item(nodeid)]),
+        [
+            _deep_eval_case("single", "Tool Correctness"),
+            _deep_eval_case("single", "Task Completion"),
+        ],
+        "offline-judge",
+    )
+    assert [metric.metric_name for metric in records[0].metrics] == [
+        "Tool Correctness",
+        "Task Completion",
+    ]
+
+
+def test_unscored_metric_is_not_persisted_as_a_zero_score(monkeypatch):
+    nodeid = "tests/evals/test_business_rules.py::test_missing_telemetry"
+    monkeypatch.setattr(
+        eval_conftest, "_EVAL_TEST_REPORTS", {nodeid: {"call": _report(nodeid, "passed")}}
+    )
+    case = _deep_eval_case("missing-telemetry", "Token Budget")
+    case.metrics_data[0].score = None
+    case.metrics_data[0].success = None
+
+    records = eval_conftest._build_eval_test_case_records(
+        SimpleNamespace(items=[_eval_item(nodeid)]), [case], "test-model"
+    )
+
+    assert records[0].metrics == []
+    assert records[0].additional_metadata["unscored_metrics"] == ["Token Budget"]
+
+
+def test_explicit_identity_wins_over_case_name_heuristics(monkeypatch):
+    first = "tests/evals/test_report_eval.py::test_report[one]"
+    second = "tests/evals/test_report_eval.py::test_report[two]"
+    monkeypatch.setattr(
+        eval_conftest,
+        "_EVAL_TEST_REPORTS",
+        {node: {"call": _report(node, "passed")} for node in (first, second)},
+    )
+    case = _deep_eval_case("one", "Faithfulness")
+    case.additional_metadata["pytest_nodeid"] = second
+    assert eval_conftest._match_deep_eval_case_to_nodeid(case, [first, second], set()) == second
+
+
+def test_session_persistence_failure_preserves_original_failure(monkeypatch):
+    monkeypatch.setattr(
+        eval_conftest,
+        "_persist_eval_session",
+        lambda *_: (_ for _ in ()).throw(ImportError("broken import")),
+    )
+    eval_conftest.pytest_sessionfinish(_session_with_options({}, None), 1)
+
+
+def test_session_without_evaluation_items_does_not_import_persistence(monkeypatch):
+    monkeypatch.setattr(
+        eval_conftest,
+        "_persist_eval_session",
+        lambda *_: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    eval_conftest.pytest_sessionfinish(
+        SimpleNamespace(
+            config=SimpleNamespace(option=SimpleNamespace(collectonly=False)), items=[]
+        ),
+        2,
+    )

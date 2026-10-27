@@ -66,6 +66,7 @@ SERPER_SEARCH_URL = "https://google.serper.dev/search"
 
 _REQUEST_TIMEOUT = 10  # seconds
 _READ_WEB_PAGE_TIMEOUT = 15
+_LLM_REQUEST_TIMEOUT_SECONDS = 30
 _READ_WEB_PAGE_MAX_CHARS = 16_000
 _JINA_READER_URL_PREFIX = "https://r.jina.ai/"
 _GITHUB_API_URL_PREFIX = "https://api.github.com/"
@@ -864,7 +865,13 @@ def _llm_extract_remediation(
     )
 
     try:
-        llm = ChatOpenAI(model=model_name, temperature=0, api_key=api_key)
+        llm = ChatOpenAI(
+            model=model_name,
+            temperature=0,
+            api_key=api_key,
+            request_timeout=_LLM_REQUEST_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
         structured_llm = llm.with_structured_output(SerperLLMResult)
         result: SerperLLMResult = structured_llm.invoke(prompt_text)
         return result.model_dump()

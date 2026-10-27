@@ -74,3 +74,24 @@ htmlcov/
 *.swo
 .DS_Store
 Thumbs.db
+# Demo local runtime data and machine-specific files
+/demo/.env
+/demo/.env.*
+!/demo/.env.example
+/demo/workspace/
+/demo/workspaces/
+/demo/data/workspace/
+/demo/data/workspaces/
+/demo/data/clones/
+/demo/data/cache/
+/demo/data/reports/
+/demo/data/trajectories/
+/demo/data/logs/
+
+# Demo frontend/backend generated dependencies and build output
+/demo/frontend/node_modules/
+/demo/frontend/dist/
+/demo/frontend/.vite/
+/demo/backend/.venv/
+/demo/backend/__pycache__/
+/demo/backend/.pytest_cache/
