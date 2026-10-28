@@ -119,19 +119,22 @@ committed stage are historical context, not a request to repeat that strategy.
 The Allowed Tactical Strategies inventory in the dynamic context is the
 authoritative strategy boundary: select exactly one strategy from that list.
 The registry candidate inventory additionally constrains versions, package
-targets, and dependency types for VERSION_BUMP and PACKAGE_OVERRIDE; it does
-not make VERSION_BUMP mandatory merely because a candidate exists. Prefer the
-strategy that most directly addresses the dominant failure mode with the
-smallest justified change. Compare the selected strategy with its leading
-alternative and state the expected validation signal in the rationale.
+targets, and dependency types for VERSION_BUMP and PACKAGE_OVERRIDE. For a
+transitive finding, use a verified VERSION_BUMP targeting its declared parent
+while a compatible parent candidate is available. A PACKAGE_OVERRIDE on the
+vulnerable child is a fallback after parent candidates are exhausted, or when
+the committed stage explicitly authorizes that override. For other findings,
+prefer the strategy that most directly addresses the dominant failure mode
+with the smallest justified change. Compare the selected strategy with its
+leading alternative and state the expected validation signal in the rationale.
 
 Use these evidence rules as a preference order, not as a mandatory stage
 ladder or an instruction to exhaust every update stage:
 1. Breaking API or confirmed source incompatibility -> immediate
    CODE_WORKAROUND when it is allowed.
-2. Transitive parent incompatibility with no compatible parent candidate and a
-   verified child candidate -> PACKAGE_OVERRIDE on the vulnerable child using
-   the native override field.
+2. Transitive parent incompatibility with no remaining compatible parent
+   candidate and a verified child candidate -> PACKAGE_OVERRIDE on the
+   vulnerable child using the native override field.
 3. Unresolved peer conflict with no compatible candidate ->
    ESCALATE_TO_PORTFOLIO as a Phase 2 referral only, when it is allowed.
 4. Otherwise, a direct dependency or compatible parent with eligible
@@ -739,8 +742,14 @@ def _build_supervisor_dynamic_context(
     # candidate but the vulnerable child has override candidates, the prompt
     # should describe the child override only; retaining the dead parent in the
     # prompt caused the model to label the action as a parent VERSION_BUMP.
+    parent_update_available = _has_available_parent_update_candidate(context)
     actionable_candidates = tuple(
-        candidate for candidate in context.candidate_sets if candidate.versions
+        candidate
+        for candidate in context.candidate_sets
+        if candidate.versions
+        and not (
+            parent_update_available and candidate.strategy == TacticalStrategy.PACKAGE_OVERRIDE
+        )
     )
     parent_action_available = any(
         candidate.strategy == TacticalStrategy.VERSION_BUMP for candidate in actionable_candidates
@@ -1132,6 +1141,25 @@ def _candidate_set_for_action(
     )
 
 
+def _has_available_parent_update_candidate(context: TacticalDiagnosticContext) -> bool:
+    """Return whether a transitive task still has a verified parent update."""
+    if (
+        not is_transitive_group(context.group)
+        or context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE
+    ):
+        return False
+    target_package = _target_package_name(context.task, context.group)
+    if not target_package:
+        return False
+    candidate = _candidate_set_for_action(
+        context,
+        TacticalStrategy.VERSION_BUMP,
+        target_package,
+        _target_dependency_type(context.task, context.group),
+    )
+    return candidate is not None and bool(candidate.versions)
+
+
 def _approved_candidate_pool(
     context: TacticalDiagnosticContext,
     package_name: str,
@@ -1230,10 +1258,10 @@ def registry_candidate_sets_for_context(
 ) -> tuple[tuple[TacticalCandidateSet, ...], str | None]:
     """Resolve separate verified whitelists for direct, parent, and child actions.
 
-    The parent package is used for a transitive version bump, while a package
-    override is always verified against the vulnerable child package.  This
-    distinction prevents a parent candidate from accidentally authorizing a
-    child override.
+    A transitive task prefers a verified parent update.  The vulnerable child
+    override is considered only when the parent has no remaining compatible
+    candidates, or when the committed stage explicitly authorizes an override.
+    Parent and child candidates are never interchangeable.
     """
     if context.task.strategy == RoutingStrategy.CODE_WORKAROUND:
         return (), None
@@ -1273,6 +1301,15 @@ def registry_candidate_sets_for_context(
     result: list[TacticalCandidateSet] = []
     try:
         for strategy, package_name, dependency_type in targets:
+            if (
+                strategy == TacticalStrategy.PACKAGE_OVERRIDE
+                and context.task.strategy_stage != SCARemediationStage.PACKAGE_OVERRIDE
+                and any(
+                    candidate.strategy == TacticalStrategy.VERSION_BUMP and candidate.versions
+                    for candidate in result
+                )
+            ):
+                continue
             assert package_name is not None
             approved_pool = _approved_candidate_pool(context, package_name, dependency_type)
             if strategy == TacticalStrategy.VERSION_BUMP and is_transitive_group(context.group):
@@ -1747,6 +1784,14 @@ def verify_tactical_action(
     ):
         return TacticalVerification(
             False, "Package overrides are restricted to transitive findings."
+        )
+    if (
+        action.selected_strategy == TacticalStrategy.PACKAGE_OVERRIDE
+        and _has_available_parent_update_candidate(context)
+    ):
+        return TacticalVerification(
+            False,
+            "A verified parent update is available; complete the parent update before switching to a package override.",
         )
     evidence = context.evaluation.failure_evidence if context.evaluation else None
     proposal_hints = _safe_relative_file_hints(

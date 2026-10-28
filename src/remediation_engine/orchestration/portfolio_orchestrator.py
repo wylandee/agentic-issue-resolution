@@ -916,6 +916,12 @@ def materialize_synthetic_dependency_tasks(
                 or (manifest_path, package_name) in records_by_key
             ):
                 continue
+            parent_name = (task.parent_package_name or group.parent_package_name or "").strip()
+            if parent_name and (manifest_path, parent_name) in records_by_key:
+                # The normal task already targets this directly declared
+                # parent. Keep its parent-first stages and let the solver
+                # choose a compatible release before considering an override.
+                continue
             fixed_version = (
                 group.fix_plan.fixed_version.strip()
                 if group.fix_plan and group.fix_plan.fixed_version

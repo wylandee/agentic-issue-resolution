@@ -106,7 +106,7 @@ def test_supervisor_prompt_keeps_static_and_dynamic_messages_separate() -> None:
         in normalized_static_prompt
     )
     assert (
-        "The registry candidate inventory additionally constrains versions, package targets, and dependency types for VERSION_BUMP and PACKAGE_OVERRIDE"
+        "The registry candidate inventory additionally constrains versions"
         in normalized_static_prompt
     )
     assert (
@@ -168,6 +168,65 @@ def test_prompt_hides_dead_parent_when_override_is_the_only_registry_action() ->
     assert "action=version_bump" not in prompt
     assert "direct-parent" not in prompt
     assert "Parent package:" not in prompt
+
+
+def test_verified_parent_candidate_prevents_child_override_pivot() -> None:
+    group = _group().model_copy(
+        update={
+            "parent_contexts": [
+                DependencyParentContext(
+                    package_name="direct-parent",
+                    package_version="1.0.0",
+                    declaration_type="dependencies",
+                )
+            ]
+        }
+    )
+    task = _task().model_copy(
+        update={
+            "target_package_name": "direct-parent",
+            "target_dependency_type": "dependencies",
+        }
+    )
+    context = build_tactical_context(
+        task,
+        group,
+        candidate_sets=(
+            TacticalCandidateSet(
+                strategy=TacticalStrategy.VERSION_BUMP,
+                target_package_name="direct-parent",
+                dependency_type="dependencies",
+                security_floor="1.2.3",
+                versions=("1.2.3",),
+                canonical_version="1.2.3",
+            ),
+            TacticalCandidateSet(
+                strategy=TacticalStrategy.PACKAGE_OVERRIDE,
+                target_package_name="test-pkg",
+                dependency_type="overrides",
+                security_floor="1.2.3",
+                versions=("2.0.1",),
+                canonical_version="2.0.1",
+            ),
+        ),
+    )
+    prompt = build_supervisor_messages(context)[1].content
+    action = PackageOverrideSupervisorAction(
+        diagnostic_basis="The child also has a verified override candidate.",
+        selected_strategy=TacticalStrategy.PACKAGE_OVERRIDE,
+        target_version="2.0.1",
+        rationale="The override would avoid changing the parent.",
+    )
+
+    verification = verify_tactical_action(context, action)
+
+    assert "action=version_bump: target=direct-parent" in prompt
+    assert "action=package_override" not in prompt
+    assert "- Strategies: version_bump, code_workaround" in prompt
+    assert verification.accepted is False
+    assert verification.reason == (
+        "A verified parent update is available; complete the parent update before switching to a package override."
+    )
 
 
 def test_verified_noncanonical_candidate_can_be_selected_with_rationale() -> None:
@@ -772,6 +831,56 @@ def test_transitive_inventory_keeps_child_override_when_parent_has_no_compatible
     assert candidate_sets[0].versions == ()
     assert candidate_sets[1].target_package_name == "test-pkg"
     assert candidate_sets[1].versions == ("2.0.1",)
+
+
+def test_transitive_inventory_suppresses_child_override_when_parent_is_compatible() -> None:
+    group = _group().model_copy(
+        update={
+            "parent_contexts": [
+                DependencyParentContext(
+                    package_name="direct-parent",
+                    package_version="1.0.0",
+                    declaration_type="dependencies",
+                )
+            ]
+        }
+    )
+    task = _task().model_copy(
+        update={
+            "target_package_name": "direct-parent",
+            "target_dependency_type": "dependencies",
+        }
+    )
+    child_registry_calls: list[str] = []
+
+    def provider(package_name: str, _security_floor: str, _attempted_versions: set[str]):
+        child_registry_calls.append(package_name)
+        return [
+            RegistryCandidate(
+                version="2.0.1",
+                semver_key=(2, 0, 1),
+                security_floor_met=True,
+                is_stable=True,
+                same_major=False,
+                already_attempted=False,
+            )
+        ]
+
+    with patch(
+        "remediation_engine.orchestration.tactical_supervisor._supervisor_plan_npm_parent_version",
+        return_value="- Eligible Candidates: 1.2.3\n- Selected Version: 1.2.3",
+    ):
+        candidate_sets, error = registry_candidate_sets_for_context(
+            build_tactical_context(task, group),
+            registry_provider=provider,
+        )
+
+    assert error is None
+    assert child_registry_calls == []
+    assert len(candidate_sets) == 1
+    assert candidate_sets[0].strategy == TacticalStrategy.VERSION_BUMP
+    assert candidate_sets[0].target_package_name == "direct-parent"
+    assert candidate_sets[0].versions == ("1.2.3",)
 
 
 def test_package_override_stage_does_not_require_parent_version() -> None:

@@ -43,6 +43,7 @@ from remediation_engine.runtime.path_policy import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_IMAGE = "node:22"
+_PINNED_NODE_NPM_VERSION = "11.19.1"
 _DEFAULT_TIMEOUT_SECONDS = 300
 _SKIP_DIR_NAMES = frozenset({".git", "node_modules"})
 _WORKSPACE_SNAPSHOT_DIR = ".remedy-attempt-snapshots"
@@ -324,7 +325,12 @@ class DockerSandbox:
 
     @traceable(run_type="tool", name="docker_sandbox.start")
     def start(self) -> None:
-        """Start the sandbox container and prepare ``/workspace``."""
+        """Start the sandbox container and prepare ``/workspace``.
+
+        Node images have npm pinned before workspace setup so nested install
+        scripts use the same resolver version as top-level npm commands. This
+        may contact the npm registry when the image has a different npm version.
+        """
         self.invalidate_read_cache("sandbox_start")
         try:
             import docker.errors as docker_errors  # type: ignore[import]
@@ -365,6 +371,29 @@ class DockerSandbox:
                 self._image,
             )
             self._container = client.containers.run(self._image, **run_kwargs)
+
+            if self._image.startswith("node:"):
+                # npm 10's Arborist crashes while resolving some optional peer
+                # sets (including the Vitest graph); pin npm for both the
+                # initial install and any nested postinstall npm commands.
+                npm_pin_command = (
+                    f'if [ "$(npm --version 2>/dev/null)" '
+                    f'!= "{_PINNED_NODE_NPM_VERSION}" ]; then '
+                    f"npm install --global npm@{_PINNED_NODE_NPM_VERSION}; fi && "
+                    f'test "$(npm --version)" = "{_PINNED_NODE_NPM_VERSION}"'
+                )
+                exit_code, output = self._container.exec_run(["/bin/sh", "-lc", npm_pin_command])
+                if exit_code != 0:
+                    detail = (
+                        output.decode("utf-8", errors="replace")
+                        if isinstance(output, bytes)
+                        else str(output or "")
+                    )
+                    raise RuntimeError(
+                        "DockerSandbox: failed to pin npm to "
+                        f"{_PINNED_NODE_NPM_VERSION} (exit {exit_code}): "
+                        f"{detail or 'no diagnostic output'}"
+                    )
 
             exit_code, output = self._container.exec_run("mkdir -p /workspace")
             if exit_code != 0:
