@@ -13,7 +13,7 @@ import logging
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from functools import cmp_to_key, lru_cache
+from functools import lru_cache
 from typing import Any
 
 from langsmith import traceable
@@ -34,7 +34,6 @@ from remediation_engine.contracts.solver_models import (
     SolverTaskDecision,
     SolverVersionCandidate,
 )
-from remediation_engine.contracts.version_policy import compare_maven_versions
 from remediation_engine.settings import DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET
 
 _MAX_DIAGNOSTICS = 64
@@ -159,55 +158,16 @@ def _diagnostic(values: list[str], message: str) -> None:
         values.append(message)
 
 
-def _compare_versions(left: str, right: str, version_scheme: str) -> int:
-    """Compare versions using the ecosystem-specific ordering contract."""
-    if version_scheme == "maven":
-        return compare_maven_versions(left, right)
-    left_key = _version_key(left)
-    right_key = _version_key(right)
-    if left_key is None or right_key is None:
-        raise ValueError("invalid semantic version")
-    return (left_key > right_key) - (left_key < right_key)
-
-
-def _compare_candidates(left: SolverVersionCandidate, right: SolverVersionCandidate) -> int:
-    """Sort candidates with their declared ecosystem ordering."""
-    if left.version_scheme != right.version_scheme:
-        return (left.version_scheme > right.version_scheme) - (
-            left.version_scheme < right.version_scheme
-        )
-    if left.version_scheme == "semver":
-        left_key = _version_key(left.version)
-        right_key = _version_key(right.version)
-        if left_key is None or right_key is None:
-            if left_key is not None:
-                return -1
-            if right_key is not None:
-                return 1
-            left_tie = (left.version, left.source)
-            right_tie = (right.version, right.source)
-            return (left_tie > right_tie) - (left_tie < right_tie)
-        comparison = (left_key > right_key) - (left_key < right_key)
-    else:
-        try:
-            comparison = _compare_versions(left.version, right.version, left.version_scheme)
-        except ValueError:
-            try:
-                _compare_versions(left.version, left.version, left.version_scheme)
-                return 1
-            except ValueError:
-                try:
-                    _compare_versions(right.version, right.version, right.version_scheme)
-                    return -1
-                except ValueError:
-                    left_tie = (left.version, left.source)
-                    right_tie = (right.version, right.source)
-                    return (left_tie > right_tie) - (left_tie < right_tie)
-    if comparison:
-        return comparison
-    left_tie = (left.version, left.source)
-    right_tie = (right.version, right.source)
-    return (left_tie > right_tie) - (left_tie < right_tie)
+def _candidate_key(candidate: SolverVersionCandidate) -> tuple[Any, ...]:
+    """Sort candidates by semantic version and then by stable source/version."""
+    key = tuple(candidate.semver_key)
+    if not key:
+        parts: list[int] = []
+        for token in candidate.version.lstrip("vV").split(".")[:3]:
+            digits = "".join(char for char in token if char.isdigit())
+            parts.append(int(digits or 0))
+        key = tuple(parts)
+    return key, candidate.version, candidate.source
 
 
 def _version_key(value: str | None) -> tuple[int, ...] | None:
@@ -239,32 +199,19 @@ def _stable_semver_major(value: str | None) -> int | None:
     return None if parsed.prerelease else parsed.major
 
 
-def _at_least(version: str, floor: str | None, version_scheme: str = "semver") -> bool:
+def _at_least(version: str, floor: str | None) -> bool:
     """Return whether a candidate version is at least a security floor."""
     if not floor:
         return True
-    if ".post" in version.casefold() or ".post" in floor.casefold():
-        try:
-            from packaging.version import Version
-
-            return Version(version) >= Version(floor)
-        except Exception:  # noqa: BLE001 - malformed Python version is not proof
-            return False
-    try:
-        return _compare_versions(version, floor, version_scheme) >= 0
-    except (TypeError, ValueError):
-        return False
+    left = _version_key(version)
+    right = _version_key(floor)
+    return left is not None and right is not None and left >= right
 
 
-def _distance_above(version: str, floor: str | None, version_scheme: str = "semver") -> int:
+def _distance_above(version: str, floor: str | None) -> int:
     """Return a bounded numeric distance above a floor for objective ranking."""
     if not floor:
         return 0
-    if version_scheme == "maven":
-        try:
-            return int(compare_maven_versions(version, floor) > 0)
-        except (TypeError, ValueError):
-            return 1_000_000_000
     current = _version_key(version)
     minimum = _version_key(floor)
     if current is None or minimum is None:
@@ -358,9 +305,7 @@ def _objective_weights(
     max_distance = sum(
         max(
             (
-                _distance_above(
-                    candidate.version, floors[target.occurrence_id], target.version_scheme
-                )
+                _distance_above(candidate.version, floors[target.occurrence_id])
                 for candidate in domains[target.occurrence_id]
             ),
             default=0,
@@ -448,18 +393,12 @@ def _as_domain(
             _diagnostic(
                 diagnostics, f"candidate domain used task-id compatibility key for {target.task_id}"
             )
-    candidates = sorted(tuple(raw or ()), key=cmp_to_key(_compare_candidates))
+    candidates = sorted(tuple(raw or ()), key=_candidate_key)
     unique: list[SolverVersionCandidate] = []
     seen: set[str] = set()
     for candidate in candidates:
         if not isinstance(candidate, SolverVersionCandidate):
             _diagnostic(diagnostics, f"invalid candidate for occurrence {target.occurrence_id}")
-            continue
-        if candidate.version_scheme != target.version_scheme:
-            _diagnostic(
-                diagnostics,
-                f"candidate version scheme does not match target {target.occurrence_id}",
-            )
             continue
         if candidate.version in seen:
             _diagnostic(
@@ -472,18 +411,13 @@ def _as_domain(
 
     installed_version = str(target.installed_version or "").strip().lstrip("vV")
     if installed_version and installed_version not in seen:
-        installed_key = (
-            _version_key(installed_version) if target.version_scheme == "semver" else None
-        )
+        installed_key = _version_key(installed_version)
         unique.append(
             SolverVersionCandidate(
                 version=installed_version,
-                version_scheme=target.version_scheme,
                 semver_key=installed_key or (),
                 source="current",
-                meets_security_floor=_at_least(
-                    installed_version, security_floor, target.version_scheme
-                ),
+                meets_security_floor=_at_least(installed_version, security_floor),
             )
         )
         seen.add(installed_version)
@@ -500,7 +434,7 @@ def _as_domain(
             f"candidate resource guard exceeded for {target.occurrence_id}: "
             f"{len(unique)}>{max_candidates}; no candidates were pruned",
         )
-    return sorted(unique, key=cmp_to_key(_compare_candidates))
+    return sorted(unique, key=_candidate_key)
 
 
 def _floor_for_target(
@@ -519,51 +453,17 @@ def _floor_for_target(
     )
     floors: list[str] = []
     for finding in requirements:
-        fixed = finding.direct_parent_minimum_version or finding.fixed_version
-        if not fixed:
+        if not finding.fixed_version:
             continue
-        if target.version_scheme == "maven":
-            try:
-                _compare_versions(fixed, fixed, target.version_scheme)
-            except (TypeError, ValueError):
-                valid = False
-            else:
-                valid = True
-        else:
-            valid = _version_key(fixed) is not None
-            if ".post" in fixed.casefold():
-                try:
-                    from packaging.version import Version
-
-                    parsed = Version(fixed)
-                    valid = (
-                        parsed.epoch == 0 and not parsed.is_prerelease and not parsed.is_devrelease
-                    )
-                except Exception:  # noqa: BLE001 - malformed PEP 440 floor is not proof
-                    valid = False
-        if not valid:
+        if _version_key(finding.fixed_version) is None:
             _diagnostic(
                 diagnostics,
-                f"invalid security floor {fixed!r} for {finding.coverage_id}",
+                f"invalid security floor {finding.fixed_version!r} for {finding.coverage_id}",
             )
             continue
-        floors.append(fixed)
+        floors.append(finding.fixed_version)
     if not floors:
         return None
-    if target.version_scheme == "maven":
-        return max(
-            floors,
-            key=cmp_to_key(
-                lambda left, right: _compare_versions(left, right, target.version_scheme)
-            ),
-        )
-    if any(".post" in item.casefold() for item in floors):
-        try:
-            from packaging.version import Version
-
-            return str(max(Version(item) for item in floors))
-        except Exception:  # noqa: BLE001 - validation above already failed closed
-            return None
     return max(floors, key=lambda item: _version_key(item) or ())
 
 
@@ -833,7 +733,7 @@ def _compatible_alternatives(
         if (
             index == selected_index
             or not candidate.meets_security_floor
-            or not _at_least(candidate.version, floor, target.version_scheme)
+            or not _at_least(candidate.version, floor)
         ):
             continue
         is_compatible = True
@@ -968,7 +868,6 @@ def _project_candidate_plan(
         _distance_above(
             domains[occurrence_id][selected_indices[occurrence_id]].version,
             floors[occurrence_id],
-            target_by_id[occurrence_id].version_scheme,
         )
         for occurrence_id in selected_indices
     )
@@ -1088,9 +987,6 @@ def _build_decision(
             "Migrate all affected production and test code to the selected package API "
             "while preserving behavior; do not change the solver-approved package or version."
         )
-    parent_requirement = next(
-        (finding for finding in requirements if finding.direct_parent_name), None
-    )
     return SolverTaskDecision(
         task_id=target.task_id,
         selected_strategy=strategy,
@@ -1110,23 +1006,6 @@ def _build_decision(
         manifest_path=target.manifest_path,
         lockfile_package_key=target.lockfile_package_key,
         dependency_type=None if non_mutating_workaround else target.dependency_type,
-        parent_package_name=(
-            parent_requirement.direct_parent_name if parent_requirement is not None else None
-        ),
-        parent_package_version=(
-            target.installed_version if parent_requirement is not None else None
-        ),
-        parent_minimum_version=(
-            parent_requirement.direct_parent_minimum_version
-            if parent_requirement is not None
-            else None
-        ),
-        vulnerable_package_name=(
-            parent_requirement.vulnerable_package if parent_requirement is not None else None
-        ),
-        vulnerable_fixed_version=(
-            parent_requirement.fixed_version if parent_requirement is not None else None
-        ),
     )
 
 
@@ -1159,7 +1038,9 @@ def _validate_forbidden_assignments(
                 malformed = True
                 break
             version = raw_version.strip().lstrip("vV")
-            if version not in {candidate.version for candidate in domains.get(occurrence_id, ())}:
+            if _version_key(version) is None or version not in {
+                candidate.version for candidate in domains.get(occurrence_id, ())
+            }:
                 diagnostics.append(
                     f"forbidden assignment {index} references an unknown version "
                     f"{version!r} for {occurrence_id!r}"
@@ -1991,13 +1872,9 @@ def solve_portfolio(
             sum(
                 1
                 for candidate in domains.get(finding.target_occurrence_id, ())
-                if (finding.direct_parent_minimum_version or finding.fixed_version)
+                if finding.fixed_version
                 and candidate.meets_security_floor
-                and _at_least(
-                    candidate.version,
-                    finding.direct_parent_minimum_version or finding.fixed_version,
-                    candidate.version_scheme,
-                )
+                and _at_least(candidate.version, finding.fixed_version)
             )
             for finding in finding_list
         )
@@ -2073,11 +1950,7 @@ def solve_portfolio(
                 not floor_required
                 or all(
                     candidate.meets_security_floor
-                    and _at_least(
-                        candidate.version,
-                        floors[target.occurrence_id],
-                        candidate.version_scheme,
-                    )
+                    and _at_least(candidate.version, floors[target.occurrence_id])
                     for _ in target_findings
                 )
             )
@@ -2626,17 +2499,12 @@ def solve_portfolio(
         occurrence_var = vars_by_id.get(finding.target_occurrence_id)
         candidates = domains.get(finding.target_occurrence_id, ())
         good_indices: list[int] = []
-        finding_floor = (
-            finding.direct_parent_minimum_version
-            if finding.direct_parent_name
-            else finding.fixed_version
-        )
-        if occurrence_var is not None and finding_floor:
+        if occurrence_var is not None and finding.fixed_version:
             good_indices = [
                 index
                 for index, candidate in enumerate(candidates)
                 if candidate.meets_security_floor
-                and _at_least(candidate.version, finding_floor, candidate.version_scheme)
+                and _at_least(candidate.version, finding.fixed_version)
             ]
         target = target_by_id.get(finding.target_occurrence_id)
         terminal_status = (
@@ -2645,12 +2513,8 @@ def solve_portfolio(
         if terminal_status is not None:
             status_quo_covered = (
                 terminal_status == "qa_passed"
-                and finding_floor is not None
-                and _at_least(
-                    target.installed_version,
-                    finding_floor,
-                    target.version_scheme,
-                )
+                and finding.fixed_version is not None
+                and _at_least(target.installed_version, finding.fixed_version)
             )
             model.Add(version_bool == int(status_quo_covered))
         elif occurrence_var is not None and good_indices:
@@ -2682,7 +2546,7 @@ def solve_portfolio(
                 # workaround carries the plan IDs that authorize it.
                 model.Add(workaround == 1)
         model.AddMaxEquality(covered, [version_bool, workaround])
-        coverage_meta[finding.coverage_id] = (good_indices, finding_floor)
+        coverage_meta[finding.coverage_id] = (good_indices, finding.fixed_version)
 
     candidate_literals: dict[str, list[Any]] = {}
     for target in eligible:
@@ -2742,7 +2606,7 @@ def solve_portfolio(
         )
         distance_terms.append(
             sum(
-                _distance_above(candidate.version, floor, target.version_scheme) * literals[index]
+                _distance_above(candidate.version, floor) * literals[index]
                 for index, candidate in enumerate(values)
             )
         )

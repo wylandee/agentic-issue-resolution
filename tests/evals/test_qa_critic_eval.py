@@ -261,18 +261,20 @@ def _build_qa_audit_completion_case(
     actual_output = test_case.actual_output
     if typed_result is not None:
         if isinstance(typed_result, Mapping):
-            category = typed_result.get("failure_category")
-            verdict = {
-                "passed": typed_result.get("passed"),
-                "failure_category": getattr(category, "value", category),
-            }
+            audit_evidence = dict(typed_result)
+        elif callable(getattr(typed_result, "model_dump", None)):
+            audit_evidence = typed_result.model_dump(mode="json")
         else:
-            category = getattr(typed_result, "failure_category", None)
-            verdict = {
+            audit_evidence = {
                 "passed": getattr(typed_result, "passed", None),
-                "failure_category": getattr(category, "value", category),
+                "failure_category": getattr(
+                    getattr(typed_result, "failure_category", None), "value", None
+                ),
             }
-        actual_output = f"Final typed QA evaluation emitted: {json.dumps(verdict, sort_keys=True)}"
+        actual_output = (
+            "Final typed QA evaluation and deterministic audit evidence: "
+            f"{json.dumps(audit_evidence, sort_keys=True, default=str)}"
+        )
     return LLMTestCase(
         name=f"{case['case_id']} [QA Audit Completion]",
         input=input_text,
@@ -396,6 +398,7 @@ class TestQACriticEval:
             elif tool_contract_applicable and DeepEvalToolCorrectnessMetric is not None:
                 tool_metric = DeepEvalToolCorrectnessMetric(
                     threshold=0.50,
+                    model=eval_settings.judge_llm or eval_settings.judge_model,
                     evaluation_params=[],
                     should_consider_ordering=True,
                     should_exact_match=False,
@@ -470,8 +473,8 @@ def test_compile_failure_does_not_require_an_exact_live_audit_tool_trace() -> No
     assert case["expected_tools"] == []
 
 
-def test_qa_completion_projection_uses_typed_verdict_not_tool_trace() -> None:
-    """Task Completion sees the typed audit result without remediation noise."""
+def test_qa_completion_projection_preserves_typed_audit_evidence_without_tool_trace() -> None:
+    """Task Completion sees typed gates and scanner evidence, without tool-call noise."""
     case = {"case_id": "qa_passed_candidate", "expected_task_completion_pass": True}
     test_case = LLMTestCase(
         name="QA test",
@@ -482,10 +485,16 @@ def test_qa_completion_projection_uses_typed_verdict_not_tool_trace() -> None:
     projected = _build_qa_audit_completion_case(
         case,
         test_case,
-        {"passed": True, "failure_category": None},
+        {
+            "passed": True,
+            "failure_category": None,
+            "deterministic_gates": {"tests_passed": True, "target_scanner_cleared": True},
+        },
     )
     assert "A correct rejection is a completed audit." in projected.input
     assert '"passed": true' in projected.actual_output
+    assert '"target_scanner_cleared": true' in projected.actual_output
+    assert "Long tool trace" not in projected.actual_output
     assert projected.tools_called == []
 
 

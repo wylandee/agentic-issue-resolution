@@ -61,13 +61,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep base64url as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for base64url (npm)</notes>
         <packageUrl regex="true">^pkg:npm/base64url@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for underscore.js (javascript)</notes>
@@ -129,13 +127,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep esbuild as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for esbuild (npm)</notes>
         <packageUrl regex="true">^pkg:npm/esbuild@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for express-jwt (npm)</notes>
@@ -191,13 +187,11 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
-<!--
     <suppress>
-        <notes>Keep jws as a selected Juice Shop fixture</notes>
+        <notes>Suppress all vulnerabilities for jws (npm)</notes>
         <packageUrl regex="true">^pkg:npm/jws@.*$</packageUrl>
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
--->
 
     <suppress>
         <notes>Suppress all vulnerabilities for lodash (javascript)</notes>
@@ -325,10 +319,114 @@
         <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+    <!-- Suppressions for newly detected vulnerabilities -->
+<!--
     <suppress>
-        <notes>Suppress all vulnerabilities for blaze.jar</notes>
-        <sha1>422762f7d9e5812d999db0cc7528b90ed0eef11c</sha1>
-        <cpe>cpe:/a:apache:ivy</cpe>
+        <notes>Suppress all vulnerabilities for @angular/router (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/%40angular%2Frouter@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
     </suppress>
 
+    <suppress>
+        <notes>Suppress all vulnerabilities for @hono/node-server (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/%40hono%2Fnode-server@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for @modelcontextprotocol/sdk (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/%40modelcontextprotocol%2Fsdk@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for @vitest/mocker (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/%40vitest%2Fmocker@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for baseline-browser-mapping (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/baseline-browser-mapping@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for braces (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/braces@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for browserslist (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/browserslist@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for colord (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/colord@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for immutable (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/immutable@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for ip-address (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/ip-address@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for pacote (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/pacote@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for postcss (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/postcss@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for postcss-selector-parser (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/postcss-selector-parser@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for proxy-addr (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/proxy-addr@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for qs (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/qs@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for source-map-js (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/source-map-js@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for vitest (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/vitest@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+
+    <suppress>
+        <notes>Suppress all vulnerabilities for zod (npm)</notes>
+        <packageUrl regex="true">^pkg:npm/zod@.*$</packageUrl>
+        <vulnerabilityName regex="true">.*</vulnerabilityName>
+    </suppress>
+    -->
 </suppressions>

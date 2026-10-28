@@ -60,6 +60,8 @@ def test_offline_runner_overrides_ambient_live_mode(monkeypatch) -> None:
     list(runner.run_eval_subprocess("report", is_live=False))
 
     assert captured_environment["EVAL_RUN_LIVE"] == "false"
+    assert captured_environment["EVAL_JUDGE_MODEL"] == "gpt-6-luna"
+    assert captured_environment["EVAL_JUDGE_REASONING_EFFORT"] == "max"
     assert "--run-eval-live" not in captured_command
 
 

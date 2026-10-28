@@ -36,7 +36,7 @@ dev = [
   "pytest-mock>=3,<4",
   "ruff>=0.15,<1",
 ]
-eval = ["deepeval>=2,<3", "pandas>=2,<3", "streamlit>=1.30,<2"]
+eval = ["deepeval>=4.3.1,<5", "openai>=2,<3", "pandas>=2,<3", "streamlit>=1.30,<2"]
 
 [project.scripts]
 remedy = "remediation_engine.cli:main"

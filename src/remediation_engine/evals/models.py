@@ -50,7 +50,7 @@ class EvalRunRecord(BaseModel):
     timestamp: str  # ISO format string
     tag: str | None = None
     suite_name: str = "eval_suite"
-    judge_model: str = "gpt-4o"
+    judge_model: str = "gpt-6-luna"
     is_live: bool = False
     total_tests: int = 0
     passed_tests: int = 0

@@ -13,6 +13,7 @@ import pytest
 from packaging.version import InvalidVersion, Version
 
 import remediation_engine.tools.fix_planner as fix_planner
+from remediation_engine.evals.judge import build_judge_score_metric
 from remediation_engine.settings import AppSettings
 from remediation_engine.tools.fix_planner import SerperLLMResult
 from tests.evals.conftest import EvalSettings
@@ -21,15 +22,14 @@ from tests.evals.golden_schema import load_golden_dataset, offline_fixture
 
 try:
     from deepeval import assert_test
-    from deepeval.metrics import FaithfulnessMetric, GEval
-    from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+    from deepeval.metrics import FaithfulnessMetric
+    from deepeval.test_case import LLMTestCase, SingleTurnParams
 
     HAS_DEEPEVAL = True
 except ImportError:
     HAS_DEEPEVAL = False
     LLMTestCase = None  # type: ignore[assignment,misc]
-    LLMTestCaseParams = None  # type: ignore[assignment,misc]
-    GEval = None  # type: ignore[assignment,misc]
+    SingleTurnParams = None  # type: ignore[assignment,misc]
     FaithfulnessMetric = None  # type: ignore[assignment,misc]
     assert_test = None  # type: ignore[assignment]
 
@@ -526,7 +526,7 @@ class TestFixPlannerEval:
                 f"Case '{case_id}' version mismatch: expected {expected_ver}, got {result.get('fixed_version')}"
             )
 
-        # 2. Live evaluation with DeepEval GEval
+        # 2. Live evaluation with structured rubric scoring
         if eval_settings.is_live:
             if not HAS_DEEPEVAL or assert_test is None:
                 pytest.skip("deepeval package is required for live evaluations")
@@ -548,7 +548,7 @@ class TestFixPlannerEval:
                 expected_output=expected_output,
             )
 
-            extraction_geval = GEval(
+            extraction_geval = build_judge_score_metric(
                 name="Fix Extraction Accuracy",
                 criteria=(
                     "Given web page content about a vulnerable package, evaluate whether "
@@ -559,9 +559,9 @@ class TestFixPlannerEval:
                     "strategy and non-null extracted values."
                 ),
                 evaluation_params=[
-                    LLMTestCaseParams.INPUT,
-                    LLMTestCaseParams.ACTUAL_OUTPUT,
-                    LLMTestCaseParams.EXPECTED_OUTPUT,
+                    SingleTurnParams.INPUT,
+                    SingleTurnParams.ACTUAL_OUTPUT,
+                    SingleTurnParams.EXPECTED_OUTPUT,
                 ],
                 threshold=0.70,
                 model=eval_settings.judge_llm or eval_settings.judge_model,
@@ -603,7 +603,7 @@ class TestFixPlannerEval:
             f"Case '{case_id}' must provide non-empty workaround_snippets for CODE_WORKAROUND"
         )
 
-        # 2. Live evaluation with DeepEval GEval
+        # 2. Live evaluation with structured rubric scoring
         if eval_settings.is_live:
             if not HAS_DEEPEVAL or assert_test is None:
                 pytest.skip("deepeval package is required for live evaluations")
@@ -619,7 +619,7 @@ class TestFixPlannerEval:
                 expected_output=str(case.get("expected_output", "")),
             )
 
-            workaround_geval = GEval(
+            workaround_geval = build_judge_score_metric(
                 name="Workaround Extraction Quality",
                 criteria=(
                     "Evaluate extraction fidelity only: whether each workaround accurately "
@@ -631,9 +631,9 @@ class TestFixPlannerEval:
                     "unsupported remediation claim."
                 ),
                 evaluation_params=[
-                    LLMTestCaseParams.INPUT,
-                    LLMTestCaseParams.ACTUAL_OUTPUT,
-                    LLMTestCaseParams.EXPECTED_OUTPUT,
+                    SingleTurnParams.INPUT,
+                    SingleTurnParams.ACTUAL_OUTPUT,
+                    SingleTurnParams.EXPECTED_OUTPUT,
                 ],
                 threshold=0.70,
                 model=eval_settings.judge_llm or eval_settings.judge_model,
@@ -819,7 +819,6 @@ def test_null_version_is_not_an_extracted_version_claim() -> None:
         )
         == {}
     )
-
 
 
 def test_pyyaml_golden_expected_version_matches_its_page_evidence() -> None:

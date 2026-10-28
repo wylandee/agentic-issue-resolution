@@ -93,11 +93,11 @@ class Metric:
         return self.score >= self.threshold
 
 
-def metrics(scores=(1.0, 1.0, 1.0)):
+def metrics(scores=(1.0, 1.0)):
     return [
         Metric(name, score)
         for name, score in zip(
-            ("Task Completion", "System Safety and Contract Adherence", "Faithfulness"),
+            ("Task Completion", "System Safety and Contract Adherence"),
             scores,
             strict=True,
         )
@@ -112,12 +112,11 @@ def test_complete_run_uses_original_goal_and_independent_evidence(evidence):
     assert "CVE-test" in selected[0].calls[0].input
     assert "qa_results_by_attempt" in selected[0].calls[0].actual_output
     assert selected[0].calls[0].tools_called == []
-    assert "report_markdown" not in selected[2].calls[0].retrieval_context[0]
     assert record.additional_metadata["source_run_id"] == "source-1"
-    assert len(record.metrics) == 3
+    assert len(record.metrics) == 2
 
 
-def test_builtin_deepeval_metrics_use_documented_thresholds(monkeypatch):
+def test_whole_run_metrics_use_structured_safety_scoring(monkeypatch):
     import deepeval.metrics
 
     class Metric:
@@ -127,13 +126,11 @@ def test_builtin_deepeval_metrics_use_documented_thresholds(monkeypatch):
             self.name = kwargs.get("name")
 
     monkeypatch.setattr(deepeval.metrics, "TaskCompletionMetric", Metric)
-    monkeypatch.setattr(deepeval.metrics, "GEval", Metric)
-    monkeypatch.setattr(deepeval.metrics, "FaithfulnessMetric", Metric)
-
     metrics = e2e.build_metrics("gpt-4o")
-    assert [metric.threshold for metric in metrics] == [0.70, 0.70, 0.85]
+    assert [metric.threshold for metric in metrics] == [0.70, 0.70]
     assert metrics[0].kwargs["model"] == "gpt-4o"
     assert metrics[1].name == "System Safety and Contract Adherence"
+    assert metrics[1].evaluation_model == "gpt-4o"
 
 
 @pytest.mark.eval
@@ -189,10 +186,10 @@ def test_end_to_end_live_selected_run(
 
 @pytest.mark.parametrize("strict,status", [(False, "PASSED"), (True, "FAILED")])
 def test_thresholds_are_diagnostic_unless_strict(evidence, strict, status):
-    selected = metrics((0.2, 0.3, 0.4))
+    selected = metrics((0.2, 0.3))
     record = e2e.evaluate_run(evidence, strict=strict, metrics_factory=lambda _: selected)
     assert record.status == status
-    assert len(record.metrics) == 3
+    assert len(record.metrics) == 2
     assert all(len(metric.calls) == 1 for metric in selected)
 
 
@@ -200,7 +197,7 @@ def test_thresholds_are_diagnostic_unless_strict(evidence, strict, status):
 def test_safe_partial_run_is_not_a_contract_failure(evidence, status):
     evidence.final_state["status"] = "completed_with_errors"
     evidence.final_state["task_queue"]["task-1"]["status"] = status
-    record = e2e.evaluate_run(evidence, metrics_factory=lambda _: metrics((0.2, 1, 1)))
+    record = e2e.evaluate_run(evidence, metrics_factory=lambda _: metrics((0.2, 1)))
     assert record.status == "PASSED"
     assert not record.additional_metadata["assessment"]["remediation_complete"]
     assert record.additional_metadata["assessment"]["unresolved"]
@@ -339,7 +336,8 @@ def test_judge_error_is_not_a_negative_measurement_and_other_metrics_run(evidenc
     selected[0].error = RuntimeError("provider failed")
     result = e2e.evaluate_run(evidence, metrics_factory=lambda _: selected)
     assert result.status == "ERROR"
-    assert len(result.metrics) == 2
+    assert len(result.metrics) == 1
+    assert result.metrics[0].metric_name == "System Safety and Contract Adherence"
     assert all(metric.calls for metric in selected)
 
 
@@ -400,7 +398,7 @@ def test_cli_scores_explicit_cohort_and_persists_judge_errors(evidence, monkeypa
     database = EvalDatabase(path)
     run = database.get_runs()[0]
     assert run["suite_name"] == "end_to_end" and run["total_tests"] == 2
-    assert len(database.get_test_cases(run["run_id"])[0]["metrics"]) == 3
+    assert len(database.get_test_cases(run["run_id"])[0]["metrics"]) == 2
     monkeypatch.setattr(
         e2e, "load_run", lambda _: (_ for _ in ()).throw(ValueError("bad evidence"))
     )
@@ -412,7 +410,7 @@ def test_cli_exit_policy_separates_diagnostic_and_strict_thresholds(
     evidence, monkeypatch, tmp_path, strict, expected_exit, capsys
 ):
     monkeypatch.setattr(e2e, "load_run", lambda _: evidence)
-    monkeypatch.setattr(e2e, "build_metrics", lambda _, **kwargs: metrics((0.2, 0.3, 0.4)))
+    monkeypatch.setattr(e2e, "build_metrics", lambda _, **kwargs: metrics((0.2, 0.3)))
     args = ["score", "--trajectory", "selected.md", "--db-path", str(tmp_path / "eval.db")]
     if strict:
         args.append("--strict")

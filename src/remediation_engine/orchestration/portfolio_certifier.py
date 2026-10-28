@@ -2243,10 +2243,11 @@ def _validate_final_coverage(
     selected_plan: SolverCandidatePlan,
     assignment: Mapping[str, str],
 ) -> tuple[list[str], list[str], list[str]]:
-    """Validate every known occurrence and reject newly introduced vulnerable copies."""
+    """Validate resolved coverage while preserving selected no-fix work for QA."""
     original_occurrences = {
         occurrence.occurrence_id: occurrence for occurrence in prepared.npm_snapshot.occurrences
     }
+    no_fix_task_ids = _selected_no_fix_task_ids(selected_plan)
     original_occurrence_ids = set(original_occurrences)
     floors_by_package: dict[tuple[str, str], list[str]] = {}
     for finding in prepared.findings:
@@ -2354,6 +2355,7 @@ def _validate_final_coverage(
         if finding.coverage_id in unresolved_ids
         and (target := targets_by_occurrence.get(finding.target_occurrence_id)) is not None
         and target.eligible_for_atomic_update
+        and target.task_id not in no_fix_task_ids
         and not target.is_terminal
     )
     if active_unresolved:
@@ -3354,10 +3356,11 @@ def _qa_prefix_evidence_errors(
     """Validate a checkpoint against its immutable, attempt-correlated QA evidence.
 
     Current task revisions may advance when a certified replan rebinds terminal
-    tasks to a new portfolio plan. The checkpoint remains valid only when every
-    task is still QA-passed and its recorded attempt and QA revision still match
-    the stored result, and the designated result identifies the exact snapshot
-    and workspace digest being restored.
+    tasks to a new portfolio plan. A task reopened as pending by post-QA
+    retriage may still belong to the checkpoint when it has no newer active
+    attempt. The recorded attempt and QA revision must match the stored result,
+    and the designated result must identify the exact snapshot and workspace
+    digest being restored.
 
     Args:
         prefix: Cumulative QA-passed workspace checkpoint under review.
@@ -3392,12 +3395,16 @@ def _qa_prefix_evidence_errors(
         if task is None:
             errors.append(f"task {task_id!r} is missing from the current task queue")
             continue
-        if getattr(task.status, "value", task.status) != TaskStatus.QA_PASSED.value:
+        task_status = getattr(task.status, "value", task.status)
+        current_attempt_id = task.current_attempt_id
+        if task_status == TaskStatus.PENDING.value:
+            if current_attempt_id is not None:
+                errors.append(f"pending task {task_id!r} has a newer active attempt")
+        elif task_status != TaskStatus.QA_PASSED.value:
             errors.append(f"task {task_id!r} is no longer QA_PASSED")
         attempt_id = attempt_ids.get(task_id)
         if not attempt_id:
             continue
-        current_attempt_id = task.current_attempt_id
         if current_attempt_id is not None and current_attempt_id != attempt_id:
             errors.append(f"task {task_id!r} has a different active attempt")
         result = qa_results_by_attempt.get(attempt_id)

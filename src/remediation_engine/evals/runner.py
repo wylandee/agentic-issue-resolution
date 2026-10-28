@@ -51,7 +51,8 @@ SUITE_PATHS: dict[str, list[str]] = {
 def run_eval_subprocess(
     suite_key: str = "all",
     is_live: bool = False,
-    judge_model: str = "gpt-4o",
+    judge_model: str = "gpt-6-luna",
+    reasoning_effort: str = "max",
     extra_args: list[str] | None = None,
     on_complete: Callable[[EvalProcessOutcome], None] | None = None,
 ) -> Generator[str, None, int]:
@@ -61,6 +62,7 @@ def run_eval_subprocess(
         suite_key: Target evaluation suite name (e.g. 'all', 'report', 'triage', 'fix_planner', 'end_to_end').
         is_live: Whether to pass --run-eval-live for live LLM judge evaluations.
         judge_model: Judge model identifier to export in EVAL_JUDGE_MODEL.
+        reasoning_effort: OpenAI reasoning effort to export in EVAL_JUDGE_REASONING_EFFORT.
         extra_args: Additional pytest CLI arguments.
         on_complete: Optional callback for the typed terminal process outcome.
 
@@ -82,6 +84,7 @@ def run_eval_subprocess(
 
     env = os.environ.copy()
     env["EVAL_JUDGE_MODEL"] = judge_model
+    env["EVAL_JUDGE_REASONING_EFFORT"] = reasoning_effort
     env["EVAL_RUN_LIVE"] = str(is_live).lower()
 
     yield f"🚀 Launching: {' '.join(cmd)}\n"
@@ -123,7 +126,7 @@ def run_eval_subprocess(
 def create_sample_run(
     db: EvalDatabase | None = None,
     suite_name: str = "report",
-    judge_model: str = "gpt-4o",
+    judge_model: str = "gpt-6-luna",
 ) -> EvalRunRecord:
     """Generate and persist a realistic sample evaluation run for demo and offline verification.
 

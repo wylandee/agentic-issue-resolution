@@ -823,6 +823,20 @@ def _attempts_for_task(
     )
 
 
+def _current_retry_plan(
+    task: RemediationTask,
+    plan: SupervisorRetryPlan | None,
+) -> SupervisorRetryPlan | None:
+    """Return a retry plan only when it is bound to the current task revision."""
+    if (
+        plan is None
+        or plan.task_id != task.task_id
+        or plan.source_task_revision != task.task_revision
+    ):
+        return None
+    return plan
+
+
 def _ordered_update_candidates(
     task: RemediationTask,
     *,
@@ -834,6 +848,9 @@ def _ordered_update_candidates(
     ecosystem: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Return candidates within the task's solver and retry allowlists."""
+    plan = _current_retry_plan(task, plan)
+    if diagnostics is not None and diagnostics.task_id != task.task_id:
+        diagnostics = None
     stage = plan.strategy_stage if plan is not None else task.strategy_stage
     maven_mode = project_language == ProjectLanguage.JAVA and (
         maven_mode
@@ -928,10 +945,14 @@ def _ordered_update_candidates(
             if (normalized := normalize_version(value))
         }
         approved_version_keys.intersection_update(plan_version_keys)
+    # Retry diagnostics describe a prior attempt's candidate pool. Once the
+    # portfolio commits an allowlist, the new authorization replaces that
+    # pool; attempted-version history below still blocks actual replays.
     if (
         diagnostics is not None
         and diagnostics_match_target
         and diagnostics.candidate_versions_considered
+        and not solver_authoritative
     ):
         diagnostic_version_keys = {
             normalized.lower()
@@ -1002,6 +1023,7 @@ def _ordered_update_candidates(
             diagnostics is not None
             and diagnostics_match_target
             and diagnostics.candidate_dependency_types
+            and not solver_authoritative
         ):
             approved_types = [
                 value
@@ -1020,11 +1042,15 @@ def _ordered_update_candidates(
         if plan is not None and plan.candidate_dependency_types:
             committed_types = set(plan.candidate_dependency_types)
             approved_types = [value for value in approved_types if value in committed_types]
-    attempted_types = {
-        str(value).strip().lower()
-        for value in (diagnostics.attempted_dependency_types if diagnostics is not None else [])
-        if str(value).strip()
-    }
+    attempted_types = (
+        {
+            str(value).strip().lower()
+            for value in diagnostics.attempted_dependency_types
+            if str(value).strip()
+        }
+        if diagnostics is not None and not solver_authoritative
+        else set()
+    )
     approved_types = [
         value for value in approved_types if value.strip().lower() not in attempted_types
     ]
@@ -1063,6 +1089,14 @@ def _authorize_update_dispatch(
     allowlist, narrowed by any matching committed retry-plan or diagnostic
     candidate pool. A selected task version alone never widens that allowlist.
     """
+    plan = _current_retry_plan(task, plan)
+    if diagnostics is not None and diagnostics.task_id != task.task_id:
+        diagnostics = None
+    solver_authoritative = (
+        bool(task.portfolio_plan_id)
+        or bool(task.allowed_target_versions)
+        or bool(task.allowed_dependency_types)
+    )
     allowed_versions, allowed_dependency_types = _ordered_update_candidates(
         task,
         plan=plan,
@@ -1079,14 +1113,14 @@ def _authorize_update_dispatch(
         plan.target_package_name
         if plan is not None and plan.target_package_name
         else diagnostics.target_package_name
-        if diagnostics is not None
+        if diagnostics is not None and not solver_authoritative
         else None
     )
     expected_type = (
         plan.target_dependency_type
         if plan is not None and plan.target_dependency_type
         else diagnostics.target_dependency_type
-        if diagnostics is not None
+        if diagnostics is not None and not solver_authoritative
         else None
     )
     normalized_ecosystem = str(ecosystem or "").strip().casefold()
@@ -3473,7 +3507,12 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
     delta_isolation_by_cluster: dict[str, Any] = dict(
         state.get("delta_isolation_by_cluster", {}) or {}
     )
-    qa_rerun_counts_by_attempt: dict[str, int] = dict(state.get("qa_rerun_counts_by_attempt", {}))
+    qa_rechecks_by_attempt: dict[str, int] = dict(
+        state.get("qa_rechecks_by_attempt", state.get("qa_rerun_counts_by_attempt", {})) or {}
+    )
+    qa_dispatch_counts_by_attempt: dict[str, int] = dict(
+        state.get("qa_dispatch_counts_by_attempt", {}) or {}
+    )
     accepted_package_inventory_by_lockfile: dict[str, str] = dict(
         state.get("accepted_package_inventory_by_lockfile", {}) or {}
     )
@@ -4239,10 +4278,10 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             if qa_requires_rerun:
                 reruns_used = max(
                     0,
-                    qa_rerun_counts_by_attempt.get(task.current_attempt_id, 0),
+                    qa_rechecks_by_attempt.get(task.current_attempt_id, 0),
                 )
                 if reruns_used < MAX_QA_EVIDENCE_RERUNS:
-                    qa_rerun_counts_by_attempt[task.current_attempt_id] = reruns_used + 1
+                    qa_rechecks_by_attempt[task.current_attempt_id] = reruns_used + 1
                 else:
                     # Repeating the same inconclusive QA evidence cannot make
                     # the task progress. Bound the reruns and preserve the
@@ -4250,9 +4289,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     qa_requires_rerun = False
                     qa_inconclusive_exhausted_task_ids.add(task_id)
                     errors.append(
-                        f"supervisor: QA remained inconclusive for {task_id} after "
-                        f"{MAX_QA_EVIDENCE_RERUNS} same-attempt rerun(s); "
-                        "marked the task inconclusive."
+                        f"supervisor: QA recheck limit reached for {task_id}; evidence "
+                        f"remained inconclusive after {MAX_QA_EVIDENCE_RERUNS} same-attempt "
+                        "rerun(s), so the task was marked inconclusive."
                     )
             if not qa_requires_rerun and not atomic_cluster_task_ids:
                 # QA closes the worker attempt before any status or stage
@@ -4672,8 +4711,14 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         if incremental_scan_coverage_complete
         else "scan_failed"
     )
+    triage_was_completed_for_current_scan = (
+        state.get("status") in {"triage_completed", "portfolio_ready"}
+        and int(state.get("post_qa_retriage_count", 0) or 0) > 0
+        and not bool(state.get("triage_required"))
+    )
     triage_required = (
-        bool(state.get("post_qa_triage_enabled", True))
+        not triage_was_completed_for_current_scan
+        and bool(state.get("post_qa_triage_enabled", True))
         and not bool(state.get("post_qa_retriage_limit_reached", False))
         and bool(new_vulnerability_identifiers or remaining_target_identifiers)
     )
@@ -4802,7 +4847,8 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             "workaround child reached a terminal state: "
             f"{stale_pivot_parent_ids}."
         )
-    # 5. Short-circuit: if an active task is optimistically_fixed â†’ qa_critic
+    # 5. Short-circuit after worker success: an active optimistic task must go
+    # through QA before the Supervisor starts a different remediation task.
     # ------------------------------------------------------------------
     decision: SupervisorDecision | None = None
     if state.get("status") != "qa_completed" and active_target_task_ids:
@@ -6286,6 +6332,202 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             resolved_target_task_ids = []
             remapped_feedback_by_task = {}
 
+    # Rechecks have to finish against the candidate workspace before unrelated
+    # workers can restore a baseline and remove their snapshot. Reassert this
+    # barrier at the final routing boundary because portfolio and fallback
+    # decisions above may have replaced the earlier active-target decision.
+    pending_qa_recheck_ids = sorted(
+        task_id
+        for task_id, task in task_queue.items()
+        if task.status == TaskStatus.OPTIMISTICALLY_FIXED
+        and task.current_attempt_id is not None
+        and max(0, int(qa_dispatch_counts_by_attempt.get(task.current_attempt_id, 0))) > 0
+    )
+    if pending_qa_recheck_ids:
+        priority_task_id = pending_qa_recheck_ids[0]
+        priority_task = task_queue[priority_task_id]
+        priority_snapshot = attempt_snapshots_by_id.get(priority_task.current_attempt_id or "")
+        priority_cluster_id = (
+            priority_snapshot.cluster_id if priority_snapshot is not None else None
+        )
+        priority_batch_id = (
+            priority_snapshot.dispatch_batch_id if priority_snapshot is not None else None
+        )
+        if priority_cluster_id or priority_batch_id:
+            priority_target_task_ids = sorted(
+                task_id
+                for task_id, task in task_queue.items()
+                if task.status == TaskStatus.OPTIMISTICALLY_FIXED
+                and task.current_attempt_id is not None
+                and (snapshot := attempt_snapshots_by_id.get(task.current_attempt_id)) is not None
+                and (not priority_cluster_id or snapshot.cluster_id == priority_cluster_id)
+                and (not priority_batch_id or snapshot.dispatch_batch_id == priority_batch_id)
+            )
+        else:
+            priority_target_task_ids = [priority_task_id]
+        decision = SupervisorDecision(
+            decision_code=(
+                DecisionCode.QA_READY_BATCH
+                if len(priority_target_task_ids) > 1
+                else DecisionCode.QA_READY
+            ),
+            next_node="qa_critic",
+            target_task_ids=priority_target_task_ids,
+            cluster_id=priority_cluster_id if len(priority_target_task_ids) > 1 else None,
+            instructions=(
+                "Finish the bounded QA recheck for the current candidate before dispatching "
+                "unrelated remediation work."
+            ),
+            decision_reason=(
+                f"Prioritizing pending QA recheck for attempt '{priority_task.current_attempt_id}'."
+            ),
+        )
+        resolved_next_node = "qa_critic"
+        resolved_target_task_ids = _normalize_target_task_ids_for_node(
+            resolved_next_node,
+            priority_target_task_ids,
+            task_queue,
+            retry_diagnostics_by_task,
+            group_by_id,
+            allow_cluster=bool(decision.cluster_id),
+        )
+        remapped_feedback_by_task = {}
+        logger.info(
+            "supervisor: prioritizing QA recheck targets=%s before unrelated dispatch.",
+            resolved_target_task_ids,
+        )
+
+    # A missing, malformed, or stale QA result must not leave an optimistic
+    # task eligible for QA forever. Permit the original QA dispatch and the
+    # configured evidence rerun, then close the attempt as inconclusive.
+    if resolved_next_node == "qa_critic" and resolved_target_task_ids:
+        max_qa_dispatches = MAX_QA_EVIDENCE_RERUNS + 1
+        exhausted_task_ids = {
+            task_id
+            for task_id in resolved_target_task_ids
+            if (task := task_queue.get(task_id)) is not None
+            and task.current_attempt_id is not None
+            and max(0, int(qa_dispatch_counts_by_attempt.get(task.current_attempt_id, 0)))
+            >= max_qa_dispatches
+        }
+        terminal_task_ids = set(exhausted_task_ids)
+        if exhausted_task_ids:
+            # Keep atomic package batches together when one of their QA
+            # attempts has exhausted its dispatch budget.
+            exhausted_clusters = {
+                snapshot.cluster_id
+                for task_id in exhausted_task_ids
+                if (task := task_queue.get(task_id)) is not None
+                and (snapshot := attempt_snapshots_by_id.get(task.current_attempt_id or ""))
+                is not None
+                and snapshot.cluster_id
+            }
+            if decision.cluster_id:
+                terminal_task_ids.update(resolved_target_task_ids)
+            elif exhausted_clusters:
+                terminal_task_ids.update(
+                    task_id
+                    for task_id in resolved_target_task_ids
+                    if (task := task_queue.get(task_id)) is not None
+                    and (snapshot := attempt_snapshots_by_id.get(task.current_attempt_id or ""))
+                    is not None
+                    and snapshot.cluster_id in exhausted_clusters
+                )
+
+            for task_id in sorted(terminal_task_ids):
+                task = task_queue.get(task_id)
+                if task is None or task.status in _TERMINAL_STATUSES:
+                    continue
+                attempt_id = task.current_attempt_id
+                dispatch_count = max(
+                    0,
+                    int(qa_dispatch_counts_by_attempt.get(attempt_id or "", 0)),
+                )
+                _commit_task_transition(
+                    task_queue,
+                    task_id,
+                    updates={"status": TaskStatus.INCONCLUSIVE},
+                    close_attempt=attempt_id is not None,
+                    clear_selected_version=task.selected_version is not None,
+                )
+                retry_plans_by_task.pop(task_id, None)
+                workaround_replay_plans_by_task.pop(task_id, None)
+                if attempt_id:
+                    processed_qa_attempt_ids.add(attempt_id)
+                    if attempt_id not in new_qa_attempt_ids:
+                        new_qa_attempt_ids.append(attempt_id)
+                consistency_events.append(
+                    _build_consistency_event(
+                        error_code="QA_DISPATCH_LIMIT_REACHED",
+                        task_id=task_id,
+                        expected_attempt_id=attempt_id,
+                        received_attempt_id=None,
+                        action="rejected",
+                        details=(
+                            f"QA had no usable result after {dispatch_count} dispatches; "
+                            "the task was marked inconclusive."
+                        ),
+                    )
+                )
+            errors.append(
+                "supervisor: QA returned no usable result within the bounded dispatch "
+                f"budget ({max_qa_dispatches}); marked task(s) "
+                f"{sorted(terminal_task_ids)} inconclusive."
+            )
+            resolved_target_task_ids = [
+                task_id for task_id in resolved_target_task_ids if task_id not in terminal_task_ids
+            ]
+            if resolved_target_task_ids:
+                decision = decision.model_copy(update={"target_task_ids": resolved_target_task_ids})
+                remapped_feedback_by_task = {
+                    task_id: feedback
+                    for task_id, feedback in remapped_feedback_by_task.items()
+                    if task_id in set(resolved_target_task_ids)
+                }
+            else:
+                decision = _deterministic_routing(
+                    task_queue,
+                    group_by_id,
+                    qa_evaluations,
+                    retry_diagnostics_by_task,
+                    action_summaries=action_summaries,
+                    active_target_task_ids=active_target_task_ids,
+                    current_status=str(state.get("status") or ""),
+                    triage_required=triage_required,
+                    portfolio_plan=state.get("portfolio_plan"),
+                    delta_replay_task_ids=_validated_delta_replay_task_ids(
+                        task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
+                    ),
+                )
+                resolved_next_node = decision.next_node
+                resolved_target_task_ids = _normalize_target_task_ids_for_node(
+                    resolved_next_node,
+                    list(decision.target_task_ids),
+                    task_queue,
+                    retry_diagnostics_by_task,
+                    group_by_id,
+                    allow_cluster=bool(decision.cluster_id),
+                )
+                remapped_feedback_by_task = {
+                    task_id: feedback
+                    for task_id, feedback in decision.feedback_by_task.items()
+                    if task_id in set(resolved_target_task_ids)
+                }
+
+        if resolved_next_node == "qa_critic":
+            for task_id in resolved_target_task_ids:
+                task = task_queue.get(task_id)
+                if task is None or task.current_attempt_id is None:
+                    continue
+                attempt_id = task.current_attempt_id
+                qa_dispatch_counts_by_attempt[attempt_id] = (
+                    max(
+                        0,
+                        int(qa_dispatch_counts_by_attempt.get(attempt_id, 0)),
+                    )
+                    + 1
+                )
+
     # Commit the exact input snapshot before exposing worker targets to the
     # graph. QA reuses the current worker attempt; update/workaround dispatches
     # always receive a new attempt identity.
@@ -6703,7 +6945,8 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         "worker_results_by_attempt": worker_results_by_attempt,
         "qa_results_by_attempt": qa_results_by_attempt,
         "delta_isolation_by_cluster": delta_isolation_by_cluster,
-        "qa_rerun_counts_by_attempt": qa_rerun_counts_by_attempt,
+        "qa_rechecks_by_attempt": qa_rechecks_by_attempt,
+        "qa_dispatch_counts_by_attempt": qa_dispatch_counts_by_attempt,
         "post_remediation_scan_identifiers": post_remediation_scan_identifiers,
         "post_remediation_scan_issues": post_remediation_scan_issues,
         "new_vulnerability_identifiers": new_vulnerability_identifiers,

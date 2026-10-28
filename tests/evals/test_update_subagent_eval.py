@@ -183,6 +183,7 @@ class TestUpdateSubagentEval:
             if DeepEvalToolCorrectnessMetric is not None:
                 tool_metric = DeepEvalToolCorrectnessMetric(
                     threshold=1.0,
+                    model=eval_settings.judge_llm or eval_settings.judge_model,
                     evaluation_params=[ToolCallParams.INPUT_PARAMETERS],
                     should_consider_ordering=True,
                     should_exact_match=True,

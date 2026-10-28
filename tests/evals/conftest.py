@@ -69,7 +69,12 @@ _INITIAL_JUDGE_MODEL = (
     os.environ.get("EVAL_JUDGE_MODEL", "").strip()
     or _DOTENV_VARS.get("EVAL_JUDGE_MODEL", "").strip()
     or _DOTENV_VARS.get("REMEDY_LLM_MODEL", "").strip()
-    or "gpt-4o"
+    or "gpt-6-luna"
+)
+_INITIAL_JUDGE_REASONING_EFFORT = (
+    os.environ.get("EVAL_JUDGE_REASONING_EFFORT", "").strip()
+    or _DOTENV_VARS.get("EVAL_JUDGE_REASONING_EFFORT", "").strip()
+    or "max"
 )
 
 
@@ -798,7 +803,9 @@ def _persist_eval_session(session: pytest.Session, exitstatus: int) -> None:
     from remediation_engine.evals.models import EvalRunRecord
 
     test_run, deep_eval_cases = _load_deep_eval_test_cases()
-    judge_model = os.environ.get("EVAL_JUDGE_MODEL", "").strip() or _INITIAL_JUDGE_MODEL or "gpt-4o"
+    judge_model = (
+        os.environ.get("EVAL_JUDGE_MODEL", "").strip() or _INITIAL_JUDGE_MODEL or "gpt-6-luna"
+    )
     is_live = bool(session.config.getoption("--run-eval-live", default=False))
     test_case_records = _build_eval_test_case_records(session, deep_eval_cases, judge_model)
     if not test_case_records:
@@ -949,23 +956,29 @@ class EvalSettings:
     openai_api_key: str = field(repr=False)
     trajectory_dir: Path
     golden_dir: Path
+    reasoning_effort: str = "max"
     judge_llm: Any = field(default=None, repr=False, compare=False)
 
 
-_EVAL_LLM_REQUEST_TIMEOUT_SECONDS = 60
+_EVAL_LLM_REQUEST_TIMEOUT_SECONDS = 180
 
 
-def _build_bounded_judge_model(model_name: str, api_key: str, *, timeout: int = 60) -> Any:
-    """Build DeepEval's GPT model with a finite request timeout and no retries.
-
-    DeepEval 2.9.7's native GPT methods use Tenacity retry decorators without a
-    stop condition. Calling the wrapped method body directly preserves its
-    response parsing and cost accounting while ensuring a failed request ends
-    the current test instead of retrying indefinitely.
-    """
+def _build_bounded_judge_model(
+    model_name: str,
+    api_key: str,
+    *,
+    timeout: int = 180,
+    reasoning_effort: str | None = None,
+) -> Any:
+    """Build DeepEval's OpenAI model with a finite request timeout and no retries."""
     from remediation_engine.evals.judge import build_bounded_judge_model
 
-    return build_bounded_judge_model(model_name, api_key, timeout=timeout)
+    return build_bounded_judge_model(
+        model_name,
+        api_key,
+        timeout=timeout,
+        reasoning_effort=reasoning_effort,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -982,6 +995,11 @@ def preserve_eval_credentials(
         judge = os.environ.get("EVAL_JUDGE_MODEL", "").strip() or _INITIAL_JUDGE_MODEL
         if judge:
             monkeypatch.setenv("EVAL_JUDGE_MODEL", judge)
+        effort = (
+            os.environ.get("EVAL_JUDGE_REASONING_EFFORT", "").strip()
+            or _INITIAL_JUDGE_REASONING_EFFORT
+        )
+        monkeypatch.setenv("EVAL_JUDGE_REASONING_EFFORT", effort)
         monkeypatch.setenv("EVAL_RUN_LIVE", "true")
 
 
@@ -989,9 +1007,14 @@ def preserve_eval_credentials(
 def eval_settings(request: pytest.FixtureRequest) -> EvalSettings:
     """Provide configuration settings for DeepEval evaluation runs.
 
-    Reads ``EVAL_JUDGE_MODEL`` (defaults to .env value or 'gpt-4o') and respects ``--run-eval-live``.
+    Reads judge model and reasoning effort from the environment and respects ``--run-eval-live``.
     """
-    judge_model = os.environ.get("EVAL_JUDGE_MODEL", "").strip() or _INITIAL_JUDGE_MODEL or "gpt-4o"
+    judge_model = (
+        os.environ.get("EVAL_JUDGE_MODEL", "").strip() or _INITIAL_JUDGE_MODEL or "gpt-6-luna"
+    )
+    reasoning_effort = (
+        os.environ.get("EVAL_JUDGE_REASONING_EFFORT", "").strip() or _INITIAL_JUDGE_REASONING_EFFORT
+    )
     is_live = bool(request.config.getoption("--run-eval-live", default=False))
     api_key = os.environ.get("OPENAI_API_KEY", "").strip() or _INITIAL_OPENAI_API_KEY
 
@@ -1004,11 +1027,13 @@ def eval_settings(request: pytest.FixtureRequest) -> EvalSettings:
         openai_api_key=api_key,
         trajectory_dir=trajectory_dir,
         golden_dir=_DEFAULT_GOLDEN_DIR,
+        reasoning_effort=reasoning_effort,
         judge_llm=(
             _build_bounded_judge_model(
                 judge_model,
                 api_key,
                 timeout=_EVAL_LLM_REQUEST_TIMEOUT_SECONDS,
+                reasoning_effort=reasoning_effort,
             )
             if is_live and api_key
             else None

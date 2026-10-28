@@ -357,7 +357,8 @@ def test_markdown_parser_resilience() -> None:
 
 def test_eval_settings_fixture(eval_settings: EvalSettings) -> None:
     """Test the eval_settings fixture configuration."""
-    assert eval_settings.judge_model in {"gpt-4o", "gpt-4o-mini"} or bool(eval_settings.judge_model)
+    assert eval_settings.judge_model == "gpt-6-luna" or bool(eval_settings.judge_model)
+    assert eval_settings.reasoning_effort == "max" or bool(eval_settings.reasoning_effort)
     assert isinstance(eval_settings.is_live, bool)
     assert isinstance(eval_settings.trajectory_dir, Path)
     assert isinstance(eval_settings.golden_dir, Path)
@@ -372,7 +373,9 @@ def test_eval_settings_env_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EVAL_JUDGE_MODEL", "gpt-4o-mini")
     # Simulate eval_settings construction
     judge = (
-        os.environ.get("EVAL_JUDGE_MODEL", "").strip() or conftest._INITIAL_JUDGE_MODEL or "gpt-4o"
+        os.environ.get("EVAL_JUDGE_MODEL", "").strip()
+        or conftest._INITIAL_JUDGE_MODEL
+        or "gpt-6-luna"
     )
     assert judge == "gpt-4o-mini"
 

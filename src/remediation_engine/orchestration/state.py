@@ -510,7 +510,10 @@ class OrchestratorState(TypedDict, total=False):
     qa_results_by_attempt: Annotated[dict[str, QAAttemptResult], merge_dict_reducer]
     # Counts same-attempt QA reruns caused by inconclusive evidence or an
     # invalid evaluator contract. The Supervisor owns this bounded ledger.
-    qa_rerun_counts_by_attempt: Annotated[dict[str, int], replace_dict_reducer]
+    qa_rechecks_by_attempt: Annotated[dict[str, int], replace_dict_reducer]
+    # Counts how many times QA has actually been dispatched for each committed
+    # worker attempt. This also bounds retries when QA returns no usable result.
+    qa_dispatch_counts_by_attempt: Annotated[dict[str, int], replace_dict_reducer]
     accepted_package_inventory_by_lockfile: Annotated[dict[str, str], replace_dict_reducer]
     current_scan_observations_by_occurrence: Annotated[
         dict[str, PackageScanOccurrence], replace_dict_reducer
@@ -679,7 +682,8 @@ def initial_orchestrator_state(
         "qa_passed_workspace_prefix": None,
         "worker_results_by_attempt": {},
         "qa_results_by_attempt": {},
-        "qa_rerun_counts_by_attempt": {},
+        "qa_rechecks_by_attempt": {},
+        "qa_dispatch_counts_by_attempt": {},
         "processed_worker_attempt_ids": [],
         "processed_qa_attempt_ids": [],
         "consistency_events": [],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from remediation_engine.contracts.schemas import (
@@ -19,6 +20,10 @@ from remediation_engine.contracts.schemas import (
     TriageResult,
     VulnerabilityGroup,
     VulnerabilityIssue,
+)
+from remediation_engine.contracts.solver_models import (
+    PortfolioReplanRequest,
+    QAPassedWorkspacePrefix,
 )
 from remediation_engine.orchestration.graph import (
     _post_triage_issue_input,
@@ -405,6 +410,7 @@ def test_post_triage_reopens_group_with_accepted_scan_change():
         {
             "task_queue": {task.task_id: task},
             "latest_successful_scan_by_task": {task.task_id: scan_record},
+            "portfolio_plan": SimpleNamespace(portfolio_plan_id="portfolio-before-triage"),
             "triage_required": True,
             "new_vulnerability_status": "detected",
             "post_remediation_scan_issues": [issue],
@@ -423,6 +429,88 @@ def test_post_triage_reopens_group_with_accepted_scan_change():
     assert reopened.retry_count == 0
     assert reopened.current_attempt_id is None
     assert task.task_id not in result["latest_successful_scan_by_task"]
+    assert result["portfolio_plan"] is state["portfolio_plan"]
+    assert result["portfolio_replan_request"] == PortfolioReplanRequest(
+        reason="POST_QA_TRIAGE",
+        source_portfolio_plan_id="portfolio-before-triage",
+    )
+    assert result["portfolio_dirty"] is True
+
+
+def test_post_triage_reopens_qa_passed_peers_from_same_accepted_dispatch_batch():
+    changed_issue = _issue("CVE-2026-0012")
+    changed_group = _group("sca:package.json:changed", changed_issue)
+    changed_candidate = _group(
+        changed_group.group_id,
+        _issue("CVE-2026-0013"),
+    )
+    peer_issue = _issue("CVE-2021-0002")
+    peer_group = _group("sca:package.json:peer", peer_issue)
+    changed_task = build_initial_remediation_task(changed_group, "task-changed").model_copy(
+        update={
+            "task_revision": 4,
+            "status": TaskStatus.QA_PASSED,
+        }
+    )
+    peer_task = build_initial_remediation_task(peer_group, "task-peer").model_copy(
+        update={
+            "task_revision": 7,
+            "status": TaskStatus.QA_PASSED,
+        }
+    )
+    state = initial_orchestrator_state(
+        "repo",
+        [changed_group, peer_group],
+        issues=[changed_issue, peer_issue],
+        system_context=SystemContext(),
+    )
+    state.update(
+        {
+            "task_queue": {"task-changed": changed_task, "task-peer": peer_task},
+            "latest_successful_scan_by_task": {
+                "task-changed": TaskScanRecord(
+                    task_id="task-changed",
+                    attempt_id="attempt-changed",
+                    task_revision=4,
+                    remaining_target_identifiers=[changed_issue.cve_id],
+                    closure_package_names=["lodash"],
+                    complete=True,
+                )
+            },
+            "attempt_snapshots_by_id": {
+                "attempt-changed": SimpleNamespace(dispatch_batch_id="batch-angular"),
+                "attempt-peer": SimpleNamespace(dispatch_batch_id="batch-angular"),
+            },
+            "qa_passed_workspace_prefix": QAPassedWorkspacePrefix(
+                graph_digest="qa-prefix",
+                certified_by_portfolio_plan_id="portfolio-before-triage",
+                batch_ids=["batch-angular"],
+                task_ids=["task-changed", "task-peer"],
+                qa_attempt_ids_by_task={
+                    "task-changed": "attempt-changed",
+                    "task-peer": "attempt-peer",
+                },
+            ),
+            "triage_required": True,
+            "new_vulnerability_status": "detected",
+            "post_remediation_scan_issues": [changed_candidate.issues[0]],
+        }
+    )
+
+    with patch(
+        "remediation_engine.orchestration.graph.run_triage_pipeline",
+        return_value=[
+            (changed_candidate, _triage_result(changed_candidate)),
+            (peer_group.model_copy(), _triage_result(peer_group)),
+        ],
+    ):
+        result = post_qa_triage_node(state)
+
+    assert result["task_queue"]["task-changed"].status == TaskStatus.PENDING
+    assert result["task_queue"]["task-changed"].task_revision == 5
+    assert result["task_queue"]["task-peer"].status == TaskStatus.PENDING
+    assert result["task_queue"]["task-peer"].task_revision == 8
+    assert result["triage_reconciliation"]["reopened_peer_batch_task_ids"] == ["task-peer"]
 
 
 def test_post_triage_updates_parent_context_without_reopening_pending_task():
@@ -497,6 +585,42 @@ def test_post_triage_uses_post_scan_odc_issues_and_retains_non_odc_baseline():
     issue_input = _post_triage_issue_input(state)
 
     assert issue_input == [sast_issue, post_odc_issue]
+
+
+def test_post_triage_restores_targeted_scan_findings_to_source_lockfiles():
+    staged_issue = _issue("CVE-2026-0008").model_copy(
+        update={
+            "package_name": "@angular/common",
+            "package_version": "21.2.17",
+            "ghsa_id": "GHSA-JHPW-976M-542J",
+            "file_path": ("scan/.odc-targeted/000/package-lock.json?/@angular/common:21.2.17"),
+        }
+    )
+    state = {
+        "issues": [],
+        "post_remediation_scan_issues": [staged_issue],
+        "latest_incremental_scan_by_input": {
+            input_path: IncrementalScanRecord(
+                source_input_path=input_path,
+                found_issues=[staged_issue],
+                complete=True,
+            )
+            for input_path in (
+                "frontend/package-lock.json",
+                "examples/demo/package-lock.json",
+            )
+        },
+    }
+
+    issue_input = _post_triage_issue_input(state)
+
+    assert sorted(issue.file_path for issue in issue_input or []) == [
+        "examples/demo/package-lock.json?/@angular/common:21.2.17",
+        "frontend/package-lock.json?/@angular/common:21.2.17",
+    ]
+    assert staged_issue.file_path == (
+        "scan/.odc-targeted/000/package-lock.json?/@angular/common:21.2.17"
+    )
 
 
 def test_post_triage_accepts_only_proven_closure_packages_in_dev_scope():

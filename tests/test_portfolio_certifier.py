@@ -896,6 +896,80 @@ def test_qa_checkpoint_uses_attempt_revision_and_snapshot():
     assert prefix.snapshot_id == "qa-passed-task-a"
 
 
+def test_qa_checkpoint_survives_post_triage_reopen_without_new_attempt():
+    source_task = RemediationTask(
+        task_id="task-a",
+        parent_group_id="group-a",
+        strategy="version_bump",
+        status=TaskStatus.QA_PASSED,
+        task_revision=2,
+    )
+    prior_plan = _certified_prior_plan(
+        {"task-a": source_task},
+        "host-fingerprint",
+        [
+            SimpleNamespace(
+                batch_id="batch-a",
+                task_ids=["task-a"],
+                dispatchable=True,
+                mutations=[object()],
+            )
+        ],
+        [SimpleNamespace(phase_number=1, batch_ids=["batch-a"])],
+        {"batch-a": "qa-workspace-digest"},
+    )
+    reopened_task = source_task.model_copy(
+        update={"status": TaskStatus.PENDING, "task_revision": 3, "current_attempt_id": None}
+    )
+    prefix = QAPassedWorkspacePrefix(
+        graph_digest="qa-workspace-digest",
+        certified_by_portfolio_plan_id="prior-plan",
+        batch_ids=["batch-a"],
+        task_ids=["task-a"],
+        task_revisions={"task-a": 2},
+        qa_attempt_ids_by_task={"task-a": "attempt-a"},
+        snapshot_id="qa-snapshot-a",
+        snapshot_attempt_id="attempt-a",
+    )
+    qa_result = QAAttemptResult(
+        attempt_id="attempt-a",
+        task_id="task-a",
+        task_revision=2,
+        portfolio_plan_id="prior-plan",
+        workspace_graph_digest="qa-workspace-digest",
+        workspace_snapshot_id="qa-snapshot-a",
+        qa_policy=QAPolicy.VERSION_BUMP,
+        qa_policy_source="attempt_snapshot",
+        evaluation=QAEvaluation(task_id="task-a", passed=True),
+    )
+    request = PortfolioReplanRequest(
+        reason="POST_QA_TRIAGE",
+        source_portfolio_plan_id="prior-plan",
+    )
+
+    retained_prefix = _last_qa_passed_prefix_provenance(
+        prior_plan,
+        {"task-a": reopened_task},
+        request,
+        "host-fingerprint",
+        qa_results_by_attempt={"attempt-a": qa_result},
+        qa_passed_workspace_prefix=prefix,
+    )
+
+    assert retained_prefix == prefix
+    assert (
+        _last_qa_passed_prefix_provenance(
+            prior_plan,
+            {"task-a": reopened_task.model_copy(update={"current_attempt_id": "attempt-new"})},
+            request,
+            "host-fingerprint",
+            qa_results_by_attempt={"attempt-a": qa_result},
+            qa_passed_workspace_prefix=prefix,
+        )
+        is None
+    )
+
+
 def test_workspace_manifest_drift_requires_exact_certified_prefix_digest():
     host_documents = {
         "package.json": json.dumps({"dependencies": {"foo": "1.0.0"}}),

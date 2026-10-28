@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import os
 
 import pandas as pd
 import streamlit as st
@@ -528,9 +529,18 @@ with tab_runner:
             format_func=lambda s: f"{s.upper()} ({', '.join(SUITE_PATHS[s])})",
         )
     with col_s2:
-        judge_choice = st.text_input("Judge Model", value="gpt-4o")
+        judge_choice = st.text_input(
+            "Judge Model", value=os.environ.get("EVAL_JUDGE_MODEL", "gpt-6-luna")
+        )
     with col_s3:
         live_eval = st.checkbox("Enable Live LLM Judge (--run-eval-live)", value=False)
+
+    reasoning_choice = st.selectbox(
+        "Judge Reasoning Effort",
+        options=("max", "xhigh", "high", "medium", "low", "minimal", "none"),
+        index=0,
+        help="Use the model's maximum supported reasoning effort.",
+    )
 
     e2e_extra_args: list[str] = []
     if suite_choice == "end_to_end":
@@ -597,6 +607,7 @@ with tab_runner:
                 suite_key=suite_choice,
                 is_live=live_eval,
                 judge_model=judge_choice,
+                reasoning_effort=reasoning_choice,
                 extra_args=e2e_extra_args,
                 on_complete=record_outcome,
             )

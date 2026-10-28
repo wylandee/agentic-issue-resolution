@@ -38,19 +38,25 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from pathlib import Path
+from collections.abc import Mapping
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
 from remediation_engine.contracts.accessors import model_or_dict_value
 from remediation_engine.contracts.schemas import (
+    IncrementalScanRecord,
     IssueSource,
     SystemContext,
     TaskScanRecord,
     TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
+)
+from remediation_engine.contracts.solver_models import (
+    PortfolioReplanRequest,
+    QAPassedWorkspacePrefix,
 )
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration._qa_runtime import group_target_identifiers
@@ -378,7 +384,10 @@ def _post_triage_issue_input(
     if "post_remediation_scan_issues" not in state:
         return None
 
-    post_scan_issues = list(state.get("post_remediation_scan_issues") or [])
+    post_scan_issues = _restore_incremental_scan_input_paths(
+        list(state.get("post_remediation_scan_issues") or []),
+        state.get("latest_incremental_scan_by_input", {}) or {},
+    )
     baseline_issues = list(state.get("issues") or [])
     retained_non_odc = [issue for issue in baseline_issues if issue.source != IssueSource.ODC]
 
@@ -404,6 +413,83 @@ def _post_triage_issue_input(
         unique_issues,
         _incremental_target_package_scope(state),
     )
+
+
+def _restore_incremental_scan_input_paths(
+    issues: list[VulnerabilityIssue],
+    scan_records: Mapping[str, IncrementalScanRecord],
+) -> list[VulnerabilityIssue]:
+    """Map targeted-scan staging paths back to their source lockfile paths.
+
+    Targeted ODC scans report paths beneath ``scan/.odc-targeted/<index>``.
+    Those paths exist only inside the QA scan workspace. Retriaged findings
+    need the original dependency input path so manifest localization and the
+    portfolio solver can match them to physical package occurrences.
+
+    Args:
+        issues: Cumulative post-remediation scan findings.
+        scan_records: Latest complete report-wide scan snapshot per input path.
+
+    Returns:
+        Findings with staged lockfile paths replaced by their recorded source
+        input paths. Findings without an exact scan-record match are preserved.
+    """
+    source_paths_by_fingerprint: dict[str, set[str]] = {}
+    for input_path, record in sorted(scan_records.items()):
+        source_input_path = str(record.source_input_path or "").replace("\\", "/").strip()
+        normalized_input_path = input_path.replace("\\", "/").strip()
+        source_path = PurePosixPath(source_input_path)
+        if (
+            not record.complete
+            or source_input_path != normalized_input_path
+            or not source_input_path
+            or source_path.is_absolute()
+            or ".." in source_path.parts
+        ):
+            continue
+        for scanned_issue in record.found_issues:
+            if scanned_issue.source != IssueSource.ODC:
+                continue
+            fingerprint = stable_issue_fingerprint(scanned_issue)
+            source_paths_by_fingerprint.setdefault(fingerprint, set()).add(source_path.as_posix())
+
+    restored: list[VulnerabilityIssue] = []
+    lockfile_names = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml"}
+    for issue in issues:
+        issue_path = str(issue.file_path or "").replace("\\", "/")
+        issue_path_before_suffix = issue_path.split("?", 1)[0].split("#", 1)[0]
+        issue_path_parts = PurePosixPath(issue_path_before_suffix).parts
+        source_paths = sorted(
+            source_paths_by_fingerprint.get(stable_issue_fingerprint(issue), set())
+        )
+        if (
+            issue.source != IssueSource.ODC
+            or ".odc-targeted" not in issue_path_parts
+            or PurePosixPath(issue_path_before_suffix).name not in lockfile_names
+            or not source_paths
+        ):
+            restored.append(issue)
+            continue
+
+        suffix_start = min(
+            (position for delimiter in ("?", "#") if (position := issue_path.find(delimiter)) >= 0),
+            default=len(issue_path),
+        )
+        suffix = issue_path[suffix_start:]
+        matched_paths = [
+            source_path
+            for source_path in source_paths
+            if PurePosixPath(source_path).name == PurePosixPath(issue_path_before_suffix).name
+        ]
+        if not matched_paths:
+            restored.append(issue)
+            continue
+        restored.extend(
+            issue.model_copy(update={"file_path": f"{source_path}{suffix}"})
+            for source_path in matched_paths
+        )
+
+    return restored
 
 
 _worker_result_value = model_or_dict_value
@@ -541,6 +627,42 @@ def _reconcile_triaged_groups(
         "removed_group_ids": sorted(set(previous_by_id) - candidate_ids - set(retained)),
     }
     return sorted(result, key=lambda group: group.group_id), reconciliation
+
+
+def _qa_passed_batch_peer_task_ids(
+    state: OrchestratorState,
+    reopened_task_ids: set[str],
+) -> set[str]:
+    """Find QA-passed tasks in the same certified dispatch batch as reopened work."""
+    prefix = state.get("qa_passed_workspace_prefix")
+    if isinstance(prefix, Mapping):
+        try:
+            prefix = QAPassedWorkspacePrefix.model_validate(prefix)
+        except Exception:  # noqa: BLE001 - malformed state is not trusted provenance
+            return set()
+    if not isinstance(prefix, QAPassedWorkspacePrefix) or not reopened_task_ids:
+        return set()
+
+    snapshots = state.get("attempt_snapshots_by_id", {}) or {}
+    batch_ids = set(prefix.batch_ids)
+    attempts_by_task = prefix.qa_attempt_ids_by_task
+    batch_ids_for_reopened_tasks = {
+        batch_id
+        for task_id in reopened_task_ids
+        if (attempt_id := attempts_by_task.get(task_id))
+        and (snapshot := snapshots.get(attempt_id)) is not None
+        and (batch_id := model_or_dict_value(snapshot, "dispatch_batch_id")) in batch_ids
+    }
+    if not batch_ids_for_reopened_tasks:
+        return set()
+
+    return {
+        task_id
+        for task_id in prefix.task_ids
+        if (attempt_id := attempts_by_task.get(task_id))
+        and (snapshot := snapshots.get(attempt_id)) is not None
+        and model_or_dict_value(snapshot, "dispatch_batch_id") in batch_ids_for_reopened_tasks
+    } - reopened_task_ids
 
 
 def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
@@ -683,6 +805,35 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             )
             reopened_task_ids.add(task_id)
 
+        # The accepted dispatch may contain terminal peer tasks needed to keep
+        # package-manager constraints satisfiable. Reopen only peers proved to
+        # have shared the same immutable, QA-passed dispatch batch as changed
+        # work so the Supervisor can plan the whole cohort atomically.
+        reopened_peer_batch_task_ids: set[str] = set()
+        for task_id in sorted(_qa_passed_batch_peer_task_ids(state, reopened_task_ids)):
+            task = task_queue.get(task_id)
+            group = groups_by_id.get(task.parent_group_id) if task is not None else None
+            if task is None or task.status != TaskStatus.QA_PASSED or group is None:
+                continue
+            fresh_task = build_initial_remediation_task(group, task_id)
+            task_queue[task_id] = task.model_copy(
+                update={
+                    "task_revision": task.task_revision + 1,
+                    "current_attempt_id": None,
+                    "strategy": fresh_task.strategy,
+                    "qa_policy": fresh_task.qa_policy,
+                    "strategy_stage": fresh_task.strategy_stage,
+                    "selected_version": fresh_task.selected_version,
+                    "selected_plan_issue_ids": list(fresh_task.selected_plan_issue_ids),
+                    "exhausted_update_path": False,
+                    "instruction": fresh_task.instruction,
+                    "status": TaskStatus.PENDING,
+                    "retry_count": 0,
+                }
+            )
+            reopened_task_ids.add(task_id)
+            reopened_peer_batch_task_ids.add(task_id)
+
         # A previous QA result belongs to the pre-retriage task revision. It
         # remains available in the attempt history, but must not close the
         # newly reopened task.
@@ -695,6 +846,8 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             reconciliation["reopen_skipped_without_accepted_change_group_ids"] = sorted(
                 skipped_unaccepted_reopen_group_ids
             )
+        if reopened_peer_batch_task_ids:
+            reconciliation["reopened_peer_batch_task_ids"] = sorted(reopened_peer_batch_task_ids)
         latest_successful_scan_by_task = {
             task_id: record
             for task_id, record in (state.get("latest_successful_scan_by_task", {}) or {}).items()
@@ -725,6 +878,15 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             or reconciliation["new_group_ids"]
             or reconciliation["reappeared_group_ids"]
         )
+        prior_portfolio_plan = state.get("portfolio_plan")
+        portfolio_replan_request = None
+        if work_reopened and prior_portfolio_plan is not None:
+            source_plan_id = model_or_dict_value(prior_portfolio_plan, "portfolio_plan_id")
+            if source_plan_id:
+                portfolio_replan_request = PortfolioReplanRequest(
+                    reason="POST_QA_TRIAGE",
+                    source_portfolio_plan_id=source_plan_id,
+                )
         if preserved_unfixable_task_ids:
             reconciliation["preserved_unfixable_task_ids"] = sorted(preserved_unfixable_task_ids)
         if preserved_pivoted_task_ids:
@@ -741,8 +903,13 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             "qa_evaluations": qa_evaluations,
             "active_target_task_ids": [],
             "portfolio_dirty": work_reopened,
-            "portfolio_plan": None if work_reopened else state.get("portfolio_plan"),
+            # Keep the committed plan as the provenance anchor for the QA-passed
+            # workspace prefix. The triage-completed Supervisor entry replans
+            # before any worker dispatch, so this plan is never reused as an
+            # execution authorization.
+            "portfolio_plan": prior_portfolio_plan,
             "portfolio_solver_plan": None if work_reopened else state.get("portfolio_solver_plan"),
+            "portfolio_replan_request": portfolio_replan_request,
             "final_full_scan_result": None
             if work_reopened
             else state.get("final_full_scan_result"),

@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from remediation_engine.evals.judge import build_judge_score_metric
 from remediation_engine.orchestration.report_node import generate_report
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import set_pytest_item_identity
@@ -18,21 +19,19 @@ try:
     from deepeval import assert_test
     from deepeval.metrics import (
         FaithfulnessMetric,
-        GEval,
         HallucinationMetric,
         SummarizationMetric,
     )
-    from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+    from deepeval.test_case import LLMTestCase, SingleTurnParams
 
     HAS_DEEPEVAL = True
 except ImportError:
     HAS_DEEPEVAL = False
     FaithfulnessMetric = None  # type: ignore[assignment,misc]
-    GEval = None  # type: ignore[assignment,misc]
     HallucinationMetric = None  # type: ignore[assignment,misc]
     SummarizationMetric = None  # type: ignore[assignment,misc]
     LLMTestCase = None  # type: ignore[assignment,misc]
-    LLMTestCaseParams = None  # type: ignore[assignment,misc]
+    SingleTurnParams = None  # type: ignore[assignment,misc]
     assert_test = None  # type: ignore[assignment]
 
 
@@ -78,7 +77,7 @@ def _report_format_evidence() -> dict[str, Any]:
     }
 
 
-_REPORT_GEVAL_CRITERIA = """
+_REPORT_JUDGE_CRITERIA = """
 Evaluate the Actual Output as a canonical remediation_report_v2 Markdown
 document against the deterministic evidence in the Context and Expected
 Output. Do not judge it as a one-paragraph narrative. The report must preserve
@@ -632,13 +631,13 @@ def _build_report_source_evidence(case: dict[str, Any]) -> str:
 
 
 def _build_report_policy_context() -> str:
-    """Render non-source constraints for the GEval judge.
+    """Render non-source constraints for the report judge.
 
     File-path placement is enforced by ``validate_report_contract`` and is
     deliberately excluded from all LLM metric contexts.
 
     Returns:
-        General report-format and evidence-policy guidance for GEval.
+        General report-format and evidence-policy guidance for rubric scoring.
     """
     format_evidence = _report_format_evidence()
     return "\n".join(
@@ -650,7 +649,7 @@ def _build_report_policy_context() -> str:
             "Successful claims require final QA-passed outcomes; failed attempts alone "
             "must not be presented as fixes.",
             "Follow-up rows should preserve supported package/version attempts and outcomes.",
-            "File-path scope is checked deterministically and is not part of this GEval.",
+            "File-path scope is checked deterministically and is not part of rubric scoring.",
         ]
     )
 
@@ -662,7 +661,7 @@ def build_report_context(case: dict[str, Any]) -> list[str]:
         case: Curated report case containing deterministic state and provenance.
 
     Returns:
-        The source-evidence document followed by general GEval policy guidance.
+        The source-evidence document followed by general report policy guidance.
     """
     return [
         _build_report_source_evidence(case),
@@ -859,14 +858,14 @@ def build_report_expected_output(case: dict[str, Any]) -> str:
     return json.dumps(expected, sort_keys=True)
 
 
-def _build_geval_expected_output(case: dict[str, Any]) -> str:
+def _build_judge_expected_output(case: dict[str, Any]) -> str:
     """Build expected report facts without path rules reserved for deterministic checks.
 
     Args:
         case: Curated report case containing the full golden contract.
 
     Returns:
-        A compact contract for GEval that excludes file-path constraints.
+        A compact contract for rubric scoring that excludes file-path constraints.
     """
     expected = json.loads(build_report_expected_output(case))
     expected.pop("code_detail_diff_paths", None)
@@ -1017,7 +1016,9 @@ def _build_metrics(eval_settings: EvalSettings, case: dict[str, Any]) -> list[An
         raise RuntimeError("DeepEval is required for live report evaluation.")
     return [
         HallucinationMetric(
-            threshold=0.30,
+            # DeepEval 4 scores hallucination in the pass direction; preserve
+            # the prior maximum 0.30 hallucination threshold as a 0.70 minimum.
+            threshold=0.70,
             model=eval_settings.judge_llm or eval_settings.judge_model,
             include_reason=True,
             verbose_mode=True,
@@ -1035,14 +1036,14 @@ def _build_metrics(eval_settings: EvalSettings, case: dict[str, Any]) -> list[An
             include_reason=True,
             verbose_mode=True,
         ),
-        GEval(
+        build_judge_score_metric(
             name="Report Constraint Adherence",
-            criteria=_REPORT_GEVAL_CRITERIA,
+            criteria=_REPORT_JUDGE_CRITERIA,
             evaluation_params=[
-                LLMTestCaseParams.INPUT,
-                LLMTestCaseParams.ACTUAL_OUTPUT,
-                LLMTestCaseParams.EXPECTED_OUTPUT,
-                LLMTestCaseParams.CONTEXT,
+                SingleTurnParams.INPUT,
+                SingleTurnParams.ACTUAL_OUTPUT,
+                SingleTurnParams.EXPECTED_OUTPUT,
+                SingleTurnParams.CONTEXT,
             ],
             threshold=0.70,
             model=eval_settings.judge_llm or eval_settings.judge_model,
@@ -1092,7 +1093,7 @@ def _build_report_metric_cases(
         name=f"{case['case_id']} [Report Constraint Adherence]",
         input=evidence,
         actual_output=report,
-        expected_output=_build_geval_expected_output(case),
+        expected_output=_build_judge_expected_output(case),
         context=context,
         retrieval_context=context,
         additional_metadata=metadata,

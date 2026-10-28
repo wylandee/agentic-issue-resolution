@@ -555,6 +555,52 @@ def test_update_dispatch_authorization_requires_committed_selected_candidate():
     assert _authorize_update_dispatch(stale_task, diagnostics=diagnostics) is None
 
 
+def test_retriage_solver_allowlist_replaces_stale_retry_candidate_pool():
+    """A fresh solver plan can dispatch even when prior retry evidence is stale."""
+    task = _make_task("task-1", "g1").model_copy(
+        update={
+            "task_revision": 4,
+            "portfolio_plan_id": "portfolio-new",
+            "target_package_name": "test-pkg",
+            "target_dependency_type": "dependencies",
+            "selected_version": "2.0.0",
+            "allowed_target_versions": ["2.0.0"],
+            "allowed_dependency_types": ["dependencies"],
+            "instruction": "Update test-pkg to the newly solver-approved version 2.0.0.",
+        }
+    )
+    stale_plan = SupervisorRetryPlan(
+        task_id=task.task_id,
+        source_task_revision=2,
+        selected_version="1.2.3",
+        target_package_name="test-pkg",
+        target_dependency_type="devDependencies",
+        candidate_versions_considered=["1.2.3"],
+        candidate_dependency_types=["devDependencies"],
+        exact_instruction="Update test-pkg to 1.2.3.",
+    )
+    prior_attempt_diagnostics = UpdateRetryDiagnostics(
+        task_id=task.task_id,
+        target_package_name="test-pkg",
+        target_dependency_type="devDependencies",
+        attempted_versions=["1.2.3"],
+        candidate_versions_considered=["1.2.3"],
+        attempted_dependency_types=["devDependencies"],
+        candidate_dependency_types=["devDependencies"],
+    )
+
+    authorization = _authorize_update_dispatch(
+        task,
+        plan=stale_plan,
+        diagnostics=prior_attempt_diagnostics,
+    )
+
+    assert authorization is not None
+    assert authorization.selected_version == "2.0.0"
+    assert authorization.allowed_target_versions == ("2.0.0",)
+    assert authorization.allowed_dependency_types == ("dependencies",)
+
+
 def test_create_attempt_snapshot_rejects_candidate_less_update():
     task = _make_task("task-1", "g1").model_copy(
         update={"instruction": "Update only with a committed candidate."}
@@ -2772,6 +2818,125 @@ def test_qa_envelope_attempt_id_must_match_current_attempt_map_key() -> None:
     assert result["accepted_package_inventory_by_lockfile"] == {prior_key: "prior-fingerprint"}
     assert result["current_scan_observations_by_occurrence"] == {prior_key: prior_occurrence}
     assert result["latest_successful_scan_by_task"] == {}
+
+
+def test_missing_qa_result_cannot_dispatch_same_attempt_forever():
+    group = _sca_group("g1")
+    attempt_id = "attempt-missing-qa-result"
+    instruction = "Update test-pkg to 2.0.0."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id="task-1",
+        task_revision=2,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.0.0",
+        target_package_name="test-pkg",
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="update_subagent",
+        qa_policy=QAPolicy.VERSION_BUMP,
+    )
+    task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+        update={
+            "task_revision": 2,
+            "current_attempt_id": attempt_id,
+            "strategy_stage": snapshot.strategy_stage,
+            "selected_version": snapshot.selected_version,
+            "target_package_name": snapshot.target_package_name,
+            "instruction": instruction,
+            "qa_policy": QAPolicy.VERSION_BUMP,
+        }
+    )
+    initial = _base_state(
+        [group],
+        status="qa_completed",
+        task_queue={"task-1": task},
+        active_target_task_ids=["task-1"],
+        attempt_snapshots_by_id={attempt_id: snapshot},
+        qa_results_by_attempt={},
+    )
+
+    first = run_supervisor_node(initial)
+    assert first["next_routing_step"] == "qa_critic"
+    assert first["qa_dispatch_counts_by_attempt"] == {attempt_id: 1}
+
+    second = run_supervisor_node(
+        {
+            **initial,
+            **first,
+            "status": "qa_completed",
+            "qa_results_by_attempt": {},
+        }
+    )
+    assert second["next_routing_step"] == "qa_critic"
+    assert second["qa_dispatch_counts_by_attempt"] == {attempt_id: 2}
+
+    third = run_supervisor_node(
+        {
+            **initial,
+            **second,
+            "status": "qa_completed",
+            "qa_results_by_attempt": {},
+        }
+    )
+
+    terminal = third["task_queue"]["task-1"]
+    assert terminal.status == TaskStatus.INCONCLUSIVE
+    assert terminal.current_attempt_id is None
+    assert third["next_routing_step"] != "qa_critic"
+    assert third["qa_dispatch_counts_by_attempt"] == {attempt_id: 2}
+    assert any(
+        event.error_code == "QA_DISPATCH_LIMIT_REACHED" for event in third["consistency_events"]
+    )
+
+
+def test_inconclusive_active_qa_attempt_is_rechecked_before_other_tasks():
+    group1 = _sca_group("g1")
+    group2 = _sca_group("g2")
+    attempt_id = "attempt-active-qa-recheck"
+    instruction = "Update test-pkg to 2.0.0."
+    snapshot = TaskAttemptSnapshot(
+        attempt_id=attempt_id,
+        task_id="task-1",
+        task_revision=2,
+        strategy_stage=SCARemediationStage.NPM_LATEST,
+        selected_version="2.0.0",
+        target_package_name="test-pkg",
+        instruction=instruction,
+        instruction_digest=instruction_digest(instruction),
+        dispatch_node="update_subagent",
+        qa_policy=QAPolicy.VERSION_BUMP,
+    )
+    active_task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
+        update={
+            "task_revision": 2,
+            "current_attempt_id": attempt_id,
+            "strategy_stage": snapshot.strategy_stage,
+            "selected_version": snapshot.selected_version,
+            "target_package_name": snapshot.target_package_name,
+            "instruction": instruction,
+            "qa_policy": QAPolicy.VERSION_BUMP,
+        }
+    )
+    unrelated_task = _make_task("task-2", "g2", status=TaskStatus.OPTIMISTICALLY_FIXED)
+    state = _base_state(
+        [group1, group2],
+        status="supervisor_routed",
+        task_queue={"task-1": active_task, "task-2": unrelated_task},
+        # A failed QA preparation can clear the active-target projection and
+        # return no attempt result. The dispatch ledger still identifies the
+        # candidate that must be rechecked before other workspace mutations.
+        active_target_task_ids=[],
+        attempt_snapshots_by_id={attempt_id: snapshot},
+        qa_results_by_attempt={},
+        qa_dispatch_counts_by_attempt={attempt_id: 1},
+    )
+
+    result = run_supervisor_node(state)
+
+    assert result["next_routing_step"] == "qa_critic"
+    assert result["active_target_task_ids"] == ["task-1"]
+    assert result["qa_dispatch_counts_by_attempt"] == {attempt_id: 2}
 
 
 def test_terminal_task_cannot_retain_retry_plan():
@@ -5663,6 +5828,51 @@ def test_supervisor_projects_incremental_metrics_before_terminal_routing(
     assert summary.authoritative is False
     assert summary.coverage_scope == "incremental_dependency_inputs"
     assert summary.coverage_complete is True
+
+
+def test_supervisor_does_not_retriage_a_scan_already_processed_by_post_qa_triage():
+    group = _sast_group("g1")
+    task = _make_task(
+        "task-1",
+        "g1",
+        strategy=RoutingStrategy.CODE_WORKAROUND,
+        status=TaskStatus.QA_PASSED,
+    )
+    issue = _issue().model_copy(
+        update={
+            "source": IssueSource.ODC,
+            "issue_type": IssueType.SCA,
+            "cve_id": "CVE-2026-55555",
+        }
+    )
+    scan_record = TaskScanRecord(
+        task_id="task-1",
+        attempt_id="attempt-1",
+        task_revision=1,
+        found_identifiers=["CVE-2026-55555"],
+        new_identifiers=["CVE-2026-55555"],
+        found_issues=[issue],
+        complete=True,
+    )
+
+    result = run_supervisor_node(
+        _base_state(
+            [group],
+            task_queue={"task-1": task},
+            latest_successful_scan_by_task={"task-1": scan_record},
+            baseline_scan_identifiers=["CVE-2024-10001"],
+            baseline_scan_complete=True,
+            package_inventory_baseline_complete=True,
+            status="portfolio_ready",
+            triage_required=False,
+            post_qa_retriage_count=1,
+        )
+    )
+
+    assert result["new_vulnerability_identifiers"] == ["CVE-2026-55555"]
+    assert result["new_vulnerability_status"] == "detected"
+    assert result["triage_required"] is False
+    assert result["next_routing_step"] == "teardown"
 
 
 def test_supervisor_defers_incremental_triage_while_remediation_remains():
