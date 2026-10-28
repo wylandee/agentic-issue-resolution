@@ -28,6 +28,7 @@ GOLDEN_DATASET_NAMES = (
     "supervisor_cases",
     "report_cases",
     "fix_planner_cases",
+    "end_to_end_cases",
 )
 
 

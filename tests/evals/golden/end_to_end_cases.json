@@ -1,0 +1,245 @@
+[
+  {
+    "case_id": "e2e-npm-single-update",
+    "eval_type": "end_to_end",
+    "input": "Remediate the requested @tootallnate/once dependency finding.",
+    "context": [
+      "Run the complete remediation engine against the Juice Shop clone using its canonical baseline issues fixture.",
+      "The fixture-backed target finding is @tootallnate/once; dependency closure may be planned by the engine.",
+      "Historical evidence: phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md and update golden update-transitive-tootallnate-once."
+    ],
+    "expected_output": "Resolve @tootallnate/once to 2.0.1, synchronize package.json and package-lock.json, and pass current-attempt QA.",
+    "expected_tools": [],
+    "live": {
+      "ecosystem": "npm",
+      "clone_dir": "juice-shop",
+      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "target_packages": ["@tootallnate/once"]
+    },
+    "provenance": {
+      "trajectory": "phase5_20260721T083757Z_d661e0c3-2466-4cf0-902a-a3215e3affdd.md",
+      "note": "The matching update golden records the 2.0.1 override and manifest synchronization; the trajectory contains a multi-package run."
+    }
+  },
+  {
+    "case_id": "e2e-npm-batch-update",
+    "eval_type": "end_to_end",
+    "input": "Remediate the requested @angular/common, @angular/compiler, and @angular/core findings as one package batch.",
+    "context": [
+      "Run the complete engine on the Juice Shop clone and authorize the three requested package seeds only.",
+      "The dependency closure contains nine Angular packages: animations, common, compiler, compiler-cli, core, forms, platform-browser, platform-browser-dynamic, and router.",
+      "Historical evidence: phase5_20261027T113941Z_678959f5-b238-4c6e-97eb-84b71018eac3.md records all nine package tasks as QA-passed; the user-provided golden expectation sets the benchmark version to 21.2.17."
+    ],
+    "expected_output": "Expand the authorized closure to the nine Angular packages, update all nine to 21.2.17 in frontend/package.json and frontend/package-lock.json, and pass current-attempt QA.",
+    "expected_tools": [],
+    "live": {
+      "ecosystem": "npm",
+      "clone_dir": "juice-shop",
+      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "target_packages": ["@angular/common", "@angular/compiler", "@angular/core"]
+    },
+    "expected_closure": [
+      "@angular/animations",
+      "@angular/common",
+      "@angular/compiler",
+      "@angular/compiler-cli",
+      "@angular/core",
+      "@angular/forms",
+      "@angular/platform-browser",
+      "@angular/platform-browser-dynamic",
+      "@angular/router"
+    ],
+    "provenance": {
+      "trajectory": "phase5_20261027T113941Z_678959f5-b238-4c6e-97eb-84b71018eac3.md",
+      "note": "The nine target tasks passed QA. The exact output version is taken from the requested golden expectation."
+    }
+  },
+  {
+    "case_id": "e2e-npm-transitive-parent-update",
+    "eval_type": "end_to_end",
+    "input": "Remediate the requested transitive crypto-js finding.",
+    "context": [
+      "Run the complete remediation engine against the Juice Shop clone using the canonical baseline issues fixture.",
+      "The requested target is crypto-js; the historical remediation updates its parent dependency pdfkit.",
+      "Historical evidence: phase5_20260929T021633Z_808c8514-4a8c-451b-941f-1fc7fe15a935.md records a QA-passed pdfkit parent update to 0.12.2."
+    ],
+    "expected_output": "Remediate crypto-js by updating the parent dependency pdfkit to 0.12.2, synchronize the npm manifests, and pass current-attempt QA.",
+    "expected_tools": [],
+    "live": {
+      "ecosystem": "npm",
+      "clone_dir": "juice-shop",
+      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "target_packages": ["crypto-js"]
+    },
+    "provenance": {
+      "trajectory": "phase5_20260929T021633Z_808c8514-4a8c-451b-941f-1fc7fe15a935.md",
+      "note": "Target task QA passed after pdfkit@0.12.2 was applied; the run also contained unrelated groups."
+    }
+  },
+  {
+    "case_id": "e2e-npm-code-migration",
+    "eval_type": "end_to_end",
+    "input": "Remediate the requested express-jwt finding while keeping the application authentication behavior valid.",
+    "context": [
+      "Run the complete remediation engine against the Juice Shop clone.",
+      "Expected lineage: update express-jwt to 6.0.0; deterministic QA detects the API breaking change; the Supervisor commits a workaround child attempt; add the algorithms argument in lib/insecurity.ts; final current-attempt QA passes.",
+      "Historical evidence: phase5_20261027T034716Z_a452b9ff-f447-4332-8cdf-459dc03ec437.md shows the failed update QA and committed workaround pivot. Its workaround attempt ended unfixable, so successful final QA remains the requested acceptance behavior and is not claimed as historical success."
+    ],
+    "expected_output": "Update express-jwt to 6.0.0, observe its breaking-change QA failure, commit a workaround pivot that adds the algorithms argument in lib/insecurity.ts, and pass final QA while retaining the package update.",
+    "expected_tools": [],
+    "live": {
+      "ecosystem": "npm",
+      "clone_dir": "juice-shop",
+      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "target_packages": ["express-jwt"]
+    },
+    "provenance": {
+      "trajectory": "phase5_20261027T034716Z_a452b9ff-f447-4332-8cdf-459dc03ec437.md",
+      "note": "Historical evidence supports the initial update, failed QA, and strategy pivot; final successful workaround behavior is the golden expectation."
+    }
+  },
+  {
+    "case_id": "e2e-npm-no-fix-removal",
+    "eval_type": "end_to_end",
+    "input": "Remediate the requested notevil finding with the available no-fix strategy.",
+    "context": [
+      "Run the complete remediation engine against the Juice Shop clone.",
+      "Remove notevil from the dependency manifest and lockfile and remove its application use from routes/b2bOrder.ts; current-attempt QA must pass.",
+      "Historical evidence: phase5_20260818T071538Z_fd6aef62-43e3-4fd4-a018-033dbb60b412.md removes the notevil import and unsafeEval use from routes/b2bOrder.ts."
+    ],
+    "expected_output": "Remove notevil from package.json and package-lock.json, remove its use from routes/b2bOrder.ts, and pass current-attempt QA.",
+    "expected_tools": [],
+    "live": {
+      "ecosystem": "npm",
+      "clone_dir": "juice-shop",
+      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "target_packages": ["notevil"]
+    },
+    "provenance": {
+      "trajectory": "phase5_20260818T071538Z_fd6aef62-43e3-4fd4-a018-033dbb60b412.md",
+      "note": "Historical patch evidence removes application use; the manifest and final QA are part of the requested acceptance contract."
+    }
+  },
+  {
+    "case_id": "e2e-npm-mixed-strategies",
+    "eval_type": "end_to_end",
+    "input": "Remediate the requested Angular, express-jwt, and notevil findings in one run.",
+    "context": [
+      "This combines the expected outcomes of e2e-npm-batch-update, e2e-npm-code-migration, and e2e-npm-no-fix-removal; it does not include crypto-js.",
+      "Angular closure: animations, common, compiler, compiler-cli, core, forms, platform-browser, platform-browser-dynamic, and router, all at 21.2.17.",
+      "express-jwt must update to 6.0.0 and pivot after breaking-change QA to the algorithms code workaround; notevil must be removed from the manifest and routes/b2bOrder.ts. Every final target attempt must pass QA.",
+      "Historical evidence: phase5_20261027T034716Z_a452b9ff-f447-4332-8cdf-459dc03ec437.md records the mixed target set, nine Angular QA passes, and the express-jwt pivot. The pivot did not pass QA in that run; successful behavior is specified by the component goldens."
+    ],
+    "expected_output": "Pass all nine Angular package updates at 21.2.17, complete the express-jwt 6.0.0 update and algorithms workaround pivot by adding the algorithms argument in lib/insecurity.ts with final QA passing, and remove notevil from the manifest and application code with QA passing.",
+    "expected_tools": [],
+    "live": {
+      "ecosystem": "npm",
+      "clone_dir": "juice-shop",
+      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "target_packages": ["@angular/common", "@angular/compiler", "@angular/core", "express-jwt", "notevil"]
+    },
+    "expected_closure": [
+      "@angular/animations",
+      "@angular/common",
+      "@angular/compiler",
+      "@angular/compiler-cli",
+      "@angular/core",
+      "@angular/forms",
+      "@angular/platform-browser",
+      "@angular/platform-browser-dynamic",
+      "@angular/router"
+    ],
+    "provenance": {
+      "trajectory": "phase5_20261027T034716Z_a452b9ff-f447-4332-8cdf-459dc03ec437.md",
+      "note": "This trace supplies partial mixed-strategy evidence; successful full completion combines the requested component-case expectations."
+    }
+  },
+  {
+    "case_id": "e2e-python-single-update",
+    "eval_type": "end_to_end",
+    "input": "Remediate the requested PyYAML dependency finding.",
+    "context": [
+      "Run the complete remediation engine against the PyGoat clone using the canonical baseline issues fixture.",
+      "PyGoat records the package as PyYAML; target selection is case-insensitive and the engine receives the fixture's canonical package spelling.",
+      "Expected output is the requested PyYAML version 5.4. No matching historical single-package trajectory was found in the available trajectory corpus."
+    ],
+    "expected_output": "Update the PyYAML requirement to 5.4 and pass current-attempt QA.",
+    "expected_tools": [],
+    "live": {
+      "ecosystem": "python",
+      "clone_dir": "pygoat",
+      "fixture_path": "examples/pygoat/fixtures/baseline_issues.jsonl",
+      "target_packages": ["pyyaml"]
+    },
+    "provenance": {
+      "trajectory": null,
+      "note": "Expected output is supplied by the golden specification; no matching historical PyGoat PyYAML run was found."
+    }
+  },
+  {
+    "case_id": "e2e-python-batch-update",
+    "eval_type": "end_to_end",
+    "input": "Remediate the requested certifi and sqlparse findings as one package batch.",
+    "context": [
+      "Run the complete remediation engine against the PyGoat clone.",
+      "Expected targets: certifi to 2024.7.4 and sqlparse to 0.4.4; pass each target's current-attempt QA.",
+      "Historical evidence: phase5_20261021T070522Z_5a20cf64-9f82-4c54-84a8-a1475a0361d3.md and phase5_20261028T055455Z_1882c41e-6e21-43f2-81f2-d366d6955d58.md record both requested updates and QA passes; the runs report unrelated newly detected findings."
+    ],
+    "expected_output": "Update certifi to 2024.7.4 and sqlparse to 0.4.4, synchronize requirements.txt, and pass current-attempt QA for both targets.",
+    "expected_tools": [],
+    "live": {
+      "ecosystem": "python",
+      "clone_dir": "pygoat",
+      "fixture_path": "examples/pygoat/fixtures/baseline_issues.jsonl",
+      "target_packages": ["certifi", "sqlparse"]
+    },
+    "provenance": {
+      "trajectory": "phase5_20261021T070522Z_5a20cf64-9f82-4c54-84a8-a1475a0361d3.md",
+      "note": "Both target tasks passed QA and their requested requirement versions appear in the patch; unrelated new findings are excluded from the completion goal."
+    }
+  },
+  {
+    "case_id": "e2e-java-single-update",
+    "eval_type": "end_to_end",
+    "input": "Remediate the requested org.postgresql:postgresql dependency finding.",
+    "context": [
+      "Run the complete remediation engine against the Vulnado clone using the canonical baseline issues fixture.",
+      "The target Maven dependency must resolve to 42.7.11 and pass current-attempt QA.",
+      "Historical evidence: phase5_20261020T035317Z_acc4a7ea-58ce-4140-becb-f26bc5764064.md records postgresql at 42.7.11 with target QA passed; the run also contains an unrelated jsoup target."
+    ],
+    "expected_output": "Update org.postgresql:postgresql to 42.7.11 in the Maven project and pass current-attempt QA.",
+    "expected_tools": [],
+    "live": {
+      "ecosystem": "java",
+      "clone_dir": "vulnado",
+      "fixture_path": "examples/Vulnado/fixtures/baseline_issues.jsonl",
+      "target_packages": ["org.postgresql:postgresql"]
+    },
+    "provenance": {
+      "trajectory": "phase5_20261020T035317Z_acc4a7ea-58ce-4140-becb-f26bc5764064.md",
+      "note": "The requested PostgreSQL task passed QA and the Maven diff records 42.7.11; another independent task was present."
+    }
+  },
+  {
+    "case_id": "e2e-java-batch-update",
+    "eval_type": "end_to_end",
+    "input": "Remediate the requested logback-classic and logback-core dependency findings as one package batch.",
+    "context": [
+      "Run the complete remediation engine against the Vulnado clone.",
+      "Update both ch.qos.logback dependencies to 1.2.13 and pass current-attempt QA for both targets.",
+      "Historical evidence: phase5_20261020T061021Z_c2b3de3e-bbb6-4d05-a68d-9db7f65027ce.md records both Maven dependency updates and QA passes; unrelated new scan identifiers are not part of this request."
+    ],
+    "expected_output": "Update ch.qos.logback:logback-classic and ch.qos.logback:logback-core to 1.2.13 in pom.xml and pass current-attempt QA for both targets.",
+    "expected_tools": [],
+    "live": {
+      "ecosystem": "java",
+      "clone_dir": "vulnado",
+      "fixture_path": "examples/Vulnado/fixtures/baseline_issues.jsonl",
+      "target_packages": ["ch.qos.logback:logback-classic", "ch.qos.logback:logback-core"]
+    },
+    "provenance": {
+      "trajectory": "phase5_20261020T061021Z_c2b3de3e-bbb6-4d05-a68d-9db7f65027ce.md",
+      "note": "Both target tasks passed QA and the pom.xml diff records version 1.2.13; newly detected unrelated vulnerabilities are ignored by the completion judge."
+    }
+  }
+]

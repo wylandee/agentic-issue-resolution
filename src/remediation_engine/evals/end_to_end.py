@@ -26,13 +26,62 @@ from remediation_engine.orchestration.trajectory_exporter import to_jsonable
 from remediation_engine.settings import AppSettings
 
 from .db import EvalDatabase
+from .end_to_end_goldens import (
+    EndToEndGolden,
+    build_golden_request,
+    golden_fixture_identity,
+    golden_settings,
+    isolated_golden_workspace,
+    load_end_to_end_goldens,
+)
 from .judge import build_bounded_judge_model, build_judge_score_metric
 from .models import EvalRunRecord, EvalTestCaseRecord, MetricRecord
-from .run_evidence import RunEvidence, assess_contracts, judge_payload, load_run, normalize_run
+from .run_evidence import (
+    NEW_FINDING_COMPLETION_RULE,
+    RunEvidence,
+    assess_contracts,
+    judge_payload,
+    load_run,
+    normalize_run,
+)
 from .trajectories import parse_trajectory_markdown
 
 MAX_JUDGE_INPUT_TOKENS = 80_000
 JUDGE_PROMPT_OVERHEAD_TOKENS = 8_000
+
+
+def _task_completion_template():
+    """Return TaskCompletion prompts that distinguish original and new findings."""
+    from deepeval.metrics.task_completion.task_completion import TaskCompletionTemplate
+
+    class EndToEndTaskCompletionTemplate(TaskCompletionTemplate):
+        @staticmethod
+        def extract_goal_and_outcome(
+            *, input: str, actual_output: str, tools_called_formatted: str
+        ):
+            prompt = TaskCompletionTemplate.extract_goal_and_outcome(
+                input=input,
+                actual_output=actual_output,
+                tools_called_formatted=tools_called_formatted,
+            )
+            return f"{prompt}\n\nCompletion scope:\n{NEW_FINDING_COMPLETION_RULE}"
+
+        @staticmethod
+        def extract_task_and_outcome_from_trace(*, trace_json: str):
+            prompt = TaskCompletionTemplate.extract_task_and_outcome_from_trace(
+                trace_json=trace_json
+            )
+            return f"{prompt}\n\nCompletion scope:\n{NEW_FINDING_COMPLETION_RULE}"
+
+        @staticmethod
+        def generate_verdict(*, task: str, actual_outcome: str):
+            prompt = TaskCompletionTemplate.generate_verdict(
+                task=task,
+                actual_outcome=actual_outcome,
+            )
+            return f"{prompt}\n\nCompletion scope:\n{NEW_FINDING_COMPLETION_RULE}"
+
+    return EndToEndTaskCompletionTemplate
 
 
 def _deepeval_version() -> str | None:
@@ -81,7 +130,12 @@ def build_metrics(judge_model: str, *, judge_llm: Any | None = None) -> list[Any
 
     judge = judge_llm if judge_llm is not None else judge_model
     return [
-        TaskCompletionMetric(threshold=0.70, model=judge, async_mode=False),
+        TaskCompletionMetric(
+            threshold=0.70,
+            model=judge,
+            async_mode=False,
+            evaluation_template=_task_completion_template(),
+        ),
         build_judge_score_metric(
             name="System Safety and Contract Adherence",
             threshold=0.70,
@@ -110,6 +164,7 @@ def evaluate_run(
     metrics_factory: Callable[[str], list[Any]] | None = None,
     judge_llm: Any | None = None,
     secrets: Sequence[str] = (),
+    golden: EndToEndGolden | None = None,
 ) -> EvalTestCaseRecord:
     """Judge a whole run, preserving all available metrics even after failures.
 
@@ -129,7 +184,21 @@ def evaluate_run(
     started = time.monotonic()
     evidence = RunEvidence.model_validate(_safe(evidence.model_dump(), secrets))
     assessment = assess_contracts(evidence)
-    goal, outcome, tools, omissions = judge_payload(evidence, assessment)
+    goal, outcome, tools, omissions = judge_payload(
+        evidence, assessment, golden=golden.case if golden is not None else None
+    )
+    golden_metadata = (
+        {
+            "case_id": golden.case_id,
+            "expected_output": golden.expected_output,
+            **golden_fixture_identity(golden),
+            "requested_packages": list(golden.requested_packages),
+            "source_run_id": evidence.source_run_id,
+            "provenance": golden.case.get("provenance", {}),
+        }
+        if golden is not None
+        else None
+    )
     metadata = {
         "source_run_id": evidence.source_run_id,
         "source": evidence.source,
@@ -143,12 +212,20 @@ def evaluate_run(
         "agent_models": evidence.request.get("model_config", {}),
         "deepeval_version": _deepeval_version(),
     }
+    if golden_metadata is not None:
+        metadata["golden"] = golden_metadata
     record = EvalTestCaseRecord(
-        case_id=evidence.source_run_id,
-        test_name=f"end_to_end[{evidence.source_run_id}]",
+        case_id=golden.case_id if golden is not None else evidence.source_run_id,
+        test_name=(
+            f"end_to_end[{golden.case_id}]"
+            if golden is not None
+            else f"end_to_end[{evidence.source_run_id}]"
+        ),
         suite="end_to_end",
         input_text=goal,
         actual_output=outcome,
+        expected_output=golden.expected_output if golden is not None else None,
+        context_text="\n".join(golden.case.get("context", [])) if golden is not None else None,
         additional_metadata=metadata,
     )
     errors = []
@@ -233,6 +310,31 @@ def evaluate_run(
     record.additional_metadata["judge_errors"] = errors
     record.latency_seconds = time.monotonic() - started
     return EvalTestCaseRecord.model_validate(_safe(record.model_dump(), secrets))
+
+
+def evaluate_golden(
+    golden: EndToEndGolden,
+    *,
+    settings: AppSettings,
+    judge_model: str = "gpt-6-luna",
+    strict: bool = False,
+    judge_llm: Any | None = None,
+    secrets: Sequence[str] = (),
+) -> EvalTestCaseRecord:
+    """Run one complete golden and judge it before restoring clone suppressions."""
+    with isolated_golden_workspace(golden):
+        evidence = run_fresh(
+            build_golden_request(golden),
+            settings=golden_settings(settings),
+        )
+        return evaluate_run(
+            evidence,
+            judge_model=judge_model,
+            strict=strict,
+            judge_llm=judge_llm,
+            secrets=secrets,
+            golden=golden,
+        )
 
 
 def repository_fingerprint(repo: Path) -> str:
@@ -381,7 +483,12 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--format", choices=("auto", "odc-json", "semgrep-json", "jsonl"), default="auto"
     )
-    for command in (score, run):
+    goldens = commands.add_parser("goldens", help="Run and score maintained end-to-end goldens")
+    goldens.add_argument(
+        "--case", action="append", default=[], help="Golden case ID or 'all'; repeatable"
+    )
+    goldens.add_argument("--clones-root", type=Path, default=None)
+    for command in (score, run, goldens):
         command.add_argument("--judge-model")
         command.add_argument("--eval-tag")
         command.add_argument("--db-path", type=Path)
@@ -413,38 +520,85 @@ def main(argv: Sequence[str] | None = None) -> int:
         settings.serper_api_key,
         settings.langsmith_api_key,
     )
-    sources = args.trajectory if args.command == "score" else [args.input]
     records = []
-    for source in sources:
+    if args.command == "goldens":
         try:
-            if args.command == "score":
-                evidence = load_run(source)
-            else:
-                from remediation_engine.cli import _load_issues
-
-                request = RemediationRequest(
-                    repo_root=args.repo.resolve(), issues=_load_issues(source, args.format)
-                )
-                evidence = run_fresh(request, settings=settings)
-            records.append(
-                evaluate_run(
-                    evidence,
-                    judge_model=judge_model,
-                    judge_llm=judge_llm,
-                    strict=args.strict,
-                    secrets=secrets,
-                )
-            )
+            options = {"case_ids": args.case}
+            if args.clones_root is not None:
+                options["clones_root"] = args.clones_root
+            goldens = load_end_to_end_goldens(**options)
         except Exception as exc:
             records.append(
                 EvalTestCaseRecord(
-                    test_name=f"end_to_end[{source}]",
+                    test_name="end_to_end[goldens]",
                     suite="end_to_end",
                     status="ERROR",
                     error_message=_safe(str(exc), secrets),
-                    additional_metadata={"source_path": str(source)},
                 )
             )
+        else:
+            for golden in goldens:
+                try:
+                    records.append(
+                        evaluate_golden(
+                            golden,
+                            settings=settings,
+                            judge_model=judge_model,
+                            judge_llm=judge_llm,
+                            strict=args.strict,
+                            secrets=secrets,
+                        )
+                    )
+                except Exception as exc:
+                    records.append(
+                        EvalTestCaseRecord(
+                            case_id=golden.case_id,
+                            test_name=f"end_to_end[{golden.case_id}]",
+                            suite="end_to_end",
+                            status="ERROR",
+                            error_message=_safe(str(exc), secrets),
+                            expected_output=golden.expected_output,
+                            additional_metadata={
+                                "golden": {
+                                    "case_id": golden.case_id,
+                                    "expected_output": golden.expected_output,
+                                    **golden_fixture_identity(golden),
+                                }
+                            },
+                        )
+                    )
+    else:
+        sources = args.trajectory if args.command == "score" else [args.input]
+        for source in sources:
+            try:
+                if args.command == "score":
+                    evidence = load_run(source)
+                else:
+                    from remediation_engine.cli import _load_issues
+
+                    request = RemediationRequest(
+                        repo_root=args.repo.resolve(), issues=_load_issues(source, args.format)
+                    )
+                    evidence = run_fresh(request, settings=settings)
+                records.append(
+                    evaluate_run(
+                        evidence,
+                        judge_model=judge_model,
+                        judge_llm=judge_llm,
+                        strict=args.strict,
+                        secrets=secrets,
+                    )
+                )
+            except Exception as exc:
+                records.append(
+                    EvalTestCaseRecord(
+                        test_name=f"end_to_end[{source}]",
+                        suite="end_to_end",
+                        status="ERROR",
+                        error_message=_safe(str(exc), secrets),
+                        additional_metadata={"source_path": str(source)},
+                    )
+                )
     now = datetime.now(UTC)
     errors = sum(record.status == "ERROR" for record in records)
     run = EvalRunRecord(

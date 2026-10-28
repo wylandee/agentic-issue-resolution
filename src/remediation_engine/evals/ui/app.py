@@ -10,6 +10,7 @@ import streamlit as st
 
 from remediation_engine.evals.comparison import format_run_label
 from remediation_engine.evals.db import EvalDatabase
+from remediation_engine.evals.end_to_end_goldens import load_end_to_end_goldens
 from remediation_engine.evals.runner import (
     SUITE_PATHS,
     EvalProcessOutcome,
@@ -543,57 +544,81 @@ with tab_runner:
     )
 
     e2e_extra_args: list[str] = []
+    e2e_golden_mode = False
+    e2e_selected_goldens: list[str] = []
     if suite_choice == "end_to_end":
-        st.caption(
-            "Whole-run judging uses only the complete runs you select here. It never scans "
-            "the local trajectory folder automatically."
-        )
-        trajectory_text = st.text_area(
-            "Recorded trajectory paths (one per line)",
-            placeholder="data/trajectories/selected-run.md",
+        e2e_golden_mode = st.radio(
+            "End-to-end source",
+            options=("Golden cases", "Recorded or fresh runs"),
+            index=0,
+            horizontal=True,
             disabled=not live_eval,
         )
-        e2e_repo_col, e2e_input_col = st.columns(2)
-        with e2e_repo_col:
-            fresh_repo = st.text_input("Fresh run repository path", disabled=not live_eval)
-        with e2e_input_col:
-            fresh_input = st.text_input("Fresh run findings file", disabled=not live_eval)
-        fresh_format = st.selectbox(
-            "Fresh run input format",
-            options=("auto", "odc-json", "semgrep-json", "jsonl"),
-            disabled=not live_eval or not fresh_input,
-        )
+        if e2e_golden_mode == "Golden cases":
+            golden_ids = [golden.case_id for golden in load_end_to_end_goldens()]
+            e2e_selected_goldens = st.multiselect(
+                "Golden cases",
+                options=golden_ids,
+                default=golden_ids,
+                disabled=not live_eval,
+            )
+            st.caption("Each case launches the engine against its fixture-backed repository clone.")
+            for case_id in e2e_selected_goldens:
+                e2e_extra_args.extend(["--e2e-golden", case_id])
+        else:
+            st.caption(
+                "Score explicitly selected complete runs; the trajectory folder is not scanned automatically."
+            )
+            trajectory_text = st.text_area(
+                "Recorded trajectory paths (one per line)",
+                placeholder="data/trajectories/selected-run.md",
+                disabled=not live_eval,
+            )
+            e2e_repo_col, e2e_input_col = st.columns(2)
+            with e2e_repo_col:
+                fresh_repo = st.text_input("Fresh run repository path", disabled=not live_eval)
+            with e2e_input_col:
+                fresh_input = st.text_input("Fresh run findings file", disabled=not live_eval)
+            fresh_format = st.selectbox(
+                "Fresh run input format",
+                options=("auto", "odc-json", "semgrep-json", "jsonl"),
+                disabled=not live_eval or not fresh_input,
+            )
+            for trajectory in trajectory_text.splitlines():
+                if trajectory.strip():
+                    e2e_extra_args.extend(["--e2e-trajectory", trajectory.strip()])
+            if bool(fresh_repo.strip()) != bool(fresh_input.strip()):
+                st.warning(
+                    "Enter both a fresh run repository and a findings file, or leave both blank."
+                )
+            elif fresh_repo.strip() and fresh_input.strip():
+                e2e_extra_args.extend(
+                    ["--e2e-run-repo", fresh_repo.strip(), "--e2e-input", fresh_input.strip()]
+                )
+                if fresh_format != "auto":
+                    e2e_extra_args.extend(["--e2e-input-format", fresh_format])
         e2e_strict = st.checkbox(
             "Fail on whole-run metric threshold misses (--e2e-strict)",
             value=False,
             disabled=not live_eval,
         )
-        for trajectory in trajectory_text.splitlines():
-            if trajectory.strip():
-                e2e_extra_args.extend(["--e2e-trajectory", trajectory.strip()])
-        if bool(fresh_repo.strip()) != bool(fresh_input.strip()):
-            st.warning(
-                "Enter both a fresh run repository and a findings file, or leave both blank."
-            )
-        elif fresh_repo.strip() and fresh_input.strip():
-            e2e_extra_args.extend(
-                ["--e2e-run-repo", fresh_repo.strip(), "--e2e-input", fresh_input.strip()]
-            )
-            if fresh_format != "auto":
-                e2e_extra_args.extend(["--e2e-input-format", fresh_format])
         if e2e_strict:
             e2e_extra_args.append("--e2e-strict")
 
     if st.button("▶ Start Evaluation Run", type="primary"):
         if suite_choice == "end_to_end" and live_eval:
-            has_fresh_pair = bool(fresh_repo.strip() and fresh_input.strip())
-            has_partial_pair = bool(fresh_repo.strip()) != bool(fresh_input.strip())
-            if has_partial_pair:
-                st.error("Provide both fresh run paths or leave both blank.")
+            if e2e_golden_mode == "Golden cases" and not e2e_selected_goldens:
+                st.error("Select at least one end-to-end golden case.")
                 st.stop()
-            if not trajectory_text.strip() and not has_fresh_pair:
-                st.error("Select at least one complete trajectory or a fresh run input pair.")
-                st.stop()
+            if e2e_golden_mode == "Recorded or fresh runs":
+                has_fresh_pair = bool(fresh_repo.strip() and fresh_input.strip())
+                has_partial_pair = bool(fresh_repo.strip()) != bool(fresh_input.strip())
+                if has_partial_pair:
+                    st.error("Provide both fresh run paths or leave both blank.")
+                    st.stop()
+                if not trajectory_text.strip() and not has_fresh_pair:
+                    st.error("Select at least one complete trajectory or a fresh run input pair.")
+                    st.stop()
         output_placeholder = st.empty()
         log_lines: list[str] = []
         terminal_outcomes: list[EvalProcessOutcome] = []

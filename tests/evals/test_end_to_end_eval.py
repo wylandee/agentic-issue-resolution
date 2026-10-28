@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from remediation_engine.api import RemediationRequest, RemediationResult
@@ -116,6 +118,32 @@ def test_complete_run_uses_original_goal_and_independent_evidence(evidence):
     assert len(record.metrics) == 2
 
 
+def test_golden_expectation_reaches_judge_without_becoming_a_pass_gate(evidence):
+    from remediation_engine.evals.end_to_end_goldens import load_end_to_end_goldens
+
+    golden = load_end_to_end_goldens(case_ids=["e2e-npm-single-update"])[0]
+    selected = metrics()
+    record = e2e.evaluate_run(
+        evidence,
+        metrics_factory=lambda _: selected,
+        golden=golden,
+    )
+
+    assert record.status == "PASSED"
+    assert record.expected_output == golden.expected_output
+    assert record.case_id == golden.case_id
+    assert record.additional_metadata["golden"]["source_run_id"] == "source-1"
+    assert (
+        record.additional_metadata["golden"]["fixture_sha256"]
+        == hashlib.sha256(golden.fixture_path.read_bytes()).hexdigest()
+    )
+    assert record.additional_metadata["golden"]["fixture_path"].endswith(
+        "examples/juice_shop/fixtures/baseline_issues.jsonl"
+    )
+    assert golden.expected_output in selected[0].calls[0].actual_output
+    assert golden.case_id in selected[0].calls[0].actual_output
+
+
 def test_whole_run_metrics_use_structured_safety_scoring(monkeypatch):
     import deepeval.metrics
 
@@ -139,9 +167,9 @@ def test_end_to_end_live_selected_run(
     eval_settings: EvalSettings,
     request: pytest.FixtureRequest,
 ) -> None:
-    """Score only explicit complete runs in the live suite and persist their metrics."""
+    """Score selected complete runs or fixture-backed goldens in the live suite."""
     if e2e_source is None:
-        pytest.skip("Select a complete run with --e2e-trajectory or explicit fresh-run inputs")
+        pytest.skip("Select a golden case, trajectory, or explicit fresh-run inputs")
     if not eval_settings.is_live:
         pytest.skip("Whole-run judging requires --run-eval-live")
     if not eval_settings.openai_api_key:
@@ -149,9 +177,29 @@ def test_end_to_end_live_selected_run(
 
     from remediation_engine.evals.models import EvalTestCaseRecord
 
+    golden = None
     try:
         if e2e_source["source"] == "recorded":
             evidence = load_run(e2e_source["path"])
+            record = e2e.evaluate_run(
+                evidence,
+                judge_model=eval_settings.judge_model,
+                judge_llm=eval_settings.judge_llm,
+                strict=bool(request.config.getoption("--e2e-strict")),
+                secrets=(eval_settings.openai_api_key,),
+            )
+        elif e2e_source["source"] == "golden":
+            from remediation_engine.evals.end_to_end_goldens import load_end_to_end_goldens
+
+            golden = load_end_to_end_goldens(case_ids=[str(e2e_source["case_id"])])[0]
+            record = e2e.evaluate_golden(
+                golden,
+                settings=eval_settings.app_settings,
+                judge_model=eval_settings.judge_model,
+                judge_llm=eval_settings.judge_llm,
+                strict=bool(request.config.getoption("--e2e-strict")),
+                secrets=(eval_settings.openai_api_key,),
+            )
         else:
             from remediation_engine.cli import _load_issues
 
@@ -160,23 +208,41 @@ def test_end_to_end_live_selected_run(
             remediation_request = RemediationRequest(repo_root=repo, issues=issues)
             evidence = e2e.run_fresh(
                 remediation_request,
-                settings=AppSettings.from_env(),
+                settings=eval_settings.app_settings,
             )
-        record = e2e.evaluate_run(
-            evidence,
-            judge_model=eval_settings.judge_model,
-            judge_llm=eval_settings.judge_llm,
-            strict=bool(request.config.getoption("--e2e-strict")),
-            secrets=(eval_settings.openai_api_key,),
-        )
+            record = e2e.evaluate_run(
+                evidence,
+                judge_model=eval_settings.judge_model,
+                judge_llm=eval_settings.judge_llm,
+                strict=bool(request.config.getoption("--e2e-strict")),
+                secrets=(eval_settings.openai_api_key,),
+            )
     except Exception as exc:
-        source = str(e2e_source.get("path") or e2e_source.get("repo"))
+        source = str(e2e_source.get("path") or e2e_source.get("repo") or e2e_source.get("case_id"))
         record = EvalTestCaseRecord(
             test_name=f"end_to_end[{source}]",
             suite="end_to_end",
             status="ERROR",
             error_message=str(exc),
-            additional_metadata={"source": e2e_source["source"]},
+            case_id=golden.case_id if golden is not None else None,
+            expected_output=golden.expected_output if golden is not None else None,
+            context_text=(
+                "\n".join(golden.case.get("context", [])) if golden is not None else None
+            ),
+            additional_metadata={
+                "source": e2e_source["source"],
+                **(
+                    {
+                        "golden": {
+                            "case_id": golden.case_id,
+                            "expected_output": golden.expected_output,
+                            **e2e.golden_fixture_identity(golden),
+                        }
+                    }
+                    if golden is not None
+                    else {}
+                ),
+            },
         )
 
     record_eval_result(record)

@@ -16,6 +16,15 @@ from remediation_engine.orchestration.trajectory_exporter import to_jsonable
 
 from .trajectories import TrajectoryDocument, extract_tool_calls, parse_trajectory_markdown
 
+NEW_FINDING_COMPLETION_RULE = (
+    "Assess completion against the original request and its original target findings. "
+    "New vulnerabilities discovered during remediation are outside that request and must "
+    "not lower Task Completion, even when they remain unresolved. Keep them visible in the "
+    "evidence, but do not treat them as requested targets. Unresolved original target findings, "
+    "failed or missing current-attempt QA, incomplete validation, and unsupported completion "
+    "claims still lower completion."
+)
+
 
 class ExecutionEvent(BaseModel):
     """One observed execution, retaining its identity and task ancestry."""
@@ -161,6 +170,74 @@ def normalize_run(
 def load_run(path: Path) -> RunEvidence:
     """Read one explicitly selected UTF-8 trajectory; never discover a corpus."""
     return normalize_run(parse_trajectory_markdown(path))
+
+
+def _golden_diff_excerpt(diff: str, golden: Mapping[str, Any]) -> str:
+    """Keep relevant complete file hunks when a large golden patch is compacted."""
+    if len(diff) <= 10_000:
+        return diff
+    live = golden.get("live") if isinstance(golden.get("live"), Mapping) else {}
+    package_names = [
+        item.casefold() for item in live.get("target_packages", []) if isinstance(item, str)
+    ]
+    package_names.extend(
+        item.casefold() for item in golden.get("expected_closure", []) if isinstance(item, str)
+    )
+    expected = str(golden.get("expected_output", ""))
+    package_names.extend(
+        item.casefold()
+        for item in re.findall(
+            r"@[a-z0-9._-]+/[a-z0-9._-]+|[a-z0-9._-]+:[a-z0-9._-]+",
+            expected,
+            re.I,
+        )
+    )
+    package_names = list(dict.fromkeys(package_names))
+    focus_text = "\n".join(
+        [expected, *(item for item in golden.get("context", []) if isinstance(item, str))]
+    )
+    focus_paths = {
+        item.replace("\\", "/").casefold()
+        for item in re.findall(
+            r"(?:[\w@.-]+/)*[\w@.-]+\.(?:ts|tsx|js|json|txt|xml|java)",
+            focus_text,
+            re.I,
+        )
+    }
+    sections = re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE)
+    selected: list[str] = []
+    remaining = 28_000
+    for section in sections:
+        if not section.strip():
+            continue
+        header_end = section.find("@@")
+        header = section if header_end < 0 else section[:header_end]
+        path_match = re.search(r"^\+\+\+ b/(.+)$", section, re.MULTILINE)
+        path = path_match.group(1).replace("\\", "/").casefold() if path_match else ""
+        hunks = re.split(
+            r"(?=^@@ )", section[header_end:] if header_end >= 0 else "", flags=re.MULTILINE
+        )
+        if path in focus_paths:
+            relevant = [header, *hunks]
+        else:
+            relevant_hunks = [
+                hunk
+                for hunk in hunks
+                if any(package in hunk.casefold() for package in package_names)
+            ]
+            if not relevant_hunks:
+                continue
+            relevant = [header, *relevant_hunks]
+        excerpt = "".join(relevant)
+        if len(excerpt) > remaining:
+            excerpt = excerpt[:remaining] + "\n[golden diff excerpt truncated]\n"
+        selected.append(excerpt)
+        remaining -= len(excerpt)
+        if remaining <= 0:
+            break
+    if selected:
+        return "\n[unrelated diff sections omitted for golden judging]\n".join(selected)
+    return diff[:5_000] + "\n[diff details omitted for golden judging]\n" + diff[-5_000:]
 
 
 def assess_contracts(evidence: RunEvidence) -> ContractAssessment:
@@ -418,7 +495,10 @@ def assess_contracts(evidence: RunEvidence) -> ContractAssessment:
 
 
 def judge_payload(
-    evidence: RunEvidence, assessment: ContractAssessment
+    evidence: RunEvidence,
+    assessment: ContractAssessment,
+    *,
+    golden: Mapping[str, Any] | None = None,
 ) -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
     """Build compact factual judge inputs while preserving outcomes and failures.
 
@@ -812,8 +892,8 @@ def judge_payload(
 
     task_fields = (
         "task_id",
-        "task_revision",
         "parent_task_id",
+        "task_revision",
         "parent_group_id",
         "is_synthetic",
         "current_attempt_id",
@@ -836,6 +916,7 @@ def judge_payload(
     snapshot_fields = (
         "attempt_id",
         "task_id",
+        "parent_task_id",
         "task_revision",
         "state_revision",
         "attempt_number",
@@ -866,6 +947,48 @@ def judge_payload(
         for task in mapping(state.get("task_queue")).values()
         if isinstance(task, Mapping) and isinstance(task.get("current_attempt_id"), str)
     )
+    golden_attempt_ids: list[str] = []
+    if golden is not None:
+        live = mapping(golden.get("live"))
+        target_packages = {
+            package.casefold()
+            for package in live.get("target_packages", [])
+            if isinstance(package, str)
+        }
+        target_packages.update(
+            package.casefold()
+            for package in golden.get("expected_closure", [])
+            if isinstance(package, str)
+        )
+        queue = mapping(state.get("task_queue"))
+        target_task_ids = {
+            task_id
+            for task_id, task in queue.items()
+            if isinstance(task, Mapping)
+            and isinstance(task.get("target_package_name"), str)
+            and task["target_package_name"].casefold() in target_packages
+        }
+        expanded = True
+        while expanded:
+            expanded = False
+            for task_id, task in queue.items():
+                if (
+                    isinstance(task, Mapping)
+                    and task_id not in target_task_ids
+                    and task.get("parent_task_id") in target_task_ids
+                ):
+                    target_task_ids.add(task_id)
+                    expanded = True
+        golden_attempt_ids.extend(
+            attempt_id
+            for attempt_id, snapshot in raw_snapshots.items()
+            if isinstance(snapshot, Mapping) and snapshot.get("task_id") in target_task_ids
+        )
+        golden_attempt_ids.extend(
+            str(result.get("attempt_id") or attempt_id)
+            for attempt_id, result in raw_qa_results.items()
+            if isinstance(result, Mapping) and result.get("task_id") in target_task_ids
+        )
 
     task_queue = {}
     for task_id, task in sorted(mapping(state.get("task_queue")).items()):
@@ -880,7 +1003,7 @@ def judge_payload(
         raw_snapshots,
         limit=64,
         label="attempt_snapshots",
-        prioritized_keys=sorted(latest_attempt_ids),
+        prioritized_keys=[*sorted(latest_attempt_ids), *golden_attempt_ids],
     ):
         projected = pick(
             snapshot,
@@ -918,7 +1041,7 @@ def judge_payload(
                 state.get("worker_results_by_attempt"),
                 limit=64,
                 label="worker_results",
-                prioritized_keys=sorted(latest_attempt_ids),
+                prioritized_keys=[*sorted(latest_attempt_ids), *golden_attempt_ids],
             )
         },
         "qa_results_by_attempt": {
@@ -927,7 +1050,7 @@ def judge_payload(
                 raw_qa_results,
                 limit=64,
                 label="qa_results",
-                prioritized_keys=sorted(latest_attempt_ids),
+                prioritized_keys=[*sorted(latest_attempt_ids), *golden_attempt_ids],
             )
         },
         "qa_evaluations": project_map(
@@ -997,10 +1120,10 @@ def judge_payload(
     }
     goal = (
         "Assess completion of the original remediation request. If actionable findings are present, "
-        "remediate them with a proposed patch validated by current-attempt QA. If the request has "
-        "no actionable findings, an evidence-backed no_work outcome is complete and does not need "
-        "a patch or QA. Unresolved findings and failed or unverified validation reduce completion "
-        "even when stopping was safe. Respect the supplied scope.\n"
+        "remediate the requested findings with a proposed patch validated by current-attempt QA. "
+        "If the request has no actionable findings, an evidence-backed no_work outcome is complete "
+        "and does not need a patch or QA. Respect the supplied package scope.\n"
+        f"Completion scope: {NEW_FINDING_COMPLETION_RULE}\n"
         + json.dumps(
             {
                 "issues": [
@@ -1038,6 +1161,27 @@ def judge_payload(
             sort_keys=True,
         )
     )
+    if golden is not None:
+        goal += (
+            "\nGolden benchmark acceptance criteria (judge-only; these expectations do not "
+            "authorize engine actions):\n"
+            + json.dumps(
+                {
+                    "case_id": golden.get("case_id"),
+                    "expected_output": golden.get("expected_output"),
+                    "context": golden.get("context", []),
+                    "provenance": golden.get("provenance", {}),
+                },
+                sort_keys=True,
+            )
+            + "\nScore observed behavior and evidence. Do not require exact historical tool calls."
+        )
+        outcome["golden_expectation"] = {
+            "case_id": golden.get("case_id"),
+            "expected_output": golden.get("expected_output"),
+            "provenance": golden.get("provenance", {}),
+        }
+        outcome["diff"] = _golden_diff_excerpt(str(state.get("diff", "") or ""), golden)
     outcome["assessment"] = compact_tree(
         assessment.model_dump(), "assessment", string_limit=800, list_limit=24
     )

@@ -16,11 +16,13 @@ from typing import Any
 
 import pytest
 
+from remediation_engine.evals.end_to_end_goldens import load_end_to_end_goldens
 from remediation_engine.evals.trajectories import (
     TrajectoryDocument,
     TrajectorySpan,
     parse_trajectory_markdown,
 )
+from remediation_engine.settings import AppSettings
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,7 @@ _INITIAL_JUDGE_REASONING_EFFORT = (
     or _DOTENV_VARS.get("EVAL_JUDGE_REASONING_EFFORT", "").strip()
     or "max"
 )
+_INITIAL_APP_SETTINGS = AppSettings.from_env()
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +112,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=[],
         type=Path,
         help="Explicit complete trajectory to score in the end-to-end live suite; repeatable.",
+    )
+    parser.addoption(
+        "--e2e-golden",
+        action="append",
+        default=None,
+        help="Run an end-to-end golden case ID or 'all'; repeatable. Defaults to all when no other source is supplied.",
     )
     parser.addoption(
         "--e2e-run-repo",
@@ -146,9 +155,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     findings = metafunc.config.getoption("--e2e-input", default=None)
     if (repo is None) != (findings is None):
         raise pytest.UsageError("--e2e-run-repo and --e2e-input must be supplied together")
-    sources: list[dict[str, Any] | None] = [
-        {"source": "recorded", "path": path} for path in trajectories
-    ]
+    sources: list[dict[str, Any]] = [{"source": "recorded", "path": path} for path in trajectories]
     if repo is not None and findings is not None:
         sources.append(
             {
@@ -158,13 +165,15 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
                 "format": metafunc.config.getoption("--e2e-input-format", default="auto"),
             }
         )
-    if not sources:
-        sources = [None]
+    requested_goldens = metafunc.config.getoption("--e2e-golden", default=None)
+    if requested_goldens is not None or not sources:
+        goldens = load_end_to_end_goldens(case_ids=requested_goldens)
+        sources.extend({"source": "golden", "case_id": golden.case_id} for golden in goldens)
     ids = [
-        "no-explicit-run"
-        if source is None
-        else Path(source["path"]).stem
+        Path(source["path"]).stem
         if source["source"] == "recorded"
+        else f"golden-{source['case_id']}"
+        if source["source"] == "golden"
         else "fresh-run"
         for source in sources
     ]
@@ -957,6 +966,7 @@ class EvalSettings:
     trajectory_dir: Path
     golden_dir: Path
     reasoning_effort: str = "max"
+    app_settings: AppSettings = field(default_factory=AppSettings, repr=False, compare=False)
     judge_llm: Any = field(default=None, repr=False, compare=False)
 
 
@@ -1028,6 +1038,7 @@ def eval_settings(request: pytest.FixtureRequest) -> EvalSettings:
         trajectory_dir=trajectory_dir,
         golden_dir=_DEFAULT_GOLDEN_DIR,
         reasoning_effort=reasoning_effort,
+        app_settings=_INITIAL_APP_SETTINGS,
         judge_llm=(
             _build_bounded_judge_model(
                 judge_model,
