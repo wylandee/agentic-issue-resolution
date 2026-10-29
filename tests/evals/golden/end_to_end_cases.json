@@ -161,9 +161,9 @@
     "context": [
       "Run the complete remediation engine against the PyGoat clone using the canonical baseline issues fixture.",
       "PyGoat records the package as PyYAML; target selection is case-insensitive and the engine receives the fixture's canonical package spelling.",
-      "Expected output is the requested PyYAML version 5.4. No matching historical single-package trajectory was found in the available trajectory corpus."
+      "Expected output is the requested PyYAML version 6.0.3. No matching historical single-package trajectory was found in the available trajectory corpus."
     ],
-    "expected_output": "Update the PyYAML requirement to 5.4 and pass current-attempt QA.",
+    "expected_output": "Update the PyYAML requirement to 6.0.3 and pass current-attempt QA.",
     "expected_tools": [],
     "live": {
       "ecosystem": "python",

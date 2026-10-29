@@ -123,7 +123,7 @@ def test_dataset_has_exact_cases_targets_versions_and_angular_closure() -> None:
         "e2e-npm-code-migration": ["express-jwt", "6.0.0", "lib/insecurity.ts"],
         "e2e-npm-no-fix-removal": ["notevil", "routes/b2bOrder.ts"],
         "e2e-npm-mixed-strategies": ["21.2.17", "6.0.0", "notevil", "lib/insecurity.ts"],
-        "e2e-python-single-update": ["PyYAML", "5.4"],
+        "e2e-python-single-update": ["PyYAML", "6.0.3"],
         "e2e-python-batch-update": ["certifi", "2024.7.4", "sqlparse", "0.4.4"],
         "e2e-java-single-update": ["org.postgresql:postgresql", "42.7.11"],
         "e2e-java-batch-update": ["logback-classic", "logback-core", "1.2.13"],
