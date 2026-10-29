@@ -28,9 +28,11 @@ from remediation_engine.contracts.schemas import (
     IncrementalScanRecord,
     IssueSource,
     IssueType,
+    LocalizedIssue,
     MavenTargetOperation,
     MultiPackageAction,
     ODCScanEvidence,
+    PackageFixPlanCandidate,
     PackageMutation,
     PackageScanOccurrence,
     PeerConflictEvidence,
@@ -103,6 +105,25 @@ def _issue() -> VulnerabilityIssue:
 
 
 def _sca_group(group_id="g1", fix_status=FixPlanStatus.VERSION_FOUND) -> VulnerabilityGroup:
+    issue = VulnerabilityIssue(
+        source=IssueSource.ODC,
+        issue_type=IssueType.SCA,
+        severity=Severity.HIGH,
+        package_name="test-pkg",
+        package_version="1.0.0",
+        purl="pkg:npm/test-pkg@1.0.0",
+        cve_id="CVE-2026-1000",
+        ecosystem="npm",
+        file_path="package-lock.json",
+    )
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file="package.json",
+        package_manager="npm",
+        declaration_type="dependencies",
+        is_direct_dependency=True,
+        localization_confidence=1.0,
+    )
     fix_plan = FixPlan(
         status=fix_status,
         fixed_version="1.2.3" if fix_status == FixPlanStatus.VERSION_FOUND else None,
@@ -117,9 +138,11 @@ def _sca_group(group_id="g1", fix_status=FixPlanStatus.VERSION_FOUND) -> Vulnera
         file_path="package.json",
         cve_ids=[],
         versions=[],
-        sources=[IssueSource.SEMGREP],
-        representative_issue_id=str(uuid4()),
-        issues=[_issue()],
+        sources=[IssueSource.ODC],
+        representative_issue_id=issue.id,
+        issues=[issue],
+        localized_issues=[localized],
+        fix_plan_candidates=[PackageFixPlanCandidate(issue_id=issue.id, plan=fix_plan)],
         fix_plan=fix_plan,
     )
 

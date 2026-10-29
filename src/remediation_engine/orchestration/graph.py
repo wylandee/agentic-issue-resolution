@@ -112,9 +112,6 @@ from remediation_engine.orchestration.supervisor_node import (
     run_supervisor_node,
     supervisor_router,
 )
-from remediation_engine.orchestration.task_utils import (
-    build_initial_remediation_task,
-)
 from remediation_engine.orchestration.teardown_node import (
     _cleanup_run_owned_maven_cache_volume,
     _cleanup_run_owned_workspace_volume,
@@ -270,6 +267,27 @@ def triage_node(state: OrchestratorState) -> dict[str, Any]:
 
 def _stable_group_fingerprint(group: VulnerabilityGroup) -> str:
     """Compare meaningful group content while ignoring volatile triage metadata."""
+    localized_context = [
+        {
+            "finding": stable_issue_fingerprint(localized.issue),
+            "manifest_file": localized.manifest_file,
+            "manifest_line": localized.manifest_line,
+            "manifest_snippet": localized.manifest_snippet,
+            "package_manager": localized.package_manager,
+            "declaration_type": localized.declaration_type,
+            "is_direct_dependency": localized.is_direct_dependency,
+            "version_property_name": localized.version_property_name,
+            "version_property_file": localized.version_property_file,
+            "dependency_ancestry": list(localized.dependency_ancestry or []),
+            "dependency_versions": dict(sorted((localized.dependency_versions or {}).items())),
+            "parent_package_name": localized.parent_package_name,
+            "parent_package_version": localized.parent_package_version,
+            "parent_declaration_type": localized.parent_declaration_type,
+            "parent_manifest_line": localized.parent_manifest_line,
+            "parent_manifest_snippet": localized.parent_manifest_snippet,
+        }
+        for localized in group.localized_issues or []
+    ]
     payload = {
         "group_id": group.group_id,
         "issue_type": group.issue_type.value,
@@ -289,14 +307,16 @@ def _stable_group_fingerprint(group: VulnerabilityGroup) -> str:
         ],
         "sources": sorted(source.value for source in (group.sources or [])),
         "issues": sorted(stable_issue_fingerprint(issue) for issue in (group.issues or [])),
-        "fix_plan_candidates": [
-            candidate.model_dump(mode="json")
-            for candidate in sorted(
-                group.fix_plan_candidates or [],
-                key=lambda candidate: str(candidate.issue_id),
-            )
-        ],
-        "fix_plan": group.fix_plan.model_dump(mode="json") if group.fix_plan else None,
+        "localized_context": sorted(
+            localized_context,
+            key=lambda item: (
+                item["finding"],
+                item["manifest_file"] or "",
+                item["package_manager"] or "",
+                item["declaration_type"] or "",
+                item["parent_package_name"] or "",
+            ),
+        ),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -787,18 +807,11 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             ):
                 skipped_unaccepted_reopen_group_ids.add(task.parent_group_id)
                 continue
-            fresh_task = build_initial_remediation_task(group, task_id)
             task_queue[task_id] = task.model_copy(
                 update={
                     "task_revision": task.task_revision + 1,
                     "current_attempt_id": None,
-                    "strategy": fresh_task.strategy,
-                    "qa_policy": fresh_task.qa_policy,
-                    "strategy_stage": fresh_task.strategy_stage,
-                    "selected_version": fresh_task.selected_version,
-                    "selected_plan_issue_ids": list(fresh_task.selected_plan_issue_ids),
                     "exhausted_update_path": False,
-                    "instruction": fresh_task.instruction,
                     "status": TaskStatus.PENDING,
                     "retry_count": 0,
                 }
@@ -815,18 +828,11 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             group = groups_by_id.get(task.parent_group_id) if task is not None else None
             if task is None or task.status != TaskStatus.QA_PASSED or group is None:
                 continue
-            fresh_task = build_initial_remediation_task(group, task_id)
             task_queue[task_id] = task.model_copy(
                 update={
                     "task_revision": task.task_revision + 1,
                     "current_attempt_id": None,
-                    "strategy": fresh_task.strategy,
-                    "qa_policy": fresh_task.qa_policy,
-                    "strategy_stage": fresh_task.strategy_stage,
-                    "selected_version": fresh_task.selected_version,
-                    "selected_plan_issue_ids": list(fresh_task.selected_plan_issue_ids),
                     "exhausted_update_path": False,
-                    "instruction": fresh_task.instruction,
                     "status": TaskStatus.PENDING,
                     "retry_count": 0,
                 }
@@ -898,6 +904,9 @@ def post_qa_triage_node(state: OrchestratorState) -> dict[str, Any]:
             "post_qa_retriage_count": retriage_count,
             "triage_reconciliation": reconciliation,
             "task_queue": task_queue,
+            "task_ids_requiring_fix_plan_refresh": sorted(
+                set(state.get("task_ids_requiring_fix_plan_refresh", []) or []) | reopened_task_ids
+            ),
             "latest_successful_scan_by_task": latest_successful_scan_by_task,
             "latest_incremental_scan_by_input": latest_incremental_scan_by_input,
             "qa_evaluations": qa_evaluations,

@@ -7,7 +7,7 @@ run_triage_pipeline(issues, system_context, repo_root=None)
     â†’ List[Tuple[VulnerabilityGroup, TriageResult]]
 
     Full pipeline:
-    1. locate + plan each SCA issue  â†’ List[Tuple[LocalizedIssue, FixPlan]]
+    1. localize each SCA issue      â†’ List[LocalizedIssue]
     2. group_issues(...)             â†’ List[VulnerabilityGroup]
     3. enrich_cves(all_cve_ids)      â†’ Dict[str, CVEEnrichment]
     4. Attach enrichment to groups   (primary CVE enrichment per group)
@@ -32,8 +32,6 @@ from langsmith import traceable
 
 from remediation_engine.contracts.schemas import (
     CVEEnrichment,
-    FixPlan,
-    FixPlanStatus,
     IssueType,
     LocalizedIssue,
     Severity,
@@ -151,24 +149,13 @@ def _fallback_localized_issue(
     )
 
 
-def _fallback_no_fix_plan() -> FixPlan:
-    """Return a safe no-fix plan when planning fails unexpectedly."""
-    return FixPlan(
-        status=FixPlanStatus.NO_FIX,
-        fixed_version=None,
-        workaround_snippets=None,
-        instruction="No upstream patch or workaround was found. Inform the user.",
-        strategy_used="NO_FIX",
-    )
-
-
 @traceable(name="triage.grouping", run_type="chain")
 def _run_grouping(
     issues: list[VulnerabilityIssue],
-    sca_issue_plans: list[tuple[LocalizedIssue, FixPlan]],
+    localized_sca_issues: list[LocalizedIssue],
 ) -> list[VulnerabilityGroup]:
-    """Group normalized findings into remediation units."""
-    return group_issues(issues, sca_issue_plans=sca_issue_plans)
+    """Group normalized findings with their localization evidence."""
+    return group_issues(issues, localized_sca_issues=localized_sca_issues)
 
 
 @traceable(name="triage.cve_enrichment", run_type="chain")
@@ -192,23 +179,22 @@ def _run_reachability(
     analyze_reachability(groups, repo_root, project_language=project_language)
 
 
-@traceable(name="triage.sca_localization_and_planning", run_type="chain")
-def _prepare_sca_issue_plans(
+@traceable(name="triage.sca_localization", run_type="chain")
+def _localize_sca_issues(
     sca_issues: list[VulnerabilityIssue],
     repo_root: str | None,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
-) -> list[tuple[LocalizedIssue, FixPlan]]:
-    """Locate and plan SCA issues before grouping."""
+) -> list[LocalizedIssue]:
+    """Locate SCA findings without invoking advisory fix planning."""
     if not sca_issues:
         return []
 
-    from remediation_engine.tools.fix_planner import plan_fix
     from remediation_engine.tools.manifest_locator import locate_from_issue
 
     repo_path = Path(repo_root) if repo_root and Path(repo_root).exists() else None
-    issue_plans: list[tuple[LocalizedIssue, FixPlan]] = []
-
-    for issue in sca_issues:
+    localized_issues: list[LocalizedIssue] = []
+    for original_issue in sca_issues:
+        issue = original_issue
         ecosystem = (issue.ecosystem or "").strip().casefold()
         purl = (issue.purl or "").strip().casefold()
         is_pypi = (
@@ -246,20 +232,8 @@ def _prepare_sca_issue_plans(
                     issue.id,
                     exc,
                 )
-
-        try:
-            fix_plan = FixPlan(**plan_fix(localized_issue))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Fix planning failed for %s (%s); using no-fix fallback.",
-                issue.id,
-                exc,
-            )
-            fix_plan = _fallback_no_fix_plan()
-
-        issue_plans.append((localized_issue, fix_plan))
-
-    return issue_plans
+        localized_issues.append(localized_issue)
+    return localized_issues
 
 
 # ---------------------------------------------------------------------------
@@ -307,10 +281,10 @@ def run_triage_pipeline(
         if primary_language is not None
         else ProjectLanguage.NODEJS
     )
-    sca_issue_plans = _prepare_sca_issue_plans(sca_issues, repo_root, project_language)
+    localized_sca_issues = _localize_sca_issues(sca_issues, repo_root, project_language)
 
-    # Step 1: Group after SCA locate + plan
-    groups = _run_grouping(issues, sca_issue_plans)
+    # Step 1: Group localized findings; fix plans are materialized by the Supervisor.
+    groups = _run_grouping(issues, localized_sca_issues)
     logger.info("Triage pipeline: produced %d groups.", len(groups))
 
     # Step 2: Collect all unique CVE IDs for bulk enrichment

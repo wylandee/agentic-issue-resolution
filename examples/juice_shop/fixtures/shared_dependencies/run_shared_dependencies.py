@@ -89,8 +89,10 @@ def load_shared_dependency_groups(
             "The jsonwebtoken group must contain the three extracted update CVEs: "
             f"{sorted(_EXPECTED_JSONWEBTOKEN_CVES)}."
         )
-    if any(group.fix_plan is None for group in groups):
-        raise ValueError("Both shared-dependency groups must include a triaged fix plan.")
+    if any(group.fix_plan is None and not group.fix_plan_candidates for group in groups):
+        raise ValueError(
+            "Both shared-dependency groups must include precomputed fix-plan evidence."
+        )
     return groups
 
 

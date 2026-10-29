@@ -21,6 +21,7 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    LocalizedIssue,
     MultiPackageAction,
     ODCScanEvidence,
     PackageMutation,
@@ -68,7 +69,7 @@ from remediation_engine.orchestration.supervisor_portfolio import (
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.orchestration.teardown_node import run_teardown_node
 from remediation_engine.settings import AppSettings
-from remediation_engine.triage.grouper import group_issues
+from tests.fix_plan_fixtures import group_with_fix_plans
 
 
 def _issue(issue_type: IssueType, file_path: str | None = None) -> VulnerabilityIssue:
@@ -3147,7 +3148,21 @@ def socket_stack_delta_case(tmp_path):
         issue = VulnerabilityIssue.model_validate_json(line)
         if issue.package_name in target_packages:
             baseline_issues.append(issue)
-    groups = group_issues(baseline_issues)
+    plan_pairs = [
+        (
+            LocalizedIssue(
+                issue=issue,
+                manifest_file="package.json",
+                package_manager="npm",
+                declaration_type="dependencies",
+                is_direct_dependency=True,
+                localization_confidence=1.0,
+            ),
+            _fix_plan(FixPlanStatus.VERSION_FOUND),
+        )
+        for issue in baseline_issues
+    ]
+    groups = group_with_fix_plans(baseline_issues, plans_by_finding=plan_pairs)
     groups_by_package = {group.vulnerable_component: group for group in groups}
     assert set(groups_by_package) == target_packages
     assert {

@@ -35,7 +35,7 @@ from remediation_engine.orchestration.supervisor_planner import (
 )
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
-from remediation_engine.triage.grouper import group_issues
+from tests.fix_plan_fixtures import group_with_fix_plans
 
 
 def _group(*, direct: bool = False, include_parent_hint: bool = True) -> VulnerabilityGroup:
@@ -72,7 +72,7 @@ def _group(*, direct: bool = False, include_parent_hint: bool = True) -> Vulnera
         instruction="Install the fixed release.",
         strategy_used="osv_api",
     )
-    group = group_issues([issue], sca_issue_plans=[(localized, fix_plan)])[0]
+    group = group_with_fix_plans([issue], plans_by_finding=[(localized, fix_plan)])[0]
     return group.model_copy(
         update={
             "parent_package_name": parent_name,
@@ -256,7 +256,7 @@ def test_committed_python_portfolio_accepts_language_specific_target_identity(
         instruction="Install the fixed release.",
         strategy_used="odc_cpe_bound",
     )
-    group = group_issues([issue], sca_issue_plans=[(localized, fix_plan)])[0]
+    group = group_with_fix_plans([issue], plans_by_finding=[(localized, fix_plan)])[0]
     group = group.model_copy(
         update={"file_path": "requirements.txt", "file_paths": ["requirements.txt"]}
     )

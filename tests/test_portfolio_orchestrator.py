@@ -68,7 +68,7 @@ from remediation_engine.solver.graph import cluster_packages
 from remediation_engine.solver.subgraph import extract_solver_subgraph
 from remediation_engine.tools.npm_graph import load_npm_graph_snapshot, make_occurrence_id
 from remediation_engine.tools.registry_cache import RegistryPackumentCache
-from remediation_engine.triage.grouper import group_issues
+from tests.fix_plan_fixtures import group_with_fix_plans
 
 
 def _group(
@@ -108,7 +108,7 @@ def _group(
         instruction=f"Update {package_name}.",
         strategy_used="osv_api",
     )
-    return group_issues([issue], sca_issue_plans=[(localized, plan)])[0]
+    return group_with_fix_plans([issue], plans_by_finding=[(localized, plan)])[0]
 
 
 def _write_manifest(root: Path, relative_path: str, payload: dict) -> None:
@@ -2318,7 +2318,7 @@ def test_apply_clears_stale_mutation_inputs_for_code_workaround():
         strategy_used="WORKAROUND",
         workaround_snippets=["Guard the vulnerable call."],
     )
-    group = group_issues([issue], sca_issue_plans=[(localized, workaround_plan)])[0]
+    group = group_with_fix_plans([issue], plans_by_finding=[(localized, workaround_plan)])[0]
     task = build_initial_remediation_task(group, "task-1")
     assert task.strategy == RoutingStrategy.CODE_WORKAROUND
     assert task.target_dependency_type == "dependencies"

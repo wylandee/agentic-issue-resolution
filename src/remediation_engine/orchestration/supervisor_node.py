@@ -105,6 +105,13 @@ from remediation_engine.orchestration.portfolio_solver import (
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.scan_identity import package_scan_occurrence_key
 from remediation_engine.orchestration.state import OrchestratorState
+from remediation_engine.orchestration.supervisor_fix_plans import (
+    ensure_workaround_fix_plan,
+    has_workaround_fix_plan,
+    prepare_supervisor_fix_plan_state,
+    workaround_lookup_fingerprint,
+    workaround_lookup_ledger_key,
+)
 from remediation_engine.orchestration.supervisor_planner import (
     _OVERRIDE_DEPENDENCY_TYPES,
     _SCA_STAGE_ORDER,
@@ -3375,13 +3382,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
        unfixable marks, new constraints, and materialized spawn requests.
     10. Return state patch.
     """
-    raw_language = state.get("project_language")
-    project_language = resolve_project_language(
-        Path(str(state.get("repo_root") or ".")),
-        str(raw_language)
-        if raw_language is not None
-        else getattr(state.get("system_context"), "primary_language", None),
-    )
     if state.get("post_qa_retriage_limit_reached"):
         scan_due = _final_full_scan_due(state, dict(state.get("task_queue", {}) or {}))
         next_node = "final_full_scan" if scan_due else "teardown"
@@ -3422,8 +3422,30 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             ),
             "new_vulnerability_status": state.get("new_vulnerability_status", "not_scanned"),
             "triage_required": False,
+            "task_ids_requiring_fix_plan_refresh": list(
+                state.get("task_ids_requiring_fix_plan_refresh", []) or []
+            ),
             **_scan_ledger_state_snapshot(state),
         }
+    raw_language = state.get("project_language")
+    project_language = resolve_project_language(
+        Path(str(state.get("repo_root") or ".")),
+        str(raw_language)
+        if raw_language is not None
+        else getattr(state.get("system_context"), "primary_language", None),
+    )
+    planned_groups, refreshed_queue, pending_refresh_ids = prepare_supervisor_fix_plan_state(
+        state.get("valid_groups", []) or [],
+        dict(state.get("task_queue", {}) or {}),
+        state.get("task_ids_requiring_fix_plan_refresh", []) or [],
+        project_language,
+    )
+    state = {
+        **state,
+        "valid_groups": planned_groups,
+        "task_queue": refreshed_queue,
+        "task_ids_requiring_fix_plan_refresh": pending_refresh_ids,
+    }
     valid_groups: list[VulnerabilityGroup] = list(state.get("valid_groups", []))
     if not valid_groups:
         if _final_full_scan_due(state, dict(state.get("task_queue", {}) or {})):
@@ -3445,6 +3467,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     decision, [], int(state.get("state_revision", 0)) + 1
                 ),
                 "supervisor_instructions": decision.instructions,
+                "task_ids_requiring_fix_plan_refresh": list(
+                    state.get("task_ids_requiring_fix_plan_refresh", []) or []
+                ),
                 **_scan_ledger_state_snapshot(state),
             }
         if state.get("triage_required") and state.get("status") in {
@@ -3468,6 +3493,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     decision, [], int(state.get("state_revision", 0)) + 1
                 ),
                 "supervisor_instructions": "Route the parseable post-remediation scan to triage.",
+                "task_ids_requiring_fix_plan_refresh": list(
+                    state.get("task_ids_requiring_fix_plan_refresh", []) or []
+                ),
                 **_scan_ledger_state_snapshot(state),
             }
         logger.info("supervisor: no valid groups â€” routing to teardown.")
@@ -3485,10 +3513,16 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             "decision_code": decision.decision_code,
             "supervisor_audit": _emit_audit(decision, [], int(state.get("state_revision", 0)) + 1),
             "supervisor_instructions": "No groups to process.",
+            "task_ids_requiring_fix_plan_refresh": list(
+                state.get("task_ids_requiring_fix_plan_refresh", []) or []
+            ),
             **_scan_ledger_state_snapshot(state),
         }
 
     group_by_id: dict[str, VulnerabilityGroup] = {g.group_id: g for g in valid_groups}
+    workaround_lookup_fingerprints: dict[str, str] = dict(
+        state.get("workaround_lookup_fingerprints", {}) or {}
+    )
     existing_constraints: list[str] = list(state.get("constraints_ledger", []))
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] = dict(
         state.get("retry_diagnostics_by_task", {})
@@ -3680,6 +3714,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             "setup_scan_evidence": setup_scan_evidence,
             "setup_scan_committed": setup_scan_committed,
             "state_revision": state_revision,
+            "task_ids_requiring_fix_plan_refresh": pending_refresh_ids,
         }
 
     # ------------------------------------------------------------------
@@ -5885,7 +5920,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             qa_evaluations=qa_evaluations,
             retry_diagnostics_by_task=retry_diagnostics_by_task,
             consistency_events=consistency_events,
+            workaround_lookup_fingerprints=workaround_lookup_fingerprints,
         )
+        group_by_id = {group.group_id: group for group in valid_groups}
         task_queue.update(new_tasks)
         # Apply the complete parent transition after children are materialized.
         # This must detach the closed update attempt as well as terminalize the
@@ -6633,6 +6670,34 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             plan = retry_plans_by_task.get(task_id)
             workaround_ctx = None
             if resolved_next_node == "workaround_subagent":
+                group = group_by_id.get(task.parent_group_id)
+                if (
+                    task.current_attempt_id is None
+                    and task.retry_count == 0
+                    and group is not None
+                    and group.issue_type == IssueType.SCA
+                    and not group.is_synthetic
+                ):
+                    fingerprint = workaround_lookup_fingerprint(group)
+                    ledger_key = workaround_lookup_ledger_key(group, fingerprint)
+                    has_workaround = has_workaround_fix_plan(group)
+                    if not has_workaround and ledger_key not in workaround_lookup_fingerprints:
+                        group = ensure_workaround_fix_plan(group)
+                        group_by_id[group.group_id] = group
+                        valid_groups[:] = [
+                            group if candidate.group_id == group.group_id else candidate
+                            for candidate in valid_groups
+                        ]
+                        workaround_lookup_fingerprints[ledger_key] = fingerprint
+                    if group is not None:
+                        selection = select_package_fix_plan(
+                            group,
+                            RoutingStrategy.CODE_WORKAROUND,
+                        )
+                        task = task.model_copy(
+                            update={"selected_plan_issue_ids": list(selection.issue_ids)}
+                        )
+                        task_queue[task_id] = task
                 attempts = _attempts_for_task(attempt_snapshots_by_id, task_id)
                 parent_task_ids = _workaround_task_ancestry(task, task_queue)
                 evidence = _qa_failure_evidence_for_workaround_retry(
@@ -6646,14 +6711,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     if attempts or _qa_evidence_indicates_test_regression(evidence)
                     else WorkaroundPhase.INITIAL_MITIGATION
                 )
-                group = next(
-                    (
-                        candidate
-                        for candidate in state.get("valid_groups", []) or []
-                        if candidate.group_id == task.parent_group_id
-                    ),
-                    None,
-                )
+                group = group_by_id.get(task.parent_group_id)
                 vulnerability_mechanism = (
                     _extract_workaround_vulnerability_mechanism(group) if group is not None else ""
                 )
@@ -6938,6 +6996,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         "qa_evaluations": qa_evaluations,
         "task_queue": task_queue,
         "valid_groups": valid_groups,
+        "workaround_lookup_fingerprints": workaround_lookup_fingerprints,
         "retry_diagnostics_by_task": retry_diagnostics_by_task,
         "retry_plans_by_task": retry_plans_by_task,
         "workaround_replay_plans_by_task": workaround_replay_plans_by_task,
@@ -6966,6 +7025,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         # constraints_ledger uses operator.add â€” return only NEW entries
         "constraints_ledger": returned_constraints,
         "errors": errors,
+        "task_ids_requiring_fix_plan_refresh": pending_refresh_ids,
     }
 
 

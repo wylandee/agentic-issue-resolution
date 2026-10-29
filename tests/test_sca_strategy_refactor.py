@@ -54,7 +54,7 @@ from remediation_engine.tools.registry_tools import (
     plan_npm_parent_version,
     select_npm_parent_version,
 )
-from remediation_engine.triage.grouper import group_issues
+from tests.fix_plan_fixtures import group_with_fix_plans
 
 
 def _issue(cve: str, *, package: str = "lodash") -> VulnerabilityIssue:
@@ -207,9 +207,9 @@ def test_same_package_findings_share_one_package_group_and_retain_candidates():
     update_b = _issue("CVE-2026-0002")
     workaround = _issue("CVE-2026-0003")
     no_fix = _issue("CVE-2026-0004")
-    groups = group_issues(
+    groups = group_with_fix_plans(
         [update_a, update_b, workaround, no_fix],
-        sca_issue_plans=[
+        plans_by_finding=[
             (_localized(update_a), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21")),
             (_localized(update_b), _plan(FixPlanStatus.VERSION_FOUND, version="4.18.0")),
             (
@@ -457,9 +457,9 @@ def test_transitive_initial_task_targets_parent_before_override():
         parent_declaration_type="dependencies",
         localization_confidence=1.0,
     )
-    group = group_issues(
+    group = group_with_fix_plans(
         [issue],
-        sca_issue_plans=[(localized, _plan(FixPlanStatus.VERSION_FOUND, version="2.0.1"))],
+        plans_by_finding=[(localized, _plan(FixPlanStatus.VERSION_FOUND, version="2.0.1"))],
     )[0]
 
     task = build_initial_remediation_task(group, "task-1")
@@ -485,9 +485,9 @@ def test_transitive_initial_planner_recovers_parent_version_from_group_evidence(
         parent_declaration_type="dependencies",
         localization_confidence=1.0,
     )
-    group = group_issues(
+    group = group_with_fix_plans(
         [issue],
-        sca_issue_plans=[(localized, _plan(FixPlanStatus.VERSION_FOUND, version="2.0.1"))],
+        plans_by_finding=[(localized, _plan(FixPlanStatus.VERSION_FOUND, version="2.0.1"))],
     )[0]
     task = build_initial_remediation_task(group, "task-1")
 
@@ -522,9 +522,9 @@ def test_update_worker_prompt_contains_no_planning_or_registry_phase():
         instruction="Update package.json to exact version 4.18.0.",
     )
     issue = _issue("CVE-2026-0001")
-    group = group_issues(
+    group = group_with_fix_plans(
         [issue],
-        sca_issue_plans=[
+        plans_by_finding=[
             (_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))
         ],
     )[0]
@@ -546,9 +546,9 @@ def test_update_worker_prompt_contains_no_planning_or_registry_phase():
 
 def test_update_worker_records_failed_exact_version_attempts_without_selecting_next_version():
     issue = _issue("CVE-2026-0001")
-    group = group_issues(
+    group = group_with_fix_plans(
         [issue],
-        sca_issue_plans=[
+        plans_by_finding=[
             (_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))
         ],
     )[0]
@@ -651,9 +651,9 @@ def test_supervisor_stage_progression_and_retry_cap():
 
 def test_qa_failure_advances_task_and_diagnostics_to_next_supervisor_stage():
     issue = _issue("CVE-2026-0001")
-    group = group_issues(
+    group = group_with_fix_plans(
         [issue],
-        sca_issue_plans=[
+        plans_by_finding=[
             (_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))
         ],
     )[0]
@@ -723,9 +723,9 @@ def test_retry_instruction_contains_exact_selected_version_and_stage():
         status=TaskStatus.NEEDS_RETRY,
     )
     issue = _issue("CVE-2026-0001")
-    group = group_issues(
+    group = group_with_fix_plans(
         [issue],
-        sca_issue_plans=[
+        plans_by_finding=[
             (_localized(issue), _plan(FixPlanStatus.VERSION_FOUND, version="4.17.21"))
         ],
     )[0]

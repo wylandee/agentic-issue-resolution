@@ -11,8 +11,8 @@ Design
 ------
 SCA grouping key: "sca:{manifest_file}:{package_name or purl}"
     * Multiple CVEs affecting the same package occurrence are grouped together;
-      remediation strategy is retained as per-issue evidence rather than group
-      identity.
+      fix-plan evidence is populated later by Supervisor orchestration and does
+      not affect group identity.
     * Duplicate CVE on the same component â†’ deduplicated.
     * Cross-tool duplicates (Semgrep SCA + ODC) with the same CVE + package +
       file â†’ merged into one group; sources list is unioned.
@@ -27,22 +27,13 @@ SAST grouping key: "sast:{file_path}:{rule_id}:{line_start}-{line_end}"
 from __future__ import annotations
 
 import logging
-import re
 from collections import defaultdict
-
-try:
-    from semantic_version import Version as SemanticVersion
-except ImportError:  # pragma: no cover - optional runtime fallback
-    SemanticVersion = None
 
 from remediation_engine.contracts.schemas import (
     DependencyParentContext,
-    FixPlan,
-    FixPlanStatus,
     IssueSource,
     IssueType,
     LocalizedIssue,
-    PackageFixPlanCandidate,
     VulnerabilityGroup,
     VulnerabilityIssue,
 )
@@ -176,166 +167,19 @@ def _choose_representative(issues: list[VulnerabilityIssue]) -> VulnerabilityIss
     return max(pool, key=_field_richness)
 
 
-def _choose_representative_from_pairs(
-    pairs: list[tuple[LocalizedIssue, FixPlan]],
-) -> VulnerabilityIssue:
-    """Choose the most informative issue from a grouped SCA pair list."""
-    with_fix = [localized.issue for localized, plan in pairs if plan.fixed_version]
-    pool = with_fix if with_fix else [localized.issue for localized, _ in pairs]
-    return max(pool, key=_field_richness)
-
-
-def _normalise_semver_text(version: str) -> str | None:
-    """Extract a semver-like token and coerce partial versions for comparison."""
-    match = re.search(
-        r"(?i)v?\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?",
-        version.strip(),
-    )
-    if not match:
-        return None
-
-    cleaned = match.group(0).lstrip("vV")
-    # Build metadata does not affect precedence and must not be fed to the
-    # integer fallback parser (for example ``1.2.3+build.1``).
-    cleaned = cleaned.split("+", 1)[0]
-    core, sep, suffix = cleaned.partition("-")
-    parts = core.split(".")
-    while len(parts) < 3:
-        parts.append("0")
-    normalized = ".".join(parts[:3])
-    if sep:
-        normalized = f"{normalized}-{suffix}"
-    return normalized
-
-
-def _semver_sort_key(version: str) -> tuple[int, object]:
-    """
-    Return a deterministic comparison key for semver-like strings.
-
-    Prefers ``semantic_version`` when available, while falling back to a manual
-    integer tuple so grouping stays functional even if the dependency is absent.
-    """
-    normalized = _normalise_semver_text(version)
-    if not normalized:
-        return (0, version)
-
-    if SemanticVersion is not None:
-        try:
-            parsed = SemanticVersion.coerce(normalized)
-            return (2, parsed)
-        except ValueError:
-            logger.warning("Failed to coerce semantic version %s", version)
-
-    core, _, prerelease = normalized.partition("-")
-    parts = tuple(int(part) for part in core.split("."))
-    return (1, (*parts, 0 if prerelease else 1, prerelease))
-
-
-def _highest_fixed_version(
-    pairs: list[tuple[LocalizedIssue, FixPlan]],
-) -> tuple[str | None, FixPlan | None]:
-    """Return the highest fixed version and its originating plan from a bucket."""
-    candidates = [(plan.fixed_version, plan) for _, plan in pairs if plan.fixed_version]
-    if not candidates:
-        return None, None
-
-    best_version, best_plan = max(
-        candidates,
-        key=lambda item: _semver_sort_key(item[0] or ""),
-    )
-    return best_version, best_plan
-
-
-def _merge_workaround_snippets(
-    pairs: list[tuple[LocalizedIssue, FixPlan]],
-) -> list[str] | None:
-    snippets: list[str] = []
-    for _, plan in pairs:
-        for snippet in plan.workaround_snippets or []:
-            if snippet not in snippets:
-                snippets.append(snippet)
-    return snippets or None
-
-
-def _build_group_fix_plan(
-    pairs: list[tuple[LocalizedIssue, FixPlan]],
-) -> FixPlan | None:
-    """Create a compatibility summary for one package-level SCA bucket.
-
-    The complete issue-level plans are retained separately in
-    ``VulnerabilityGroup.fix_plan_candidates``.  This summary is intentionally
-    kept for older consumers that still display ``group.fix_plan``; Supervisor
-    strategy selection must use the retained candidates instead.
-    """
-    if not pairs:
-        return None
-
-    version_pairs = [pair for pair in pairs if pair[1].status == FixPlanStatus.VERSION_FOUND]
-    workaround_pairs = [pair for pair in pairs if pair[1].status == FixPlanStatus.WORKAROUND_FOUND]
-
-    if version_pairs:
-        best_version, best_plan = _highest_fixed_version(version_pairs)
-        plan_source = best_plan or version_pairs[0][1]
-        return plan_source.model_copy(
-            update={
-                "fixed_version": best_version,
-                "workaround_snippets": None,
-                "strategy_used": "UPDATE_VERSION",
-            }
-        )
-
-    if workaround_pairs:
-        exemplar_plan = workaround_pairs[0][1]
-        return exemplar_plan.model_copy(
-            update={
-                "fixed_version": None,
-                "workaround_snippets": _merge_workaround_snippets(workaround_pairs),
-                "strategy_used": "WORKAROUND",
-            }
-        )
-
-    return pairs[0][1].model_copy(
-        update={
-            "fixed_version": None,
-            "workaround_snippets": None,
-            "strategy_used": "NO_FIX",
-        }
-    )
-
-
-def _build_fix_plan_candidates(
-    pairs: list[tuple[LocalizedIssue, FixPlan]],
-) -> list[PackageFixPlanCandidate]:
-    """Retain unique issue-level plans in deterministic order."""
-    candidates: dict[tuple[str, str], PackageFixPlanCandidate] = {}
-    for localized_issue, plan in pairs:
-        issue_id = localized_issue.issue.id
-        key = (str(issue_id), plan.model_dump_json())
-        candidates.setdefault(
-            key,
-            PackageFixPlanCandidate(issue_id=issue_id, plan=plan),
-        )
-    return [candidates[key] for key in sorted(candidates, key=lambda item: (item[0], item[1]))]
-
-
 # ---------------------------------------------------------------------------
 # SCA grouping
 # ---------------------------------------------------------------------------
 
 
-def _group_sca(
-    issue_plans: list[tuple[LocalizedIssue, FixPlan]],
-) -> dict[str, VulnerabilityGroup]:
-    """Return a dict of group_id â†’ VulnerabilityGroup for SCA issue + plan pairs."""
-    buckets: dict[str, list[tuple[LocalizedIssue, FixPlan]]] = defaultdict(list)
-    for pair in issue_plans:
-        localized_issue, _ = pair
-        key = _sca_key(localized_issue)
-        buckets[key].append(pair)
+def _group_sca(localized_issues: list[LocalizedIssue]) -> dict[str, VulnerabilityGroup]:
+    """Return triage groups from localized SCA findings without fix plans."""
+    buckets: dict[str, list[LocalizedIssue]] = defaultdict(list)
+    for localized_issue in localized_issues:
+        buckets[_sca_key(localized_issue)].append(localized_issue)
 
     groups: dict[str, VulnerabilityGroup] = {}
     for key, members in buckets.items():
-        # Deduplicate CVE IDs, GHSA IDs, and versions
         seen_cves: list[str] = []
         seen_ghsas: list[str] = []
         seen_versions: list[str] = []
@@ -343,13 +187,10 @@ def _group_sca(
         seen_ghsa_set: set[str] = set()
         seen_ver_set: set[str] = set()
         sources_set: set[IssueSource] = set()
-
-        localized_members: list[LocalizedIssue] = []
         member_issues: list[VulnerabilityIssue] = []
 
-        for localized_issue, _ in members:
+        for localized_issue in members:
             issue = localized_issue.issue
-            localized_members.append(localized_issue)
             member_issues.append(issue)
             if issue.cve_id and issue.cve_id not in seen_cve_set:
                 seen_cves.append(issue.cve_id)
@@ -362,28 +203,22 @@ def _group_sca(
                 seen_ver_set.add(issue.package_version)
             sources_set.add(issue.source)
 
-        rep = _choose_representative_from_pairs(members)
-        component = _component_from_issue(rep)
-        group_fix_plan = _build_group_fix_plan(members)
-        fix_plan_candidates = _build_fix_plan_candidates(members)
+        representative = _choose_representative(member_issues)
         group_file_paths = _dedupe_paths(
-            [
-                localized_issue.manifest_file or localized_issue.issue.file_path
-                for localized_issue in localized_members
-            ]
+            [localized.manifest_file or localized.issue.file_path for localized in members]
         )
         group_file_path = (
             group_file_paths[0]
             if group_file_paths
-            else (localized_members[0].manifest_file or rep.file_path)
+            else (members[0].manifest_file or representative.file_path)
         )
-        exemplar_localized = localized_members[0] if localized_members else None
-        parent_contexts = _parent_contexts(localized_members)
+        parent_contexts = _parent_contexts(members)
+        exemplar_localized = members[0] if members else None
         parent_localized = next(
             (
                 localized
                 for context in parent_contexts
-                for localized in localized_members
+                for localized in members
                 if localized.parent_package_name == context.package_name
                 and (
                     localized.parent_package_version
@@ -407,7 +242,7 @@ def _group_sca(
         groups[key] = VulnerabilityGroup(
             group_id=key,
             issue_type=IssueType.SCA,
-            vulnerable_component=component,
+            vulnerable_component=_component_from_issue(representative),
             file_path=group_file_path,
             file_paths=group_file_paths,
             cve_ids=seen_cves,
@@ -416,23 +251,22 @@ def _group_sca(
             dependency_ancestry=(
                 list(context_localized.dependency_ancestry) if context_localized else []
             ),
-            dependency_versions=_merged_dependency_versions(localized_members),
+            dependency_versions=_merged_dependency_versions(members),
             parent_package_name=(
                 context_localized.parent_package_name if context_localized else None
             ),
-            parent_package_version=(context_parent_version),
+            parent_package_version=context_parent_version,
             parent_declaration_type=(
                 context_localized.parent_declaration_type if context_localized else None
             ),
             parent_contexts=parent_contexts,
             sources=sorted(sources_set, key=lambda source: source.value),
-            representative_issue_id=rep.id,
+            representative_issue_id=representative.id,
             issues=member_issues,
-            localized_issues=localized_members,
-            fix_plan_candidates=fix_plan_candidates,
-            fix_plan=group_fix_plan,
+            localized_issues=list(members),
+            fix_plan_candidates=[],
+            fix_plan=None,
         )
-
     return groups
 
 
@@ -481,70 +315,29 @@ def _group_sast(issues: list[VulnerabilityIssue]) -> dict[str, VulnerabilityGrou
 
 def group_issues(
     issues: list[VulnerabilityIssue],
-    sca_issue_plans: list[tuple[LocalizedIssue, FixPlan]] | None = None,
+    localized_sca_issues: list[LocalizedIssue] | None = None,
 ) -> list[VulnerabilityGroup]:
-    """
-    Group a mixed list of SAST and SCA ``VulnerabilityIssue`` records.
+    """Group findings, retaining SCA localization and deferring fix planning.
 
-    Returns one ``VulnerabilityGroup`` per distinct vulnerable
-    component/location.  Cross-tool duplicates sharing the same CVE +
-    package + file are merged into a single group.
+    Args:
+        issues: Scanner findings from any supported source.
+        localized_sca_issues: Optional localization results keyed by issue ID.
+            Missing results receive a conservative issue-path fallback.
 
-    Parameters
-    ----------
-    issues:
-        Flat list of issues from any scanner (Semgrep, ODC, etc.).
-
-    Returns
-    -------
-    List[VulnerabilityGroup]
-        Ordered by group_id (deterministic, testable).
+    Returns:
+        Groups ordered by deterministic group ID. SCA plan fields remain empty.
     """
     if not issues:
         return []
 
-    sca_issues = [i for i in issues if i.issue_type == IssueType.SCA]
-    sast_issues = [i for i in issues if i.issue_type == IssueType.SAST]
-    effective_sca_pairs = list(sca_issue_plans) if sca_issue_plans is not None else None
-    if effective_sca_pairs is None:
-        effective_sca_pairs = [
-            (
-                LocalizedIssue(
-                    issue=issue,
-                    manifest_file=issue.file_path,
-                    localization_confidence=0.0,
-                ),
-                FixPlan(
-                    status=FixPlanStatus.NO_FIX,
-                    fixed_version=None,
-                    workaround_snippets=None,
-                    instruction="Compatibility fallback plan for pre-planned grouping.",
-                    strategy_used="NO_FIX",
-                ),
-            )
-            for issue in sca_issues
-        ]
-    else:
-        planned_issue_ids = {localized.issue.id for localized, _ in effective_sca_pairs}
-        for issue in sca_issues:
-            if issue.id in planned_issue_ids:
-                continue
-            effective_sca_pairs.append(
-                (
-                    LocalizedIssue(
-                        issue=issue,
-                        manifest_file=issue.file_path,
-                        localization_confidence=0.0,
-                    ),
-                    FixPlan(
-                        status=FixPlanStatus.NO_FIX,
-                        fixed_version=None,
-                        workaround_snippets=None,
-                        instruction="Compatibility fallback plan for missing pre-group plan.",
-                        strategy_used="NO_FIX",
-                    ),
-                )
-            )
+    sca_issues = [issue for issue in issues if issue.issue_type == IssueType.SCA]
+    sast_issues = [issue for issue in issues if issue.issue_type == IssueType.SAST]
+    localized_by_id = {localized.issue.id: localized for localized in (localized_sca_issues or [])}
+    effective_localized = [
+        localized_by_id.get(issue.id)
+        or LocalizedIssue(issue=issue, manifest_file=issue.file_path, localization_confidence=0.0)
+        for issue in sca_issues
+    ]
 
     logger.debug(
         "Grouping %d issues (%d SCA, %d SAST).",
@@ -552,11 +345,9 @@ def group_issues(
         len(sca_issues),
         len(sast_issues),
     )
-
     all_groups: dict[str, VulnerabilityGroup] = {}
-    all_groups.update(_group_sca(effective_sca_pairs))
+    all_groups.update(_group_sca(effective_localized))
     all_groups.update(_group_sast(sast_issues))
-
-    result = sorted(all_groups.values(), key=lambda g: g.group_id)
+    result = sorted(all_groups.values(), key=lambda group: group.group_id)
     logger.debug("Produced %d groups.", len(result))
     return result

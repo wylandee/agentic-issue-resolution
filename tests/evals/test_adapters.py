@@ -127,6 +127,14 @@ def test_trajectory_span_computed_properties() -> None:
     assert llm_span.is_llm is True
     assert llm_span.is_tool is False
 
+    supervisor_plan_fix_span = TrajectorySpan(
+        run_id="s3",
+        name="supervisor.plan_fix",
+        run_type="chain",
+    )
+    assert supervisor_plan_fix_span.is_llm is True
+    assert supervisor_plan_fix_span.is_tool is False
+
     tool_span = TrajectorySpan(
         run_id="s2",
         name="tool.validate_manifest_sync",

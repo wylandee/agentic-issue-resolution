@@ -823,6 +823,8 @@ def _llm_extract_remediation(
     page_contents: list[dict[str, str]],
     package_name: str,
     vuln_id: str,
+    *,
+    workaround_only: bool = False,
 ) -> dict[str, Any] | None:
     """
     Use LLM structured output to extract version bump or workaround steps from web page text.
@@ -853,15 +855,24 @@ def _llm_extract_remediation(
         pages_text.append(f"--- Page {idx}: {url} ---\n{content}")
     combined_pages = "\n\n".join(pages_text)
 
+    remediation_instructions = (
+        "Analyze the content only for actionable code workarounds or mitigation steps. "
+        "Do not return a version recommendation. If no usable workaround is found, "
+        "set strategy='NO_FIX'.\n"
+        if workaround_only
+        else (
+            "Analyze the content carefully and extract actionable remediation info:\n"
+            "1. If the page provides a clear patched version to bump to, set strategy='VERSION_BUMP' and fixed_version='X.Y.Z'.\n"
+            "2. If the page provides a code workaround or mitigation steps, set strategy='CODE_WORKAROUND' and workaround_snippets=[...].\n"
+            "3. If no actionable fixed version or code workaround is found, set strategy='NO_FIX'.\n"
+        )
+    )
     prompt_text = (
         f"You are a security engineer analyzing web page findings for vulnerable package '{package_name}' "
         f"(vulnerability ID: '{vuln_id}').\n\n"
         f"Below are fetched web page contents from security advisories, release notes, or issue threads:\n\n"
         f"{combined_pages}\n\n"
-        "Analyze the content carefully and extract actionable remediation info:\n"
-        "1. If the page provides a clear patched version to bump to, set strategy='VERSION_BUMP' and fixed_version='X.Y.Z'.\n"
-        "2. If the page provides a code workaround or mitigation steps, set strategy='CODE_WORKAROUND' and workaround_snippets=[...].\n"
-        "3. If no actionable fixed version or code workaround is found, set strategy='NO_FIX'.\n"
+        f"{remediation_instructions}"
     )
 
     try:
@@ -932,7 +943,12 @@ def _query_serper(issue: Any, package_name: str) -> list[dict[str, str]] | None:
         return None
 
 
-def _serper_search_and_extract(issue: Any, package_name: str) -> dict[str, Any] | None:
+def _serper_search_and_extract(
+    issue: Any,
+    package_name: str,
+    *,
+    workaround_only: bool = False,
+) -> dict[str, Any] | None:
     """
     Orchestrate Serper search, page fetch, and LLM remediation extraction.
 
@@ -963,6 +979,13 @@ def _serper_search_and_extract(issue: Any, package_name: str) -> dict[str, Any] 
         or getattr(issue, "rule_id", None)
         or ""
     )
+    if workaround_only:
+        return _llm_extract_remediation(
+            pages,
+            package_name,
+            str(vuln_id),
+            workaround_only=True,
+        )
     return _llm_extract_remediation(pages, package_name, str(vuln_id))
 
 
@@ -971,8 +994,16 @@ def _serper_search_and_extract(issue: Any, package_name: str) -> dict[str, Any] 
 # ---------------------------------------------------------------------------
 
 
-def plan_fix(localized_issue: LocalizedIssue) -> dict:
-    """Plan one SCA finding from OSV advisory data and Serper fallback."""
+def plan_fix(localized_issue: LocalizedIssue, *, skip_osv: bool = False) -> dict:
+    """Plan one localized SCA finding from advisory and optional web evidence.
+
+    Args:
+        localized_issue: Finding and repository localization context.
+        skip_osv: Skip OSV and request workaround-only Serper/LLM evidence.
+
+    Returns:
+        A dictionary suitable for validation as ``FixPlan``.
+    """
     issue = localized_issue.issue
     package_manager = localized_issue.package_manager
     is_maven = str(package_manager or "").strip().lower() == "maven"
@@ -998,16 +1029,20 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
 
     # Step 1: OSV advisory data. The registry release choice is Supervisor-owned.
     osv_result = (
-        _query_osv_fixed_version(issue, maven_mode=True)
-        if is_maven
-        else _query_osv_fixed_version(issue)
+        None
+        if skip_osv
+        else (
+            _query_osv_fixed_version(issue, maven_mode=True)
+            if is_maven
+            else _query_osv_fixed_version(issue)
+        )
     )
     if isinstance(osv_result, tuple) and len(osv_result) == 2:
         fixed, snippets = osv_result
     else:
         fixed, snippets = None, None
 
-    if fixed:
+    if fixed and not skip_osv:
         return _version_plan(
             package_name,
             fixed,
@@ -1020,7 +1055,7 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
             ecosystem=issue.ecosystem,
             declaration_type=localized_issue.declaration_type,
         )
-    if snippets:
+    if snippets and not skip_osv:
         return {
             "status": FixPlanStatus.WORKAROUND_FOUND.value,
             "fixed_version": None,
@@ -1031,10 +1066,19 @@ def plan_fix(localized_issue: LocalizedIssue) -> dict:
 
     # Non-version workaround discovery can be useful for Maven, but text from
     # search/LLM results is never accepted as Maven release authorization.
-    serper_llm_result = _serper_search_and_extract(issue, package_name)
+    serper_llm_result = (
+        _serper_search_and_extract(issue, package_name, workaround_only=True)
+        if skip_osv
+        else _serper_search_and_extract(issue, package_name)
+    )
     if serper_llm_result and isinstance(serper_llm_result, dict):
         strategy = serper_llm_result.get("strategy")
-        if not is_maven and strategy == "VERSION_BUMP" and serper_llm_result.get("fixed_version"):
+        if (
+            not skip_osv
+            and not is_maven
+            and strategy == "VERSION_BUMP"
+            and serper_llm_result.get("fixed_version")
+        ):
             return _version_plan(
                 package_name,
                 serper_llm_result["fixed_version"],

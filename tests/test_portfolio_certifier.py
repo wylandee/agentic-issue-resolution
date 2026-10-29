@@ -84,7 +84,7 @@ from remediation_engine.tools.npm_graph import (
     make_occurrence_id,
     resolve_lockfile_dependency_package,
 )
-from remediation_engine.triage.grouper import group_issues
+from tests.fix_plan_fixtures import group_with_fix_plans
 
 
 class _FakeSandboxState:
@@ -368,7 +368,7 @@ def _jsonwebtoken_group() -> VulnerabilityGroup:
         instruction="Upgrade jsonwebtoken to the fixed release.",
         strategy_used="osv_api",
     )
-    return group_issues([issue], sca_issue_plans=[(localized, fix_plan)])[0]
+    return group_with_fix_plans([issue], plans_by_finding=[(localized, fix_plan)])[0]
 
 
 def _express_jwt_coordination_group() -> VulnerabilityGroup:
@@ -2106,9 +2106,9 @@ def test_active_transitive_workaround_keeps_physical_target_and_other_mutations(
         strategy_used="WORKAROUND",
         workaround_snippets=["Use a path-contained extraction destination."],
     )
-    decompress_group = group_issues(
+    decompress_group = group_with_fix_plans(
         [issue],
-        sca_issue_plans=[(localized, workaround_plan)],
+        plans_by_finding=[(localized, workaround_plan)],
     )[0]
 
     foo_issue = VulnerabilityIssue(
@@ -2134,7 +2134,7 @@ def test_active_transitive_workaround_keeps_physical_target_and_other_mutations(
         instruction="Update foo to its fixed version.",
         strategy_used="osv_api",
     )
-    foo_group = group_issues([foo_issue], sca_issue_plans=[(foo_localized, foo_plan)])[0]
+    foo_group = group_with_fix_plans([foo_issue], plans_by_finding=[(foo_localized, foo_plan)])[0]
 
     manifest = {
         "name": "app",
@@ -3434,9 +3434,9 @@ def test_dependency_range_failure_learns_pair_only_for_exact_mutable_physical_ed
         is_direct_dependency=True,
         localization_confidence=1.0,
     )
-    child_group = group_issues(
+    child_group = group_with_fix_plans(
         [child_issue],
-        sca_issue_plans=[
+        plans_by_finding=[
             (
                 child_localized,
                 FixPlan(
@@ -3748,7 +3748,7 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
             instruction=f"Update {package_name} to the fixed release.",
             strategy_used="osv_api",
         )
-        return group_issues([issue], sca_issue_plans=[(localized, fix_plan)])[0]
+        return group_with_fix_plans([issue], plans_by_finding=[(localized, fix_plan)])[0]
 
     def lockfile_for(dependencies: dict[str, str]) -> dict[str, Any]:
         packages: dict[str, dict[str, Any]] = {

@@ -574,6 +574,11 @@ class OrchestratorState(TypedDict, total=False):
     initial_triage_status: str
     initial_triage_executed: bool
     triage_reconciliation: dict[str, list[str]]
+    # Post-QA triage records reopened tasks here; the Supervisor replans their
+    # groups and refreshes planning-derived task inputs before portfolio work.
+    task_ids_requiring_fix_plan_refresh: list[str]
+    # Group input fingerprints whose targeted workaround lookup already ran.
+    workaround_lookup_fingerprints: Annotated[dict[str, str], replace_dict_reducer]
 
     status: str
     diff: str
@@ -733,6 +738,8 @@ def initial_orchestrator_state(
         "initial_triage_status": "pending",
         "initial_triage_executed": False,
         "triage_reconciliation": {},
+        "task_ids_requiring_fix_plan_refresh": [],
+        "workaround_lookup_fingerprints": {},
         "diff": "",
         "trajectory_path": "",
         "report_markdown": "",

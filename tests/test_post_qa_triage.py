@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import uuid4
 
 from remediation_engine.contracts.schemas import (
     DependencyParentContext,
@@ -12,6 +13,7 @@ from remediation_engine.contracts.schemas import (
     IncrementalScanRecord,
     IssueSource,
     IssueType,
+    LocalizedIssue,
     QAEvaluation,
     Severity,
     SystemContext,
@@ -27,6 +29,7 @@ from remediation_engine.contracts.solver_models import (
 )
 from remediation_engine.orchestration.graph import (
     _post_triage_issue_input,
+    _stable_group_fingerprint,
     build_orchestrator_graph,
     post_qa_triage_node,
     run_qa_critic_from_orchestrator,
@@ -39,6 +42,7 @@ from remediation_engine.orchestration.supervisor_node import (
 )
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
+from tests.fix_plan_fixtures import group_with_fix_plans
 
 
 def _issue(cve: str, *, source: IssueSource = IssueSource.ODC) -> VulnerabilityIssue:
@@ -54,23 +58,24 @@ def _issue(cve: str, *, source: IssueSource = IssueSource.ODC) -> VulnerabilityI
 
 
 def _group(group_id: str, issue: VulnerabilityIssue) -> VulnerabilityGroup:
-    return VulnerabilityGroup(
-        group_id=group_id,
-        issue_type=IssueType.SCA,
-        vulnerable_component=issue.package_name,
-        file_path=issue.file_path,
-        cve_ids=[issue.cve_id] if issue.cve_id else [],
-        versions=[issue.package_version] if issue.package_version else [],
-        sources=[issue.source],
-        representative_issue_id=issue.id,
-        issues=[issue],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="4.17.21",
-            instruction="Upgrade lodash to 4.17.21.",
-            strategy_used="test",
-        ),
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file=issue.file_path,
+        package_manager="npm",
+        declaration_type="dependencies",
+        is_direct_dependency=True,
+        localization_confidence=1.0,
     )
+    plan = FixPlan(
+        status=FixPlanStatus.VERSION_FOUND,
+        fixed_version="4.17.21",
+        instruction="Upgrade lodash to 4.17.21.",
+        strategy_used="test",
+    )
+    return group_with_fix_plans(
+        [issue],
+        plans_by_finding=[(localized, plan)],
+    )[0].model_copy(update={"group_id": group_id})
 
 
 def _triage_result(group: VulnerabilityGroup) -> TriageResult:
@@ -97,7 +102,10 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
         _issue("CVE-2026-0004", source=IssueSource.ODC),
     )
     new_group = _group("sca:package.json:new", new_issue)
-    candidate_unchanged = unchanged.model_copy()
+    candidate_unchanged = unchanged.model_copy(update={"fix_plan": None, "fix_plan_candidates": []})
+    changed_candidate = changed_candidate.model_copy(
+        update={"fix_plan": None, "fix_plan_candidates": []}
+    )
 
     changed_task = build_initial_remediation_task(changed, "task-changed").model_copy(
         update={
@@ -185,11 +193,48 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
     assert reopened.retry_count == 0
     assert reopened.current_attempt_id is None
     assert reopened.qa_policy == changed_task.qa_policy
+    assert result["task_ids_requiring_fix_plan_refresh"] == ["task-changed"]
     assert "task-changed" not in result["qa_evaluations"]
     assert "task-changed" not in result["latest_successful_scan_by_task"]
     assert set(result["latest_incremental_scan_by_input"]) == {"unchanged/package-lock.json"}
     assert result["task_queue"]["task-unchanged"] is unchanged_task
     assert result["active_target_task_ids"] == []
+
+
+def test_stable_group_fingerprint_ignores_plan_and_generated_issue_id_but_tracks_localization():
+    issue = _issue("CVE-2026-1000")
+    localized = LocalizedIssue(
+        issue=issue,
+        manifest_file="package.json",
+        package_manager="npm",
+        declaration_type="dependencies",
+        is_direct_dependency=True,
+    )
+    planned = _group("sca:package.json:lodash", issue).model_copy(
+        update={"localized_issues": [localized]}
+    )
+    regenerated_issue = issue.model_copy(update={"id": uuid4()})
+    regenerated_localized = localized.model_copy(update={"issue": regenerated_issue})
+    fresh_observation = planned.model_copy(
+        update={
+            "issues": [regenerated_issue],
+            "representative_issue_id": regenerated_issue.id,
+            "localized_issues": [regenerated_localized],
+            "fix_plan": None,
+            "fix_plan_candidates": [],
+        }
+    )
+
+    assert _stable_group_fingerprint(planned) == _stable_group_fingerprint(fresh_observation)
+
+    changed_localization = fresh_observation.model_copy(
+        update={
+            "localized_issues": [
+                regenerated_localized.model_copy(update={"is_direct_dependency": False})
+            ]
+        }
+    )
+    assert _stable_group_fingerprint(planned) != _stable_group_fingerprint(changed_localization)
 
 
 def test_post_triage_development_limit_uses_configured_pass_count():

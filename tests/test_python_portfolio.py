@@ -40,7 +40,7 @@ from remediation_engine.orchestration.supervisor_portfolio import (
 )
 from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
-from remediation_engine.triage.grouper import group_issues
+from tests.fix_plan_fixtures import group_with_fix_plans
 
 
 def _python_group(
@@ -76,7 +76,7 @@ def _python_group(
         instruction="Update certifi",
         strategy_used="fixture",
     )
-    return group_issues([issue], sca_issue_plans=[(localized, fix)])[0]
+    return group_with_fix_plans([issue], plans_by_finding=[(localized, fix)])[0]
 
 
 def _pypi_candidate(version: str) -> RegistryCandidate:

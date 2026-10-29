@@ -19,8 +19,6 @@ import pytest
 
 from remediation_engine.contracts.schemas import (
     CVEEnrichment,
-    FixPlan,
-    FixPlanStatus,
     IssueSource,
     IssueType,
     LineRange,
@@ -35,7 +33,7 @@ from remediation_engine.language import ProjectLanguage
 from remediation_engine.triage.pipeline import (
     TriagePipelineError,
     TriageSelectionError,
-    _prepare_sca_issue_plans,
+    _localize_sca_issues,
     run_triage_pipeline,
     select_issues_for_remediation,
 )
@@ -98,27 +96,18 @@ def _empty_enrichment_map(cve_ids: list[str]):
     }
 
 
-def _sca_issue_plans(issues: list[VulnerabilityIssue]):
-    pairs = []
-    for issue in issues:
-        if issue.issue_type != IssueType.SCA:
-            continue
-        localized = LocalizedIssue(
+def _localized_sca_issues(issues: list[VulnerabilityIssue]):
+    return [
+        LocalizedIssue(
             issue=issue,
             manifest_file=issue.file_path,
             is_direct_dependency=True,
             package_manager="npm",
             localization_confidence=0.95,
         )
-        plan = FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="4.17.21",
-            workaround_snippets=None,
-            instruction="test plan",
-            strategy_used="osv_api",
-        )
-        pairs.append((localized, plan))
-    return pairs
+        for issue in issues
+        if issue.issue_type == IssueType.SCA
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +119,7 @@ class TestRunTriagePipeline:
     def test_empty_input_returns_empty(self):
         with (
             patch("remediation_engine.triage.pipeline.enrich_cves", return_value={}),
-            patch("remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=[]),
+            patch("remediation_engine.triage.pipeline._localize_sca_issues", return_value=[]),
         ):
             result = run_triage_pipeline([], _ctx())
         assert result == []
@@ -143,8 +132,8 @@ class TestRunTriagePipeline:
                 "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
             ),
             patch(
-                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
-                return_value=_sca_issue_plans(issues),
+                "remediation_engine.triage.pipeline._localize_sca_issues",
+                return_value=_localized_sca_issues(issues),
             ),
         ):
             result = run_triage_pipeline(issues, _ctx())
@@ -161,7 +150,7 @@ class TestRunTriagePipeline:
             patch(
                 "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
             ),
-            patch("remediation_engine.triage.pipeline._prepare_sca_issue_plans", return_value=[]),
+            patch("remediation_engine.triage.pipeline._localize_sca_issues", return_value=[]),
         ):
             result = run_triage_pipeline(issues, _ctx())
 
@@ -179,8 +168,8 @@ class TestRunTriagePipeline:
                 "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
             ),
             patch(
-                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
-                return_value=_sca_issue_plans(issues),
+                "remediation_engine.triage.pipeline._localize_sca_issues",
+                return_value=_localized_sca_issues(issues),
             ),
         ):
             result = run_triage_pipeline(issues, _ctx())
@@ -195,8 +184,8 @@ class TestRunTriagePipeline:
                 "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
             ),
             patch(
-                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
-                return_value=_sca_issue_plans(issues),
+                "remediation_engine.triage.pipeline._localize_sca_issues",
+                return_value=_localized_sca_issues(issues),
             ),
         ):
             result = run_triage_pipeline(issues, _ctx())
@@ -222,8 +211,8 @@ class TestRunTriagePipeline:
                 return_value={"CVE-2021-23337": kev_enrichment},
             ),
             patch(
-                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
-                return_value=_sca_issue_plans(issues),
+                "remediation_engine.triage.pipeline._localize_sca_issues",
+                return_value=_localized_sca_issues(issues),
             ),
         ):
             result = run_triage_pipeline(issues, _ctx())
@@ -242,8 +231,8 @@ class TestRunTriagePipeline:
                 "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
             ),
             patch(
-                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
-                return_value=_sca_issue_plans(issues),
+                "remediation_engine.triage.pipeline._localize_sca_issues",
+                return_value=_localized_sca_issues(issues),
             ),
             patch("remediation_engine.triage.pipeline.analyze_reachability") as mock_reachability,
         ):
@@ -261,8 +250,8 @@ class TestRunTriagePipeline:
                 "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
             ),
             patch(
-                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
-                return_value=_sca_issue_plans(issues),
+                "remediation_engine.triage.pipeline._localize_sca_issues",
+                return_value=_localized_sca_issues(issues),
             ),
             patch("remediation_engine.triage.pipeline.analyze_reachability") as mock_reachability,
         ):
@@ -270,24 +259,26 @@ class TestRunTriagePipeline:
 
         mock_reachability.assert_not_called()
 
-    def test_pipeline_locates_and_plans_sca_before_grouping(self, tmp_path, monkeypatch):
+    def test_pipeline_localizes_sca_without_fix_planning(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
         issues = [_sca()]
-        planned_pairs = _sca_issue_plans(issues)
+        planned_pairs = _localized_sca_issues(issues)
 
         with (
             patch(
                 "remediation_engine.triage.pipeline.enrich_cves", side_effect=_empty_enrichment_map
             ),
             patch(
-                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+                "remediation_engine.triage.pipeline._localize_sca_issues",
                 return_value=planned_pairs,
             ) as mock_prepare,
+            patch("remediation_engine.tools.fix_planner.plan_fix") as mock_plan,
         ):
             result = run_triage_pipeline(issues, _ctx(), repo_root=str(tmp_path))
 
         mock_prepare.assert_called_once()
-        assert result[0][0].fix_plan is not None
+        mock_plan.assert_not_called()
+        assert result[0][0].fix_plan is None
         assert result[0][0].localized_issues
 
     def test_group_triage_failure_is_explicit_instead_of_dropping_group(
@@ -299,7 +290,7 @@ class TestRunTriagePipeline:
             _sca(package_name="lodash", file_path="package.json"),
             _sca(package_name="express", file_path="backend/package.json"),
         ]
-        planned_pairs = _sca_issue_plans(issues)
+        planned_pairs = _localized_sca_issues(issues)
         seen_group_ids: list[str] = []
 
         def triage_one(group, _context):
@@ -323,7 +314,7 @@ class TestRunTriagePipeline:
                 side_effect=_empty_enrichment_map,
             ),
             patch(
-                "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+                "remediation_engine.triage.pipeline._localize_sca_issues",
                 return_value=planned_pairs,
             ),
             patch("remediation_engine.triage.pipeline.run_triage", side_effect=triage_one),
@@ -355,7 +346,7 @@ class TestRunTriagePipeline:
         with pytest.raises(TriageSelectionError, match="sast:missing"):
             select_issues_for_remediation([(group, triage)])
 
-    def test_prepare_sca_issue_plans_calls_locator_and_planner(self, tmp_path):
+    def test_localize_sca_issues_calls_locator_without_planner(self, tmp_path):
         issue = _sca()
         localized = LocalizedIssue(
             issue=issue,
@@ -364,30 +355,18 @@ class TestRunTriagePipeline:
             package_manager="npm",
             localization_confidence=0.95,
         )
-        raw_plan = {
-            "status": FixPlanStatus.VERSION_FOUND.value,
-            "fixed_version": "4.17.21",
-            "workaround_snippets": None,
-            "instruction": "test plan",
-            "strategy_used": "osv_api",
-        }
-
         with (
             patch(
                 "remediation_engine.tools.manifest_locator.locate_from_issue",
                 return_value=localized,
             ) as mock_locate,
-            patch(
-                "remediation_engine.tools.fix_planner.plan_fix", return_value=raw_plan
-            ) as mock_plan,
+            patch("remediation_engine.tools.fix_planner.plan_fix") as mock_plan,
         ):
-            pairs = _prepare_sca_issue_plans([issue], str(tmp_path))
+            localized_issues = _localize_sca_issues([issue], str(tmp_path))
 
         mock_locate.assert_called_once()
-        mock_plan.assert_called_once_with(localized)
-        assert len(pairs) == 1
-        assert pairs[0][0] is localized
-        assert pairs[0][1].fixed_version == "4.17.21"
+        mock_plan.assert_not_called()
+        assert localized_issues == [localized]
 
     @pytest.mark.parametrize(
         ("updates", "package_name"),
@@ -405,13 +384,6 @@ class TestRunTriagePipeline:
         )
         if "purl" in updates:
             issue = issue.model_copy(update={"package_name": None})
-        raw_plan = {
-            "status": FixPlanStatus.VERSION_FOUND.value,
-            "fixed_version": "2.32.0",
-            "workaround_snippets": None,
-            "instruction": "test plan",
-            "strategy_used": "osv_api",
-        }
 
         def locate_python(canonical_issue, _repo_path):
             return LocalizedIssue(
@@ -429,19 +401,19 @@ class TestRunTriagePipeline:
                 side_effect=locate_python,
             ) as python_locate,
             patch("remediation_engine.tools.manifest_locator.locate_from_issue") as npm_locate,
-            patch("remediation_engine.tools.fix_planner.plan_fix", return_value=raw_plan),
+            patch("remediation_engine.tools.fix_planner.plan_fix") as mock_plan,
         ):
-            pairs = _prepare_sca_issue_plans([issue], str(tmp_path))
+            localized_issues = _localize_sca_issues([issue], str(tmp_path))
 
         python_locate.assert_called_once()
         npm_locate.assert_not_called()
+        mock_plan.assert_not_called()
         localized = python_locate.call_args.args[0]
         assert localized.ecosystem == "pypi"
         assert localized.package_name == package_name
-        assert pairs[0][0].issue.ecosystem == "pypi"
-        assert pairs[0][0].issue.package_name == package_name
-        assert pairs[0][1].fixed_version == "2.32.0"
-        assert pairs[0][0].manifest_file == "requirements.txt"
+        assert localized_issues[0].issue.ecosystem == "pypi"
+        assert localized_issues[0].issue.package_name == package_name
+        assert localized_issues[0].manifest_file == "requirements.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -573,14 +545,14 @@ def test_pipeline_threads_explicit_java_language_to_localization_and_reachabilit
     monkeypatch.setenv("TRIAGE_CACHE_DIR", str(tmp_path))
     issues = [_sca()]
     context = SystemContext(environment="production", primary_language="java")
-    plans = _sca_issue_plans(issues)
+    plans = _localized_sca_issues(issues)
     with (
         patch(
             "remediation_engine.triage.pipeline.enrich_cves",
             side_effect=_empty_enrichment_map,
         ),
         patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
+            "remediation_engine.triage.pipeline._localize_sca_issues",
             return_value=plans,
         ) as prepare,
         patch("remediation_engine.triage.pipeline.analyze_reachability") as reachability,
@@ -600,8 +572,8 @@ def test_pipeline_without_primary_language_preserves_node_fallback(monkeypatch, 
             side_effect=_empty_enrichment_map,
         ),
         patch(
-            "remediation_engine.triage.pipeline._prepare_sca_issue_plans",
-            return_value=_sca_issue_plans(issues),
+            "remediation_engine.triage.pipeline._localize_sca_issues",
+            return_value=_localized_sca_issues(issues),
         ) as prepare,
     ):
         run_triage_pipeline(issues, _ctx())

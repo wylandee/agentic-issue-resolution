@@ -18,6 +18,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityIssue,
 )
 from remediation_engine.triage.grouper import group_issues
+from tests.fix_plan_fixtures import group_with_fix_plans
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -116,9 +117,9 @@ class TestSCAGrouping:
             _sca(cve_id="CVE-2026-1001"),
             _sca(cve_id="CVE-2026-1002"),
         ]
-        groups = group_issues(
+        groups = group_with_fix_plans(
             issues,
-            sca_issue_plans=[
+            plans_by_finding=[
                 (
                     _localized(
                         issues[0],
@@ -156,9 +157,9 @@ class TestSCAGrouping:
     def test_generic_and_parent_aware_paths_share_one_remediation_group(self):
         generic = _sca(cve_id="CVE-2026-1003")
         parent_aware = _sca(cve_id="CVE-2026-1004")
-        groups = group_issues(
+        groups = group_with_fix_plans(
             [generic, parent_aware],
-            sca_issue_plans=[
+            plans_by_finding=[
                 (
                     _localized(generic, is_direct_dependency=False),
                     _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
@@ -196,7 +197,7 @@ class TestSCAGrouping:
                 _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.22"),
             ),
         ]
-        groups = group_issues(issues, sca_issue_plans=pairs)
+        groups = group_with_fix_plans(issues, plans_by_finding=pairs)
         assert len(groups) == 1
         g = groups[0]
         assert set(g.cve_ids) == {"CVE-2021-23337", "CVE-2020-28500"}
@@ -221,7 +222,7 @@ class TestSCAGrouping:
                 _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
             ),
         ]
-        groups = group_issues(issues, sca_issue_plans=pairs)
+        groups = group_with_fix_plans(issues, plans_by_finding=pairs)
         assert len(groups) == 1
         assert groups[0].cve_ids == ["CVE-2021-23337"]
 
@@ -229,9 +230,9 @@ class TestSCAGrouping:
         """Semgrep SCA + ODC finding the same CVE on the same package/file â†’ merge."""
         semgrep_issue = _sca(source=IssueSource.SEMGREP, cve_id="CVE-2021-44228")
         odc_issue = _sca(source=IssueSource.ODC, cve_id="CVE-2021-44228")
-        groups = group_issues(
+        groups = group_with_fix_plans(
             [semgrep_issue, odc_issue],
-            sca_issue_plans=[
+            plans_by_finding=[
                 (
                     _localized(semgrep_issue),
                     _plan(
@@ -261,9 +262,9 @@ class TestSCAGrouping:
             _sca(package_name="lodash", file_path="package.json"),
             _sca(package_name="express", file_path="backend/package.json"),
         ]
-        groups = group_issues(
+        groups = group_with_fix_plans(
             issues,
-            sca_issue_plans=[
+            plans_by_finding=[
                 (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
                 (_localized(issues[1]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
             ],
@@ -280,7 +281,7 @@ class TestSCAGrouping:
             strategy_used="NO_FIX",
         )
 
-        groups = group_issues([issue], sca_issue_plans=[(_localized(issue), plan)])
+        groups = group_with_fix_plans([issue], plans_by_finding=[(_localized(issue), plan)])
 
         assert len(groups) == 1
         assert groups[0].vulnerable_component == "@scope/pkg"
@@ -303,7 +304,7 @@ class TestSCAGrouping:
             for issue in issues
         ]
 
-        groups = group_issues(issues, sca_issue_plans=pairs)
+        groups = group_with_fix_plans(issues, plans_by_finding=pairs)
 
         assert len(groups) == 1
         assert groups[0].vulnerable_component == "zope-interface"
@@ -319,7 +320,7 @@ class TestSCAGrouping:
             for issue in issues
         ]
 
-        assert len(group_issues(issues, sca_issue_plans=pairs)) == 2
+        assert len(group_with_fix_plans(issues, plans_by_finding=pairs)) == 2
 
     def test_group_tracks_all_manifest_paths(self):
         issues = [
@@ -337,7 +338,7 @@ class TestSCAGrouping:
             ),
         ]
 
-        groups = group_issues(issues, sca_issue_plans=pairs)
+        groups = group_with_fix_plans(issues, plans_by_finding=pairs)
 
         assert len(groups) == 2
         assert groups[0].file_paths == ["frontend/package.json"] or groups[0].file_paths == [
@@ -358,9 +359,9 @@ class TestSCAGrouping:
             _sca(package_version="4.17.20", cve_id="CVE-2021-23337"),
             _sca(package_version="4.17.20", cve_id="CVE-2020-28500"),
         ]
-        groups = group_issues(
+        groups = group_with_fix_plans(
             issues,
-            sca_issue_plans=[
+            plans_by_finding=[
                 (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
                 (_localized(issues[1]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
             ],
@@ -369,9 +370,9 @@ class TestSCAGrouping:
 
     def test_no_cve_sca_still_groups(self):
         issues = [_sca(cve_id=None), _sca(cve_id=None)]
-        groups = group_issues(
+        groups = group_with_fix_plans(
             issues,
-            sca_issue_plans=[
+            plans_by_finding=[
                 (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
                 (_localized(issues[1]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
             ],
@@ -385,9 +386,9 @@ class TestSCAGrouping:
             _sca(cve_id=None, ghsa_id="GHSA-VPQ2-C234-7XJ6"),
             _sca(cve_id=None, ghsa_id="ghsa-vpq2-c234-7xj6"),
         ]
-        groups = group_issues(
+        groups = group_with_fix_plans(
             issues,
-            sca_issue_plans=[
+            plans_by_finding=[
                 (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
                 (_localized(issues[1]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
             ],
@@ -401,9 +402,9 @@ class TestSCAGrouping:
             _sca(cve_id="CVE-2021-23337"),
             _sca(cve_id="CVE-2020-28500"),
         ]
-        groups = group_issues(
+        groups = group_with_fix_plans(
             issues,
-            sca_issue_plans=[
+            plans_by_finding=[
                 (
                     _localized(issues[0]),
                     _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="4.17.21"),
@@ -430,9 +431,9 @@ class TestSCAGrouping:
             _sca(cve_id="CVE-2021-23337"),
             _sca(cve_id="CVE-2020-28500"),
         ]
-        groups = group_issues(
+        groups = group_with_fix_plans(
             issues,
-            sca_issue_plans=[
+            plans_by_finding=[
                 (
                     _localized(issues[0]),
                     _plan(status=FixPlanStatus.VERSION_FOUND, fixed_version="v1.2"),
@@ -450,9 +451,9 @@ class TestSCAGrouping:
 
     def test_highest_fixed_version_ignores_build_metadata(self):
         issue = _sca()
-        groups = group_issues(
+        groups = group_with_fix_plans(
             [issue],
-            sca_issue_plans=[
+            plans_by_finding=[
                 (
                     _localized(issue),
                     _plan(
@@ -513,9 +514,9 @@ class TestMixedGrouping:
             _sca(package_name="express", file_path="backend/package.json"),
             _sast(file_path="src/login.js", rule_id="xss", line_start=5, line_end=5),
         ]
-        groups = group_issues(
+        groups = group_with_fix_plans(
             issues,
-            sca_issue_plans=[
+            plans_by_finding=[
                 (_localized(issues[0]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
                 (
                     _localized(issues[1]),

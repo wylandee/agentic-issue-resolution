@@ -1108,6 +1108,53 @@ def test_maven_serper_version_bump_is_not_authorized():
     assert "99.0" not in plan["instruction"]
 
 
+def test_skip_osv_mode_accepts_workaround_evidence_but_rejects_version_only_results():
+    issue = _make_localized()
+    version_only = {"strategy": "VERSION_BUMP", "fixed_version": "99.0"}
+    with (
+        patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv,
+        patch(
+            "remediation_engine.tools.fix_planner._serper_search_and_extract",
+            return_value=version_only,
+        ) as serper,
+    ):
+        version_plan = plan_fix(issue, skip_osv=True)
+
+    osv.assert_not_called()
+    serper.assert_called_once_with(issue.issue, "lodash", workaround_only=True)
+    assert version_plan["status"] == FixPlanStatus.NO_FIX.value
+    assert version_plan["fixed_version"] is None
+
+    with (
+        patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv,
+        patch(
+            "remediation_engine.tools.fix_planner._serper_search_and_extract",
+            return_value={
+                "strategy": "CODE_WORKAROUND",
+                "workaround_snippets": ["Disable the affected option."],
+            },
+        ),
+    ):
+        workaround_plan = plan_fix(issue, skip_osv=True)
+
+    osv.assert_not_called()
+    assert workaround_plan["status"] == FixPlanStatus.WORKAROUND_FOUND.value
+    assert workaround_plan["workaround_snippets"] == ["Disable the affected option."]
+
+
+def test_skip_osv_mode_keeps_maven_manifest_authorization():
+    with (
+        patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv,
+        patch("remediation_engine.tools.fix_planner._serper_search_and_extract") as serper,
+    ):
+        plan = plan_fix(_make_maven_localized(manifest_file=None), skip_osv=True)
+
+    assert plan["status"] == FixPlanStatus.NO_FIX.value
+    assert "authorized Maven POM" in plan["instruction"]
+    osv.assert_not_called()
+    serper.assert_not_called()
+
+
 def test_maven_osv_fixed_events_use_comparable_version_order():
     vuln = {
         "affected": [

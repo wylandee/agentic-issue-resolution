@@ -22,6 +22,9 @@ from remediation_engine.orchestration.portfolio_orchestrator import (
 )
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.state import OrchestratorState
+from remediation_engine.orchestration.supervisor_fix_plans import (
+    prepare_supervisor_fix_plan_state,
+)
 from remediation_engine.orchestration.task_utils import TERMINAL_TASK_STATUSES
 
 log = logging.getLogger(__name__)
@@ -252,6 +255,13 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
     """
     iteration = int(state.get("portfolio_iteration", 0) or 0) + 1
     request = _portfolio_replan_request(state)
+    fix_plan_state: dict[str, Any] = {
+        "valid_groups": list(state.get("valid_groups", []) or []),
+        "task_queue": dict(state.get("task_queue", {}) or {}),
+        "task_ids_requiring_fix_plan_refresh": list(
+            state.get("task_ids_requiring_fix_plan_refresh", []) or []
+        ),
+    }
     replan_history, replan_guard_error = _record_portfolio_replan_attempt(state, request)
     if replan_guard_error:
         log.warning("run_portfolio_plan_tool: %s", replan_guard_error)
@@ -265,12 +275,11 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "portfolio_replan_history": replan_history,
             "portfolio_dirty": False,
             "portfolio_escalation": None,
-            "valid_groups": list(state.get("valid_groups", []) or []),
-            "task_queue": dict(state.get("task_queue", {}) or {}),
             "active_target_task_ids": [],
             "active_cluster_id": None,
             "active_dispatch_batch_id": None,
             "active_multi_package_action": None,
+            **fix_plan_state,
             "errors": [replan_guard_error],
         }
     peer_conflict_pairs = request.peer_conflict_pairs if request else ()
@@ -281,14 +290,25 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
         project_language = resolve_project_language(
             state["repo_root"], str(state.get("project_language") or "") or None
         )
-        prepared_groups, prepared_queue, prepare_diagnostics = prepare_portfolio_inputs(
-            state["repo_root"],
+        planned_groups, refreshed_queue, pending_refresh_ids = prepare_supervisor_fix_plan_state(
             state.get("valid_groups", []),
             dict(state.get("task_queue", {}) or {}),
+            state.get("task_ids_requiring_fix_plan_refresh", []) or [],
+            project_language,
+        )
+        fix_plan_state = {
+            "valid_groups": planned_groups,
+            "task_queue": refreshed_queue,
+            "task_ids_requiring_fix_plan_refresh": pending_refresh_ids,
+        }
+        prepared_groups, prepared_queue, prepare_diagnostics = prepare_portfolio_inputs(
+            state["repo_root"],
+            planned_groups,
+            refreshed_queue,
             target_packages=state.get("target_packages", []),
             project_language=project_language,
         )
-        source_queue = dict(state.get("task_queue", {}) or {})
+        source_queue = refreshed_queue
         portfolio_queue: dict[str, Any] = {}
         for task_id, task in prepared_queue.items():
             source_task = source_queue.get(task_id)
@@ -318,6 +338,7 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
                 "active_target_task_ids": [],
                 "active_cluster_id": None,
                 "active_dispatch_batch_id": None,
+                "task_ids_requiring_fix_plan_refresh": pending_refresh_ids,
                 "errors": sorted(set(prepare_diagnostics)),
             }
         plan = build_certified_portfolio_plan(
@@ -350,6 +371,7 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "portfolio_iteration": iteration,
             "portfolio_replan_request": request,
             "portfolio_replan_history": replan_history,
+            **fix_plan_state,
             "errors": [f"portfolio node failed: {exc}"],
         }
 
@@ -447,6 +469,9 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "active_dispatch_batch_id": None,
             "active_multi_package_action": None,
             "errors": errors,
+            "task_ids_requiring_fix_plan_refresh": fix_plan_state[
+                "task_ids_requiring_fix_plan_refresh"
+            ],
         }
     try:
         committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
@@ -467,6 +492,9 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "valid_groups": prepared_groups,
             "task_queue": portfolio_queue,
             "active_target_task_ids": [],
+            "task_ids_requiring_fix_plan_refresh": fix_plan_state[
+                "task_ids_requiring_fix_plan_refresh"
+            ],
             "errors": [f"portfolio plan application failed: {exc}"],
         }
     diagnostics = sorted(set(diagnostics) | set(apply_diagnostics))
@@ -517,6 +545,9 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "active_dispatch_batch_id": None,
             "active_multi_package_action": None,
             "errors": [*diagnostics, reconcile_reason],
+            "task_ids_requiring_fix_plan_refresh": fix_plan_state[
+                "task_ids_requiring_fix_plan_refresh"
+            ],
         }
     result_state = {
         "status": "portfolio_ready",
@@ -535,6 +566,9 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
         "active_dispatch_batch_id": None,
         "active_multi_package_action": None,
         "errors": diagnostics,
+        "task_ids_requiring_fix_plan_refresh": fix_plan_state[
+            "task_ids_requiring_fix_plan_refresh"
+        ],
     }
     certified_prefix = getattr(
         getattr(plan, "resolution_certificate", None),

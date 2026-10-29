@@ -98,6 +98,7 @@ _KNOWN_LLM_SPAN_NAMES = frozenset(
         "react.llm",
         "ChatOpenAI",
         "fix_planner.llm",
+        "supervisor.plan_fix",
         "supervisor.tactical_reasoner",
     }
 )

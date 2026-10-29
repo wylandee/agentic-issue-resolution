@@ -21,6 +21,7 @@ from typing import Any
 from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueType,
+    PortfolioPlan,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -598,10 +599,14 @@ def prepare_portfolio_inputs(
     Returns:
         ``(groups, task_queue, diagnostics)`` containing detached Pydantic objects.
     """
-    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
-
     prepared_groups = [group.model_copy(deep=True) for group in groups]
     prepared_queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
+    missing_plan_diagnostic = _missing_sca_plan_diagnostic(prepared_groups)
+    if missing_plan_diagnostic:
+        return prepared_groups, prepared_queue, [missing_plan_diagnostic]
+
+    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+
     represented = {task.parent_group_id for task in prepared_queue.values()}
     next_index = 1
     for group in sorted(prepared_groups, key=lambda item: item.group_id):
@@ -3430,10 +3435,20 @@ def build_portfolio_plan(
     This path does not run npm or require Docker. A registry fetcher can be
     supplied when a complete current candidate catalog is required.
     """
+    group_list = list(groups)
+    missing_plan_diagnostic = _missing_sca_plan_diagnostic(group_list)
+    if missing_plan_diagnostic:
+        return _unplanned_sca_portfolio_plan(
+            group_list,
+            task_queue,
+            missing_plan_diagnostic,
+            portfolio_iteration=portfolio_iteration,
+        )
+
     resolved_settings = settings or AppSettings()
     prepared = _prepare_portfolio_problem(
         repo_root,
-        list(groups),
+        group_list,
         task_queue,
         target_packages=target_packages,
         peer_conflict_pairs=tuple(peer_conflict_pairs),
@@ -3454,6 +3469,101 @@ def build_portfolio_plan(
         prepared,
         solver_plan,
         portfolio_iteration=portfolio_iteration,
+    )
+
+
+def _missing_sca_plan_diagnostic(groups: Iterable[VulnerabilityGroup]) -> str | None:
+    """Describe actionable, finding-backed SCA groups without any plan data."""
+    group_ids = sorted(
+        group.group_id
+        for group in groups
+        if group.issue_type == IssueType.SCA
+        and not group.is_synthetic
+        and group.fix_plan is None
+        and not group.fix_plan_candidates
+    )
+    if not group_ids:
+        return None
+    return f"actionable SCA groups are missing Supervisor fix plans: {group_ids!r}"
+
+
+def _unplanned_sca_portfolio_plan(
+    groups: Sequence[VulnerabilityGroup],
+    task_queue: Mapping[str, RemediationTask],
+    diagnostic: str,
+    *,
+    portfolio_iteration: int,
+) -> PortfolioPlan:
+    """Return an explicitly non-dispatchable plan without deriving tasks."""
+    missing_groups = [
+        group
+        for group in groups
+        if group.issue_type == IssueType.SCA
+        and not group.is_synthetic
+        and group.fix_plan is None
+        and not group.fix_plan_candidates
+    ]
+    digest = hashlib.sha256(
+        json.dumps(
+            {"diagnostic": diagnostic, "group_ids": sorted(g.group_id for g in missing_groups)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    task_ids: list[str] = []
+    clusters: list[TaskCluster] = []
+    revisions: dict[str, int] = {}
+    for index, group in enumerate(sorted(missing_groups, key=lambda item: item.group_id), start=1):
+        task = next(
+            (item for item in task_queue.values() if item.parent_group_id == group.group_id),
+            None,
+        )
+        task_id = task.task_id if task is not None else f"unplanned-sca-{index}"
+        task_ids.append(task_id)
+        revisions[task_id] = task.task_revision if task is not None else 0
+        cluster_id = f"unplanned-cluster-{index}"
+        clusters.append(
+            TaskCluster(
+                cluster_id=cluster_id,
+                task_ids=[task_id],
+                reason="missing fix-plan evidence prevents safe portfolio derivation",
+                dispatchable=False,
+            )
+        )
+    solver_plan = SolverRemediationPlan(
+        status=SolverStatus.UNKNOWN,
+        input_digest=digest,
+        domain_digest=digest,
+        repository_digest=digest,
+        candidate_catalog_complete=False,
+        diagnostics=[diagnostic],
+    )
+    return PortfolioPlan(
+        plan_id=f"portfolio-{digest[:24]}",
+        portfolio_plan_id=f"portfolio-{digest[:24]}",
+        repository_fingerprint=digest,
+        graph_digest=digest,
+        plan_digest=digest,
+        solver_input_digest=digest,
+        solver_plan=solver_plan,
+        portfolio_iteration=max(0, int(portfolio_iteration)),
+        task_ids=task_ids,
+        clusters=clusters,
+        cluster_order=[cluster.cluster_id for cluster in clusters],
+        task_order=task_ids,
+        task_to_cluster={
+            task_id: cluster.cluster_id for cluster in clusters for task_id in cluster.task_ids
+        },
+        task_revisions=revisions,
+        planned_task_revisions=revisions,
+        task_strategies={
+            task_id: next(
+                (task.strategy for task in task_queue.values() if task.task_id == task_id),
+                RoutingStrategy.CODE_WORKAROUND,
+            )
+            for task_id in task_ids
+        },
+        diagnostics=[diagnostic],
     )
 
 

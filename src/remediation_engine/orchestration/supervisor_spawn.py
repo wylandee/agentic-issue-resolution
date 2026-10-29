@@ -9,6 +9,7 @@ from remediation_engine.contracts.schemas import (
     MAX_ANCESTRY_DEPTH,
     MAX_TASK_QUEUE_SIZE,
     FailureCategory,
+    IssueType,
     QAEvaluation,
     QAPolicy,
     RemediationTask,
@@ -22,6 +23,12 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
 )
 from remediation_engine.language import ProjectLanguage
+from remediation_engine.orchestration.supervisor_fix_plans import (
+    ensure_workaround_fix_plan,
+    has_workaround_fix_plan,
+    workaround_lookup_fingerprint,
+    workaround_lookup_ledger_key,
+)
 from remediation_engine.orchestration.supervisor_planner import (
     _build_high_level_retry_instruction,
     instruction_digest,
@@ -243,6 +250,7 @@ def _materialize_spawn_requests(
     qa_evaluations: dict[str, QAEvaluation] | None = None,
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] | None = None,
     consistency_events: list[StateConsistencyEvent] | None = None,
+    workaround_lookup_fingerprints: dict[str, str] | None = None,
 ) -> tuple[dict[str, RemediationTask], dict[str, list[str]]]:
     """Validate and materialize spawn requests into new RemediationTask objects.
 
@@ -372,6 +380,24 @@ def _materialize_spawn_requests(
             )
         else:
             child_policy = QAPolicy.INITIAL_CODE_WORKAROUND
+
+        if req.strategy == RoutingStrategy.CODE_WORKAROUND:
+            group = group_by_id.get(parent_task.parent_group_id)
+            if group is not None and group.issue_type == IssueType.SCA and not group.is_synthetic:
+                fingerprint = workaround_lookup_fingerprint(group)
+                ledger = workaround_lookup_fingerprints
+                ledger_key = workaround_lookup_ledger_key(group, fingerprint)
+                has_workaround = has_workaround_fix_plan(group)
+                if not has_workaround and ledger_key not in (ledger or {}):
+                    updated_group = ensure_workaround_fix_plan(group)
+                    if ledger is not None:
+                        ledger[ledger_key] = fingerprint
+                    group_by_id[group.group_id] = updated_group
+                    if valid_groups is not None:
+                        valid_groups[:] = [
+                            updated_group if item.group_id == group.group_id else item
+                            for item in valid_groups
+                        ]
 
         new_group_id = parent_task.parent_group_id
         # Strategy pivots remain child-task audit records, but the package-only

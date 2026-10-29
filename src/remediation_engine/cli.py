@@ -332,6 +332,10 @@ def _run_solve(args: argparse.Namespace, settings: AppSettings) -> int:
         prepared_queue,
         settings=settings,
     )
+    if any("missing Supervisor fix plans" in item for item in prepare_diagnostics):
+        output = _solve_output(plan, prepare_diagnostics, [])
+        _write_json(args.output, output, sort_keys=True)
+        return 1
     _committed_groups, _committed_queue, apply_diagnostics = apply_portfolio_plan(
         plan,
         prepared_groups,
