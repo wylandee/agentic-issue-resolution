@@ -697,7 +697,7 @@ def _execute_run_thread(session: RunSession) -> None:
                 deployment_os="linux",
                 deployment_architecture="containerized",
                 environment="development",
-                primary_language="javascript/nodejs",
+                primary_language="auto",
             ),
         )
 

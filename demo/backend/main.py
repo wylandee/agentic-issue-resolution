@@ -5,12 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from pathlib import Path
-from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -40,6 +38,8 @@ app.add_middleware(
 
 
 class SelectPathRequest(BaseModel):
+    """Request payload for attaching a local repository directory."""
+
     path: str
 
 
@@ -52,6 +52,7 @@ class StartRunRequest(BaseModel):
 
 @app.get("/api/health")
 async def health_check() -> dict[str, str]:
+    """Return a small readiness response for local demo health checks."""
     return {"status": "ok"}
 
 
@@ -92,7 +93,9 @@ async def upload_folder(request: Request) -> WorkspaceInfo:
     try:
         first_path_item = raw_paths[0]
         if isinstance(first_path_item, UploadFile):
-            first_path_str = (await first_path_item.read()).decode("utf-8", errors="replace").strip()
+            first_path_str = (
+                (await first_path_item.read()).decode("utf-8", errors="replace").strip()
+            )
             await first_path_item.seek(0)
         else:
             first_path_str = str(first_path_item).strip()
@@ -112,7 +115,9 @@ async def upload_folder(request: Request) -> WorkspaceInfo:
                 continue
 
             if hasattr(rel_path_item, "read"):
-                rel_path_str = (await rel_path_item.read()).decode("utf-8", errors="replace").strip()
+                rel_path_str = (
+                    (await rel_path_item.read()).decode("utf-8", errors="replace").strip()
+                )
             else:
                 rel_path_str = str(rel_path_item).strip()
 
@@ -303,7 +308,11 @@ async def get_run_report(run_id: str) -> ReportResponse:
             f"**Remediated Findings:** {session.tracker.remediated_count}\n\n"
             f"**Remaining Active Findings:** {len(session.tracker.active_findings)}\n\n"
             f"## Changed Files\n\n"
-            + ("\n".join(f"- `{f}`" for f in changed_files) if changed_files else "_No files modified._")
+            + (
+                "\n".join(f"- `{f}`" for f in changed_files)
+                if changed_files
+                else "_No files modified._"
+            )
         )
 
     return ReportResponse(
@@ -321,4 +330,3 @@ if _FRONTEND_DIST.is_dir():
     from fastapi.staticfiles import StaticFiles
 
     app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")
-

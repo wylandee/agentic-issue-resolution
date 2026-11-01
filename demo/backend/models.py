@@ -80,7 +80,9 @@ class RunState(BaseModel):
 
     run_id: str
     workspace_id: str
-    status: Literal["pending", "running", "completed", "completed_with_errors", "failed"] = "pending"
+    status: Literal["pending", "running", "completed", "completed_with_errors", "failed"] = (
+        "pending"
+    )
     current_node: str | None = None
     active_findings: list[FindingModel] = Field(default_factory=list)
     remediated_count: int = 0

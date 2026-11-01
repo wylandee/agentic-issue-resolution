@@ -2433,7 +2433,7 @@ def _collect_dependency_package_state(
         cwd_path = Path(manifest).parent
         cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
-        command = f"{prefix}npm ls {shlex.quote(package)} --all --json --package-lock-only"
+        command = f"{prefix}npm ls {shlex.quote(package)} --all --json"
         try:
             command_result = _run_readonly(
                 sandbox,
@@ -3184,7 +3184,7 @@ def _collect_group_package_state(
         cwd_path = Path(manifest).parent
         cwd = "" if str(cwd_path) == "." else cwd_path.as_posix().strip("/")
         prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
-        command = f"{prefix}npm ls {shlex.quote(package)} --all --json --package-lock-only"
+        command = f"{prefix}npm ls {shlex.quote(package)} --all --json"
         try:
             command_result = _run_readonly(
                 sandbox,
@@ -5189,10 +5189,32 @@ def _attribute_reported_occurrences(
     )
 
 
-def _cleanup_targeted_artifacts(sandbox: DockerSandbox) -> None:
-    """Remove the fixed temporary targeted-scan directory from the workspace."""
+def _cleanup_targeted_artifacts(
+    sandbox: DockerSandbox,
+    scan_subdir: str = ".odc-targeted",
+) -> None:
+    """Remove the validated targeted-scan staging directory from a workspace.
+
+    Args:
+        sandbox: Active Docker sandbox containing the staged artifacts.
+        scan_subdir: Repository-relative staging directory to remove. Only the
+            fixed ``.odc-targeted`` directory is accepted.
+
+    Returns:
+        None.
+
+    Side Effects:
+        Runs a cleanup command in the sandbox. Invalid paths and cleanup
+        failures are logged and swallowed so they do not mask the QA result.
+    """
     try:
-        sandbox.run("rm -rf -- .odc-targeted", timeout=30)
+        validated_subdir = _validate_qa_path(scan_subdir)
+        if validated_subdir != ".odc-targeted":
+            raise ValueError("unexpected targeted-scan cleanup path")
+        sandbox.run(
+            f"rm -rf -- {shlex.quote(validated_subdir)}",
+            timeout=30,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("qa_critic: targeted artifact cleanup failed — %s", exc)
 

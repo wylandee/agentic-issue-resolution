@@ -47,6 +47,7 @@ from remediation_engine.contracts.version_policy import (
     compare_maven_versions,
     is_stable_maven_version,
 )
+from remediation_engine.orchestration.llm_client import create_chat_model
 from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.tools.maven_manifest_locator import _canonical_gav
 from remediation_engine.tools.package_identity import (
@@ -876,12 +877,13 @@ def _llm_extract_remediation(
     )
 
     try:
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=0,
-            api_key=api_key,
+        llm = create_chat_model(
+            model_name,
+            settings=settings,
+            reasoning_effort=getattr(settings, "triage_llm_reasoning_effort", None),
             request_timeout=_LLM_REQUEST_TIMEOUT_SECONDS,
             max_retries=0,
+            chat_openai_class=ChatOpenAI,
         )
         structured_llm = llm.with_structured_output(SerperLLMResult)
         result: SerperLLMResult = structured_llm.invoke(prompt_text)

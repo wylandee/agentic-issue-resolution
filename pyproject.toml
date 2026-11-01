@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "docker>=7,<9",
-  "langchain-openai>=0.3,<2",
+  "langchain-openai>=1.0,<2",
   "langgraph>=1.2,<2",
   "langsmith>=0.8,<1",
   "packageurl-python>=0.11",
@@ -21,7 +21,6 @@ dependencies = [
   "packaging>=24",
   "tomlkit>=0.13,<1",
   "semantic-version>=2.10,<3",
-  "tomlkit>=0.12,<1",
   "tree-sitter>=0.23,<0.24",
   "tree-sitter-python>=0.23,<0.24",
   "tree-sitter-javascript>=0.21,<0.22",
@@ -71,4 +70,3 @@ markers = [
   "llm: requires an LLM provider",
   "eval: DeepEval LLM evaluation tests (requires OPENAI_API_KEY)",
 ]
-

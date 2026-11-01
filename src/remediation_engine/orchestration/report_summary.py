@@ -14,12 +14,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from remediation_engine.settings import AppSettings
 
-from .runtime_context import get_runtime_settings, openai_api_key_kwargs
+from .llm_client import create_chat_model
+from .runtime_context import get_runtime_settings
 
 log = logging.getLogger(__name__)
 
-_SUMMARY_TIMEOUT_SECONDS = 30
-_SUMMARY_MAX_TOKENS = 550
+_SUMMARY_TIMEOUT_SECONDS = 60
+_SUMMARY_MAX_TOKENS = 2048
 _REQUIRED_FACTS = (
     "original_counts",
     "special_remediations",
@@ -623,13 +624,14 @@ def generate_executive_summary(
         if model_factory is None:
             from langchain_openai import ChatOpenAI
 
-            model = ChatOpenAI(
-                model=model_name,
-                temperature=0,
+            model = create_chat_model(
+                model_name,
+                settings=resolved_settings,
+                reasoning_effort=getattr(resolved_settings, "remedy_llm_reasoning_effort", None),
                 request_timeout=_SUMMARY_TIMEOUT_SECONDS,
                 max_retries=0,
                 max_tokens=_SUMMARY_MAX_TOKENS,
-                **openai_api_key_kwargs(resolved_settings),
+                chat_openai_class=ChatOpenAI,
             )
         else:
             model = model_factory(resolved_settings)

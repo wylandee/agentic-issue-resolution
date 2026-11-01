@@ -395,9 +395,12 @@ rejections, never an implicit unchanged-file result.
 `AppSettings.from_env()` is evaluated at the application boundary and bound
 for one graph run. Business logic uses that bound settings object rather than
 reading process environment variables directly. Supported operational names
-include `OPENAI_API_KEY`, `REMEDY_LLM_MODEL`, the node-specific
-`TRIAGE_LLM_MODEL`, `UPDATE_LLM_MODEL`, `WORKAROUND_LLM_MODEL`, and
-`QA_LLM_MODEL`, `TRIAGE_LLM_ENABLED`, `SERPER_API_KEY`, `GITHUB_TOKEN`,
+include `OPENAI_API_KEY`, `REMEDY_LLM_MODEL`, the per-role
+`SUPERVISOR_LLM_MODEL`, `TRIAGE_LLM_MODEL`, `UPDATE_LLM_MODEL`,
+`WORKAROUND_LLM_MODEL`, and `QA_LLM_MODEL`, plus the optional matching
+`*_LLM_REASONING_EFFORT` values for GPT-6 Luna. Unset supervisor overrides
+inherit the default remediation model and effort. Other settings include
+`TRIAGE_LLM_ENABLED`, `SERPER_API_KEY`, `GITHUB_TOKEN`,
 `ODC_EXTRA_ARGS`, `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`,
 `LANGSMITH_PROJECT`, `LANGSMITH_ENDPOINT`, `TRIAGE_CACHE_DIR`,
 `REMEDIATION_TRAJECTORY_DIR`, `REMEDIATION_REPORT_DIR`,

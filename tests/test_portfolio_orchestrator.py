@@ -2630,6 +2630,61 @@ def test_supervisor_rejects_stale_resolution_certificate():
     ]
 
 
+def test_scoped_transitive_finding_with_direct_parent_keeps_parent_first_task(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {"name": "app", "dependencies": {"pdfkit": "0.11.0"}},
+    )
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/pdfkit": {
+                    "version": "0.11.0",
+                    "dependencies": {"crypto-js": "^4.1.1"},
+                },
+                "node_modules/crypto-js": {"version": "4.1.1"},
+            },
+        },
+    )
+
+    group = _group("crypto-js", "package.json", package_version="4.1.1", fixed_version="4.2.0")
+    group = group.model_copy(
+        update={
+            "dependency_ancestry": ["pdfkit", "crypto-js"],
+            "parent_package_name": "pdfkit",
+            "parent_package_version": "0.11.0",
+            "parent_declaration_type": "dependencies",
+            "localized_issues": [
+                localized.model_copy(
+                    update={"is_direct_dependency": False, "declaration_type": None}
+                )
+                for localized in group.localized_issues
+            ],
+            "versions": ["4.1.1"],
+        }
+    )
+
+    prepared_groups, queue, diagnostics = prepare_portfolio_inputs(
+        tmp_path,
+        [group],
+        _tasks(group),
+        target_packages=["crypto-js"],
+    )
+
+    assert diagnostics == []
+    assert [prepared.vulnerable_component for prepared in prepared_groups] == ["crypto-js"]
+    task = next(iter(queue.values()))
+    assert task.target_package_name == "pdfkit"
+    assert task.target_dependency_type == "dependencies"
+    assert task.strategy_stage.value == "osv_minimum"
+
+
 def test_scoped_transitive_findings_become_override_solver_tasks(tmp_path: Path):
     _write_manifest(
         tmp_path,

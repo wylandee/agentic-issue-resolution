@@ -35,12 +35,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TEMPORARY: limit QA package-state validation to install, scan, and test evidence.
+# Keep the broader package-state rollout opt-in while requiring installed-tree
+# verification for version-bump attempts.
 _QA_PACKAGE_STATE_CHECKS_ENABLED = False
+_QA_VERSION_BUMP_PACKAGE_STATE_CHECKS_ENABLED = True
 
 
 _PEER_CONFLICT_PATTERNS = ("ERESOLVE", "EOVERRIDE", "peer dep", "peer tree")
 _ENGINE_CONFLICT_PATTERNS = ("EBADENGINE",)
+
+
+def _package_state_checks_enabled(policy: QAPolicy | None) -> bool:
+    """Return whether deterministic package-state checks apply to a policy."""
+    return _QA_PACKAGE_STATE_CHECKS_ENABLED or (
+        _QA_VERSION_BUMP_PACKAGE_STATE_CHECKS_ENABLED and policy == QAPolicy.VERSION_BUMP
+    )
 
 
 @dataclass(frozen=True)
@@ -139,20 +148,21 @@ def _qa_policy_prompt_block(policy: QAPolicy | None) -> str:
             "- Treat missing policy as an inconclusive contract condition."
         )
     spec = _QA_POLICY_PROMPT_SPECS[policy]
+    package_state_checks_enabled = _package_state_checks_enabled(policy)
     package_rule = (
         spec.package_rule
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED
+        if package_state_checks_enabled
         else "Package manifest, lockfile, and installed-tree checks are temporarily disabled. "
         "Do not inspect or fail based on dependency-state evidence."
     )
     review_focus = (
         spec.review_focus
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED
+        if package_state_checks_enabled
         else "Assess install, scanner, and test evidence under this task's applicable policy."
     )
     prohibited_conclusions = (
         spec.prohibited_conclusions
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED
+        if package_state_checks_enabled
         else "Do not claim package manifest, lockfile, or installed-tree checks were performed."
     )
     return "\n".join(
@@ -264,6 +274,7 @@ def _evaluate_policy_gates(
         )
         package_state = results.package_state_by_task.get(task_id, _QAPackageState())
         dependency_evidence = package_state.dependency_evidence
+        package_state_checks_enabled = _package_state_checks_enabled(policy)
         target_cleared = (
             False
             if task_scan_projection_missing
@@ -290,10 +301,10 @@ def _evaluate_policy_gates(
             diagnostics.append(
                 "ODC scan evidence was incomplete; target clearance is inconclusive."
             )
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED and not target_package_absent:
+        if package_state_checks_enabled and not target_package_absent:
             diagnostics.extend(package_state.diagnostics)
         if (
-            _QA_PACKAGE_STATE_CHECKS_ENABLED
+            package_state_checks_enabled
             and policy == QAPolicy.VERSION_BUMP
             and not target_package_absent
             and dependency_evidence is None
@@ -311,7 +322,7 @@ def _evaluate_policy_gates(
         if policy in _HARD_TEST_QA_POLICIES:
             deterministic_pass = deterministic_pass and tests_passed is True
         if (
-            _QA_PACKAGE_STATE_CHECKS_ENABLED
+            package_state_checks_enabled
             and policy == QAPolicy.VERSION_BUMP
             and not target_package_absent
         ):
@@ -320,7 +331,7 @@ def _evaluate_policy_gates(
                 and dependency_evidence is not None
                 and dependency_evidence.status == DependencyEvidenceStatus.VERIFIED
             )
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED and not target_package_absent:
+        if package_state_checks_enabled and not target_package_absent:
             if policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
                 deterministic_pass = deterministic_pass and package_state.manifest_state == "absent"
                 deterministic_pass = deterministic_pass and package_state.graph_state == "absent"
@@ -405,7 +416,7 @@ def _disabled_package_state_failure(
     policy: QAPolicy | None,
 ) -> bool:
     """Return whether a security failure cites temporarily disabled package-state checks."""
-    if _QA_PACKAGE_STATE_CHECKS_ENABLED or policy not in {
+    if _package_state_checks_enabled(policy) or policy not in {
         QAPolicy.VERSION_BUMP,
         QAPolicy.NO_FIX_PACKAGE_REMOVAL,
         QAPolicy.NO_FIX_CODE_REMOVAL,
@@ -716,7 +727,7 @@ def _apply_policy_decision(
             )
         )
         dependency_evidence_inconclusive = (
-            _QA_PACKAGE_STATE_CHECKS_ENABLED
+            _package_state_checks_enabled(policy)
             and policy == QAPolicy.VERSION_BUMP
             and not gates.target_package_absent
             and (
@@ -798,7 +809,7 @@ def _apply_policy_decision(
                     )
                 )
         if (
-            _QA_PACKAGE_STATE_CHECKS_ENABLED
+            _package_state_checks_enabled(policy)
             and policy == QAPolicy.VERSION_BUMP
             and not gates.target_package_absent
             and gates.dependency_evidence is not None
@@ -836,7 +847,7 @@ def _apply_policy_decision(
                         "VERSION_BUMP tests failed without valid structured exoneration evidence.",
                     )
                 )
-        if _QA_PACKAGE_STATE_CHECKS_ENABLED and not gates.target_package_absent:
+        if _package_state_checks_enabled(policy) and not gates.target_package_absent:
             if policy == QAPolicy.NO_FIX_PACKAGE_REMOVAL:
                 if gates.package_manifest_state != "absent":
                     failures.append(

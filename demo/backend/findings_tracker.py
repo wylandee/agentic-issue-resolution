@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 _SEVERITY_RANK = {"UNKNOWN": 0, "INFO": 1, "LOW": 2, "MEDIUM": 3, "HIGH": 4, "CRITICAL": 5}
 
 
-
 class FindingsTracker:
     """Maintains active, remediated, and newly detected vulnerability findings."""
 
@@ -126,10 +125,15 @@ class FindingsTracker:
         return sorted(
             self.findings_by_id.values(),
             key=lambda f: (
-                0 if f.severity == "CRITICAL" else
-                1 if f.severity == "HIGH" else
-                2 if f.severity == "MEDIUM" else
-                3 if f.severity == "LOW" else 4,
+                0
+                if f.severity == "CRITICAL"
+                else 1
+                if f.severity == "HIGH"
+                else 2
+                if f.severity == "MEDIUM"
+                else 3
+                if f.severity == "LOW"
+                else 4,
                 0 if f.is_new else 1,
                 f.package_name,
             ),
@@ -209,7 +213,9 @@ class FindingsTracker:
                 )
         return updates
 
-    def mark_group_remediated(self, group_id: str, remaining_target_identifiers: list[str] | None = None) -> list[DashboardUpdate]:
+    def mark_group_remediated(
+        self, group_id: str, remaining_target_identifiers: list[str] | None = None
+    ) -> list[DashboardUpdate]:
         """Remove remediated findings for a passed group."""
         updates: list[DashboardUpdate] = []
         target_fids = set(self.group_to_finding_ids.get(group_id, set()))
@@ -283,7 +289,9 @@ class FindingsTracker:
 
         return updates
 
-    def process_node_state_update(self, node_name: str, state_patch: dict[str, Any]) -> list[DashboardUpdate]:
+    def process_node_state_update(
+        self, node_name: str, state_patch: dict[str, Any]
+    ) -> list[DashboardUpdate]:
         """Inspect a LangGraph node's returned state dictionary and emit dashboard updates."""
         updates: list[DashboardUpdate] = []
 
@@ -303,7 +311,7 @@ class FindingsTracker:
                 status = getattr(task, "status", None)
                 status_val = str(getattr(status, "value", status)).lower()
                 parent_group_id = getattr(task, "parent_group_id", "")
-                
+
                 if status_val == "qa_passed" and parent_group_id:
                     cleared_updates = self.mark_group_remediated(parent_group_id)
                     updates.extend(cleared_updates)
@@ -316,7 +324,8 @@ class FindingsTracker:
             if new_ids and found_issues:
                 # Add only new issues
                 new_issues = [
-                    iss for iss in found_issues
+                    iss
+                    for iss in found_issues
                     if (iss.cve_id and iss.cve_id.upper() in [x.upper() for x in new_ids])
                     or (iss.ghsa_id and iss.ghsa_id.upper() in [x.upper() for x in new_ids])
                 ]
@@ -328,9 +337,16 @@ class FindingsTracker:
         new_vuln_ids = state_patch.get("new_vulnerability_identifiers") or []
         if post_scan_issues and new_vuln_ids:
             new_issues = [
-                iss for iss in post_scan_issues
-                if (getattr(iss, "cve_id", None) and iss.cve_id.upper() in [x.upper() for x in new_vuln_ids])
-                or (getattr(iss, "ghsa_id", None) and iss.ghsa_id.upper() in [x.upper() for x in new_vuln_ids])
+                iss
+                for iss in post_scan_issues
+                if (
+                    getattr(iss, "cve_id", None)
+                    and iss.cve_id.upper() in [x.upper() for x in new_vuln_ids]
+                )
+                or (
+                    getattr(iss, "ghsa_id", None)
+                    and iss.ghsa_id.upper() in [x.upper() for x in new_vuln_ids]
+                )
             ]
             if new_issues:
                 updates.extend(self.add_new_scan_findings(new_issues))
@@ -341,9 +357,10 @@ class FindingsTracker:
         """Authoritative final reconciliation against the final orchestrator state."""
         task_queue = final_raw_state.get("task_queue") or {}
         remaining_target_ids = {
-            tid.upper().strip() for tid in final_raw_state.get("remaining_target_identifiers", []) or []
+            tid.upper().strip()
+            for tid in final_raw_state.get("remaining_target_identifiers", []) or []
         }
-        
+
         # 1. Identify all QA passed groups
         qa_passed_group_ids: set[str] = set()
         if isinstance(task_queue, Mapping):
@@ -377,9 +394,16 @@ class FindingsTracker:
             new_ids = getattr(final_scan, "new_identifiers", None) or []
             if new_ids and found_issues:
                 new_issues = [
-                    iss for iss in found_issues
-                    if (getattr(iss, "cve_id", None) and iss.cve_id.upper() in [x.upper() for x in new_ids])
-                    or (getattr(iss, "ghsa_id", None) and iss.ghsa_id.upper() in [x.upper() for x in new_ids])
+                    iss
+                    for iss in found_issues
+                    if (
+                        getattr(iss, "cve_id", None)
+                        and iss.cve_id.upper() in [x.upper() for x in new_ids]
+                    )
+                    or (
+                        getattr(iss, "ghsa_id", None)
+                        and iss.ghsa_id.upper() in [x.upper() for x in new_ids]
+                    )
                 ]
                 self.add_new_scan_findings(new_issues)
 

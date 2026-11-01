@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from remediation_engine.contracts.schemas import PeerConflictEvidence, QAFailureEvidence
 from remediation_engine.language import LANGUAGE_CONFIGS, ProjectLanguage
+from remediation_engine.runtime.path_policy import normalize_workspace_path
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
 from . import _test_normalization
@@ -240,23 +242,43 @@ def _python_install_command(sandbox: DockerSandbox) -> str:
 def _run_install(
     sandbox: DockerSandbox,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    *,
+    package_lock_paths: Sequence[str] = (),
 ) -> _QAInstallOutcome:
-    """Run the language-specific dependency install and retain bounded evidence.
+    """Run the language-specific install and retain bounded evidence.
 
     Args:
         sandbox: Active QA sandbox in which dependencies should be installed.
         project_language: Project language selecting the deterministic install command.
+        package_lock_paths: Changed npm lockfiles whose adjacent hidden metadata
+            must be discarded before an install.
 
     Returns:
         A structured install outcome with bounded command evidence.
+
+    Raises:
+        ValueError: If a supplied npm lock path is invalid or is not a
+            ``package-lock.json`` file.
     """
 
     is_python = project_language == ProjectLanguage.PYTHON
-    command = (
-        _python_install_command(sandbox)
-        if is_python
-        else LANGUAGE_CONFIGS[project_language].install_command
-    )
+    if is_python:
+        command = _python_install_command(sandbox)
+    elif project_language == ProjectLanguage.NODEJS:
+        hidden_lockfiles: set[str] = set()
+        for raw_path in package_lock_paths:
+            lockfile = normalize_workspace_path(raw_path, allow_workspace_prefix=False)
+            if lockfile.rsplit("/", 1)[-1].casefold() != "package-lock.json":
+                raise ValueError(
+                    f"changed npm lockfile path is not package-lock.json: {raw_path!r}"
+                )
+            parent = lockfile.rpartition("/")[0]
+            hidden_lockfiles.add(f"{parent + '/' if parent else ''}node_modules/.package-lock.json")
+        command = "npm install --package-lock=true"
+        if hidden_lockfiles:
+            command = f"rm -f -- {shlex.join(sorted(hidden_lockfiles))} && {command}"
+    else:
+        command = LANGUAGE_CONFIGS[project_language].install_command
     label = {
         ProjectLanguage.NODEJS: "npm install",
         ProjectLanguage.JAVA: "mvn -B -q -DskipTests clean package",

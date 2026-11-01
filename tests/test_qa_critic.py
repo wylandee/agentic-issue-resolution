@@ -6,10 +6,12 @@ import json
 from unittest.mock import MagicMock, patch
 
 from remediation_engine.contracts.schemas import (
+    DependencyEvidenceStatus,
     FailureCategory,
     FixPlanStatus,
     NoFixMitigationStage,
     ODCScanEvidence,
+    QADependencyEvidence,
     QAEvaluation,
     QAFailureEvidence,
     QAPolicy,
@@ -34,6 +36,43 @@ from tests.test_qa_critic_support import (
     _make_group,
     _make_minimal_state,
 )
+
+
+def _add_verified_package_evidence(
+    results: _QAExecutionResults,
+    task_groups: dict[str, object],
+) -> None:
+    """Supply matching installed-tree evidence when global QA is mocked."""
+    for task_id, group in task_groups.items():
+        if task_id in results.package_state_by_task:
+            continue
+        version = getattr(getattr(group, "fix_plan", None), "fixed_version", None)
+        package = str(getattr(group, "vulnerable_component", "") or "").strip()
+        if not package or not version:
+            continue
+        manifest_paths = list(getattr(group, "file_paths", ()) or ())
+        if not manifest_paths and getattr(group, "file_path", None):
+            manifest_paths = [group.file_path]
+        lockfile_paths = [
+            f"{path.rsplit('/', 1)[0] + '/' if '/' in path else ''}package-lock.json"
+            for path in manifest_paths
+            if path.endswith("package.json")
+        ]
+        results.package_state_by_task[task_id] = _QAPackageState(
+            manifest_state="present",
+            graph_state="present",
+            dependency_evidence=QADependencyEvidence(
+                status=DependencyEvidenceStatus.VERIFIED,
+                target_package=package,
+                expected_version=version,
+                manifest_paths=manifest_paths,
+                lockfile_paths=lockfile_paths,
+                declarations={f"{path}#/{package}": version for path in manifest_paths},
+                resolved_versions=[version],
+                lockfile_versions=[version],
+                evidence_refs=[*manifest_paths, *lockfile_paths],
+            ),
+        )
 
 
 def _commit_tasks(state, tasks):
@@ -96,6 +135,10 @@ class TestRunQACriticNode:
             evaluations
             if isinstance(evaluations, dict)
             else {evaluation.task_id: evaluation for evaluation in evaluations}
+        )
+        _add_verified_package_evidence(
+            results,
+            {task_id: group for task_id in evaluations_by_task},
         )
         investigations = {
             task_id: GroupInvestigation(
@@ -605,6 +648,10 @@ class TestRunQACriticNodeMapReduce:
         if global_results is None:
             global_results = _make_fully_populated_results(ok=True)
         task_ids = [f"task-{index}" for index, _ in enumerate(groups, start=1)]
+        _add_verified_package_evidence(
+            global_results,
+            dict(zip(task_ids, groups, strict=True)),
+        )
         if evaluations is None:
             evaluations = [QAEvaluation(task_id=task_id, passed=True) for task_id in task_ids]
         evaluations_by_task = (

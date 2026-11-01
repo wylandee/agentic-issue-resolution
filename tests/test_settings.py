@@ -7,9 +7,24 @@ from remediation_engine.settings import (
     AppSettings,
 )
 
+_LLM_REASONING_EFFORT_ENV_NAMES = (
+    "REMEDY_LLM_REASONING_EFFORT",
+    "SUPERVISOR_LLM_REASONING_EFFORT",
+    "TRIAGE_LLM_REASONING_EFFORT",
+    "UPDATE_LLM_REASONING_EFFORT",
+    "WORKAROUND_LLM_REASONING_EFFORT",
+    "QA_LLM_REASONING_EFFORT",
+)
+
+
+def _clear_llm_reasoning_effort_environment(monkeypatch):
+    for env_name in _LLM_REASONING_EFFORT_ENV_NAMES:
+        monkeypatch.delenv(env_name, raising=False)
+
 
 def test_node_models_can_be_configured_independently(monkeypatch):
     monkeypatch.setenv("REMEDY_LLM_MODEL", "remedy-default")
+    monkeypatch.setenv("SUPERVISOR_LLM_MODEL", "supervisor-model")
     monkeypatch.setenv("TRIAGE_LLM_MODEL", "triage-model")
     monkeypatch.setenv("UPDATE_LLM_MODEL", "update-model")
     monkeypatch.setenv("WORKAROUND_LLM_MODEL", "workaround-model")
@@ -18,9 +33,95 @@ def test_node_models_can_be_configured_independently(monkeypatch):
     settings = AppSettings.from_env()
 
     assert settings.triage_llm_model == "triage-model"
+    assert settings.supervisor_llm_model == "supervisor-model"
     assert settings.update_llm_model == "update-model"
     assert settings.workaround_llm_model == "workaround-model"
     assert settings.qa_llm_model == "qa-model"
+
+
+@pytest.mark.parametrize(
+    ("env_name", "field_name"),
+    [
+        ("REMEDY_LLM_REASONING_EFFORT", "remedy_llm_reasoning_effort"),
+        ("SUPERVISOR_LLM_REASONING_EFFORT", "supervisor_llm_reasoning_effort"),
+        ("TRIAGE_LLM_REASONING_EFFORT", "triage_llm_reasoning_effort"),
+        ("UPDATE_LLM_REASONING_EFFORT", "update_llm_reasoning_effort"),
+        ("WORKAROUND_LLM_REASONING_EFFORT", "workaround_llm_reasoning_effort"),
+        ("QA_LLM_REASONING_EFFORT", "qa_llm_reasoning_effort"),
+    ],
+)
+@pytest.mark.parametrize("effort", ["none", "low", "medium", "high", "xhigh", "max"])
+def test_luna_reasoning_efforts_are_configurable_per_agent(
+    monkeypatch, env_name, field_name, effort
+):
+    _clear_llm_reasoning_effort_environment(monkeypatch)
+    monkeypatch.setenv("REMEDY_LLM_MODEL", "gpt-6-luna")
+    for model_env in (
+        "TRIAGE_LLM_MODEL",
+        "UPDATE_LLM_MODEL",
+        "WORKAROUND_LLM_MODEL",
+        "QA_LLM_MODEL",
+    ):
+        monkeypatch.delenv(model_env, raising=False)
+    monkeypatch.setenv(env_name, effort)
+
+    assert getattr(AppSettings.from_env(), field_name) == effort
+
+
+def test_luna_reasoning_effort_defaults_to_provider_default(monkeypatch):
+    _clear_llm_reasoning_effort_environment(monkeypatch)
+    monkeypatch.setenv("REMEDY_LLM_MODEL", "gpt-6-luna")
+
+    assert AppSettings.from_env().remedy_llm_reasoning_effort is None
+
+
+def test_supervisor_model_and_effort_inherit_default_remedy_settings(monkeypatch):
+    _clear_llm_reasoning_effort_environment(monkeypatch)
+    monkeypatch.setenv("REMEDY_LLM_MODEL", "gpt-6-luna")
+    monkeypatch.setenv("REMEDY_LLM_REASONING_EFFORT", "medium")
+    monkeypatch.delenv("SUPERVISOR_LLM_MODEL", raising=False)
+
+    settings = AppSettings.from_env()
+
+    assert settings.supervisor_llm_model is None
+    assert settings.supervisor_llm_reasoning_effort is None
+    assert settings.remedy_llm_model == "gpt-6-luna"
+    assert settings.remedy_llm_reasoning_effort == "medium"
+
+
+def test_supervisor_effort_requires_luna_model(monkeypatch):
+    monkeypatch.setenv("REMEDY_LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("SUPERVISOR_LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("SUPERVISOR_LLM_REASONING_EFFORT", "xhigh")
+
+    with pytest.raises(ValueError, match="SUPERVISOR_LLM_REASONING_EFFORT only applies"):
+        AppSettings.from_env()
+
+
+def test_luna_reasoning_effort_is_case_normalized(monkeypatch):
+    _clear_llm_reasoning_effort_environment(monkeypatch)
+    monkeypatch.setenv("REMEDY_LLM_MODEL", "gpt-6-luna")
+    monkeypatch.setenv("REMEDY_LLM_REASONING_EFFORT", " HIGH ")
+
+    assert AppSettings.from_env().remedy_llm_reasoning_effort == "high"
+
+
+def test_luna_reasoning_effort_rejects_unknown_values(monkeypatch):
+    _clear_llm_reasoning_effort_environment(monkeypatch)
+    monkeypatch.setenv("REMEDY_LLM_MODEL", "gpt-6-luna")
+    monkeypatch.setenv("REMEDY_LLM_REASONING_EFFORT", "minimal")
+
+    with pytest.raises(ValueError, match="REMEDY_LLM_REASONING_EFFORT must be one of"):
+        AppSettings.from_env()
+
+
+def test_luna_reasoning_effort_requires_gpt_6_luna(monkeypatch):
+    _clear_llm_reasoning_effort_environment(monkeypatch)
+    monkeypatch.setenv("REMEDY_LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("REMEDY_LLM_REASONING_EFFORT", "low")
+
+    with pytest.raises(ValueError, match="only applies when its model is gpt-6-luna"):
+        AppSettings.from_env()
 
 
 def test_remediation_node_models_fall_back_to_legacy_remedy_model(monkeypatch):

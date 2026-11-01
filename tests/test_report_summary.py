@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
+import remediation_engine.orchestration.report_summary as report_summary_module
 from remediation_engine.orchestration.report_summary import (
     ExecutiveSummaryDraft,
     ExecutiveSummaryEvidence,
@@ -125,6 +126,32 @@ def test_summary_uses_configured_model_and_resolves_factual_slots() -> None:
     assert "terminal scan coverage is incomplete for incremental dependency inputs" in result.text
     assert "findings outside that scope remain unknown" in result.text
     assert result.text != fallback_executive_summary(_evidence()).text
+
+
+def test_summary_builds_luna_client_with_bounded_reasoning_budget(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+    model = _StructuredModel(_draft_response())
+
+    def create_model(model_name: str, **kwargs: Any) -> _StructuredModel:
+        captured.update(model_name=model_name, **kwargs)
+        return model
+
+    monkeypatch.setattr(report_summary_module, "create_chat_model", create_model)
+    settings = AppSettings(
+        openai_api_key="test-key",
+        remedy_llm_model="gpt-6-luna",
+        remedy_llm_reasoning_effort="medium",
+    )
+
+    result = generate_executive_summary(_evidence(), settings=settings)
+
+    assert result.status == "generated"
+    assert captured["model_name"] == "gpt-6-luna"
+    assert captured["settings"] is settings
+    assert captured["reasoning_effort"] == "medium"
+    assert captured["request_timeout"] == 60
+    assert captured["max_retries"] == 0
+    assert captured["max_tokens"] == 2048
 
 
 def test_complete_incremental_new_counts_are_scoped_in_summary() -> None:

@@ -28,10 +28,8 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.context_manager import ContextManager
-from remediation_engine.orchestration.runtime_context import (
-    get_runtime_settings,
-    openai_api_key_kwargs,
-)
+from remediation_engine.orchestration.llm_client import create_chat_model
+from remediation_engine.orchestration.runtime_context import get_runtime_settings
 from remediation_engine.orchestration.subagent_runtime import run_bounded_subagent_loop
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
@@ -946,10 +944,11 @@ def _run_individual_investigations(
             skip_phase_gating=True,
             scratchpad_scope=ScratchpadScope.QA,
         )
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=0,
-            **openai_api_key_kwargs(settings),
+        llm = create_chat_model(
+            model_name,
+            settings=settings,
+            reasoning_effort=getattr(settings, "qa_llm_reasoning_effort", None),
+            chat_openai_class=ChatOpenAI,
         )
         initial_messages = [
             SystemMessage(content=_build_qa_evaluator_system_prompt(project_language)),

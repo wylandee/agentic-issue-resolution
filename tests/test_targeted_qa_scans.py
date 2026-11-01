@@ -3128,9 +3128,6 @@ def test_workspace_setup_scan_stages_changed_package_lockfile_inputs(tmp_path):
             "remediation_engine.orchestration.qa_critic._attribute_reported_occurrences",
             return_value=(manifest, True),
         ),
-        patch(
-            "remediation_engine.orchestration.qa_critic._cleanup_targeted_artifacts",
-        ) as cleanup,
     ):
         result = run_workspace_setup_scan_node(
             {
@@ -3154,7 +3151,7 @@ def test_workspace_setup_scan_stages_changed_package_lockfile_inputs(tmp_path):
         ".odc-targeted",
         {"CVE-BASE"},
     )
-    cleanup.assert_called_once_with(sandbox)
+    sandbox.run.assert_called_once_with("rm -rf -- .odc-targeted", timeout=30)
     evidence = result["setup_scan_evidence"]
     assert evidence.complete is True
     assert evidence.scan_performed is True
