@@ -52,6 +52,7 @@ from remediation_engine.orchestration.qa_policy_engine import (
     _apply_policy_decision,
     _attach_scan_evidence_to_evaluations,
     _evaluate_policy_gates,
+    _package_state_checks_enabled,
 )
 from remediation_engine.orchestration.qa_types import (
     QATaskContext,
@@ -344,9 +345,15 @@ def _evaluate(
     context = _task_context(group, policy=policy)
     if package_state is not None:
         results.package_state_by_task[context.task_id] = package_state
-    with patch(
-        "remediation_engine.orchestration.qa_policy_engine._QA_PACKAGE_STATE_CHECKS_ENABLED",
-        package_state is not None,
+    with (
+        patch(
+            "remediation_engine.orchestration.qa_policy_engine._QA_PACKAGE_STATE_CHECKS_ENABLED",
+            package_state is not None,
+        ),
+        patch(
+            "remediation_engine.orchestration.qa_policy_engine._QA_VERSION_BUMP_PACKAGE_STATE_CHECKS_ENABLED",
+            package_state is not None,
+        ),
     ):
         gates, _ = _evaluate_policy_gates(
             [context],
@@ -361,6 +368,12 @@ def _evaluate(
             {context.task_id: investigation} if investigation is not None else None,
         )
     return evaluations[context.task_id]
+
+
+def test_installed_tree_checks_are_scoped_to_version_bump_policy() -> None:
+    """Version bumps verify the installed tree without enabling unrelated gates."""
+    assert _package_state_checks_enabled(QAPolicy.VERSION_BUMP) is True
+    assert _package_state_checks_enabled(QAPolicy.NO_FIX_PACKAGE_REMOVAL) is False
 
 
 def test_version_bump_scanner_is_group_scoped() -> None:
@@ -648,6 +661,7 @@ def test_version_bump_collects_task_keyed_dependency_evidence() -> None:
     assert package_state.dependency_evidence.resolved_versions == ["2.0.0"]
     assert package_state.dependency_evidence.lockfile_versions == ["2.0.0"]
     assert package_state.dependency_evidence.manifest_paths == ["package.json"]
+    assert "--package-lock-only" not in sandbox.run.call_args.args[0]
     sandbox.run.assert_called_once()
 
 

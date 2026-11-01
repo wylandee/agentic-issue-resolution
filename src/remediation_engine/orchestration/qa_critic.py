@@ -81,6 +81,7 @@ from ._qa_runtime import (
     _targeted_extra_args_conflict,
     _targeted_project_for_report_path,
     _TargetedPackageBatch,
+    _worker_package_lock_paths,
     _write_targeted_artifacts,
 )
 from .qa_policy_engine import (
@@ -100,8 +101,9 @@ from .qa_types import (
 
 logger = logging.getLogger(__name__)
 
-# TEMPORARY: disable npm's installed-tree inspection while diagnosing QA results.
-_QA_NPM_LS_ENABLED = False
+# Inspect npm's materialized tree after install so lockfile state cannot stand
+# in for the package versions actually present in node_modules.
+_QA_NPM_LS_ENABLED = True
 
 
 def _missing_targeted_input_paths(
@@ -235,18 +237,38 @@ def _run_global_execution(
     package_state_collector: Callable[[DockerSandbox, bool], Mapping[str, _QAPackageState]]
     | None = None,
     scan_state: OrchestratorState | None = None,
+    package_lock_paths: Sequence[str] = (),
 ) -> _QAExecutionResults:
     """
     Run install, optional package evidence, security scan, and unit tests in order.
 
     Package evidence is collected immediately after install. No LLM tool wrappers
     are involved; results are stored in a _QAExecutionResults cache for downstream
-    use.
+    use. Changed npm lockfiles invalidate their adjacent hidden npm lock metadata
+    before install so npm reconciles the physical tree against the accepted lock.
+
+    Args:
+        sandbox: Active workspace sandbox.
+        workspace_volume: Docker volume mounted for the workspace.
+        target_identifiers: Vulnerability identifiers covered by the QA run.
+        baseline_identifiers: Identifiers present before remediation.
+        scan_targets: Task-scoped package targets for targeted ODC.
+        skip_scan: Whether policy permits skipping the security scan.
+        scan_skip_reason: Stable reason for a policy-authorized scan skip.
+        package_state_collector: Optional callback that reads installed package state.
+        scan_state: Orchestrator state used to prepare task-scoped scans.
+        package_lock_paths: Changed npm locks that may have stale hidden lock data.
+
+    Returns:
+        Deterministic install, package, scan, and test evidence.
     """
     results = _QAExecutionResults()
 
     logger.info("qa_critic: [Step 0] running npm install.")
-    install_outcome = _qa_test_parsing_module._run_install(sandbox)
+    install_outcome = _qa_test_parsing_module._run_install(
+        sandbox,
+        package_lock_paths=package_lock_paths,
+    )
     _qa_test_parsing_module._store_install_outcome(results, install_outcome)
     install_ok = results.install[0]
     if package_state_collector is not None:
@@ -825,6 +847,11 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
     candidate_changed_files: list[str] = sorted(
         {path for paths in changed_files_by_task.values() for path in paths}
     )
+    changed_package_lock_paths, _lock_path_errors = _worker_package_lock_paths(
+        state,
+        set(active_task_ids),
+    )
+    package_lock_paths = tuple(sorted(changed_package_lock_paths))
     baseline_identifiers = _collect_baseline_identifiers(state, valid_groups)
     scan_targets = _build_qa_scan_targets(state, valid_groups)
     active_tasks = [context.task for context in task_contexts]
@@ -894,6 +921,11 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 QAPolicy.NO_FIX_CODE_REMOVAL,
             }:
                 continue
+            if (
+                policy != QAPolicy.VERSION_BUMP
+                and not _qa_policy_engine_module._QA_PACKAGE_STATE_CHECKS_ENABLED
+            ):
+                continue
             expected_version = None
             version_evidence_inconclusive = False
             if policy == QAPolicy.VERSION_BUMP:
@@ -929,9 +961,13 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 scan_skip_reason="no_fix_package_removal" if skip_scan else None,
                 package_state_collector=(
                     collect_package_states
-                    if _qa_policy_engine_module._QA_PACKAGE_STATE_CHECKS_ENABLED
+                    if (
+                        _qa_policy_engine_module._QA_PACKAGE_STATE_CHECKS_ENABLED
+                        or _qa_policy_engine_module._QA_VERSION_BUMP_PACKAGE_STATE_CHECKS_ENABLED
+                    )
                     else None
                 ),
+                package_lock_paths=package_lock_paths,
             )
             scan_projection = _scan_state_projection(
                 results,

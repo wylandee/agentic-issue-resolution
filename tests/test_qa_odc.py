@@ -330,6 +330,21 @@ class TestRunInstall:
             timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
         )
 
+    def test_changed_package_lock_invalidates_adjacent_hidden_lockfile(self):
+        sandbox = _make_sandbox()
+
+        outcome = _run_install(
+            sandbox,
+            package_lock_paths=("frontend/package-lock.json", "package-lock.json"),
+        )
+
+        assert outcome.ok is True
+        sandbox.run.assert_called_once_with(
+            "rm -f -- frontend/node_modules/.package-lock.json "
+            "node_modules/.package-lock.json && npm install --package-lock=true",
+            timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
+        )
+
     def test_failure_returns_false_and_includes_exit_code(self):
         sandbox = _make_sandbox(
             run_side_effects=[

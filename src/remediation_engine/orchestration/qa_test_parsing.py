@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from remediation_engine.contracts.schemas import PeerConflictEvidence, QAFailureEvidence
+from remediation_engine.runtime.path_policy import normalize_workspace_path
 from remediation_engine.runtime.sandbox_mgr import DockerSandbox
 
 from . import _test_normalization
@@ -196,20 +198,41 @@ def _store_test_outcome(results: _QAExecutionResults, outcome: _QATestExecutionO
     _append_qa_log_records(results, "tests", outcome.log_records)
 
 
-def _run_install(sandbox: DockerSandbox) -> _QAInstallOutcome:
+def _run_install(
+    sandbox: DockerSandbox,
+    *,
+    package_lock_paths: Sequence[str] = (),
+) -> _QAInstallOutcome:
     """Run npm install and retain bounded and raw deterministic evidence.
 
     Args:
         sandbox: Active QA sandbox in which npm should run.
+        package_lock_paths: Changed repository-relative npm lockfiles whose
+            adjacent hidden npm install metadata must be discarded first.
 
     Returns:
         A structured install outcome. Raw streams remain private to the
         invocation and are also represented by one immutable log record.
+
+    Raises:
+        ValueError: If a supplied lockfile path is invalid or does not name a
+            ``package-lock.json`` file.
     """
+    hidden_lockfiles: set[str] = set()
+    for raw_path in package_lock_paths:
+        lockfile = normalize_workspace_path(raw_path, allow_workspace_prefix=False)
+        if lockfile.rsplit("/", 1)[-1].casefold() != "package-lock.json":
+            raise ValueError(f"changed npm lockfile path is not package-lock.json: {raw_path!r}")
+        parent = lockfile.rpartition("/")[0]
+        hidden_lockfiles.add(f"{parent + '/' if parent else ''}node_modules/.package-lock.json")
+    command = "npm install --package-lock=true"
+    if hidden_lockfiles:
+        command = f"rm -f -- {shlex.join(sorted(hidden_lockfiles))} && {command}"
+
     error: BaseException | None = None
     try:
         result = sandbox.run(
-            "npm install --package-lock=true",
+            command,
             timeout=_NPM_INSTALL_TIMEOUT_SECONDS,
         )
         exit_code = int(getattr(result, "exit_code", 1))
