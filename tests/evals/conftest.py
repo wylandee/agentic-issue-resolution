@@ -23,6 +23,7 @@ from remediation_engine.evals.trajectories import (
     parse_trajectory_markdown,
 )
 from remediation_engine.settings import AppSettings
+from tests.evals.eval_case_helpers import case_metadata_dict
 
 logger = logging.getLogger(__name__)
 
@@ -324,8 +325,8 @@ def _nodeid_parameter_id(nodeid: str) -> str | None:
 
 def _case_id_from_test_case(tc: Any) -> str | None:
     """Extract a stable case ID from DeepEval metadata or its display name."""
-    metadata = getattr(tc, "additional_metadata", None)
-    if isinstance(metadata, dict) and metadata.get("case_id"):
+    metadata = case_metadata_dict(tc)
+    if metadata.get("case_id"):
         return str(metadata["case_id"])
 
     name = str(getattr(tc, "name", "") or "")
@@ -415,9 +416,8 @@ def _pytest_item_observation(nodeid: str) -> dict[str, Any]:
 
 
 def _test_case_metadata(tc: Any) -> dict[str, Any]:
-    """Return a mutable metadata copy from a DeepEval test case."""
-    metadata = getattr(tc, "additional_metadata", None)
-    return dict(metadata) if isinstance(metadata, dict) else {}
+    """Return a mutable copy of metadata from either DeepEval case shape."""
+    return case_metadata_dict(tc)
 
 
 def _token_replay_identity(record: Any) -> tuple[str, str, str] | None:
@@ -476,8 +476,8 @@ def _deep_eval_node_score(tc: Any, nodeid: str) -> int:
     elif case_id and case_id.casefold() in normalized_nodeid:
         score += 1_000
 
-    metadata = getattr(tc, "additional_metadata", None)
-    replay_source = str(metadata.get("replay_source") or "") if isinstance(metadata, dict) else ""
+    metadata = case_metadata_dict(tc)
+    replay_source = str(metadata.get("replay_source") or "")
     if replay_source == "production_live" and "live_replay" in normalized_nodeid:
         score += 100
 

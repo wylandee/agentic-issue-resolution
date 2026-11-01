@@ -14,7 +14,7 @@ import math
 import os
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
@@ -28,6 +28,27 @@ def as_output_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, indent=2, sort_keys=True, default=str)
+
+
+def case_metadata_dict(test_case: Any) -> dict[str, Any]:
+    """Return a copy of metadata across supported DeepEval case shapes.
+
+    Args:
+        test_case: A classic ``LLMTestCase`` or a serialized API case. Older
+            cases expose ``additional_metadata``; current API cases expose
+            ``metadata``.
+
+    Returns:
+        A merged metadata dictionary, with legacy case values taking
+        precedence if both attributes are present. The input case is not
+        mutated.
+    """
+    metadata: dict[str, Any] = {}
+    for attribute in ("metadata", "additional_metadata"):
+        value = getattr(test_case, attribute, None)
+        if isinstance(value, Mapping):
+            metadata.update(value)
+    return metadata
 
 
 def observations(
@@ -183,10 +204,16 @@ def set_pytest_item_identity(test_case: Any) -> None:
     nodeid = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
     if not nodeid:
         return
-    metadata = dict(getattr(test_case, "additional_metadata", None) or {})
+    metadata = case_metadata_dict(test_case)
     metadata["pytest_nodeid"] = nodeid
-    with suppress(AttributeError, TypeError):
-        test_case.additional_metadata = metadata
+    for attribute in ("additional_metadata", "metadata"):
+        if not hasattr(test_case, attribute):
+            continue
+        try:
+            setattr(test_case, attribute, metadata)
+            break
+        except (AttributeError, TypeError):
+            continue
 
 
 @contextmanager
@@ -304,13 +331,13 @@ def measure_and_record_metric(
                 or None,
                 latency_seconds=time.monotonic() - started,
                 error_message=str(exc),
-                additional_metadata=dict(getattr(test_case, "additional_metadata", {}) or {}),
+                additional_metadata=case_metadata_dict(test_case),
             )
         )
         raise RuntimeError(f"{getattr(metric, '__name__', type(metric).__name__)}: {exc}") from exc
 
     successful = bool(metric.is_successful())
-    metadata = dict(getattr(test_case, "additional_metadata", {}) or {})
+    metadata = case_metadata_dict(test_case)
     record_eval_result(
         EvalTestCaseRecord(
             case_id=case_id,

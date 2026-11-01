@@ -53,10 +53,14 @@ def test_summarization_metric_receives_case_specific_questions(monkeypatch) -> N
     monkeypatch.setattr(test_report_eval, "HallucinationMetric", FakeMetric)
     monkeypatch.setattr(test_report_eval, "FaithfulnessMetric", FakeMetric)
     monkeypatch.setattr(test_report_eval, "SummarizationMetric", FakeMetric)
-    monkeypatch.setattr(test_report_eval, "GEval", FakeMetric)
     monkeypatch.setattr(
         test_report_eval,
-        "LLMTestCaseParams",
+        "build_judge_score_metric",
+        lambda **kwargs: FakeMetric(**kwargs),
+    )
+    monkeypatch.setattr(
+        test_report_eval,
+        "SingleTurnParams",
         SimpleNamespace(
             INPUT="input",
             ACTUAL_OUTPUT="actual_output",
@@ -66,7 +70,7 @@ def test_summarization_metric_receives_case_specific_questions(monkeypatch) -> N
     )
     case = test_report_eval._load_golden_cases()[0]
     metrics = test_report_eval._build_metrics(
-        SimpleNamespace(judge_model="test-model"),
+        SimpleNamespace(judge_model="test-model", judge_llm=None),
         case,
     )
 
@@ -82,6 +86,8 @@ def test_summarization_metric_receives_case_specific_questions(monkeypatch) -> N
         "CVE-2026-30001 -> vulnerable package base64url" in question for question in questions
     )
     assert all("Does the report" not in question for question in questions)
+    assert any("5 canonical findings across 4 groups" in question for question in questions)
+    assert not any("None" in question for question in questions)
 
 
 def test_code_detail_files_are_source_only_for_package_removal() -> None:
@@ -118,8 +124,8 @@ def test_code_detail_files_are_source_only_for_package_removal() -> None:
     )
 
 
-def test_live_report_evaluates_geval_after_factual_threshold_failure(monkeypatch) -> None:
-    """A factual threshold failure does not skip the separate GEval case."""
+def test_live_report_evaluates_constraint_metric_after_factual_failure(monkeypatch) -> None:
+    """A factual threshold failure does not skip the separate constraint case."""
 
     class FakeLLMTestCase:
         def __init__(self, **kwargs: Any) -> None:
@@ -137,7 +143,11 @@ def test_live_report_evaluates_geval_after_factual_threshold_failure(monkeypatch
 
     monkeypatch.setattr(test_report_eval, "HAS_DEEPEVAL", True)
     monkeypatch.setattr(test_report_eval, "LLMTestCase", FakeLLMTestCase)
-    monkeypatch.setattr(test_report_eval, "render_report", lambda case: "report")
+    monkeypatch.setattr(
+        test_report_eval,
+        "render_report",
+        lambda case, **_kwargs: "report",
+    )
     monkeypatch.setattr(
         test_report_eval,
         "validate_report_contract",
@@ -148,10 +158,25 @@ def test_live_report_evaluates_geval_after_factual_threshold_failure(monkeypatch
         "build_report_context",
         lambda case: ["evidence", "policy"],
     )
+    monkeypatch.setattr(test_report_eval, "_build_context", lambda state: object())
+    monkeypatch.setattr(
+        test_report_eval, "_build_executive_summary_evidence", lambda context: object()
+    )
+    summary_result = SimpleNamespace(
+        used_llm=True,
+        status="generated",
+        error=None,
+        metadata=lambda: {"status": "generated", "model": "test-model"},
+    )
+    monkeypatch.setattr(
+        test_report_eval,
+        "generate_executive_summary",
+        lambda evidence, *, settings: summary_result,
+    )
     monkeypatch.setattr(
         test_report_eval,
         "_build_report_metric_cases",
-        lambda case, report, context: (factual_case, policy_case),
+        lambda case, report, context, **_kwargs: (factual_case, policy_case),
     )
     monkeypatch.setattr(
         test_report_eval,
@@ -165,7 +190,13 @@ def test_live_report_evaluates_geval_after_factual_threshold_failure(monkeypatch
         "case_id": "fixture",
         "expected_contract": {},
     }
-    settings = SimpleNamespace(is_live=True, openai_api_key="test", judge_model="test-model")
+    settings = SimpleNamespace(
+        is_live=True,
+        openai_api_key="test",
+        judge_model="test-model",
+        judge_llm=None,
+        app_settings=object(),
+    )
     test_report_eval.TestReportNodeEval().test_report_uses_only_the_four_requested_metrics(
         case,
         settings,

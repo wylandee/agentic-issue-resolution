@@ -1213,16 +1213,20 @@ def run_orchestrator(
             result.setdefault("report_path", None)
             result.setdefault("report_status", "pending")
             result.setdefault("report_error", None)
+            result.setdefault("report_summary_metadata", None)
             result["trajectory_path"] = str(planned_trajectory_path)
             try:
+                summary_metadata: dict[str, Any] = {}
                 report_markdown, report_path = finalize_report(
                     result,
                     recorder=recorder,
                     trajectory_path=str(planned_trajectory_path),
                     trace_url=trace_url or result.get("langsmith_trace_url"),
                     settings=settings,
+                    summary_metadata=summary_metadata,
                 )
                 result["report_markdown"] = report_markdown
+                result["report_summary_metadata"] = summary_metadata
                 if report_path is not None:
                     result["report_path"] = str(report_path)
                     result["report_status"] = "persisted"
@@ -1239,6 +1243,10 @@ def run_orchestrator(
                 result["report_path"] = None
                 result["report_status"] = "failed"
                 result["report_error"] = str(report_error)
+                result["report_summary_metadata"] = {
+                    "status": "fallback_finalization_error",
+                    "error": str(report_error),
+                }
                 result.setdefault("errors", []).append(
                     f"report finalization failed: {report_error}"
                 )

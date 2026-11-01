@@ -11,9 +11,14 @@ from typing import Any
 import pytest
 
 from remediation_engine.evals.judge import build_judge_score_metric
-from remediation_engine.orchestration.report_node import generate_report
+from remediation_engine.orchestration.report_node import (
+    _build_context,
+    _build_executive_summary_evidence,
+    generate_executive_summary,
+    generate_report,
+)
 from tests.evals.conftest import EvalSettings
-from tests.evals.eval_case_helpers import set_pytest_item_identity
+from tests.evals.eval_case_helpers import case_metadata_dict, set_pytest_item_identity
 
 try:
     from deepeval import assert_test
@@ -39,9 +44,9 @@ _GOLDEN_FILE = Path(__file__).resolve().parent / "golden" / "report_cases.json"
 _REPORT_CASES = json.loads(_GOLDEN_FILE.read_text(encoding="utf-8"))
 _REPORT_CASE_IDS = [case["case_id"] for case in _REPORT_CASES]
 
-_REPORT_FORMAT_VERSION = "remediation_report_v2"
+_REPORT_FORMAT_VERSION = "remediation_report_v4"
 _REPORT_SECTIONS = (
-    "## 1. Summary",
+    "## 1. Executive Summary",
     "## 2. Follow up Actions",
     "## 3. Successful Remediations",
     "## 4. References",
@@ -74,18 +79,29 @@ def _report_format_evidence() -> dict[str, Any]:
             "Counts, statuses, attempts, package transitions, file paths, and references "
             "must come from the typed report state."
         ),
+        "executive_summary_style": (
+            "Use concise connected prose with no category labels followed by colons; "
+            "bold numeric finding and group counts."
+        ),
     }
 
 
 _REPORT_JUDGE_CRITERIA = """
-Evaluate the Actual Output as a canonical remediation_report_v2 Markdown
+Evaluate the Actual Output as a canonical remediation_report_v3 Markdown
 document against the deterministic evidence in the Context and Expected
-Output. Do not judge it as a one-paragraph narrative. The report must preserve
-the evidence-backed outcome and critical report rules:
+Output. The first section is an Executive Summary paragraph followed by the
+existing metrics table. The report must preserve the evidence-backed outcome
+and critical report rules:
 
-1. The summary's successful and follow-up counts must match the effective final
-   task statuses. Every successful group must have one successful-remediation
-   row, and every outstanding group must have one follow-up action.
+1. The Executive Summary must include original, QA-remediated, follow-up, and
+   newly detected finding and group counts. Counts must match the evidence,
+   remain separate when finding/group cardinalities differ, and describe
+   incomplete or unavailable evidence as partial or unknown rather than zero.
+   Write it as connected natural-language prose, without category labels followed
+   by colons, and bold the numeric counts.
+   Its remediated/follow-up group totals must also match the metrics table.
+   Every successful group must have one successful-remediation row, and every
+   outstanding group must have one follow-up action.
 2. Follow-up actions must retain the attempted-remediation evidence that is
    present in the context, including package/version attempts and their
    outcomes. Do not promote a worker claim or a diff into a successful fix
@@ -106,6 +122,11 @@ File-path scope is validated deterministically and is not scored by this judge.
 """.strip()
 
 
+def _expected_count_label(value: Any) -> str:
+    """Render an expected count without turning unavailable evidence into zero."""
+    return "unknown" if value is None else str(value)
+
+
 def _report_summarization_questions(case: dict[str, Any]) -> list[str]:
     """Build direct, case-specific yes/no questions from report source facts.
 
@@ -123,7 +144,32 @@ def _report_summarization_questions(case: dict[str, Any]) -> list[str]:
         f"{summary['total_groups']} vulnerability groups?",
         f"Are {summary['fixed']} vulnerability groups successfully remediated and "
         f"{summary['follow_up']} vulnerability groups requiring follow-up?",
+        "Does the Executive Summary read as connected natural-language prose, avoid "
+        "category labels followed by colons, and bold its numeric counts?",
     ]
+    executive_summary = case["expected_contract"].get("executive_summary", {})
+    questions.extend(
+        [
+            "Are the original totals "
+            f"{_expected_count_label(executive_summary.get('original_findings'))} canonical findings across "
+            f"{_expected_count_label(executive_summary.get('original_groups'))} groups?",
+            "Are accepted-remediation totals "
+            f"{_expected_count_label(executive_summary.get('remediated_findings'))} findings across "
+            f"{_expected_count_label(executive_summary.get('remediated_groups'))} groups, with follow-up totals "
+            f"{_expected_count_label(executive_summary.get('follow_up_findings'))} findings across "
+            f"{_expected_count_label(executive_summary.get('follow_up_groups'))} groups?",
+            "Are new-finding and new-group totals stated as "
+            f"{_expected_count_label(executive_summary.get('new_findings'))} and "
+            f"{_expected_count_label(executive_summary.get('new_groups'))}, without substituting "
+            "zero for unavailable evidence?",
+        ]
+    )
+    for special in executive_summary.get("special_remediations", []):
+        questions.append(
+            "Is the supported special remediation "
+            f"{special['kind']} for {special['package']} with outcome "
+            f"{special['outcome']}?"
+        )
     identity_facts = [
         f"{', '.join(group['scanner_finding_identifiers'])} -> vulnerable package "
         f"{group['vulnerable_package']}"
@@ -135,6 +181,10 @@ def _report_summarization_questions(case: dict[str, Any]) -> list[str]:
         questions.append("Are these scanner-ID mappings true: " + "; ".join(identity_facts) + "?")
     package_changes = [
         f"{change['name']} from {change.get('old') or 'not present'} "
+        f"to {change.get('new') or 'removed'} in {change['file']}"
+        f" (dependency section {change['section']})"
+        if change.get("section")
+        else f"{change['name']} from {change.get('old') or 'not present'} "
         f"to {change.get('new') or 'removed'} in {change['file']}"
         for change in facts["package_changes"]
     ]
@@ -161,8 +211,13 @@ def _report_summarization_questions(case: dict[str, Any]) -> list[str]:
             coverage_label = "Unavailable"
         known_identifiers = ", ".join(scan["known_new_vulnerability_identifiers"]) or "none"
         questions.append(
-            f"Does the report state dependency scan coverage as {coverage_label} "
-            f"and known new vulnerability identifiers as {known_identifiers}?"
+            f"Is dependency scan coverage {coverage_label} with known new vulnerability "
+            f"identifiers {known_identifiers}?"
+        )
+    else:
+        questions.append(
+            "Is final dependency scan evidence unrecorded, leaving terminal coverage and "
+            "absence of new findings unknown?"
         )
     source_changes = [
         f"{change['file']} from {change['removed']} to {change['added']}"
@@ -170,11 +225,17 @@ def _report_summarization_questions(case: dict[str, Any]) -> list[str]:
     ]
     if source_changes:
         questions.append("Are these source changes supported: " + "; ".join(source_changes) + "?")
+    if not facts["executive_summary"].get("special_remediations"):
+        questions.append(
+            "Does the curated Executive Summary evidence record no special remediation?"
+        )
     follow_up_packages = set(case["expected_contract"].get("follow_up_packages", []))
     attempt_facts = [
-        f"{attempt['package']} status {attempt['status']}, selected version "
+        f"attempt {attempt['attempt_id'] or 'ID not recorded'} for {attempt['package']} "
+        f"status {attempt['status']}, selected version "
         f"{attempt['selected_version'] or 'not specified'}, outcome "
-        f"{attempt['outcome'] or attempt['summary'] or 'not recorded'}"
+        f"{attempt['outcome'] or attempt['summary'] or 'not recorded'}, dependency type "
+        f"{attempt['target_dependency_type'] or 'not recorded'}"
         for group in facts["finding_groups"]
         if group["vulnerable_package"] in follow_up_packages
         for attempt in group["remediation_attempts"]
@@ -210,14 +271,7 @@ def _group_state(group: dict[str, Any]) -> dict[str, Any]:
         "issue_type": "sca",
         "sources": ["odc"],
         "file_path": group.get("file", "package.json"),
-        "issues": [
-            {
-                "package_name": group["package"],
-                "package_version": group.get("version", ""),
-                "severity": group.get("severity", "high"),
-                "source": "odc",
-            }
-        ],
+        "issues": [],
     }
     for field_name in (
         "cve_ids",
@@ -229,9 +283,9 @@ def _group_state(group: dict[str, Any]) -> dict[str, Any]:
     ):
         if field_name in group:
             result[field_name] = group[field_name]
-    issue_overrides = group.get("issues")
-    if isinstance(issue_overrides, list) and issue_overrides:
-        result["issues"] = issue_overrides
+    issue_records = group.get("issues", [])
+    if isinstance(issue_records, list):
+        result["issues"] = issue_records
     return result
 
 
@@ -350,6 +404,7 @@ def _build_report_state(case: dict[str, Any]) -> dict[str, Any]:
         if "outcome" in attempt:
             summary["final_outcome"] = attempt["outcome"]
         action_summaries.append(summary)
+        task["current_attempt_id"] = attempt["id"]
         if "qa" in attempt:
             qa_results_by_attempt[attempt["id"]] = {
                 "attempt_id": attempt["id"],
@@ -424,13 +479,18 @@ def _build_report_source_facts(case: dict[str, Any]) -> dict[str, Any]:
         group_task_ids = {task.get("id") for task in group_tasks}
         task_evidence = [
             {
+                "task_id": task.get("id"),
                 "final_status": task.get("status"),
                 "strategy": task.get("strategy"),
+                "strategy_stage": task.get("strategy_stage"),
                 "qa_passed": task.get("qa"),
                 "target_package": task.get("target_package_name"),
+                "target_dependency_type": task.get("target_dependency_type"),
                 "parent_package": task.get("parent_package_name"),
                 "parent_package_version": task.get("parent_package_version"),
                 "selected_version": task.get("selected_version"),
+                "qa_policy": task.get("qa_policy"),
+                "no_fix_stage": task.get("no_fix_stage"),
             }
             for task in group_tasks
         ]
@@ -448,15 +508,23 @@ def _build_report_source_facts(case: dict[str, Any]) -> dict[str, Any]:
             )
             attempt_evidence.append(
                 {
+                    "attempt_id": attempt.get("id"),
+                    "task_id": attempt.get("task"),
                     "package": attempt.get("package")
                     or task.get("target_package_name")
                     or group.get("package"),
                     "status": attempt.get("status"),
                     "selected_version": attempt.get("selected_version"),
+                    "instruction": attempt.get("instruction"),
                     "outcome": attempt.get("outcome"),
                     "summary": attempt.get("final_note") or attempt.get("summary"),
                     "changed_files": attempt.get("files", []),
                     "qa_passed": attempt.get("qa", task.get("qa")),
+                    "strategy": task.get("strategy"),
+                    "target_package": task.get("target_package_name"),
+                    "target_dependency_type": task.get("target_dependency_type"),
+                    "parent_package": task.get("parent_package_name"),
+                    "parent_package_version": task.get("parent_package_version"),
                 }
             )
         group_evidence: dict[str, Any] = {
@@ -491,6 +559,7 @@ def _build_report_source_facts(case: dict[str, Any]) -> dict[str, Any]:
         "fixed": summary_contract.get("fixed", 0),
         "follow_up": summary_contract.get("follow_up", 0),
     }
+    executive_summary = contract.get("executive_summary", {})
     changed_files = state.get("changed_files", [])
     diff_paths = re.findall(r"(?m)^--- a/([^\n]+)$", str(state.get("diff", "")))
     patch_files = list(
@@ -540,6 +609,7 @@ def _build_report_source_facts(case: dict[str, Any]) -> dict[str, Any]:
             "patch_reference": "Included in run result" if has_patch else "Not available",
         },
         "summary_facts": summary_facts,
+        "executive_summary": executive_summary,
         "scan_evidence": scan_evidence,
         "finding_groups": finding_groups,
         "package_changes": fixture.get("package_changes", []),
@@ -563,6 +633,7 @@ def _build_report_source_evidence(case: dict[str, Any]) -> str:
     scan = facts["scan_evidence"]
     lines = [
         "Authoritative source facts for the remediation report:",
+        "Executive Summary style: concise connected prose without category labels followed by colons; numeric counts are bold.",
         f"Run ID: {metadata['run_id']}.",
         f"Run status: {metadata['status']}.",
         f"Run duration: {metadata['duration']}.",
@@ -571,9 +642,39 @@ def _build_report_source_evidence(case: dict[str, Any]) -> str:
         f"Changed files: {', '.join(metadata['changed_files']) or 'none'}.",
         f"There are exactly {summary['total_findings']} total scanner findings and "
         f"{summary['total_groups']} vulnerability groups.",
+        "The fixture-authored finding total is canonical: CVE/GHSA aliases recorded on "
+        "the same issue occurrence count as one finding, while group count is independent.",
         f"Final outcomes: {summary['fixed']} vulnerability groups were successfully "
         f"remediated; {summary['follow_up']} vulnerability groups require follow-up.",
     ]
+    if facts["errors"]:
+        lines.append("Recorded run errors: " + "; ".join(map(str, facts["errors"])) + ".")
+    executive_summary = facts["executive_summary"]
+    if executive_summary:
+        lines.extend(
+            [
+                "Executive Summary counts: "
+                f"original {_expected_count_label(executive_summary['original_findings'])} findings across "
+                f"{_expected_count_label(executive_summary['original_groups'])} groups; remediated "
+                f"{_expected_count_label(executive_summary['remediated_findings'])} findings across "
+                f"{_expected_count_label(executive_summary['remediated_groups'])} groups; follow-up "
+                f"{_expected_count_label(executive_summary['follow_up_findings'])} findings across "
+                f"{_expected_count_label(executive_summary['follow_up_groups'])} groups; newly detected "
+                f"{_expected_count_label(executive_summary['new_findings'])} findings across "
+                f"{_expected_count_label(executive_summary['new_groups'])} groups.",
+                "The accepted-remediation counts include only outcomes accepted by final QA.",
+                "Unknown expected counts are stated as unknown, never interpreted as zero.",
+            ]
+        )
+        for special in executive_summary.get("special_remediations", []):
+            lines.append(
+                "Special remediation expectation: "
+                f"{special['kind']} for {special['package']}; outcome {special['outcome']}."
+            )
+        if not executive_summary.get("special_remediations"):
+            lines.append(
+                "The fixture-authored Executive Summary facts record no special remediation."
+            )
     if scan["recorded"]:
         lines.append(
             "Final scan evidence: "
@@ -582,6 +683,11 @@ def _build_report_source_evidence(case: dict[str, Any]) -> str:
             f"new-identifier status {scan['new_vulnerability_status']}; "
             "known new vulnerability identifiers "
             f"{', '.join(scan['known_new_vulnerability_identifiers']) or 'none recorded'}."
+        )
+    else:
+        lines.append(
+            "No final scan record is present in this fixture. Terminal scan coverage and "
+            "absence outside recorded evidence are unavailable or unknown."
         )
     for group in facts["finding_groups"]:
         identifiers = ", ".join(group["scanner_finding_identifiers"])
@@ -599,23 +705,56 @@ def _build_report_source_evidence(case: dict[str, Any]) -> str:
                 outcome += f" QA passed: {task['qa_passed']}."
             if task["strategy"]:
                 outcome += f" Strategy: {task['strategy']}."
+            if task["target_dependency_type"]:
+                outcome += f" Dependency type: {task['target_dependency_type']}."
+            if task["target_package"]:
+                outcome += f" Editable target package: {task['target_package']}."
+            if task["parent_package"]:
+                outcome += f" Parent package: {task['parent_package']}."
+            if task["parent_package_version"]:
+                outcome += f" Parent package version: {task['parent_package_version']}."
+            if task["selected_version"]:
+                outcome += f" Selected version: {task['selected_version']}."
+            if task["strategy_stage"]:
+                outcome += f" Strategy stage: {task['strategy_stage']}."
+            if task["qa_policy"]:
+                outcome += f" QA policy: {task['qa_policy']}."
+            if task["no_fix_stage"]:
+                outcome += f" No-fix stage: {task['no_fix_stage']}."
             lines.append(outcome)
         for attempt in group["remediation_attempts"]:
             attempt_text = (
-                f"Attempt for {attempt['package']}: status {attempt['status']}; "
+                f"Attempt {attempt['attempt_id'] or 'ID not recorded'} for {attempt['package']}: "
+                f"status {attempt['status']}; "
                 f"selected version {attempt['selected_version'] or 'not specified'}; "
                 f"outcome {attempt['outcome'] or attempt['summary'] or 'not recorded'}."
             )
+            if attempt["task_id"]:
+                attempt_text += f" Task ID: {attempt['task_id']}."
+            if attempt["strategy"]:
+                attempt_text += f" Strategy: {attempt['strategy']}."
+            if attempt["target_dependency_type"]:
+                attempt_text += f" Dependency type: {attempt['target_dependency_type']}."
+            if attempt["target_package"]:
+                attempt_text += f" Editable target package: {attempt['target_package']}."
+            if attempt["parent_package"]:
+                attempt_text += f" Parent package: {attempt['parent_package']}."
+            if attempt["parent_package_version"]:
+                attempt_text += f" Parent package version: {attempt['parent_package_version']}."
             if attempt["changed_files"]:
                 attempt_text += f" Files: {', '.join(attempt['changed_files'])}."
+            if attempt["instruction"]:
+                attempt_text += f" Committed instruction: {attempt['instruction']}."
             if attempt["qa_passed"] is not None:
                 attempt_text += f" QA passed: {attempt['qa_passed']}."
             lines.append(attempt_text)
     for change in facts["package_changes"]:
+        section = change.get("section")
         lines.append(
             f"Package transition: {change['name']} changed from "
             f"{change.get('old') or 'not present'} to {change.get('new') or 'removed'} "
-            f"in {change['file']}."
+            f"in {change['file']}"
+            f"{f', dependency section {section}' if section else ''}."
         )
     for change in facts["source_changes"]:
         lines.append(
@@ -646,6 +785,7 @@ def _build_report_policy_context() -> str:
             f"Required sections: {', '.join(format_evidence['sections'])}.",
             format_evidence["finding_identity"],
             format_evidence["evidence_policy"],
+            format_evidence["executive_summary_style"],
             "Successful claims require final QA-passed outcomes; failed attempts alone "
             "must not be presented as fixes.",
             "Follow-up rows should preserve supported package/version attempts and outcomes.",
@@ -669,7 +809,7 @@ def build_report_context(case: dict[str, Any]) -> list[str]:
     ]
 
 
-def render_report(case: dict[str, Any]) -> str:
+def render_report(case: dict[str, Any], *, executive_summary: Any = None) -> str:
     """Render the production report for one evidence-backed golden case.
 
     Args:
@@ -678,7 +818,67 @@ def render_report(case: dict[str, Any]) -> str:
     Returns:
         The deterministic Markdown report emitted by generate_report().
     """
-    return generate_report(_build_report_state(case))
+    return generate_report(_build_report_state(case), executive_summary=executive_summary)
+
+
+def _count_value_from_phrase(phrase: str) -> int | None:
+    """Read an explicit count phrase, keeping unknown separate from zero."""
+    if "unknown number" in phrase.casefold() or "count of newly detected" in phrase.casefold():
+        return None
+    match = re.search(r"(?:at least\s+)?(?P<count>\d+)\b", phrase)
+    return int(match.group("count")) if match else None
+
+
+def _parse_summary_count_pair(summary: str, marker: str) -> tuple[int | None, int | None]:
+    """Extract a finding/group pair by its position in the ordered fact slots."""
+    count_value = r"(?:at least\s+)?(?:\*\*\d+[^*]*\*\*|an unknown number of [^.;!?]+?)"
+    pair_pattern = re.compile(
+        rf"(?P<finding>{count_value})\s+(?:across|in)\s+(?P<group>{count_value})",
+        re.IGNORECASE,
+    )
+    pairs = list(pair_pattern.finditer(summary))
+    if len(pairs) < 3:
+        return None, None
+
+    slots = [
+        (
+            _count_value_from_phrase(match.group("finding")),
+            _count_value_from_phrase(match.group("group")),
+        )
+        for match in pairs
+    ]
+    requested = {
+        "original": 0,
+        "remediated": 1,
+        "follow-up": 2,
+        "new": 3,
+    }.get(marker)
+    if requested is None:
+        raise ValueError(f"Unknown Executive Summary count slot {marker!r}")
+    if requested < len(slots):
+        return slots[requested]
+    if requested == 3 and "count of newly detected findings" in summary.casefold():
+        return None, None
+    return None, None
+
+
+def _parse_executive_summary(summary: str) -> dict[str, Any]:
+    """Parse ordered renderer count pairs while preserving unknown totals."""
+    original = _parse_summary_count_pair(summary, "original")
+    remediated = _parse_summary_count_pair(summary, "remediated")
+    follow_up = _parse_summary_count_pair(summary, "follow-up")
+    new_findings, new_groups = _parse_summary_count_pair(summary, "new")
+    return {
+        "original_findings": original[0],
+        "original_groups": original[1],
+        "remediated_findings": remediated[0],
+        "remediated_groups": remediated[1],
+        "follow_up_findings": follow_up[0],
+        "follow_up_groups": follow_up[1],
+        "new_findings": new_findings,
+        "new_groups": new_groups,
+        "text": summary,
+    }
 
 
 def _split_table_row(line: str) -> list[str]:
@@ -794,11 +994,14 @@ def parse_report(report: str) -> dict[str, Any]:
         records, source-scoped code-detail diff and file paths, and references.
     """
     sections = _report_sections(report)
-    summary = sections.get("## 1. Summary", "")
+    summary = sections.get("## 1. Executive Summary", "")
     follow_up = sections.get("## 2. Follow up Actions", "")
     successful = sections.get("## 3. Successful Remediations", "")
     references = sections.get("## 4. References", "")
     summary_rows = _table_rows(summary, "Metric")
+    summary_text = "\n".join(
+        line for line in summary.splitlines() if not line.lstrip().startswith("|")
+    ).strip()
     success_rows = _table_rows(successful, "Finding")
     code_detail_match = re.search(r"(?ms)^### Code workaround details\n(?P<body>.*)$", successful)
     code_details = code_detail_match.group("body") if code_detail_match else ""
@@ -825,6 +1028,7 @@ def parse_report(report: str) -> dict[str, Any]:
             "fixed": _integer_metric(summary_rows, "Successfully remediated vulnerability groups"),
             "follow_up": _integer_metric(summary_rows, "Vulnerability groups requiring follow-up"),
         },
+        "executive_summary": _parse_executive_summary(summary_text),
         "follow_up": _parse_follow_up_records(follow_up),
         "successful_rows": success_rows,
         "code_detail_diff_paths": code_diff_paths,
@@ -849,6 +1053,7 @@ def build_report_expected_output(case: dict[str, Any]) -> str:
             **contract.get("summary", {}),
             "total_findings": contract.get("total_findings", len(fixture.get("issues", []))),
         },
+        "executive_summary": contract.get("executive_summary", {}),
         "finding_identifiers": contract.get("finding_identifiers", []),
         "successful_packages": contract.get("successful_packages", []),
         "follow_up_packages": contract.get("follow_up_packages", []),
@@ -919,6 +1124,33 @@ def validate_report_contract(
             violations.append(
                 "summary total_findings was "
                 f"{actual_total_findings!r}, expected {expected_total_findings!r}"
+            )
+
+    expected_executive_summary = contract.get("executive_summary", {})
+    actual_executive_summary = parsed["executive_summary"]
+    if re.search(
+        r"\b(?:baseline|accepted outcomes|remaining follow-up|new detections|"
+        r"special actions|evidence limits)\s*:",
+        actual_executive_summary["text"],
+        re.IGNORECASE,
+    ):
+        violations.append("executive summary uses a category label followed by a colon")
+    if not re.search(r"\*\*\d+ [^*]+\*\*", actual_executive_summary["text"]):
+        violations.append("executive summary does not bold its numeric counts")
+    for key, expected_value in expected_executive_summary.items():
+        if key == "special_remediations":
+            actual_text = actual_executive_summary["text"].casefold()
+            for special in expected_value:
+                for required in (special["kind"], special["package"], special["outcome"]):
+                    if required.casefold() not in actual_text:
+                        violations.append(
+                            f"executive summary omitted special-remediation evidence: {required}"
+                        )
+            continue
+        actual_value = actual_executive_summary.get(key)
+        if actual_value != expected_value:
+            violations.append(
+                f"executive summary {key} was {actual_value!r}, expected {expected_value!r}"
             )
 
     successful_packages = {row.get("Package / Target", "") for row in parsed["successful_rows"]}
@@ -1072,6 +1304,8 @@ def _build_report_metric_cases(
     case: dict[str, Any],
     report: str,
     context: list[str],
+    *,
+    summary_generation: dict[str, Any] | None = None,
 ) -> tuple[Any, Any]:
     """Build factual-judge and policy-judge cases with separate contexts."""
     metadata = {
@@ -1080,6 +1314,8 @@ def _build_report_metric_cases(
         "fixture_type": case.get("fixture_type", "historical"),
         "report_format": _REPORT_FORMAT_VERSION,
     }
+    if summary_generation is not None:
+        metadata["executive_summary_generation"] = summary_generation
     evidence = context[0]
     factual_case = LLMTestCase(
         name=f"{case['case_id']} [Factual Report Metrics]",
@@ -1134,8 +1370,43 @@ class TestReportNodeEval:
         if not eval_settings.openai_api_key and not os.environ.get("OPENAI_API_KEY"):
             pytest.skip("OPENAI_API_KEY environment variable is required for live evaluations")
 
+        report_state = _build_report_state(case)
+        summary_evidence = _build_executive_summary_evidence(_build_context(report_state))
+        summary_result = generate_executive_summary(
+            summary_evidence,
+            settings=eval_settings.app_settings,
+        )
+        report = render_report(case, executive_summary=summary_result)
+        violations = validate_report_contract(
+            report,
+            case["expected_contract"],
+            package_changes=requirements_changes,
+            follow_up_attempts=case["fixture"].get("attempts", []),
+        )
+        assert not violations, (
+            f"Case {case['case_id']} generated an invalid Executive Summary: {violations}"
+        )
+        if request is not None:
+            request.node.user_properties.append(
+                (
+                    "executive_summary_live_coverage",
+                    "passed" if summary_result.used_llm else "failed",
+                )
+            )
+            request.node.user_properties.append(
+                (
+                    "executive_summary_generation",
+                    json.dumps(summary_result.metadata(), sort_keys=True),
+                )
+            )
+
         context = build_report_context(case)
-        factual_case, policy_case = _build_report_metric_cases(case, report, context)
+        factual_case, policy_case = _build_report_metric_cases(
+            case,
+            report,
+            context,
+            summary_generation=summary_result.metadata(),
+        )
         metrics = _build_metrics(eval_settings, case)
         metric_groups = (
             ("factual metrics", factual_case, metrics[:3]),
@@ -1144,6 +1415,11 @@ class TestReportNodeEval:
         failures = _record_live_report_metrics(metric_groups)
         if failures and request is not None:
             request.node.user_properties.append(("live_metric_diagnostics", "\n".join(failures)))
+        if not summary_result.used_llm:
+            pytest.fail(
+                "Live Executive Summary coverage failed: "
+                f"generation status was {summary_result.status}; {summary_result.error or 'no validated model output'}"
+            )
 
 
 @pytest.mark.parametrize("case", _load_golden_cases(), ids=_REPORT_CASE_IDS)
@@ -1159,6 +1435,21 @@ def test_report_goldens_use_current_evidence_contract(case: dict[str, Any]) -> N
     assert "finding_identifiers" in contract
     assert contract.get("allow_synthetic_finding_ids") is not True
     assert json.loads(case["expected_output"]) == json.loads(build_report_expected_output(case))
+    for group in case["fixture"].get("groups", []):
+        assert group.get("issues"), f"{case['case_id']}:{group['id']} lacks explicit scanner issues"
+        group_ids = (
+            set(group.get("finding_ids", []))
+            | set(group.get("cve_ids", []))
+            | set(group.get("ghsa_ids", []))
+        )
+        issue_ids = {
+            str(issue[field])
+            for issue in group["issues"]
+            for field in ("finding_id", "cve_id", "ghsa_id", "rule_id")
+            if issue.get(field)
+        }
+        assert group_ids <= issue_ids, f"{case['case_id']}:{group['id']} omits scanner IDs"
+        assert all(not value.startswith("eval-fixture:") for value in issue_ids)
 
 
 def test_python_report_diff_fixtures_use_requirements_file_syntax() -> None:
@@ -1201,9 +1492,63 @@ def test_report_summarization_questions_match_rendered_scan_fields() -> None:
     assert "coverage complete True" in context
     assert "authoritative False" in context
     assert "Incremental dependency inputs (complete)" in scan_question
-    assert "known new vulnerability identifiers as none" in scan_question
+    assert "known new vulnerability identifiers none" in scan_question
     assert "authoritative" not in scan_question
     assert "status none" not in scan_question
+
+
+def test_report_source_evidence_explains_unknown_counts_and_scan_scope() -> None:
+    """Fixture facts tell judges that absent final scans leave counts unknown."""
+    case = next(case for case in _REPORT_CASES if case["case_id"] == "all_pass_4_historical")
+
+    evidence = _build_report_source_evidence(case)
+
+    assert "canonical: CVE/GHSA aliases" in evidence
+    assert "original 5 findings across 4 groups" in evidence
+    assert "newly detected unknown findings across unknown groups" in evidence
+    assert "Unknown expected counts are stated as unknown, never interpreted as zero." in evidence
+    assert "accepted by final QA" in evidence
+    assert "dependency section overrides" in evidence
+    assert "no special remediation" in evidence
+    assert "No final scan record is present" in evidence
+    assert "newly detected None" not in evidence
+
+
+def test_report_source_evidence_preserves_pivot_attempt_identity_and_outcomes() -> None:
+    """The judge sees every attempt ID and distinguishes failed from accepted edits."""
+    case = next(
+        case for case in _REPORT_CASES if case["case_id"] == "strategy_pivot_removal_to_workaround"
+    )
+
+    evidence = _build_report_source_evidence(case)
+
+    assert "Attempt a-removal for notevil: status failed" in evidence
+    assert "Attempt a-removal-code for notevil: status success" in evidence
+    assert "outcome Package removal failed validation" in evidence
+    assert "outcome Removed the vulnerable notevil execution path" in evidence
+    assert "accepted by final QA" in evidence
+    assert "not recorded" not in evidence.split("Attempt a-removal for", 1)[1].split("\n", 1)[0]
+
+
+def test_live_metric_cases_carry_summary_generation_provenance() -> None:
+    """The live DeepEval cases carry actual-generation status and fingerprint."""
+    case = next(case for case in _REPORT_CASES if case["case_id"] == "all_pass_4_historical")
+    generation = {
+        "status": "generated",
+        "source_fingerprint": "fixture-fingerprint",
+    }
+
+    factual_case, policy_case = _build_report_metric_cases(
+        case,
+        render_report(case),
+        build_report_context(case),
+        summary_generation=generation,
+    )
+
+    for metric_case in (factual_case, policy_case):
+        metadata = case_metadata_dict(metric_case)
+        assert metadata["executive_summary_generation"] == generation
+        assert metadata["case_id"] == case["case_id"]
 
 
 def test_report_live_judge_failures_are_non_gating_diagnostics(

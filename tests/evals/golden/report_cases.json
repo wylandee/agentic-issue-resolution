@@ -26,6 +26,17 @@
           "finding_ids": [
             "CVE-2026-3449",
             "GHSA-VPQ2-C234-7XJ6"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-3449",
+              "ghsa_id": "GHSA-VPQ2-C234-7XJ6",
+              "package_name": "@tootallnate/once",
+              "package_version": "1.1.2",
+              "severity": "medium",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         },
         {
@@ -35,6 +46,16 @@
           "severity": "medium",
           "finding_ids": [
             "CVE-2026-30001"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-30001",
+              "package_name": "base64url",
+              "package_version": "2.0.0",
+              "severity": "medium",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         },
         {
@@ -44,6 +65,16 @@
           "severity": "low",
           "finding_ids": [
             "CVE-2026-30002"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-30002",
+              "package_name": "cookie",
+              "package_version": "0.6.0",
+              "severity": "low",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         },
         {
@@ -53,6 +84,16 @@
           "severity": "low",
           "finding_ids": [
             "CVE-2026-30003"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-30003",
+              "package_name": "nanoid",
+              "package_version": "3.3.4",
+              "severity": "low",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         }
       ],
@@ -124,7 +165,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\", \"CVE-2026-30001\", \"CVE-2026-30002\", \"CVE-2026-30003\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"@tootallnate/once\", \"base64url\", \"cookie\", \"nanoid\"], \"summary\": {\"fixed\": 4, \"follow_up\": 0, \"total_findings\": 5, \"total_groups\": 4}}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 5, \"original_groups\": 4, \"remediated_findings\": 4, \"remediated_groups\": 4, \"special_remediations\": []}, \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\", \"CVE-2026-30001\", \"CVE-2026-30002\", \"CVE-2026-30003\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"@tootallnate/once\", \"base64url\", \"cookie\", \"nanoid\"], \"summary\": {\"fixed\": 4, \"follow_up\": 0, \"total_findings\": 5, \"total_groups\": 4}}",
     "expected_contract": {
       "summary": {
         "fixed": 4,
@@ -154,13 +195,24 @@
       ],
       "forbidden_fragments": [
         "### Code workaround details"
-      ]
+      ],
+      "executive_summary": {
+        "original_findings": 5,
+        "original_groups": 4,
+        "remediated_findings": 4,
+        "remediated_groups": 4,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": []
+      }
     },
     "eval_type": "report",
     "input": "Render the deterministic remediation report from the supplied evidence.",
     "context": [
       "Provenance:\nFour-pass success trace d661e0c3-2466-4cf0-902a-a3215e3affdd.",
-      "Current report contract:\n{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":4,\"follow_up\":0,\"total_groups\":4,\"total_findings\":5},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\",\"CVE-2026-30001\",\"CVE-2026-30002\",\"CVE-2026-30003\"],\"successful_packages\":[\"@tootallnate/once\",\"base64url\",\"cookie\",\"nanoid\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}"
+      "Current report contract:\n{\"code_detail_diff_paths\":[],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":null,\"new_groups\":null,\"original_findings\":5,\"original_groups\":4,\"remediated_findings\":4,\"remediated_groups\":4,\"special_remediations\":[]},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\",\"CVE-2026-30001\",\"CVE-2026-30002\",\"CVE-2026-30003\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"@tootallnate/once\",\"base64url\",\"cookie\",\"nanoid\"],\"summary\":{\"fixed\":4,\"follow_up\":0,\"total_findings\":5,\"total_groups\":4}}"
     ],
     "expected_tools": [],
     "offline_fixture": {}
@@ -190,6 +242,17 @@
           "finding_ids": [
             "CVE-2026-3449",
             "GHSA-VPQ2-C234-7XJ6"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-3449",
+              "ghsa_id": "GHSA-VPQ2-C234-7XJ6",
+              "package_name": "@tootallnate/once",
+              "package_version": "1.1.2",
+              "severity": "medium",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         },
         {
@@ -200,6 +263,17 @@
           "finding_ids": [
             "CVE-2020-15084",
             "GHSA-6G6M-M6H5-W9GF"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2020-15084",
+              "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+              "package_name": "express-jwt",
+              "package_version": "0.1.3",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         },
         {
@@ -210,7 +284,17 @@
           "finding_ids": [
             "CVE-2026-30004"
           ],
-          "file": "frontend/package.json"
+          "file": "frontend/package.json",
+          "issues": [
+            {
+              "cve_id": "CVE-2026-30004",
+              "package_name": "ws",
+              "package_version": "8.18.0",
+              "severity": "medium",
+              "file_path": "frontend/package.json",
+              "source": "odc"
+            }
+          ]
         }
       ],
       "tasks": [
@@ -309,7 +393,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\", \"CVE-2020-15084\", \"GHSA-6G6M-M6H5-W9GF\", \"CVE-2026-30004\"], \"follow_up_packages\": [\"express-jwt\", \"ws\"], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"@tootallnate/once\"], \"summary\": {\"fixed\": 1, \"follow_up\": 2, \"total_findings\": 3, \"total_groups\": 3}}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"executive_summary\": {\"follow_up_findings\": 2, \"follow_up_groups\": 2, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 3, \"original_groups\": 3, \"remediated_findings\": 1, \"remediated_groups\": 1, \"special_remediations\": []}, \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\", \"CVE-2020-15084\", \"GHSA-6G6M-M6H5-W9GF\", \"CVE-2026-30004\"], \"follow_up_packages\": [\"express-jwt\", \"ws\"], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"@tootallnate/once\"], \"summary\": {\"fixed\": 1, \"follow_up\": 2, \"total_findings\": 3, \"total_groups\": 3}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -335,13 +419,24 @@
         "Updated express-jwt 0.1.3",
         "Updated ws 8.18.0",
         "2.0.1"
-      ]
+      ],
+      "executive_summary": {
+        "original_findings": 3,
+        "original_groups": 3,
+        "remediated_findings": 1,
+        "remediated_groups": 1,
+        "follow_up_findings": 2,
+        "follow_up_groups": 2,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": []
+      }
     },
     "eval_type": "report",
     "input": "Render the deterministic remediation report from the supplied evidence.",
     "context": [
       "Provenance:\nPartial remediation trace aa632865-4cce-4bec-86ba-8c6dfb526f67.",
-      "Current report contract:\n{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":2,\"total_groups\":3,\"total_findings\":3},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\",\"CVE-2020-15084\",\"GHSA-6G6M-M6H5-W9GF\",\"CVE-2026-30004\"],\"successful_packages\":[\"@tootallnate/once\"],\"follow_up_packages\":[\"express-jwt\",\"ws\"],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}"
+      "Current report contract:\n{\"code_detail_diff_paths\":[],\"executive_summary\":{\"follow_up_findings\":2,\"follow_up_groups\":2,\"new_findings\":null,\"new_groups\":null,\"original_findings\":3,\"original_groups\":3,\"remediated_findings\":1,\"remediated_groups\":1,\"special_remediations\":[]},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\",\"CVE-2020-15084\",\"GHSA-6G6M-M6H5-W9GF\",\"CVE-2026-30004\"],\"follow_up_packages\":[\"express-jwt\",\"ws\"],\"forbidden_code_detail_diff_paths\":[],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"@tootallnate/once\"],\"summary\":{\"fixed\":1,\"follow_up\":2,\"total_findings\":3,\"total_groups\":3}}"
     ],
     "expected_tools": [],
     "offline_fixture": {}
@@ -371,6 +466,17 @@
           "finding_ids": [
             "CVE-2026-3449",
             "GHSA-VPQ2-C234-7XJ6"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-3449",
+              "ghsa_id": "GHSA-VPQ2-C234-7XJ6",
+              "package_name": "@tootallnate/once",
+              "package_version": "1.1.2",
+              "severity": "medium",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         },
         {
@@ -381,6 +487,17 @@
           "finding_ids": [
             "CVE-2020-15084",
             "GHSA-6G6M-M6H5-W9GF"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2020-15084",
+              "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+              "package_name": "express-jwt",
+              "package_version": "0.1.3",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         },
         {
@@ -391,6 +508,17 @@
           "finding_ids": [
             "CVE-2026-30005",
             "GHSA-6QX4-9M5V-2H7J"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-30005",
+              "ghsa_id": "GHSA-6QX4-9M5V-2H7J",
+              "package_name": "sanitize-html",
+              "package_version": "1.4.2",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         }
       ],
@@ -478,7 +606,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\", \"CVE-2020-15084\", \"GHSA-6G6M-M6H5-W9GF\", \"CVE-2026-30005\", \"GHSA-6QX4-9M5V-2H7J\"], \"follow_up_packages\": [\"@tootallnate/once\", \"express-jwt\", \"sanitize-html\"], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [], \"summary\": {\"fixed\": 0, \"follow_up\": 3, \"total_findings\": 3, \"total_groups\": 3}}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"executive_summary\": {\"follow_up_findings\": 3, \"follow_up_groups\": 3, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 3, \"original_groups\": 3, \"remediated_findings\": 0, \"remediated_groups\": 0, \"special_remediations\": []}, \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\", \"CVE-2020-15084\", \"GHSA-6G6M-M6H5-W9GF\", \"CVE-2026-30005\", \"GHSA-6QX4-9M5V-2H7J\"], \"follow_up_packages\": [\"@tootallnate/once\", \"express-jwt\", \"sanitize-html\"], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v4\", \"successful_packages\": [], \"summary\": {\"fixed\": 0, \"follow_up\": 3, \"total_findings\": 3, \"total_groups\": 3}}",
     "expected_contract": {
       "summary": {
         "fixed": 0,
@@ -504,13 +632,24 @@
         "Updated express-jwt 0.1.3",
         "Updated sanitize-html 1.4.2",
         "No successful remediations were produced during this run."
-      ]
+      ],
+      "executive_summary": {
+        "original_findings": 3,
+        "original_groups": 3,
+        "remediated_findings": 0,
+        "remediated_groups": 0,
+        "follow_up_findings": 3,
+        "follow_up_groups": 3,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": []
+      }
     },
     "eval_type": "report",
     "input": "Render the deterministic remediation report from the supplied evidence.",
     "context": [
       "Provenance:\nThree-unfixable trace 80e0225f-0ffa-4030-b37a-26cfb063d18b.",
-      "Current report contract:\n{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":0,\"follow_up\":3,\"total_groups\":3,\"total_findings\":3},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\",\"CVE-2020-15084\",\"GHSA-6G6M-M6H5-W9GF\",\"CVE-2026-30005\",\"GHSA-6QX4-9M5V-2H7J\"],\"successful_packages\":[],\"follow_up_packages\":[\"@tootallnate/once\",\"express-jwt\",\"sanitize-html\"],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}"
+      "Current report contract:\n{\"code_detail_diff_paths\":[],\"executive_summary\":{\"follow_up_findings\":3,\"follow_up_groups\":3,\"new_findings\":null,\"new_groups\":null,\"original_findings\":3,\"original_groups\":3,\"remediated_findings\":0,\"remediated_groups\":0,\"special_remediations\":[]},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\",\"CVE-2020-15084\",\"GHSA-6G6M-M6H5-W9GF\",\"CVE-2026-30005\",\"GHSA-6QX4-9M5V-2H7J\"],\"follow_up_packages\":[\"@tootallnate/once\",\"express-jwt\",\"sanitize-html\"],\"forbidden_code_detail_diff_paths\":[],\"format\":\"remediation_report_v3\",\"successful_packages\":[],\"summary\":{\"fixed\":0,\"follow_up\":3,\"total_findings\":3,\"total_groups\":3}}"
     ],
     "expected_tools": [],
     "offline_fixture": {}
@@ -536,6 +675,16 @@
           "severity": "high",
           "finding_ids": [
             "CVE-2026-30006"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-30006",
+              "package_name": "undici",
+              "package_version": "5.0.0",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         }
       ],
@@ -563,7 +712,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-30006\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"undici\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 1, \"original_groups\": 1, \"remediated_findings\": 1, \"remediated_groups\": 1, \"special_remediations\": []}, \"finding_identifiers\": [\"CVE-2026-30006\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"undici\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -585,13 +734,24 @@
       ],
       "forbidden_fragments": [
         "### Code workaround details"
-      ]
+      ],
+      "executive_summary": {
+        "original_findings": 1,
+        "original_groups": 1,
+        "remediated_findings": 1,
+        "remediated_groups": 1,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": []
+      }
     },
     "eval_type": "report",
     "input": "Render the deterministic remediation report from the supplied evidence.",
     "context": [
       "Provenance:\nVersion-only row from the four-pass trace d661e0c3-2466-4cf0-902a-a3215e3affdd.",
-      "Current report contract:\n{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2026-30006\"],\"successful_packages\":[\"undici\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}"
+      "Current report contract:\n{\"code_detail_diff_paths\":[],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":null,\"new_groups\":null,\"original_findings\":1,\"original_groups\":1,\"remediated_findings\":1,\"remediated_groups\":1,\"special_remediations\":[]},\"finding_identifiers\":[\"CVE-2026-30006\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"undici\"],\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_findings\":1,\"total_groups\":1}}"
     ],
     "expected_tools": [],
     "offline_fixture": {}
@@ -618,6 +778,17 @@
           "finding_ids": [
             "CVE-2020-15084",
             "GHSA-6G6M-M6H5-W9GF"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2020-15084",
+              "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+              "package_name": "express-jwt",
+              "package_version": "5.0.0",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         }
       ],
@@ -653,7 +824,7 @@
         "src/guard.ts"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [\"src/guard.ts\"], \"finding_identifiers\": [\"CVE-2020-15084\", \"GHSA-6G6M-M6H5-W9GF\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\"], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"express-jwt\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
+    "expected_output": "{\"code_detail_diff_paths\": [\"src/guard.ts\"], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 1, \"original_groups\": 1, \"remediated_findings\": 1, \"remediated_groups\": 1, \"special_remediations\": [{\"kind\": \"code workaround\", \"outcome\": \"successfully accepted by final QA\", \"package\": \"express-jwt\"}]}, \"finding_identifiers\": [\"CVE-2020-15084\", \"GHSA-6G6M-M6H5-W9GF\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\"], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"express-jwt\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -679,13 +850,152 @@
       ],
       "forbidden_code_detail_diff_paths": [
         "package.json"
-      ]
+      ],
+      "executive_summary": {
+        "original_findings": 1,
+        "original_groups": 1,
+        "remediated_findings": 1,
+        "remediated_groups": 1,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": [
+          {
+            "kind": "code workaround",
+            "package": "express-jwt",
+            "outcome": "successfully accepted by final QA"
+          }
+        ]
+      }
     },
     "eval_type": "report",
     "input": "Render the deterministic remediation report from the supplied evidence.",
     "context": [
       "Provenance:\nSynthetic positive fixture for the initial CODE_WORKAROUND shape; closest historical source-only no-fix trace is 4e04f8ff-d8b9-48dc-924c-b1295de20c95.",
-      "Current report contract:\n{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2020-15084\",\"GHSA-6G6M-M6H5-W9GF\"],\"successful_packages\":[\"express-jwt\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[\"src/guard.ts\"],\"forbidden_code_detail_diff_paths\":[\"package.json\"]}"
+      "Current report contract:\n{\"code_detail_diff_paths\":[\"src/guard.ts\"],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":null,\"new_groups\":null,\"original_findings\":1,\"original_groups\":1,\"remediated_findings\":1,\"remediated_groups\":1,\"special_remediations\":[{\"kind\":\"code workaround\",\"outcome\":\"successfully accepted by final QA\",\"package\":\"express-jwt\"}]},\"finding_identifiers\":[\"CVE-2020-15084\",\"GHSA-6G6M-M6H5-W9GF\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[\"package.json\"],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"express-jwt\"],\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_findings\":1,\"total_groups\":1}}"
+    ],
+    "expected_tools": [],
+    "offline_fixture": {}
+  },
+  {
+    "case_id": "api_migration_workaround",
+    "fixture_type": "synthetic",
+    "provenance": "Curated API migration example with final QA and source-diff evidence.",
+    "historical_evidence": [
+      "The closest historical case proves source-only vulnerable-path removal, but not a clean initial generic workaround.",
+      "This fixture isolates the requested initial code-workaround output shape."
+    ],
+    "fixture": {
+      "status": "completed",
+      "issues": [
+        "express-jwt"
+      ],
+      "groups": [
+        {
+          "id": "g-code",
+          "package": "express-jwt",
+          "version": "5.0.0",
+          "severity": "high",
+          "finding_ids": [
+            "CVE-2020-15084",
+            "GHSA-6G6M-M6H5-W9GF"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2020-15084",
+              "ghsa_id": "GHSA-6G6M-M6H5-W9GF",
+              "package_name": "express-jwt",
+              "package_version": "5.0.0",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
+          ]
+        }
+      ],
+      "tasks": [
+        {
+          "id": "t-code",
+          "group": "g-code",
+          "status": "qa_passed",
+          "strategy": "CODE_WORKAROUND",
+          "strategy_stage": "migration_code_workaround"
+        }
+      ],
+      "attempts": [
+        {
+          "id": "a-code",
+          "task": "t-code",
+          "status": "success",
+          "final_note": "Added a guard before the vulnerable middleware call.",
+          "files": [
+            "src/guard.ts"
+          ],
+          "qa": true
+        }
+      ],
+      "source_changes": [
+        {
+          "file": "src/guard.ts",
+          "removed": "unsafe(input)",
+          "added": "safe(input)"
+        }
+      ],
+      "changed_files": [
+        "src/guard.ts"
+      ]
+    },
+    "expected_output": "{\"code_detail_diff_paths\": [\"src/guard.ts\"], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 1, \"original_groups\": 1, \"remediated_findings\": 1, \"remediated_groups\": 1, \"special_remediations\": [{\"kind\": \"API migration\", \"outcome\": \"successfully accepted by final QA\", \"package\": \"express-jwt\"}]}, \"finding_identifiers\": [\"CVE-2020-15084\", \"GHSA-6G6M-M6H5-W9GF\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\"], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"express-jwt\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
+    "expected_contract": {
+      "summary": {
+        "fixed": 1,
+        "follow_up": 0,
+        "total_groups": 1
+      },
+      "total_findings": 1,
+      "finding_identifiers": [
+        "CVE-2020-15084",
+        "GHSA-6G6M-M6H5-W9GF"
+      ],
+      "successful_packages": [
+        "express-jwt"
+      ],
+      "required_fragments": [
+        "Code workaround",
+        "src/guard.ts",
+        "unsafe(input)",
+        "safe(input)"
+      ],
+      "code_detail_diff_paths": [
+        "src/guard.ts"
+      ],
+      "forbidden_code_detail_diff_paths": [
+        "package.json"
+      ],
+      "executive_summary": {
+        "original_findings": 1,
+        "original_groups": 1,
+        "remediated_findings": 1,
+        "remediated_groups": 1,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": [
+          {
+            "kind": "API migration",
+            "package": "express-jwt",
+            "outcome": "successfully accepted by final QA"
+          }
+        ]
+      }
+    },
+    "eval_type": "report",
+    "input": "Render the deterministic remediation report from the supplied evidence.",
+    "context": [
+      "Curated API migration example with final QA and source-diff evidence.",
+      "Current report contract:\n{\"code_detail_diff_paths\":[\"src/guard.ts\"],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":null,\"new_groups\":null,\"original_findings\":1,\"original_groups\":1,\"remediated_findings\":1,\"remediated_groups\":1,\"special_remediations\":[{\"kind\":\"API migration\",\"outcome\":\"successfully accepted by final QA\",\"package\":\"express-jwt\"}]},\"finding_identifiers\":[\"CVE-2020-15084\",\"GHSA-6G6M-M6H5-W9GF\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[\"package.json\"],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"express-jwt\"],\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_findings\":1,\"total_groups\":1}}"
     ],
     "expected_tools": [],
     "offline_fixture": {}
@@ -713,6 +1023,17 @@
           "finding_ids": [
             "CVE-2021-23771",
             "GHSA-8G4M-CJM2-96WQ"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2021-23771",
+              "ghsa_id": "GHSA-8G4M-CJM2-96WQ",
+              "package_name": "notevil",
+              "package_version": "1.3.3",
+              "severity": "medium",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         }
       ],
@@ -767,7 +1088,7 @@
         "routes/b2bOrder.ts"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [\"routes/b2bOrder.ts\"], \"finding_identifiers\": [\"CVE-2021-23771\", \"GHSA-8G4M-CJM2-96WQ\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\", \"package-lock.json\"], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"notevil\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
+    "expected_output": "{\"code_detail_diff_paths\": [\"routes/b2bOrder.ts\"], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 1, \"original_groups\": 1, \"remediated_findings\": 1, \"remediated_groups\": 1, \"special_remediations\": [{\"kind\": \"package removal with source edits\", \"outcome\": \"successfully accepted by final QA\", \"package\": \"notevil\"}]}, \"finding_identifiers\": [\"CVE-2021-23771\", \"GHSA-8G4M-CJM2-96WQ\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\", \"package-lock.json\"], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"notevil\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -795,13 +1116,30 @@
       "forbidden_code_detail_diff_paths": [
         "package.json",
         "package-lock.json"
-      ]
+      ],
+      "executive_summary": {
+        "original_findings": 1,
+        "original_groups": 1,
+        "remediated_findings": 1,
+        "remediated_groups": 1,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": [
+          {
+            "kind": "package removal with source edits",
+            "package": "notevil",
+            "outcome": "successfully accepted by final QA"
+          }
+        ]
+      }
     },
     "eval_type": "report",
     "input": "Render the deterministic remediation report from the supplied evidence.",
     "context": [
       "Provenance:\nPackage-removal evidence from task-4 in mixed strategy trace c46e0277-fe40-48ab-a91e-fe9041fdcd87.",
-      "Current report contract:\n{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2021-23771\",\"GHSA-8G4M-CJM2-96WQ\"],\"successful_packages\":[\"notevil\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[\"routes/b2bOrder.ts\"],\"forbidden_code_detail_diff_paths\":[\"package.json\",\"package-lock.json\"]}"
+      "Current report contract:\n{\"code_detail_diff_paths\":[\"routes/b2bOrder.ts\"],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":null,\"new_groups\":null,\"original_findings\":1,\"original_groups\":1,\"remediated_findings\":1,\"remediated_groups\":1,\"special_remediations\":[{\"kind\":\"package removal with source edits\",\"outcome\":\"successfully accepted by final QA\",\"package\":\"notevil\"}]},\"finding_identifiers\":[\"CVE-2021-23771\",\"GHSA-8G4M-CJM2-96WQ\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[\"package.json\",\"package-lock.json\"],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"notevil\"],\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_findings\":1,\"total_groups\":1}}"
     ],
     "expected_tools": [],
     "offline_fixture": {}
@@ -829,6 +1167,17 @@
           "finding_ids": [
             "CVE-2026-30005",
             "GHSA-6QX4-9M5V-2H7J"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-30005",
+              "ghsa_id": "GHSA-6QX4-9M5V-2H7J",
+              "package_name": "sanitize-html",
+              "package_version": "1.4.2",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         },
         {
@@ -841,7 +1190,18 @@
             "GHSA-6QX4-9M5V-2H7J"
           ],
           "initial": false,
-          "final": true
+          "final": true,
+          "issues": [
+            {
+              "cve_id": "CVE-2026-30005",
+              "ghsa_id": "GHSA-6QX4-9M5V-2H7J",
+              "package_name": "sanitize-html",
+              "package_version": "1.4.2",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
+          ]
         }
       ],
       "tasks": [
@@ -918,7 +1278,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [\"lib/insecurity.ts\"], \"finding_identifiers\": [\"CVE-2026-30005\", \"GHSA-6QX4-9M5V-2H7J\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\", \"package-lock.json\"], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"sanitize-html\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
+    "expected_output": "{\"code_detail_diff_paths\": [\"lib/insecurity.ts\"], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 1, \"original_groups\": 1, \"remediated_findings\": 1, \"remediated_groups\": 1, \"special_remediations\": [{\"kind\": \"code workaround\", \"outcome\": \"successfully accepted by final QA\", \"package\": \"sanitize-html\"}]}, \"finding_identifiers\": [\"CVE-2026-30005\", \"GHSA-6QX4-9M5V-2H7J\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\", \"package-lock.json\"], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"sanitize-html\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -946,13 +1306,30 @@
       "forbidden_code_detail_diff_paths": [
         "package.json",
         "package-lock.json"
-      ]
+      ],
+      "executive_summary": {
+        "original_findings": 1,
+        "original_groups": 1,
+        "remediated_findings": 1,
+        "remediated_groups": 1,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": [
+          {
+            "kind": "code workaround",
+            "package": "sanitize-html",
+            "outcome": "successfully accepted by final QA"
+          }
+        ]
+      }
     },
     "eval_type": "report",
     "input": "Render the deterministic remediation report from the supplied evidence.",
     "context": [
       "Provenance:\nVersion-bump to code-workaround pivot in sanitize-html from mixed strategy trace c46e0277-fe40-48ab-a91e-fe9041fdcd87.",
-      "Current report contract:\n{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2026-30005\",\"GHSA-6QX4-9M5V-2H7J\"],\"successful_packages\":[\"sanitize-html\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[\"lib/insecurity.ts\"],\"forbidden_code_detail_diff_paths\":[\"package.json\",\"package-lock.json\"]}"
+      "Current report contract:\n{\"code_detail_diff_paths\":[\"lib/insecurity.ts\"],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":null,\"new_groups\":null,\"original_findings\":1,\"original_groups\":1,\"remediated_findings\":1,\"remediated_groups\":1,\"special_remediations\":[{\"kind\":\"code workaround\",\"outcome\":\"successfully accepted by final QA\",\"package\":\"sanitize-html\"}]},\"finding_identifiers\":[\"CVE-2026-30005\",\"GHSA-6QX4-9M5V-2H7J\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[\"package.json\",\"package-lock.json\"],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"sanitize-html\"],\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_findings\":1,\"total_groups\":1}}"
     ],
     "expected_tools": [],
     "offline_fixture": {}
@@ -980,6 +1357,17 @@
           "finding_ids": [
             "CVE-2021-23771",
             "GHSA-8G4M-CJM2-96WQ"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2021-23771",
+              "ghsa_id": "GHSA-8G4M-CJM2-96WQ",
+              "package_name": "notevil",
+              "package_version": "1.3.3",
+              "severity": "medium",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         },
         {
@@ -992,7 +1380,18 @@
             "GHSA-8G4M-CJM2-96WQ"
           ],
           "initial": false,
-          "final": true
+          "final": true,
+          "issues": [
+            {
+              "cve_id": "CVE-2021-23771",
+              "ghsa_id": "GHSA-8G4M-CJM2-96WQ",
+              "package_name": "notevil",
+              "package_version": "1.3.3",
+              "severity": "medium",
+              "file_path": "package.json",
+              "source": "odc"
+            }
+          ]
         }
       ],
       "tasks": [
@@ -1049,7 +1448,7 @@
         "routes/b2bOrder.ts"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [\"routes/b2bOrder.ts\"], \"finding_identifiers\": [\"CVE-2021-23771\", \"GHSA-8G4M-CJM2-96WQ\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\", \"package-lock.json\"], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"notevil\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
+    "expected_output": "{\"code_detail_diff_paths\": [\"routes/b2bOrder.ts\"], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 1, \"original_groups\": 1, \"remediated_findings\": 1, \"remediated_groups\": 1, \"special_remediations\": [{\"kind\": \"package removal\", \"outcome\": \"attempted but failed QA\", \"package\": \"notevil\"}, {\"kind\": \"code workaround\", \"outcome\": \"successfully accepted by final QA\", \"package\": \"notevil\"}]}, \"finding_identifiers\": [\"CVE-2021-23771\", \"GHSA-8G4M-CJM2-96WQ\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [\"package.json\", \"package-lock.json\"], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"notevil\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -1077,13 +1476,35 @@
       "forbidden_code_detail_diff_paths": [
         "package.json",
         "package-lock.json"
-      ]
+      ],
+      "executive_summary": {
+        "original_findings": 1,
+        "original_groups": 1,
+        "remediated_findings": 1,
+        "remediated_groups": 1,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": [
+          {
+            "kind": "package removal",
+            "package": "notevil",
+            "outcome": "attempted but failed QA"
+          },
+          {
+            "kind": "code workaround",
+            "package": "notevil",
+            "outcome": "successfully accepted by final QA"
+          }
+        ]
+      }
     },
     "eval_type": "report",
     "input": "Render the deterministic remediation report from the supplied evidence.",
     "context": [
       "Provenance:\nSynthetic exact-pivot fixture based on package-removal evidence in c46e0277 and source-only vulnerable-path removal in 4e04f8ff.",
-      "Current report contract:\n{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2021-23771\",\"GHSA-8G4M-CJM2-96WQ\"],\"successful_packages\":[\"notevil\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[\"routes/b2bOrder.ts\"],\"forbidden_code_detail_diff_paths\":[\"package.json\",\"package-lock.json\"]}"
+      "Current report contract:\n{\"code_detail_diff_paths\":[\"routes/b2bOrder.ts\"],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":null,\"new_groups\":null,\"original_findings\":1,\"original_groups\":1,\"remediated_findings\":1,\"remediated_groups\":1,\"special_remediations\":[{\"kind\":\"package removal\",\"outcome\":\"attempted but failed QA\",\"package\":\"notevil\"},{\"kind\":\"code workaround\",\"outcome\":\"successfully accepted by final QA\",\"package\":\"notevil\"}]},\"finding_identifiers\":[\"CVE-2021-23771\",\"GHSA-8G4M-CJM2-96WQ\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[\"package.json\",\"package-lock.json\"],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"notevil\"],\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_findings\":1,\"total_groups\":1}}"
     ],
     "expected_tools": [],
     "offline_fixture": {}
@@ -1111,7 +1532,17 @@
           "finding_ids": [
             "CVE-2026-30007"
           ],
-          "file": "package.json"
+          "file": "package.json",
+          "issues": [
+            {
+              "cve_id": "CVE-2026-30007",
+              "package_name": "lodash",
+              "package_version": "4.17.20",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
+          ]
         },
         {
           "id": "g-frontend-ws",
@@ -1121,7 +1552,17 @@
           "finding_ids": [
             "CVE-2026-30008"
           ],
-          "file": "frontend/package.json"
+          "file": "frontend/package.json",
+          "issues": [
+            {
+              "cve_id": "CVE-2026-30008",
+              "package_name": "ws",
+              "package_version": "8.18.0",
+              "severity": "medium",
+              "file_path": "frontend/package.json",
+              "source": "odc"
+            }
+          ]
         }
       ],
       "tasks": [
@@ -1165,7 +1606,7 @@
         "frontend/package.json"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-30007\", \"CVE-2026-30008\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"lodash\", \"ws\"], \"summary\": {\"fixed\": 2, \"follow_up\": 0, \"total_findings\": 2, \"total_groups\": 2}}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 2, \"original_groups\": 2, \"remediated_findings\": 2, \"remediated_groups\": 2, \"special_remediations\": []}, \"finding_identifiers\": [\"CVE-2026-30007\", \"CVE-2026-30008\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"lodash\", \"ws\"], \"summary\": {\"fixed\": 2, \"follow_up\": 0, \"total_findings\": 2, \"total_groups\": 2}}",
     "expected_contract": {
       "summary": {
         "fixed": 2,
@@ -1191,13 +1632,24 @@
       ],
       "forbidden_fragments": [
         "### Code workaround details"
-      ]
+      ],
+      "executive_summary": {
+        "original_findings": 2,
+        "original_groups": 2,
+        "remediated_findings": 2,
+        "remediated_groups": 2,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": []
+      }
     },
     "eval_type": "report",
     "input": "Render the deterministic remediation report from the supplied evidence.",
     "context": [
       "Provenance:\nSynthetic positive multi-manifest fixture based on root/frontend manifest paths observed in partial trace aa632865.",
-      "Current report contract:\n{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":2,\"follow_up\":0,\"total_groups\":2,\"total_findings\":2},\"finding_identifiers\":[\"CVE-2026-30007\",\"CVE-2026-30008\"],\"successful_packages\":[\"lodash\",\"ws\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}"
+      "Current report contract:\n{\"code_detail_diff_paths\":[],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":null,\"new_groups\":null,\"original_findings\":2,\"original_groups\":2,\"remediated_findings\":2,\"remediated_groups\":2,\"special_remediations\":[]},\"finding_identifiers\":[\"CVE-2026-30007\",\"CVE-2026-30008\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"lodash\",\"ws\"],\"summary\":{\"fixed\":2,\"follow_up\":0,\"total_findings\":2,\"total_groups\":2}}"
     ],
     "expected_tools": [],
     "offline_fixture": {}
@@ -1225,6 +1677,17 @@
           "finding_ids": [
             "CVE-2026-3449",
             "GHSA-VPQ2-C234-7XJ6"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-3449",
+              "ghsa_id": "GHSA-VPQ2-C234-7XJ6",
+              "package_name": "@tootallnate/once",
+              "package_version": "1.1.2",
+              "severity": "medium",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         }
       ],
@@ -1255,7 +1718,7 @@
         "package.json"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"@tootallnate/once\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": null, \"new_groups\": null, \"original_findings\": 1, \"original_groups\": 1, \"remediated_findings\": 1, \"remediated_groups\": 1, \"special_remediations\": []}, \"finding_identifiers\": [\"CVE-2026-3449\", \"GHSA-VPQ2-C234-7XJ6\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"@tootallnate/once\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 1, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -1278,13 +1741,24 @@
       ],
       "forbidden_fragments": [
         "### Code workaround details"
-      ]
+      ],
+      "executive_summary": {
+        "original_findings": 1,
+        "original_groups": 1,
+        "remediated_findings": 1,
+        "remediated_groups": 1,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": null,
+        "new_groups": null,
+        "special_remediations": []
+      }
     },
     "eval_type": "report",
     "input": "Render the deterministic remediation report from the supplied evidence.",
     "context": [
       "Provenance:\nTransitive override evidence from task-1 in mixed strategy trace c46e0277-fe40-48ab-a91e-fe9041fdcd87.",
-      "Current report contract:\n{\"format\":\"remediation_report_v2\",\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_groups\":1,\"total_findings\":1},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\"],\"successful_packages\":[\"@tootallnate/once\"],\"follow_up_packages\":[],\"code_detail_diff_paths\":[],\"forbidden_code_detail_diff_paths\":[]}"
+      "Current report contract:\n{\"code_detail_diff_paths\":[],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":null,\"new_groups\":null,\"original_findings\":1,\"original_groups\":1,\"remediated_findings\":1,\"remediated_groups\":1,\"special_remediations\":[]},\"finding_identifiers\":[\"CVE-2026-3449\",\"GHSA-VPQ2-C234-7XJ6\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"@tootallnate/once\"],\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_findings\":1,\"total_groups\":1}}"
     ],
     "expected_tools": [],
     "offline_fixture": {}
@@ -1316,6 +1790,26 @@
             "GHSA-XQR8-7JWR-RHP7",
             "CVE-2024-39689",
             "GHSA-248V-346W-9CWC"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2023-37920",
+              "ghsa_id": "GHSA-XQR8-7JWR-RHP7",
+              "package_name": "certifi",
+              "package_version": "2022.12.7",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            },
+            {
+              "cve_id": "CVE-2024-39689",
+              "ghsa_id": "GHSA-248V-346W-9CWC",
+              "package_name": "certifi",
+              "package_version": "2022.12.7",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         }
       ],
@@ -1369,7 +1863,7 @@
         "teardown_node: incremental scans detected 19 new identifier(s)"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2023-37920\", \"GHSA-XQR8-7JWR-RHP7\", \"CVE-2024-39689\", \"GHSA-248V-346W-9CWC\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"certifi\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 2, \"total_groups\": 1}}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": 0, \"new_groups\": 0, \"original_findings\": 2, \"original_groups\": 1, \"remediated_findings\": 2, \"remediated_groups\": 1, \"special_remediations\": []}, \"finding_identifiers\": [\"CVE-2023-37920\", \"GHSA-XQR8-7JWR-RHP7\", \"CVE-2024-39689\", \"GHSA-248V-346W-9CWC\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"certifi\"], \"summary\": {\"fixed\": 1, \"follow_up\": 0, \"total_findings\": 2, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 1,
@@ -1391,13 +1885,25 @@
       "required_fragments": [
         "No follow-up actions are required."
       ],
-      "forbidden_fragments": []
+      "forbidden_fragments": [],
+      "executive_summary": {
+        "original_findings": 2,
+        "original_groups": 1,
+        "remediated_findings": 2,
+        "remediated_groups": 1,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": 0,
+        "new_groups": 0,
+        "special_remediations": []
+      }
     },
     "eval_type": "report",
     "input": "Render an evidence-backed remediation report for python-report-certifi-success-with-warning.",
     "context": [
       "Certifi task QA passed with requirements.txt changed; overall completed_with_errors reflects 19 unrelated identifiers in the incremental scan.",
-      "The final incremental scan is non-authoritative and may report unrelated new identifiers."
+      "The final incremental scan is non-authoritative and may report unrelated new identifiers.",
+      "Current report contract:\n{\"code_detail_diff_paths\":[],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":0,\"new_groups\":0,\"original_findings\":2,\"original_groups\":1,\"remediated_findings\":2,\"remediated_groups\":1,\"special_remediations\":[]},\"finding_identifiers\":[\"CVE-2023-37920\",\"GHSA-XQR8-7JWR-RHP7\",\"CVE-2024-39689\",\"GHSA-248V-346W-9CWC\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"certifi\"],\"summary\":{\"fixed\":1,\"follow_up\":0,\"total_findings\":2,\"total_groups\":1}}"
     ],
     "expected_tools": [],
     "offline_fixture": {
@@ -1451,6 +1957,26 @@
             "GHSA-XQR8-7JWR-RHP7",
             "CVE-2024-39689",
             "GHSA-248V-346W-9CWC"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2023-37920",
+              "ghsa_id": "GHSA-XQR8-7JWR-RHP7",
+              "package_name": "certifi",
+              "package_version": "2022.12.7",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            },
+            {
+              "cve_id": "CVE-2024-39689",
+              "ghsa_id": "GHSA-248V-346W-9CWC",
+              "package_name": "certifi",
+              "package_version": "2022.12.7",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         },
         {
@@ -1461,6 +1987,17 @@
           "finding_ids": [
             "CVE-2023-30608",
             "GHSA-RRM6-WVJ7-CWH2"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2023-30608",
+              "ghsa_id": "GHSA-RRM6-WVJ7-CWH2",
+              "package_name": "sqlparse",
+              "package_version": "0.3.1",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         }
       ],
@@ -1544,7 +2081,7 @@
         "teardown_node: incremental scans detected 17 new identifier(s)"
       ]
     },
-    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2023-37920\", \"GHSA-XQR8-7JWR-RHP7\", \"CVE-2024-39689\", \"GHSA-248V-346W-9CWC\", \"CVE-2023-30608\", \"GHSA-RRM6-WVJ7-CWH2\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [\"certifi\", \"sqlparse\"], \"summary\": {\"fixed\": 2, \"follow_up\": 0, \"total_findings\": 3, \"total_groups\": 2}}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"executive_summary\": {\"follow_up_findings\": 0, \"follow_up_groups\": 0, \"new_findings\": 0, \"new_groups\": 0, \"original_findings\": 3, \"original_groups\": 2, \"remediated_findings\": 3, \"remediated_groups\": 2, \"special_remediations\": []}, \"finding_identifiers\": [\"CVE-2023-37920\", \"GHSA-XQR8-7JWR-RHP7\", \"CVE-2024-39689\", \"GHSA-248V-346W-9CWC\", \"CVE-2023-30608\", \"GHSA-RRM6-WVJ7-CWH2\"], \"follow_up_packages\": [], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v4\", \"successful_packages\": [\"certifi\", \"sqlparse\"], \"summary\": {\"fixed\": 2, \"follow_up\": 0, \"total_findings\": 3, \"total_groups\": 2}}",
     "expected_contract": {
       "summary": {
         "fixed": 2,
@@ -1569,13 +2106,25 @@
       "required_fragments": [
         "No follow-up actions are required."
       ],
-      "forbidden_fragments": []
+      "forbidden_fragments": [],
+      "executive_summary": {
+        "original_findings": 3,
+        "original_groups": 2,
+        "remediated_findings": 3,
+        "remediated_groups": 2,
+        "follow_up_findings": 0,
+        "follow_up_groups": 0,
+        "new_findings": 0,
+        "new_groups": 0,
+        "special_remediations": []
+      }
     },
     "eval_type": "report",
     "input": "Render an evidence-backed remediation report for python-report-atomic-batch-success-with-warning.",
     "context": [
       "The atomic requirements action passed QA for both tasks; the final incremental scan warning remains separately reportable.",
-      "The final incremental scan is non-authoritative and may report unrelated new identifiers."
+      "The final incremental scan is non-authoritative and may report unrelated new identifiers.",
+      "Current report contract:\n{\"code_detail_diff_paths\":[],\"executive_summary\":{\"follow_up_findings\":0,\"follow_up_groups\":0,\"new_findings\":0,\"new_groups\":0,\"original_findings\":3,\"original_groups\":2,\"remediated_findings\":3,\"remediated_groups\":2,\"special_remediations\":[]},\"finding_identifiers\":[\"CVE-2023-37920\",\"GHSA-XQR8-7JWR-RHP7\",\"CVE-2024-39689\",\"GHSA-248V-346W-9CWC\",\"CVE-2023-30608\",\"GHSA-RRM6-WVJ7-CWH2\"],\"follow_up_packages\":[],\"forbidden_code_detail_diff_paths\":[],\"format\":\"remediation_report_v3\",\"successful_packages\":[\"certifi\",\"sqlparse\"],\"summary\":{\"fixed\":2,\"follow_up\":0,\"total_findings\":3,\"total_groups\":2}}"
     ],
     "expected_tools": [],
     "offline_fixture": {
@@ -1637,6 +2186,52 @@
             "GHSA-993G-76C3-P5M4",
             "GHSA-FHV5-28VV-H8M8",
             "GHSA-XGMM-8J9V-C9WX"
+          ],
+          "issues": [
+            {
+              "cve_id": "CVE-2026-32597",
+              "ghsa_id": "GHSA-752W-5FWX-JX9F",
+              "package_name": "pyjwt",
+              "package_version": "2.4.0",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            },
+            {
+              "cve_id": "CVE-2026-48522",
+              "ghsa_id": "GHSA-993G-76C3-P5M4",
+              "package_name": "pyjwt",
+              "package_version": "2.4.0",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            },
+            {
+              "cve_id": "CVE-2026-48524",
+              "ghsa_id": "GHSA-FHV5-28VV-H8M8",
+              "package_name": "pyjwt",
+              "package_version": "2.4.0",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            },
+            {
+              "cve_id": "CVE-2026-48526",
+              "ghsa_id": "GHSA-XGMM-8J9V-C9WX",
+              "package_name": "pyjwt",
+              "package_version": "2.4.0",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            },
+            {
+              "cve_id": "CVE-2025-45770",
+              "package_name": "pyjwt",
+              "package_version": "2.4.0",
+              "severity": "high",
+              "file_path": "package.json",
+              "source": "odc"
+            }
           ]
         }
       ],
@@ -1678,7 +2273,7 @@
         "authoritative": false
       }
     },
-    "expected_output": "{\"code_detail_diff_paths\": [], \"finding_identifiers\": [\"CVE-2025-45770\", \"CVE-2026-32597\", \"CVE-2026-48522\", \"CVE-2026-48524\", \"CVE-2026-48526\", \"GHSA-752W-5FWX-JX9F\", \"GHSA-993G-76C3-P5M4\", \"GHSA-FHV5-28VV-H8M8\", \"GHSA-XGMM-8J9V-C9WX\"], \"follow_up_packages\": [\"pyjwt\"], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v2\", \"successful_packages\": [], \"summary\": {\"fixed\": 0, \"follow_up\": 1, \"total_findings\": 5, \"total_groups\": 1}}",
+    "expected_output": "{\"code_detail_diff_paths\": [], \"executive_summary\": {\"follow_up_findings\": 5, \"follow_up_groups\": 1, \"new_findings\": 0, \"new_groups\": 0, \"original_findings\": 5, \"original_groups\": 1, \"remediated_findings\": 0, \"remediated_groups\": 0, \"special_remediations\": []}, \"finding_identifiers\": [\"CVE-2025-45770\", \"CVE-2026-32597\", \"CVE-2026-48522\", \"CVE-2026-48524\", \"CVE-2026-48526\", \"GHSA-752W-5FWX-JX9F\", \"GHSA-993G-76C3-P5M4\", \"GHSA-FHV5-28VV-H8M8\", \"GHSA-XGMM-8J9V-C9WX\"], \"follow_up_packages\": [\"pyjwt\"], \"forbidden_code_detail_diff_paths\": [], \"format\": \"remediation_report_v4\", \"successful_packages\": [], \"summary\": {\"fixed\": 0, \"follow_up\": 1, \"total_findings\": 5, \"total_groups\": 1}}",
     "expected_contract": {
       "summary": {
         "fixed": 0,
@@ -1706,13 +2301,25 @@
         "Incremental",
         "follow-up"
       ],
-      "forbidden_fragments": []
+      "forbidden_fragments": [],
+      "executive_summary": {
+        "original_findings": 5,
+        "original_groups": 1,
+        "remediated_findings": 0,
+        "remediated_groups": 0,
+        "follow_up_findings": 5,
+        "follow_up_groups": 1,
+        "new_findings": 0,
+        "new_groups": 0,
+        "special_remediations": []
+      }
     },
     "eval_type": "report",
     "input": "Render an evidence-backed remediation report for python-report-pyjwt-follow-up.",
     "context": [
       "PyJWT update did not clear all target identifiers and the later workaround did not pass validation; final status was unfixable.",
-      "The final incremental scan is non-authoritative and may report unrelated new identifiers."
+      "The final incremental scan is non-authoritative and may report unrelated new identifiers.",
+      "Current report contract:\n{\"code_detail_diff_paths\":[],\"executive_summary\":{\"follow_up_findings\":5,\"follow_up_groups\":1,\"new_findings\":0,\"new_groups\":0,\"original_findings\":5,\"original_groups\":1,\"remediated_findings\":0,\"remediated_groups\":0,\"special_remediations\":[]},\"finding_identifiers\":[\"CVE-2025-45770\",\"CVE-2026-32597\",\"CVE-2026-48522\",\"CVE-2026-48524\",\"CVE-2026-48526\",\"GHSA-752W-5FWX-JX9F\",\"GHSA-993G-76C3-P5M4\",\"GHSA-FHV5-28VV-H8M8\",\"GHSA-XGMM-8J9V-C9WX\"],\"follow_up_packages\":[\"pyjwt\"],\"forbidden_code_detail_diff_paths\":[],\"format\":\"remediation_report_v3\",\"successful_packages\":[],\"summary\":{\"fixed\":0,\"follow_up\":1,\"total_findings\":5,\"total_groups\":1}}"
     ],
     "expected_tools": [],
     "offline_fixture": {

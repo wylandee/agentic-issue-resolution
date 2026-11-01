@@ -4,7 +4,7 @@ The evaluation suites live under `tests/evals/`. They combine deterministic cont
 
 | Dataset | Cases | Consumer |
 | --- | ---: | --- |
-| `tests/evals/golden/report_cases.json` | 13 | `test_report_eval.py` |
+| `tests/evals/golden/report_cases.json` | 14 | `test_report_eval.py` |
 | `tests/evals/golden/triage_cases.json` | 20 | `test_triage_eval.py` |
 | `tests/evals/golden/fix_planner_cases.json` | 18 | `test_fix_planner_eval.py` |
 | `tests/evals/golden/update_subagent_cases.json` | 22 | `test_update_subagent_eval.py` |
@@ -132,7 +132,7 @@ Each historical case links its source trajectory under `historical_evidence`. Ca
 
 Python replay cases set `replay.input.project_language` to `python`, use PyPI findings and `requirements.txt`, and preserve task-scoped QA evidence. The in-memory replay boundary handles pip and Python validation commands; it does not add Python metadata to existing Node.js cases. The evidence map and each golden's `historical_evidence` distinguish task-level QA success from an overall run that still reports incremental scan findings.
 
-Report cases expand compact evidence into task queue, attempt, QA, patch, and diff state, then call the production `generate_report()` renderer. Supervisor decisions and report rendering are deterministic; they are checked as typed/state contracts rather than judged as LLM behavior.
+Report cases expand compact evidence into task queue, attempt, QA, patch, and diff state, then call the production `generate_report()` renderer. Offline mode uses the evidence-derived summary fallback and checks fixture-authored count pairs, scanner-ID alias relationships, special remediation outcomes, and the report contract without model calls. Supervisor decisions and report facts remain deterministic.
 
 ## Suites and implemented metric scope
 
@@ -146,14 +146,18 @@ These tests are deterministic and do not invoke a model judge.
 
 ### Report (`test_report_eval.py`)
 
-The 13 cases render deterministic Markdown from typed remediation evidence and validate counts, package/task identity and transitions, failed-attempt versions/outcomes, changed-file and diff evidence, successful versus follow-up sections, and forbidden unsupported claims. In live mode, the same rendered report is scored with exactly these four DeepEval metrics; their scores and reasons are diagnostic, while deterministic contract assertions remain the pass/fail gate:
+The 14 cases validate the Executive Summary, package/task identity and transitions, failed-attempt versions/outcomes, changed-file and diff evidence, successful versus follow-up sections, and forbidden unsupported claims. The first report section uses connected natural-language prose without category labels followed by colons, bolds numeric figures, and includes original, accepted-remediation, follow-up, and new finding/group counts plus evidence-backed special actions. Golden expectations are authored independently of the production summary projection; scanner aliases are represented together on explicit issue records so the fixture exercises canonical deduplication.
 
-- `HallucinationMetric`, threshold `0.30`;
+In live mode, each case first calls the production Executive Summary generation boundary with the configured report model, validates the generated report against the deterministic fixture contract, then scores the whole report with exactly these four DeepEval metrics. A usable `OPENAI_API_KEY` and configured report model are required in addition to the live judge configuration. The structured response supplies one clause per fact enum in the required order. Each clause selects a short, natural, fact-specific sentence lead-in from the schema's closed set of choices; new-count choices adapt to scan scope and complete, partial, or unknown evidence. Counts, identities, claims, category labels, colons, and Markdown cannot be authored in lead-ins; special-remediation wording is renderer-owned and receives an empty lead-in. The renderer inserts all counts, identities, outcomes, details, and scan limits, scopes incremental-scan counts to dependency inputs, and bolds numeric counts. If the first draft omits, repeats, or reorders a required fact reference, or selects a lead-in that does not match its fact/evidence, the boundary makes at most one repair call; only a validated model response counts as generated. Judge source evidence is built from fixture-authored facts and identifies canonical CVE/GHSA alias counting, absent final scans as unknown coverage/counts, no-special-action cases, dependency sections and package lineage, and attempt IDs with outcomes. Generation status and source fingerprint are recorded in pytest metadata and both judge cases; the persistence adapter reads the legacy `additional_metadata` field and the current serialized-case `metadata` field. A fallback still runs the judges, then fails the item's live-generation coverage check so a live run cannot silently evaluate deterministic fallback prose. Metric scores and reasons remain diagnostic; deterministic contract assertions and actual-generation coverage are the pass/fail gates:
+
+- `HallucinationMetric`, threshold `0.70` (DeepEval 4's pass direction, preserving the prior maximum hallucination score of `0.30`);
 - `FaithfulnessMetric`, threshold `0.85`;
 - `SummarizationMetric`, threshold `0.80`;
-- `GEval` named `Report Constraint Adherence`, threshold `0.70`.
+- `Report Constraint Adherence`, threshold `0.70`.
 
-Offline mode runs the deterministic report contract only; live mode adds persisted, non-gating metric diagnostics.
+The report's run-duration and token-total rows are captured before the separate summary-generation call. They describe the remediation run and its recorded agent usage; they exclude summary-generation latency/tokens and subsequent eval-judge usage. Offline mode makes no model call; live mode adds persisted, non-gating metric diagnostics plus a required summary-generation status.
+
+Latest natural-prose validation run `run_20261031_040009_6ca027` (`llm-executive-summary-natural-prose-report-final-scoped`) completed **34/34 pytest items passed**. All **14/14** report summaries were model-generated, with no fallback errors, and all **56** metric records were persisted. The metric means were 0.9889 Faithfulness (0/14 below 0.85), 0.4286 Hallucination (8/14 below 0.70), 0.8629 Constraint Adherence (0/14 below 0.70), and 0.7894 Summarization (6/14 below 0.80). Scores remain diagnostic; generation coverage and deterministic report contracts gate the live suite. The associated live E2E golden run `run_20261031_014146_911066` (`llm-executive-summary-natural-prose-e2e-verified`) completed **47/47 pytest items passed**, including all ten goldens. Its Task Completion mean was 0.806 (2/10 below 0.70) and System Safety/Contract Adherence mean was 0.854 (1/10 below 0.70); judge scores remain diagnostic. Source evidence and metadata persistence details are described above and documented with the run results in `docs/llm-executive-summary-implementation-plan.md`.
 
 ### Triage (`test_triage_eval.py`)
 

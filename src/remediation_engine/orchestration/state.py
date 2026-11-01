@@ -589,6 +589,7 @@ class OrchestratorState(TypedDict, total=False):
     report_path: str | None
     report_status: str
     report_error: str | None
+    report_summary_metadata: dict[str, Any] | None
     errors: Annotated[list[str], operator.add]
 
 
@@ -746,6 +747,7 @@ def initial_orchestrator_state(
         "report_path": None,
         "report_status": "pending",
         "report_error": None,
+        "report_summary_metadata": None,
         "errors": [],
     }
     if issues is not None:

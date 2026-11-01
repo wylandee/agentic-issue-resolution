@@ -3,14 +3,14 @@
 The graph node renders the state available after teardown and before the graph
 exits. The orchestrator finalizes and persists that report before returning a
 typed result. Report facts, statuses, findings, and file changes are derived
-deterministically; no model-authored prose or error telemetry is included.
+deterministically; only the validated executive-summary narrative is model-authored.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ from typing import Any
 from remediation_engine.contracts.schemas import VulnerabilityGroup, VulnerabilityIssue
 from remediation_engine.settings import AppSettings
 
+from .issue_identity import canonical_issue_components, finding_occurrence_key
 from .report_context import (
     _KNOWN_ERROR_CODES,
     _KNOWN_ERROR_SOURCES,
@@ -75,6 +76,14 @@ from .report_diff import (
     _unified_diff_blocks,
 )
 from .report_persistence import report_filename, resolve_report_dir, write_report_atomic
+from .report_summary import (
+    ExecutiveSummaryEvidence,
+    ExecutiveSummaryResult,
+    SpecialRemediation,
+    SummaryCount,
+    fallback_executive_summary,
+    generate_executive_summary,
+)
 from .runtime_context import get_runtime_settings
 from .state import OrchestratorState
 from .task_utils import effective_group_status, task_group_lineage, terminal_outcome_issues
@@ -2256,20 +2265,586 @@ def _scan_coverage_label(context: ReportContext) -> str:
     return "Unavailable"
 
 
-def _render_summary(context: ReportContext) -> str:
-    """Render the run summary, including dependency scan scope and coverage."""
-    unique_statuses = _unique_vulnerability_statuses_by_group(context)
-    fixed = sum(status == "qa_passed" for status in unique_statuses.values())
+def _summary_group_statuses(context: ReportContext) -> dict[str, str]:
+    """Return the authoritative unique-group status projection for the summary."""
+    return _unique_vulnerability_statuses_by_group(context)
+
+
+def _finding_component_key(component: Sequence[Any], index: int) -> tuple[Any, ...]:
+    """Build a stable key for one canonical package-occurrence finding."""
+    issue = component[0] if component else {}
+    occurrence = finding_occurrence_key(issue)
+    identifiers = tuple(
+        sorted({value.casefold() for item in component for value in _issue_identifiers(item)})
+    )
+    if identifiers:
+        return (*occurrence, *identifiers)
+    issue_ids = tuple(
+        sorted(
+            _text(_value(item, "id")).casefold()
+            for item in component
+            if _text(_value(item, "id")).strip()
+        )
+    )
+    return (*occurrence, *(issue_ids or (f"anonymous-{index}",)))
+
+
+def _summary_group_issues(group: _ReportGroup) -> list[Any]:
+    """Return issue evidence from a group or one unambiguous group identifier."""
+    issues = _items(_value(group, "issues"))
+    if issues:
+        return issues
+    localized = [
+        issue
+        for item in _items(_value(group, "localized_issues"))
+        if (issue := _value(item, "issue")) is not None
+    ]
+    if localized:
+        return localized
+    identifiers = _unique_texts(
+        value
+        for field_name in ("cve_ids", "ghsa_ids", "finding_ids", "rule_ids", "identifiers")
+        for value in _items(_value(group, field_name))
+        if _text(value).strip()
+    )
+    if len(identifiers) != 1:
+        return []
+    representative = _group_issue(group)
+    return [
+        {
+            "finding_id": identifiers[0],
+            "package_name": _group_finding_package(group),
+            "package_version": _text(_value(representative, "package_version")),
+            "file_path": _text(_value(representative, "file_path") or _value(group, "file_path")),
+        }
+    ]
+
+
+def _summary_finding_components(
+    context: ReportContext,
+) -> tuple[dict[tuple[Any, ...], set[str]], set[str]]:
+    """Map canonical findings to their report groups.
+
+    Args:
+        context: Normalized final state used by the report renderer.
+
+    Returns:
+        A mapping from each canonical finding component to its report-group
+        identities, plus group identities whose finding records are missing or
+        incomplete. An empty component is not treated as evidence of zero
+        findings when the group projection lacks issue identities.
+    """
+    discovered_ids = set(_discovered_group_ids(context))
+    group_memberships: dict[int, set[str]] = {}
+    missing_groups: set[str] = set()
+    issue_records: list[Any] = []
+    for group in _report_groups(context):
+        raw_id = _text(_value(group, "group_id"))
+        if not raw_id:
+            continue
+        group_id = _report_group_identity(context, raw_id, discovered_ids)
+        issues = _summary_group_issues(group)
+        if not issues:
+            missing_groups.add(group_id)
+            continue
+        for issue in issues:
+            issue_records.append(issue)
+            group_memberships.setdefault(id(issue), set()).add(group_id)
+
+    # The follow-up projection can contain task-backed placeholders with no
+    # corresponding VulnerabilityGroup. Preserve the missing identity as an
+    # uncertainty instead of silently counting it as zero findings.
+    represented_group_ids = set().union(*group_memberships.values()) if group_memberships else set()
+    for group_id, _group in _follow_up_groups(context):
+        if group_id not in represented_group_ids:
+            missing_groups.add(group_id)
+
+    findings: dict[tuple[Any, ...], set[str]] = {}
+    for index, component in enumerate(canonical_issue_components(issue_records)):
+        key = _finding_component_key(component, index)
+        findings.setdefault(key, set()).update(
+            group_id for issue in component for group_id in group_memberships.get(id(issue), set())
+        )
+    return findings, missing_groups
+
+
+def _new_group_ids(context: ReportContext) -> tuple[set[str], bool]:
+    """Identify distinct, retained root groups discovered after baseline triage.
+
+    Args:
+        context: Normalized final report state, including accepted scan,
+            reconciliation, task, and group records.
+
+    Returns:
+        A pair containing established new root group IDs and whether the
+        available scan and reconciliation evidence is complete. Reopened
+        baseline groups, pivot children, synthetic coordination tasks, and
+        unproven reappeared groups are excluded; a retained root task can prove
+        that a group first discovered after baseline remains a new discovery.
+    """
+    reconciliation = context.triage_reconciliation
+    added_ids = set(_reconciliation_ids(reconciliation, "added", "new_group_ids"))
+    reappeared_ids = set(_reconciliation_ids(reconciliation, "reappeared", "reappeared_group_ids"))
+    initial_ids = {_text(_value(group, "group_id")) for group in context.initial_valid_groups}
+    represented_ids = {_text(_value(group, "group_id")) for group in _report_groups(context)} | {
+        _text(_value(task, "parent_group_id"))
+        for task in context.task_queue.values()
+        if not bool(_value(task, "is_synthetic"))
+    }
+    # The graph retains root tasks/groups after triage_reconciliation is
+    # replaced by a later round (or cleared by a no-op scan). Those records
+    # preserve accepted historical discoveries across the whole run.
+    retained_root_ids = {
+        group_id
+        for group_id in represented_ids
+        if group_id
+        and group_id not in initial_ids
+        and _lineage_root_group_id(context, group_id) == group_id
+    }
+    # A reappeared ID with a retained root task absent from the baseline is a
+    # rediscovered historical new group. Keep its one group count. A
+    # reappeared ID without that proof remains excluded conservatively.
+    unproven_reappeared_ids = reappeared_ids - retained_root_ids
+    established = {
+        group_id
+        for group_id in (added_ids | retained_root_ids) - unproven_reappeared_ids - initial_ids
+        if group_id in represented_ids and _lineage_root_group_id(context, group_id) == group_id
+    }
+    scan_usable = context.scan_evidence_state in {
+        "complete",
+        "incremental_complete",
+        "incremental_incomplete",
+    }
+    complete = (
+        scan_usable and not context.triage_required and not context.group_reconciliation_incomplete
+    )
+    return established, complete
+
+
+def _component_identity_matches(
+    left: Sequence[Any],
+    right: Sequence[Any],
+) -> bool:
+    """Match two observations only when occurrence and a scanner alias agree."""
+    if not left or not right:
+        return False
+    if finding_occurrence_key(left[0]) != finding_occurrence_key(right[0]):
+        return False
+    left_ids = {value.casefold() for item in left for value in _issue_identifiers(item)}
+    right_ids = {value.casefold() for item in right for value in _issue_identifiers(item)}
+    return bool(left_ids & right_ids)
+
+
+def _new_finding_count(context: ReportContext) -> SummaryCount:
+    """Count canonical findings established by accepted post-baseline evidence.
+
+    Args:
+        context: Normalized final report state with baseline issues, accepted
+            scan observations, and any retained post-scan triage groups.
+
+    Returns:
+        A canonical finding count with scope, provenance, and completeness.
+        Missing scan identity coverage or group issue evidence produces a
+        partial or unknown count rather than a fabricated zero. Finding
+        identity uses the repository's occurrence-aware CVE/GHSA alias rules.
+    """
+    if context.scan_evidence_state not in {
+        "complete",
+        "incremental_complete",
+        "incremental_incomplete",
+    } and not _reconciliation_ids(context.triage_reconciliation, "added", "new_group_ids"):
+        return SummaryCount(None, scope="accepted scan evidence unavailable")
+
+    baseline_issues = context.issues
+    baseline_components = canonical_issue_components(baseline_issues)
+    new_ids = {identifier.casefold() for identifier in context.new_vulnerability_identifiers}
+    candidate_issues: list[Any] = []
+    scan_issues = context.post_remediation_scan_issues
+    represented_new_ids: set[str] = set()
+    if new_ids:
+        matching_scan_issues = [
+            issue
+            for issue in scan_issues
+            if new_ids.intersection(value.casefold() for value in _issue_identifiers(issue))
+        ]
+        candidate_issues.extend(matching_scan_issues)
+        represented_new_ids.update(
+            value.casefold()
+            for issue in matching_scan_issues
+            for value in _issue_identifiers(issue)
+        )
+
+    discovered, _complete_groups = _new_group_ids(context)
+    for group in _report_groups(context):
+        raw_id = _text(_value(group, "group_id"))
+        if raw_id in discovered:
+            group_issues = _summary_group_issues(group)
+            candidate_issues.extend(group_issues)
+            represented_new_ids.update(
+                value.casefold() for issue in group_issues for value in _issue_identifiers(issue)
+            )
+
+    missing_scan_details = bool(new_ids - represented_new_ids)
+    groups_by_id = {
+        _text(_value(group, "group_id")): group
+        for group in _report_groups(context)
+        if _text(_value(group, "group_id"))
+    }
+    missing_group_details = any(
+        group_id not in groups_by_id or not _summary_group_issues(groups_by_id[group_id])
+        for group_id in discovered
+    )
+    # Accepted scan identifiers remain sufficient finding identities even
+    # when a later triage round dropped group issue details. A retained new
+    # group with no scan identifiers still leaves the finding count unknown.
+    missing_group_details = missing_group_details and not new_ids
+
+    candidate_components = canonical_issue_components(candidate_issues)
+    new_components = [
+        component
+        for component in candidate_components
+        if not any(
+            _component_identity_matches(component, baseline) for baseline in baseline_components
+        )
+    ]
+    if (missing_scan_details or missing_group_details) and not candidate_issues:
+        return SummaryCount(
+            None,
+            complete=False,
+            scope=context.scan_coverage_scope,
+            source_refs=("new_vulnerability_identifiers",),
+        )
+    complete = context.scan_evidence_state in {"complete", "incremental_complete"}
+    if (
+        context.triage_required
+        or context.scan_evidence_state == "incremental_incomplete"
+        or missing_scan_details
+        or missing_group_details
+    ):
+        complete = False
+    return SummaryCount(
+        len(new_components),
+        complete=complete,
+        scope=context.scan_coverage_scope,
+        source_refs=(
+            "final_full_scan_result.new_identifiers",
+            "triage_reconciliation.new_group_ids",
+        ),
+    )
+
+
+def _special_remediation_evidence(context: ReportContext) -> tuple[SpecialRemediation, ...]:
+    """Project notable special actions from current attempts and retained changes.
+
+    Args:
+        context: Normalized final report state, including committed attempts,
+            QA outcomes, group status, and final diff evidence.
+
+    Returns:
+        Special remediation records for code workarounds, API migrations, or
+        package removals. Each outcome distinguishes accepted current QA,
+        failed or unavailable QA, and QA that no longer has retained current
+        patch support; worker prose alone never establishes success.
+    """
+    discovered_ids = set(_discovered_group_ids(context))
+    statuses = _summary_group_statuses(context)
+    evidence: list[SpecialRemediation] = []
+    seen: set[tuple[str, str]] = set()
+    for group in _report_groups(context):
+        raw_group_id = _text(_value(group, "group_id"))
+        if not raw_group_id:
+            continue
+        group_id = _report_group_identity(context, raw_group_id, discovered_ids)
+        group_status = statuses.get(group_id, _report_group_status(context, group_id))
+        for summary, metadata in _attempt_records_for_group(context, raw_group_id):
+            attempt_id = _text(_value(summary, "attempt_id")) or _text(
+                _value(metadata, "attempt_id")
+            )
+            key = (attempt_id or _attempt_summary_key(summary, metadata), group_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            attempt_kind = _attempt_kind(context, raw_group_id, summary, metadata)
+            candidates = _attempt_evidence_candidates(context, summary, metadata)
+            migration = any(
+                "migration_code_workaround" in _text(_value(candidate, field_name)).casefold()
+                or "major-version migration" in _text(_value(candidate, field_name)).casefold()
+                or "api migration" in _text(_value(candidate, field_name)).casefold()
+                for candidate in candidates
+                for field_name in ("qa_policy", "strategy_stage", "instruction", "no_fix_stage")
+            )
+            package_removal = _is_package_removal_attempt(context, raw_group_id, summary, metadata)
+            files, explicit_no_files = _attempt_files(
+                context,
+                raw_group_id,
+                summary,
+                metadata,
+                attempt_id=attempt_id,
+            )
+            source_blocks = _final_attempt_diff_blocks(context, summary, metadata, files)
+            source_paths = sorted(_diff_block_paths(source_blocks))
+            if package_removal and source_paths:
+                kind = "package removal with source edits"
+            elif migration and source_paths:
+                kind = "API migration"
+            elif attempt_kind == "Code Workaround":
+                kind = "code workaround"
+            elif migration:
+                kind = "API migration"
+            elif package_removal and files:
+                kind = "package removal"
+            else:
+                continue
+
+            qa_verdict = _attempt_qa_verdict(context, summary, metadata)
+            task_id = _text(_value(summary, "task_id")) or _text(_value(metadata, "task_id"))
+            task = context.task_queue.get(task_id)
+            current_attempt = bool(
+                attempt_id
+                and _text(_value(task, "current_attempt_id")) == attempt_id
+                and _text(_value(task, "status")).casefold() == "qa_passed"
+            )
+            successful_projection = _successful_remediation_evidence(
+                context,
+                _report_group_for_id(context, raw_group_id) or group,
+            )
+            projected_source_blocks = successful_projection[3]
+            retained_in_success_projection = bool(source_blocks) and all(
+                block in projected_source_blocks for block in source_blocks
+            )
+            removal = (
+                _attempt_package_removal_text(
+                    context, raw_group_id, summary, metadata, files, explicit_no_files
+                )
+                if package_removal
+                else ""
+            )
+            accepted = (
+                qa_verdict is True
+                and group_status == "qa_passed"
+                and current_attempt
+                and retained_in_success_projection
+                and (not package_removal or bool(removal))
+            )
+            if accepted:
+                outcome = "successfully accepted by final QA"
+                detail = (
+                    "; ".join(_diff_code_change_details("\n".join(source_blocks), source_paths))
+                    or "The accepted attempt is present in the final patch."
+                )
+            elif qa_verdict is True and group_status != "qa_passed":
+                outcome = "previously passed QA but is not successful in the final group state"
+                detail = "Final evidence no longer supports counting this as a current success."
+            elif qa_verdict is False:
+                outcome = "attempted but failed QA"
+                detail = "No successful remediation claim is made."
+            elif qa_verdict is None:
+                outcome = "attempted; QA outcome is unavailable"
+                detail = "No successful remediation claim is made."
+            else:
+                outcome = (
+                    "QA passed for this attempt; a retained current remediation is not established"
+                )
+                detail = "The final report evidence does not establish a retained current change."
+            if package_removal and source_paths and removal and accepted:
+                detail = f"{removal} {'; '.join(_diff_code_change_details(chr(10).join(source_blocks), source_paths))}"
+            source_refs = [f"group:{group_id}"]
+            if attempt_id:
+                source_refs.append(f"attempt:{attempt_id}")
+            source_refs.extend(f"diff:{path}" for path in source_paths)
+            evidence.append(
+                SpecialRemediation(
+                    kind=kind,
+                    package=_attempt_package_name(context, raw_group_id, summary, metadata)
+                    or _group_finding_package(group),
+                    attempt_id=attempt_id or None,
+                    outcome=outcome,
+                    details=detail,
+                    source_refs=tuple(source_refs),
+                )
+            )
+    return tuple(evidence)
+
+
+def _build_executive_summary_evidence(context: ReportContext) -> ExecutiveSummaryEvidence:
+    """Build summary facts from the same normalized evidence as report sections.
+
+    Args:
+        context: Final normalized report context used by the metrics table and
+            detail sections.
+
+    Returns:
+        Typed canonical finding/group counts, evidence-backed special actions,
+        scan scope, and explicit uncertainty. Unavailable identities or
+        incomplete reconciliation remain unknown or partial instead of being
+        converted to zero. The function does not mutate report state.
+    """
+    statuses = _summary_group_statuses(context)
+    fixed_group_ids = {group_id for group_id, status in statuses.items() if status == "qa_passed"}
+    follow_up_group_ids = {
+        group_id
+        for group_id, _group in _follow_up_groups(context)
+        if _report_group_status(context, group_id) in _OUTSTANDING_GROUP_STATUSES
+    }
+    if context.group_reconciliation_incomplete or not context.initial_group_evidence_available:
+        original_group_count = None
+    else:
+        original_group_count = len(
+            {
+                _report_group_identity(
+                    context,
+                    _text(_value(group, "group_id")),
+                    set(_discovered_group_ids(context)),
+                )
+                for group in context.initial_valid_groups
+                if _text(_value(group, "group_id"))
+            }
+        )
+
+    findings_by_group, missing_group_findings = _summary_finding_components(context)
+    if context.issues:
+        original_findings = SummaryCount(
+            len(canonical_issue_components(context.issues)),
+            source_refs=("issues", "initial_valid_groups.issues"),
+        )
+    elif original_group_count == 0:
+        original_findings = SummaryCount(0, source_refs=("initial_valid_groups", "issues"))
+    else:
+        original_findings = SummaryCount(None, scope="baseline finding identities unavailable")
+
+    def count_findings_for_groups(
+        selected_group_ids: set[str],
+        *,
+        only_fully_remediated: bool = False,
+    ) -> SummaryCount:
+        """Count deduplicated finding components associated with selected groups.
+
+        Args:
+            selected_group_ids: Effective report group identities to project.
+            only_fully_remediated: When true, include a shared finding only if
+                every associated group is QA-passed.
+
+        Returns:
+            Finding count with report-projection provenance. Missing group
+            identities produce an unknown value; incomplete reconciliation
+            marks otherwise countable evidence partial.
+        """
+        if not selected_group_ids:
+            return SummaryCount(0, source_refs=("task_queue", "qa_results_by_attempt"))
+        unresolved_source = bool(selected_group_ids & missing_group_findings)
+        selected_components = {
+            key
+            for key, member_groups in findings_by_group.items()
+            if member_groups & selected_group_ids
+            and (
+                not only_fully_remediated
+                or all(statuses.get(member, "unknown") == "qa_passed" for member in member_groups)
+            )
+        }
+        partial = unresolved_source or (
+            context.group_reconciliation_incomplete and bool(selected_group_ids)
+        )
+        return SummaryCount(
+            len(selected_components) if not unresolved_source else None,
+            complete=not partial,
+            scope="findings associated with the report group projection",
+            source_refs=("initial_valid_groups.issues", "valid_groups.issues", "task_queue"),
+        )
+
+    discovered_ids, new_groups_complete = _new_group_ids(context)
+    if (
+        context.scan_evidence_state in {"complete", "incremental_complete"}
+        and not context.triage_required
+    ):
+        new_group_value = len(discovered_ids)
+        new_group_complete = not context.group_reconciliation_incomplete
+    elif context.scan_evidence_state == "incremental_incomplete" or discovered_ids:
+        new_group_value = len(discovered_ids)
+        new_group_complete = False
+    else:
+        new_group_value = None
+        new_group_complete = False
+
+    scan_complete = (
+        True
+        if context.scan_evidence_state in {"complete", "incremental_complete"}
+        else False
+        if context.scan_evidence_state == "incremental_incomplete"
+        else None
+    )
+    evidence_limits: list[str] = []
+    if context.group_reconciliation_incomplete:
+        evidence_limits.append("baseline group reconciliation is incomplete")
+    if missing_group_findings:
+        evidence_limits.append("some report groups do not carry enough issue identity evidence")
+    if context.triage_required:
+        evidence_limits.append("post-scan triage is still required")
+    return ExecutiveSummaryEvidence(
+        original_findings=original_findings,
+        original_groups=SummaryCount(
+            original_group_count,
+            complete=original_group_count is not None,
+            scope="initial triage groups",
+            source_refs=("initial_valid_groups",),
+        ),
+        remediated_findings=count_findings_for_groups(
+            fixed_group_ids,
+            only_fully_remediated=True,
+        ),
+        remediated_groups=SummaryCount(
+            len(fixed_group_ids),
+            source_refs=("task_queue", "qa_results_by_attempt", "final_full_scan_result"),
+        ),
+        follow_up_findings=count_findings_for_groups(follow_up_group_ids),
+        follow_up_groups=SummaryCount(
+            len(follow_up_group_ids),
+            source_refs=("_follow_up_groups", "task_queue", "final_full_scan_result"),
+        ),
+        new_findings=_new_finding_count(context),
+        new_groups=SummaryCount(
+            new_group_value,
+            complete=new_group_complete and new_groups_complete,
+            scope=context.scan_coverage_scope,
+            source_refs=("triage_reconciliation.added", "triage_reconciliation.new_group_ids"),
+        ),
+        special_remediations=_special_remediation_evidence(context),
+        scan_scope=_scan_coverage_label(context),
+        scan_complete=scan_complete,
+        evidence_limits=tuple(evidence_limits),
+    )
+
+
+def _render_summary(
+    context: ReportContext,
+    executive_summary: ExecutiveSummaryResult | None = None,
+) -> str:
+    """Render the Executive Summary, existing metrics table, and scan note.
+
+    Args:
+        context: Normalized report context supplying table values and the
+            fingerprint against which generated prose is checked.
+        executive_summary: Optional model result already generated for this
+            exact evidence snapshot. A stale result is replaced by the
+            deterministic evidence fallback.
+
+    Returns:
+        Markdown for the first report section, metrics table, and any
+        incomplete-scan note. This function does not mutate the context.
+    """
+    group_statuses = _summary_group_statuses(context)
+    fixed = sum(status == "qa_passed" for status in group_statuses.values())
     follow_up = sum(
         _report_group_status(context, group_id) in _OUTSTANDING_GROUP_STATUSES
         for group_id, _ in _follow_up_groups(context)
     )
-    total_vulnerability_groups = len(unique_statuses)
-    actionable = max(total_vulnerability_groups, fixed + follow_up)
-    sentence = (
-        f"**{fixed} of {actionable}** vulnerability groups were successfully remediated. "
-        f"**{follow_up} require follow-up review.**"
-    )
+    total_vulnerability_groups = len(group_statuses)
+    summary_evidence = _build_executive_summary_evidence(context)
+    summary_result = executive_summary or fallback_executive_summary(summary_evidence)
+    if (
+        summary_result.source_fingerprint
+        != fallback_executive_summary(summary_evidence).source_fingerprint
+    ):
+        summary_result = fallback_executive_summary(summary_evidence)
     metrics = [
         ("Run ID", context.run_id),
         ("Total findings (CVEs and GHSAs)", context.canonical_finding_count),
@@ -2298,9 +2873,9 @@ def _render_summary(context: ReportContext) -> str:
         [
             "# Remediation Run Report",
             "",
-            "## 1. Summary",
+            "## 1. Executive Summary",
             "",
-            sentence,
+            summary_result.text,
             "",
             _table(("Metric", "Value"), metrics),
             *(["", coverage_note] if coverage_note else []),
@@ -2656,6 +3231,7 @@ def _render_references(context: ReportContext) -> str:
 def generate_report(
     state: Mapping[str, Any],
     *,
+    executive_summary: ExecutiveSummaryResult | None = None,
     trajectory_path: str | None = None,
     trace_url: str | None = None,
     token_summary: Mapping[str, Any] | None = None,
@@ -2665,6 +3241,9 @@ def generate_report(
 
     Args:
         state: Graph state or a compatible mapping of remediation evidence.
+        executive_summary: Optional summary generated from the same report
+            evidence. Stale or nonmatching summary inputs use the deterministic
+            evidence fallback.
         trajectory_path: Optional exported trajectory reference.
         trace_url: Optional LangSmith trace reference.
         token_summary: Optional prompt/completion token totals.
@@ -2681,17 +3260,20 @@ def generate_report(
         token_summary=token_summary,
         run_ended_at=run_ended_at,
     )
-    return _render_report_context(context)
+    return _render_report_context(context, executive_summary)
 
 
-def _render_report_context(context: ReportContext) -> str:
+def _render_report_context(
+    context: ReportContext,
+    executive_summary: ExecutiveSummaryResult | None = None,
+) -> str:
     """Render a report from one already-built evidence context."""
     sections = [
         _render_follow_up_actions(context),
         _render_successful_remediations(context),
         _render_references(context),
     ]
-    return _render_summary(context) + "\n\n" + "\n\n".join(sections) + "\n"
+    return _render_summary(context, executive_summary) + "\n\n" + "\n\n".join(sections) + "\n"
 
 
 def _resolve_report_dir(settings: AppSettings | None = None) -> Path:
@@ -2721,11 +3303,16 @@ def run_report_node(state: OrchestratorState) -> OrchestratorState:
         preserving the remediation graph's failure isolation.
     """
     try:
+        context = _build_context(state)
+        summary_status = fallback_executive_summary(
+            _build_executive_summary_evidence(context)
+        ).metadata()
         return {
             "report_markdown": generate_report(state),
             "report_path": None,
             "report_status": "rendered",
             "report_error": None,
+            "report_summary_metadata": summary_status,
         }
     except Exception as exc:  # noqa: BLE001 - reporting must not mask remediation
         log.exception("report_node: deterministic rendering failed")
@@ -2734,6 +3321,7 @@ def run_report_node(state: OrchestratorState) -> OrchestratorState:
             "report_path": None,
             "report_status": "failed",
             "report_error": str(exc),
+            "report_summary_metadata": {"status": "fallback_render_failure", "error": str(exc)},
             "errors": [f"report_node: failed to render report: {exc}"],
         }
 
@@ -2745,6 +3333,7 @@ def finalize_report(
     trajectory_path: str | None,
     trace_url: str | None,
     settings: AppSettings | None = None,
+    summary_metadata: MutableMapping[str, Any] | None = None,
 ) -> tuple[str, Path | None]:
     """Render and atomically persist the final report.
 
@@ -2755,14 +3344,20 @@ def finalize_report(
         trace_url: Remote trace URL, when available.
         settings: Optional validated settings for report persistence and the
             report directory.
+        summary_metadata: Optional mutable mapping populated with report-only
+            model status, source fingerprint, and any generation error.
 
     Returns:
         A tuple containing Markdown and the canonical path. The path is
         ``None`` if persistence fails; the Markdown remains available.
 
     Side Effects:
-        Writes the canonical Markdown report through an atomic sibling-file
-        replacement.
+        Makes one bounded call to the configured report-summary model when
+        credentials are available, with at most one repair call when required
+        fact references are missing or repeated. Records generation status in
+        ``summary_metadata`` when supplied. Generation failures use an
+        evidence-derived fallback. Writes the canonical Markdown report
+        through an atomic sibling-file replacement.
     """
     token_summary = _extract_token_summary(recorder)
     ended_at = datetime.now(UTC)
@@ -2774,7 +3369,11 @@ def finalize_report(
         token_summary=token_summary,
         run_ended_at=ended_at,
     )
-    markdown = _render_report_context(base_context)
+    summary_evidence = _build_executive_summary_evidence(base_context)
+    summary_result = generate_executive_summary(summary_evidence, settings=settings)
+    if summary_metadata is not None:
+        summary_metadata.update(summary_result.metadata())
+    markdown = _render_report_context(base_context, summary_result)
     try:
         report_dir = _resolve_report_dir(settings)
         path = report_dir / _report_filename(base_context.run_id)

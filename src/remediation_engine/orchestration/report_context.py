@@ -45,6 +45,7 @@ class ReportContext:
     error_strings: list[str]
     error_records: list[ErrorRecord]
     initial_valid_groups: list[Any]
+    initial_group_evidence_available: bool
     final_valid_groups: list[Any]
     issues: list[Any]
     task_queue: dict[str, Any]
@@ -631,7 +632,7 @@ def _build_context(
         for group in _items(state.get("initial_valid_groups"))
         if not bool(_value(group, "is_synthetic"))
     ]
-    if not initial_groups:
+    if not initial_groups and "initial_valid_groups" not in state:
         initial_groups = [
             group
             for group in _items(state.get("valid_groups"))
@@ -805,13 +806,18 @@ def _build_context(
         groups_inconclusive=counts["inconclusive"],
         groups_pending=counts["pending"],
         groups_retriage_discovered=new_group_metrics["discovered"],
-        group_reconciliation_incomplete=bool(issues) and not initial_groups,
+        group_reconciliation_incomplete=(
+            bool(issues)
+            and not initial_groups
+            and state.get("initial_triage_status") != "completed_no_work"
+        ),
         consistency_events=_items(state.get("consistency_events")),
         error_strings=[
             f"{record.source}/{record.code}: {record.message}" for record in error_records
         ],
         error_records=error_records,
         initial_valid_groups=initial_groups,
+        initial_group_evidence_available="initial_valid_groups" in state,
         final_valid_groups=final_groups,
         issues=issues,
         task_queue=task_queue,

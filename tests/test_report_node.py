@@ -66,6 +66,11 @@ def _state() -> dict:
     }
 
 
+def _executive_summary_evidence(state: dict):
+    """Build the final-state summary evidence used by report projections."""
+    return report_node._build_executive_summary_evidence(report_node._build_context(state))
+
+
 def test_generate_report_contains_four_sections_and_final_change_evidence():
     """The canonical report exposes only the user-facing sections and final change."""
     report = generate_report(
@@ -81,7 +86,7 @@ def test_generate_report_contains_four_sections_and_final_change_evidence():
 
     headings = [line for line in report.splitlines() if line.startswith("## ")]
     assert headings == [
-        "## 1. Summary",
+        "## 1. Executive Summary",
         "## 2. Follow up Actions",
         "## 3. Successful Remediations",
         "## 4. References",
@@ -103,6 +108,26 @@ def test_generate_report_contains_four_sections_and_final_change_evidence():
     assert "Targeted remediation" not in report
     assert "Post-remediation security status" not in report
     assert "Re-triage groups discovered" not in report
+
+
+def test_sections_two_through_four_use_the_existing_section_renderers():
+    """The Executive Summary change leaves the detailed report sections intact."""
+    state = _state()
+    context = report_node._build_context(state)
+    report = generate_report(state)
+    section_start = report.index("## 2. Follow up Actions")
+    expected_sections = (
+        "\n\n".join(
+            (
+                report_node._render_follow_up_actions(context),
+                report_node._render_successful_remediations(context),
+                report_node._render_references(context),
+            )
+        )
+        + "\n"
+    )
+
+    assert report[section_start:] == expected_sections
     assert "Targeted QA coverage" not in report
     assert "Patch present" not in report
     assert "## 2. Run Overview" not in report
@@ -168,12 +193,235 @@ def test_non_authoritative_scan_does_not_change_the_four_section_contract():
     report = generate_report(state)
 
     assert [line for line in report.splitlines() if line.startswith("## ")] == [
-        "## 1. Summary",
+        "## 1. Executive Summary",
         "## 2. Follow up Actions",
         "## 3. Successful Remediations",
         "## 4. References",
     ]
     assert "New groups discovered" not in report
+
+
+def test_explicit_empty_baseline_stays_empty_when_final_groups_exist():
+    state = _state()
+    state["initial_valid_groups"] = []
+    state["issues"] = []
+    state["valid_groups"] = [
+        {
+            "group_id": "group-new",
+            "issues": [{"cve_id": "CVE-NEW", "package_name": "new-package"}],
+        }
+    ]
+
+    context = report_node._build_context(state)
+    evidence = report_node._build_executive_summary_evidence(context)
+
+    assert context.initial_valid_groups == []
+    assert evidence.original_groups.value == 0
+    assert evidence.original_findings.value == 0
+
+
+def test_completed_no_work_keeps_known_zero_original_groups_with_issues():
+    state = _state()
+    state.update(
+        {
+            "initial_valid_groups": [],
+            "issues": [
+                {
+                    "cve_id": "CVE-INITIAL",
+                    "package_name": "untriaged-package",
+                    "package_version": "1.0",
+                    "file_path": "package-lock.json",
+                }
+            ],
+            "valid_groups": [],
+            "initial_triage_status": "completed_no_work",
+        }
+    )
+
+    evidence = _executive_summary_evidence(state)
+
+    assert evidence.original_findings.value == 1
+    assert evidence.original_groups.value == 0
+    assert evidence.original_groups.complete
+
+
+def test_historical_new_group_survives_later_reappeared_triage_projection():
+    state = _state()
+    new_issue = {
+        "cve_id": "CVE-NEW-HISTORICAL",
+        "package_name": "new-package",
+        "package_version": "1.0",
+        "file_path": "package-lock.json",
+    }
+    state["valid_groups"] = [{"group_id": "group-new", "issues": [new_issue]}]
+    state["task_queue"]["task-new"] = {
+        "task_id": "task-new",
+        "parent_group_id": "group-new",
+        "parent_task_id": None,
+        "status": "qa_passed",
+    }
+    state["triage_reconciliation"] = {
+        "new_group_ids": [],
+        "reappeared_group_ids": ["group-new"],
+    }
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "completed",
+        "coverage_scope": "full_workspace",
+        "coverage_complete": True,
+        "found_issues": [new_issue],
+        "new_identifiers": [],
+    }
+
+    evidence = _executive_summary_evidence(state)
+
+    assert evidence.new_groups.value == 1
+    assert evidence.new_findings.value == 1
+
+
+def test_synthetic_coordination_root_is_not_counted_as_a_new_group():
+    state = _state()
+    state.update(
+        {
+            "initial_valid_groups": [],
+            "valid_groups": [],
+            "issues": [],
+            "task_queue": {
+                "task-coordination": {
+                    "task_id": "task-coordination",
+                    "parent_group_id": "synthetic-coordination-root",
+                    "parent_task_id": None,
+                    "is_synthetic": True,
+                    "status": "qa_passed",
+                }
+            },
+            "initial_triage_status": "completed_no_work",
+            "triage_required": False,
+            "triage_reconciliation": {},
+            "final_full_scan_result": {
+                "completed": True,
+                "authoritative": True,
+                "status": "completed",
+                "coverage_scope": "full_workspace",
+                "coverage_complete": True,
+                "found_issues": [],
+                "new_identifiers": [],
+            },
+        }
+    )
+
+    evidence = _executive_summary_evidence(state)
+
+    assert evidence.new_groups.value == 0
+    assert evidence.new_groups.complete
+    assert evidence.new_findings.value == 0
+    assert evidence.new_findings.complete
+
+
+def test_partial_new_identifier_coverage_returns_partial_finding_count():
+    state = _state()
+    first = {
+        "cve_id": "CVE-NEW-1",
+        "package_name": "new-package",
+        "package_version": "1.0",
+        "file_path": "package-lock.json",
+    }
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "completed",
+        "coverage_scope": "full_workspace",
+        "coverage_complete": True,
+        "found_issues": [first],
+        "new_identifiers": ["CVE-NEW-1", "CVE-NEW-2"],
+    }
+
+    evidence = _executive_summary_evidence(state)
+
+    assert evidence.new_findings.value == 1
+    assert not evidence.new_findings.complete
+
+
+def test_new_fixed_group_without_finding_identity_is_not_reported_as_zero_findings():
+    state = _state()
+    state["task_queue"]["task-new"] = {
+        "task_id": "task-new",
+        "parent_group_id": "group-new",
+        "parent_task_id": None,
+        "status": "qa_passed",
+    }
+    state["triage_reconciliation"] = {"new_group_ids": []}
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "completed",
+        "coverage_scope": "full_workspace",
+        "coverage_complete": True,
+        "found_issues": [],
+        "new_identifiers": [],
+    }
+
+    evidence = _executive_summary_evidence(state)
+
+    assert evidence.new_groups.value == 1
+    assert evidence.new_findings.value is None
+    assert not evidence.new_findings.complete
+
+
+def test_synthetic_follow_up_group_without_issue_identity_is_unknown():
+    state = _state()
+    state["task_queue"]["task-1"]["status"] = "qa_passed"
+    state["task_queue"]["task-open"] = {
+        "task_id": "task-open",
+        "parent_group_id": "group-open",
+        "parent_task_id": None,
+        "status": "needs_retry",
+    }
+
+    evidence = _executive_summary_evidence(state)
+
+    assert evidence.follow_up_groups.value == 1
+    assert evidence.follow_up_findings.value is None
+    assert not evidence.follow_up_findings.complete
+
+
+def test_qa_pass_without_retained_special_patch_is_not_described_as_qa_failure():
+    state = _state()
+    state["task_queue"]["task-1"].update(
+        {
+            "strategy": "CODE_WORKAROUND",
+            "strategy_stage": "code_workaround",
+            "status": "qa_passed",
+            "current_attempt_id": "attempt-1",
+        }
+    )
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "status": "success",
+            "summary": "Completed validated code workaround edits; changed files: src/guard.ts.",
+        }
+    ]
+    state["worker_results_by_attempt"] = {
+        "attempt-1": {
+            "attempt_id": "attempt-1",
+            "task_id": "task-1",
+            "status": "success",
+            "changed_files": ["src/guard.ts"],
+        }
+    }
+    state["qa_results_by_attempt"] = {"attempt-1": {"evaluation": {"passed": True}}}
+    state["diff"] = ""
+
+    evidence = _executive_summary_evidence(state)
+    special = evidence.special_remediations[0]
+
+    assert special.outcome == (
+        "QA passed for this attempt; a retained current remediation is not established"
+    )
+    assert "not accepted by final QA" not in special.outcome
 
 
 def test_incremental_incomplete_report_keeps_known_new_identifiers_visible():
@@ -299,12 +547,15 @@ def test_finalize_report_writes_canonical_report_atomically(tmp_path: Path, monk
         total_prompt_tokens=20,
         total_completion_tokens=7,
     )
+    summary_metadata = {}
 
     markdown, path = finalize_report(
         _state(),
         recorder=recorder,
         trajectory_path="trajectory.md",
         trace_url="https://trace.example/run",
+        settings=AppSettings(openai_api_key="", remediation_report_dir=tmp_path),
+        summary_metadata=summary_metadata,
     )
 
     assert path == tmp_path / "remediation_trace-report-1.md"
@@ -313,6 +564,8 @@ def test_finalize_report_writes_canonical_report_atomically(tmp_path: Path, monk
     assert "27" in markdown
     assert "https://trace.example/run" in markdown
     assert not list(tmp_path.glob("*.tmp"))
+    assert summary_metadata["status"] == "fallback_no_credentials"
+    assert len(summary_metadata["source_fingerprint"]) == 64
 
 
 def test_report_node_converts_rendering_errors_to_new_error(monkeypatch):
