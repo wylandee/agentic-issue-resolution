@@ -260,7 +260,10 @@ class TestSandboxLifecycle:
 
     def test_workspace_initialization_failure_is_transactional(self, tmp_path):
         docker_mod, docker_errors, client, container = _docker_modules()
-        container.exec_run.return_value = (1, b"mkdir failed")
+        container.exec_run.side_effect = [
+            (0, (b"npm pin succeeded", b"")),
+            (1, b"mkdir failed"),
+        ]
 
         with (
             patch.dict(

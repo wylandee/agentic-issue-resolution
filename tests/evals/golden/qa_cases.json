@@ -25,6 +25,31 @@
       "tests_passed": true,
       "package_manifest_state": "present",
       "package_graph_state": "present",
+      "dependency_evidence": {
+        "status": "verified",
+        "target_package": "debug",
+        "expected_version": "1.0.0",
+        "manifest_paths": [
+          "package.json"
+        ],
+        "lockfile_paths": [
+          "package-lock.json"
+        ],
+        "declarations": {
+          "package.json#/dependencies/debug": "1.0.0"
+        },
+        "resolved_versions": [
+          "1.0.0"
+        ],
+        "lockfile_versions": [
+          "1.0.0"
+        ],
+        "evidence_refs": [
+          "package.json#/dependencies/debug",
+          "package-lock.json#resolved/debug"
+        ],
+        "diagnostics": []
+      },
       "requested_scope": "targeted",
       "effective_scope": "targeted",
       "scan_complete": true,
@@ -46,6 +71,7 @@
       "package.json",
       "package-lock.json"
     ],
+    "selected_version": "1.0.0",
     "worker_action_summary": "Updated debug to the committed fixed version and synchronized the lockfile.",
     "expected_qa_verdict": {
       "passed": true,
@@ -124,6 +150,31 @@
             "debug"
           ],
           "closure_lockfile_keys": [],
+          "dependency_evidence": {
+            "status": "verified",
+            "target_package": "debug",
+            "expected_version": "1.0.0",
+            "manifest_paths": [
+              "package.json"
+            ],
+            "lockfile_paths": [
+              "package-lock.json"
+            ],
+            "declarations": {
+              "package.json#/dependencies/debug": "1.0.0"
+            },
+            "resolved_versions": [
+              "1.0.0"
+            ],
+            "lockfile_versions": [
+              "1.0.0"
+            ],
+            "evidence_refs": [
+              "package.json#/dependencies/debug",
+              "package-lock.json#resolved/debug"
+            ],
+            "diagnostics": []
+          },
           "fallback_reason": null
         },
         "execution_logs": {
@@ -132,8 +183,8 @@
           "test_output": "npm test passed."
         },
         "workspace_files": {
-          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{}}\n",
-          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{}}\n",
+          "package.json": "{\"name\":\"eval-qa\",\"version\":\"1.0.0\",\"dependencies\":{\"debug\":\"1.0.0\"}}\n",
+          "package-lock.json": "{\"name\":\"eval-qa\",\"lockfileVersion\":3,\"packages\":{\"\":{\"dependencies\":{\"debug\":\"1.0.0\"}},\"node_modules/debug\":{\"version\":\"1.0.0\"}}}\n",
           "src/eval.ts": "export function evaluate() { return true; }\n",
           "test/eval.test.ts": "describe('eval', () => { it('passes', () => {}); });\n"
         }
@@ -4961,7 +5012,27 @@
         "certifi"
       ],
       "closure_lockfile_keys": [],
-      "fallback_reason": null
+      "fallback_reason": null,
+      "dependency_evidence": {
+        "status": "verified",
+        "target_package": "certifi",
+        "expected_version": "2024.7.4",
+        "manifest_paths": [
+          "requirements.txt"
+        ],
+        "lockfile_paths": [],
+        "declarations": {
+          "requirements.txt#L1": "certifi==2024.7.4"
+        },
+        "resolved_versions": [
+          "2024.7.4"
+        ],
+        "lockfile_versions": [],
+        "evidence_refs": [
+          "requirements.txt#L1"
+        ],
+        "diagnostics": []
+      }
     },
     "execution_logs": {
       "install_log": "pip dependency installation passed.",
@@ -5056,7 +5127,27 @@
             "certifi"
           ],
           "closure_lockfile_keys": [],
-          "fallback_reason": null
+          "fallback_reason": null,
+          "dependency_evidence": {
+            "status": "verified",
+            "target_package": "certifi",
+            "expected_version": "2024.7.4",
+            "manifest_paths": [
+              "requirements.txt"
+            ],
+            "lockfile_paths": [],
+            "declarations": {
+              "requirements.txt#L1": "certifi==2024.7.4"
+            },
+            "resolved_versions": [
+              "2024.7.4"
+            ],
+            "lockfile_versions": [],
+            "evidence_refs": [
+              "requirements.txt#L1"
+            ],
+            "diagnostics": []
+          }
         },
         "execution_logs": {
           "install_log": "pip passed.",
@@ -5126,7 +5217,27 @@
         "sqlparse"
       ],
       "closure_lockfile_keys": [],
-      "fallback_reason": null
+      "fallback_reason": null,
+      "dependency_evidence": {
+        "status": "verified",
+        "target_package": "sqlparse",
+        "expected_version": "0.4.4",
+        "manifest_paths": [
+          "requirements.txt"
+        ],
+        "lockfile_paths": [],
+        "declarations": {
+          "requirements.txt#L1": "sqlparse==0.4.4"
+        },
+        "resolved_versions": [
+          "0.4.4"
+        ],
+        "lockfile_versions": [],
+        "evidence_refs": [
+          "requirements.txt#L1"
+        ],
+        "diagnostics": []
+      }
     },
     "execution_logs": {
       "install_log": "pip dependency installation passed.",
@@ -5223,7 +5334,27 @@
             "sqlparse"
           ],
           "closure_lockfile_keys": [],
-          "fallback_reason": null
+          "fallback_reason": null,
+          "dependency_evidence": {
+            "status": "verified",
+            "target_package": "sqlparse",
+            "expected_version": "0.4.4",
+            "manifest_paths": [
+              "requirements.txt"
+            ],
+            "lockfile_paths": [],
+            "declarations": {
+              "requirements.txt#L1": "sqlparse==0.4.4"
+            },
+            "resolved_versions": [
+              "0.4.4"
+            ],
+            "lockfile_versions": [],
+            "evidence_refs": [
+              "requirements.txt#L1"
+            ],
+            "diagnostics": []
+          }
         },
         "execution_logs": {
           "install_log": "pip passed.",
