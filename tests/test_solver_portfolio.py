@@ -771,6 +771,69 @@ def test_cp_sat_selects_smallest_security_floor_and_deterministic_alternative():
     assert any("CP-SAT raw status" in diagnostic for diagnostic in result.diagnostics)
 
 
+def test_cp_sat_uses_compatible_parent_floor_for_transitive_npm_finding():
+    from remediation_engine.tools.registry_tools import select_npm_parent_version
+
+    parent_selection = select_npm_parent_version(
+        {
+            "versions": {
+                "0.11.0": {"dependencies": {"crypto-js": "^3.0.0"}},
+                "0.12.2": {"dependencies": {"crypto-js": "^4.0.0"}},
+                "0.13.0": {"dependencies": {"crypto-js": "^4.0.0"}},
+            }
+        },
+        parent_package_name="pdfkit",
+        child_package_name="crypto-js",
+        child_fixed_version="4.2.0",
+        installed_parent_version="0.11.0",
+        selection="minimum",
+    )
+    assert parent_selection["selected"] == "0.12.2"
+    assert parent_selection["compatible"] == ["0.12.2", "0.13.0"]
+
+    target = _target("task-parent", "package-lock.json::pdfkit").model_copy(
+        update={
+            "package_name": "crypto-js",
+            "target_package_name": "pdfkit",
+            "lockfile_package_key": "node_modules/pdfkit",
+            "installed_version": "0.11.0",
+            "dependency_ancestry": ["pdfkit", "crypto-js"],
+        }
+    )
+    finding = _finding_for_target(target, "GHSA-TRANSITIVE", "4.2.0").model_copy(
+        update={
+            "coverage_id": "",
+            "vulnerable_occurrence_id": "package-lock.json::crypto-js",
+            "direct_parent_name": "pdfkit",
+            "direct_parent_minimum_version": parent_selection["selected"],
+            "is_transitive": True,
+        }
+    )
+    subgraph = _solver_subgraph(targets=[target], findings=[finding])
+
+    result = solve_portfolio(
+        subgraph,
+        {
+            target.occurrence_id: [
+                SolverVersionCandidate(
+                    version="0.11.0",
+                    source="current",
+                    meets_security_floor=False,
+                ),
+                SolverVersionCandidate(version="0.12.2", source="parent-compatibility"),
+                SolverVersionCandidate(version="0.13.0", source="parent-compatibility"),
+            ]
+        },
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+    )
+
+    assert result.status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
+    assert result.selected_plan is not None
+    decision = result.selected_plan.task_decisions[0]
+    assert decision.selected_version == "0.12.2"
+    assert result.unresolved_finding_ids == []
+
+
 def test_forced_singleton_and_phase_budget_are_preserved():
     left = _target("task-1", "package.json::left").model_copy(
         update={"package_name": "left", "target_package_name": "left", "finding_ids": []}

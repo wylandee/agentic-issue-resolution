@@ -208,6 +208,40 @@ def _at_least(version: str, floor: str | None) -> bool:
     return left is not None and right is not None and left >= right
 
 
+def _finding_security_floor(
+    target: SolverTarget | None,
+    finding: SolverFindingRequirement,
+) -> str | None:
+    """Return the applicable target floor while retaining child-finding evidence.
+
+    npm transitive findings retain the vulnerable child's fixed version in
+    ``fixed_version``. When the authorized mutation target is its direct parent,
+    the compatible parent minimum is the version floor for that target. Python
+    parent targets have no npm lockfile key and keep their adapter's PEP 440
+    candidate evidence; Maven targets retain their native version handling.
+
+    Args:
+        target: Mutation target associated with the finding, if present.
+        finding: Vulnerability requirement whose target-specific floor is needed.
+
+    Returns:
+        The proof-backed parent minimum for a matching npm parent target, or the
+        finding's vulnerable-package fixed version for other targets.
+    """
+    parent_floor = finding.direct_parent_minimum_version
+    if (
+        target is not None
+        and target.version_scheme == "semver"
+        and target.lockfile_package_key
+        and target.package_name.casefold() != target.target_package_name.casefold()
+        and finding.direct_parent_name
+        and finding.direct_parent_name.casefold() == target.target_package_name.casefold()
+        and parent_floor
+    ):
+        return parent_floor
+    return finding.fixed_version
+
+
 def _distance_above(version: str, floor: str | None) -> int:
     """Return a bounded numeric distance above a floor for objective ranking."""
     if not floor:
@@ -453,15 +487,16 @@ def _floor_for_target(
     )
     floors: list[str] = []
     for finding in requirements:
-        if not finding.fixed_version:
+        floor = _finding_security_floor(target, finding)
+        if not floor:
             continue
-        if _version_key(finding.fixed_version) is None:
+        if _version_key(floor) is None:
             _diagnostic(
                 diagnostics,
-                f"invalid security floor {finding.fixed_version!r} for {finding.coverage_id}",
+                f"invalid security floor {floor!r} for {finding.coverage_id}",
             )
             continue
-        floors.append(finding.fixed_version)
+        floors.append(floor)
     if not floors:
         return None
     return max(floors, key=lambda item: _version_key(item) or ())
@@ -1632,6 +1667,7 @@ def solve_portfolio(
 
     diagnostics = list(subgraph.diagnostics)
     targets = sorted(subgraph.targets, key=lambda item: item.occurrence_id)
+    target_by_id = {target.occurrence_id: target for target in targets}
     findings = {finding.coverage_id: finding for finding in subgraph.findings}
     finding_list = sorted(subgraph.findings, key=lambda item: item.coverage_id)
     issue_finding_ids = sorted({finding.finding_id for finding in finding_list})
@@ -1872,9 +1908,13 @@ def solve_portfolio(
             sum(
                 1
                 for candidate in domains.get(finding.target_occurrence_id, ())
-                if finding.fixed_version
+                if (
+                    floor := _finding_security_floor(
+                        target_by_id.get(finding.target_occurrence_id), finding
+                    )
+                )
                 and candidate.meets_security_floor
-                and _at_least(candidate.version, finding.fixed_version)
+                and _at_least(candidate.version, floor)
             )
             for finding in finding_list
         )
@@ -1909,7 +1949,6 @@ def solve_portfolio(
             diagnostics=diagnostics,
         )
 
-    target_by_id = {target.occurrence_id: target for target in targets}
     evidence_by_id = {occurrence.occurrence_id: occurrence for occurrence in subgraph.occurrences}
     vars_by_id: dict[str, Any] = {}
     finding_by_target: dict[str, list[SolverFindingRequirement]] = {}
@@ -2498,23 +2537,23 @@ def solve_portfolio(
         findings_version[finding.coverage_id] = version_bool
         occurrence_var = vars_by_id.get(finding.target_occurrence_id)
         candidates = domains.get(finding.target_occurrence_id, ())
+        target = target_by_id.get(finding.target_occurrence_id)
+        floor = _finding_security_floor(target, finding)
         good_indices: list[int] = []
-        if occurrence_var is not None and finding.fixed_version:
+        if occurrence_var is not None and floor:
             good_indices = [
                 index
                 for index, candidate in enumerate(candidates)
-                if candidate.meets_security_floor
-                and _at_least(candidate.version, finding.fixed_version)
+                if candidate.meets_security_floor and _at_least(candidate.version, floor)
             ]
-        target = target_by_id.get(finding.target_occurrence_id)
         terminal_status = (
             target.terminal_status if target is not None and target.is_terminal else None
         )
         if terminal_status is not None:
             status_quo_covered = (
                 terminal_status == "qa_passed"
-                and finding.fixed_version is not None
-                and _at_least(target.installed_version, finding.fixed_version)
+                and floor is not None
+                and _at_least(target.installed_version, floor)
             )
             model.Add(version_bool == int(status_quo_covered))
         elif occurrence_var is not None and good_indices:
@@ -2546,7 +2585,7 @@ def solve_portfolio(
                 # workaround carries the plan IDs that authorize it.
                 model.Add(workaround == 1)
         model.AddMaxEquality(covered, [version_bool, workaround])
-        coverage_meta[finding.coverage_id] = (good_indices, finding.fixed_version)
+        coverage_meta[finding.coverage_id] = (good_indices, floor)
 
     candidate_literals: dict[str, list[Any]] = {}
     for target in eligible:
