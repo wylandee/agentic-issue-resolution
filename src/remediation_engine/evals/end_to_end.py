@@ -14,6 +14,7 @@ import json
 import math
 import os
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Sequence
@@ -48,6 +49,21 @@ from .trajectories import parse_trajectory_markdown
 
 MAX_JUDGE_INPUT_TOKENS = 80_000
 JUDGE_PROMPT_OVERHEAD_TOKENS = 8_000
+
+_TIKTOKEN_ASSETS: dict[str, tuple[tuple[str, str], ...]] = {
+    "cl100k_base": (
+        (
+            "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken",
+            "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
+        ),
+    ),
+    "o200k_base": (
+        (
+            "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+            "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
+        ),
+    ),
+}
 
 
 def _task_completion_template():
@@ -107,23 +123,83 @@ def _safe(value: Any, secrets: Sequence[str]) -> Any:
     return value
 
 
+def _tiktoken_cache_directory() -> Path | None:
+    """Resolve tiktoken's configured cache directory without enabling downloads.
+
+    Returns:
+        The configured cache directory, or ``None`` when caching is disabled.
+    """
+    if "TIKTOKEN_CACHE_DIR" in os.environ:
+        cache_dir = os.environ["TIKTOKEN_CACHE_DIR"]
+    elif "DATA_GYM_CACHE_DIR" in os.environ:
+        cache_dir = os.environ["DATA_GYM_CACHE_DIR"]
+    else:
+        return Path(tempfile.gettempdir()) / "data-gym-cache"
+    return Path(cache_dir) if cache_dir else None
+
+
+def _tiktoken_asset_is_cached(cache_dir: Path, url: str, expected_hash: str) -> bool:
+    """Return whether one tiktoken cache entry matches its published SHA-256.
+
+    Args:
+        cache_dir: Directory selected by tiktoken's cache configuration.
+        url: Official asset URL used to derive tiktoken's cache filename.
+        expected_hash: Published SHA-256 digest for the asset.
+
+    Returns:
+        Whether the cache file exists and its contents match ``expected_hash``.
+    """
+    cache_path = cache_dir / hashlib.sha1(url.encode()).hexdigest()
+    try:
+        with cache_path.open("rb") as asset:
+            digest = hashlib.file_digest(asset, "sha256").hexdigest()
+    except OSError:
+        return False
+    return digest == expected_hash
+
+
+def _cached_tiktoken_encoding(model: str) -> Any | None:
+    """Load a built-in tokenizer only when all verified assets are already cached.
+
+    Args:
+        model: Judge model name used to select a tiktoken encoding.
+
+    Returns:
+        A cached tiktoken encoding, or ``None`` when it is unavailable offline.
+    """
+    try:
+        import tiktoken
+        from tiktoken.model import encoding_name_for_model
+    except ImportError:
+        return None
+
+    try:
+        encoding_name = encoding_name_for_model(model)
+    except KeyError:
+        encoding_name = "o200k_base"
+
+    cache_dir = _tiktoken_cache_directory()
+    assets = _TIKTOKEN_ASSETS.get(encoding_name)
+    if cache_dir is None or assets is None:
+        return None
+    if not all(
+        _tiktoken_asset_is_cached(cache_dir, url, expected_hash) for url, expected_hash in assets
+    ):
+        return None
+    return tiktoken.get_encoding(encoding_name)
+
+
 def _estimate_judge_input_tokens(value: Any, model: str) -> tuple[int, str]:
     """Estimate serialized evaluator input tokens with a conservative fallback."""
     serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     try:
-        import tiktoken
-
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            encoding = tiktoken.get_encoding("o200k_base")
+        encoding = _cached_tiktoken_encoding(model)
+        if encoding is None:
+            raise LookupError("No verified tokenizer asset is available in the local cache")
         return len(encoding.encode(serialized)), "tiktoken"
-    except ImportError:
-        # UTF-8 byte length is an upper bound on byte-fallback tokenization.
-        return len(serialized.encode("utf-8")), "utf8_bytes_upper_bound"
     except Exception:
-        # Unsupported models and cold tokenizer caches may fail while loading
-        # an encoding. Evaluation sizing must remain usable without network.
+        # Sizing must remain bounded and must not trigger tiktoken's unbounded
+        # network download when a recognized tokenizer asset is not cached.
         return len(serialized.encode("utf-8")), "utf8_bytes_upper_bound"
 
 

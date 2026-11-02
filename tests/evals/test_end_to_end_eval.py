@@ -21,6 +21,8 @@ from remediation_engine.evals.trajectories import parse_trajectory_dict
 from remediation_engine.settings import AppSettings
 from tests.evals.conftest import EvalSettings, record_eval_result
 
+_REAL_CACHED_TIKTOKEN_ENCODING = e2e._cached_tiktoken_encoding
+
 
 @pytest.fixture
 def evidence():
@@ -116,31 +118,25 @@ def deterministic_offline_tokenizer(monkeypatch, request):
     if is_live_eval:
         return
 
-    try:
-        import tiktoken
-    except ImportError:
-        return
-
     class DeterministicEncoding:
         def encode(self, text):
             return list(range(len(text.encode("utf-8"))))
 
     encoding = DeterministicEncoding()
-    monkeypatch.setattr(tiktoken, "encoding_for_model", lambda _model: encoding)
-    monkeypatch.setattr(tiktoken, "get_encoding", lambda _name: encoding)
+    monkeypatch.setattr(e2e, "_cached_tiktoken_encoding", lambda _model: encoding)
 
 
-def test_judge_input_token_estimate_falls_back_when_encoding_is_unavailable(monkeypatch):
+def test_judge_input_token_estimate_does_not_download_missing_encoding(monkeypatch, tmp_path):
     import tiktoken
 
-    def unavailable_model(_model):
-        raise KeyError("unsupported model")
+    monkeypatch.setattr(e2e, "_cached_tiktoken_encoding", _REAL_CACHED_TIKTOKEN_ENCODING)
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("DATA_GYM_CACHE_DIR", raising=False)
 
-    def unavailable_encoding(_name):
-        raise OSError("tokenizer cache is unavailable offline")
+    def download_would_be_unbounded(_name):
+        pytest.fail("estimator attempted to load an uncached tokenizer")
 
-    monkeypatch.setattr(tiktoken, "encoding_for_model", unavailable_model)
-    monkeypatch.setattr(tiktoken, "get_encoding", unavailable_encoding)
+    monkeypatch.setattr(tiktoken, "get_encoding", download_would_be_unbounded)
 
     value = {"content": "Unicode café and package metadata"}
     estimate, method = e2e._estimate_judge_input_tokens(value, "gpt-6-luna")
@@ -148,6 +144,58 @@ def test_judge_input_token_estimate_falls_back_when_encoding_is_unavailable(monk
 
     assert estimate == len(serialized.encode("utf-8"))
     assert method == "utf8_bytes_upper_bound"
+
+
+def test_cached_tiktoken_encoding_uses_only_hash_verified_assets(monkeypatch, tmp_path):
+    import tiktoken
+
+    monkeypatch.setattr(e2e, "_cached_tiktoken_encoding", _REAL_CACHED_TIKTOKEN_ENCODING)
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("DATA_GYM_CACHE_DIR", raising=False)
+    asset_url, _ = e2e._TIKTOKEN_ASSETS["o200k_base"][0]
+    content = b"verified tokenizer test asset"
+    expected_hash = hashlib.sha256(content).hexdigest()
+    monkeypatch.setitem(e2e._TIKTOKEN_ASSETS, "o200k_base", ((asset_url, expected_hash),))
+    cache_path = tmp_path / hashlib.sha1(asset_url.encode()).hexdigest()
+    cache_path.write_bytes(content)
+    encoding = object()
+    calls = []
+
+    def get_encoding(name):
+        calls.append(name)
+        return encoding
+
+    monkeypatch.setattr(tiktoken, "get_encoding", get_encoding)
+
+    assert e2e._cached_tiktoken_encoding("gpt-6-luna") is encoding
+    assert calls == ["o200k_base"]
+
+
+@pytest.mark.parametrize("cache_state", ["corrupt", "disabled"])
+def test_cached_tiktoken_encoding_rejects_corrupt_or_disabled_cache(
+    monkeypatch, tmp_path, cache_state
+):
+    import tiktoken
+
+    monkeypatch.setattr(e2e, "_cached_tiktoken_encoding", _REAL_CACHED_TIKTOKEN_ENCODING)
+    monkeypatch.delenv("DATA_GYM_CACHE_DIR", raising=False)
+    asset_url, _ = e2e._TIKTOKEN_ASSETS["o200k_base"][0]
+    content = b"valid tokenizer test asset"
+    expected_hash = hashlib.sha256(content).hexdigest()
+    monkeypatch.setitem(e2e._TIKTOKEN_ASSETS, "o200k_base", ((asset_url, expected_hash),))
+    cache_path = tmp_path / hashlib.sha1(asset_url.encode()).hexdigest()
+    cache_path.write_bytes(b"corrupt")
+    if cache_state == "disabled":
+        monkeypatch.setenv("TIKTOKEN_CACHE_DIR", "")
+    else:
+        monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path))
+
+    def download_would_be_unbounded(_name):
+        pytest.fail("estimator attempted to load an unverified tokenizer")
+
+    monkeypatch.setattr(tiktoken, "get_encoding", download_would_be_unbounded)
+
+    assert e2e._cached_tiktoken_encoding("gpt-6-luna") is None
 
 
 def test_complete_run_uses_original_goal_and_independent_evidence(evidence):
