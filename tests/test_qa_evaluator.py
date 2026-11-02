@@ -22,8 +22,11 @@ from remediation_engine.contracts.schemas import (
     RoutingStrategy,
     ScratchpadScope,
     SecurityReviewVerdict,
+    TaskAttemptSnapshot,
     TaskStatus,
     TestAttributionVerdict,
+    WorkerAttemptResult,
+    WorkerExecutionDiagnostics,
 )
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration._qa_runtime import (
@@ -195,6 +198,63 @@ def test_dynamic_context_renders_install_and_test_tuple_statuses():
     )
     assert "- Install: FAIL" in failing_context
     assert "- Unit tests: FAIL" in failing_context
+
+
+def test_dynamic_context_uses_committed_instruction_and_allows_authorized_alternative():
+    """QA sees the sealed attempt rule rather than stale group advice."""
+    group = _make_group(group_id="group-a")
+    advisory = group.fix_plan.model_copy(
+        update={
+            "instruction": "Update @angular/platform-browser to 21.2.14.",
+            "fixed_version": "21.2.14",
+        }
+    )
+    group = group.model_copy(
+        update={
+            "vulnerable_component": "@angular/platform-browser",
+            "issues": [
+                issue.model_copy(update={"package_name": "@angular/platform-browser"})
+                for issue in group.issues
+            ],
+            "fix_plan": advisory,
+        }
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-2",
+        task_id="task-a",
+        task_revision=2,
+        selected_version="21.2.17",
+        allowed_target_versions=["21.2.17", "21.2.18"],
+        target_package_name="@angular/platform-browser",
+        target_dependency_type="dependencies",
+        allowed_dependency_types=["dependencies"],
+        instruction=(
+            'Update "@angular/platform-browser" using the committed candidate rule: '
+            "choose the lowest verified version from 21.2.17 or 21.2.18."
+        ),
+        instruction_digest="attempt-digest",
+        dispatch_node="update_subagent",
+    )
+
+    context = _build_qa_dynamic_context(
+        group=group,
+        task_id="task-a",
+        strategy="version_bump",
+        results=_make_fully_populated_results(ok=True),
+        group_remaining_ids=[],
+        candidate_changed_files=["package.json", "package-lock.json"],
+        action_summaries=[],
+        qa_policy=QAPolicy.VERSION_BUMP,
+        attempt_snapshot=snapshot,
+        effective_target_version="21.2.18",
+    )
+
+    assert snapshot.instruction in context
+    assert "21.2.14" not in context
+    assert "21.2.17, 21.2.18" in context
+    assert "Worker-reported effective target version: 21.2.18" in context
+    assert "Committed selected version: 21.2.17" in context
+    assert "Upgrade lodash to 4.17.21." not in context
 
 
 class TestRunGlobalExecution:
@@ -471,6 +531,52 @@ class TestBuildIndividualInvestigatorPrompt:
         assert len(bounded_prompt) < len(prompt) + 2_000
 
 
+def test_stale_or_missing_attempt_snapshot_is_rejected_before_qa_model_invocation():
+    """Missing and wrong-revision snapshots cannot authorize the current task."""
+    task = RemediationTask(
+        task_id="task-1",
+        parent_group_id="g1",
+        strategy=RoutingStrategy.VERSION_BUMP,
+        status=TaskStatus.OPTIMISTICALLY_FIXED,
+        instruction="Current committed instruction.",
+        current_attempt_id="attempt-current",
+        task_revision=2,
+    )
+    snapshot = TaskAttemptSnapshot(
+        attempt_id="attempt-current",
+        task_id="task-1",
+        task_revision=1,
+        instruction="Stale committed instruction.",
+        instruction_digest="stale-digest",
+        dispatch_node="update_subagent",
+    )
+
+    for snapshots in ({"attempt-current": snapshot}, {}):
+        with (
+            patch("langchain_openai.ChatOpenAI"),
+            patch(
+                "remediation_engine.orchestration.qa_evaluator.run_bounded_subagent_loop"
+            ) as investigator,
+        ):
+            investigations = _run_individual_investigations(
+                task_contexts=[QATaskContext(task=task, group=_make_group(group_id="g1"))],
+                task_strategies={"task-1": "version_bump"},
+                action_summaries=[],
+                changed_files_by_task={"task-1": []},
+                sandbox=MagicMock(),
+                repo_root=None,
+                results=_make_fully_populated_results(ok=True),
+                task_policies={"task-1": QAPolicy.VERSION_BUMP},
+                attempt_snapshots_by_id=snapshots,
+            )
+
+        investigator.assert_not_called()
+        evaluation = investigations["task-1"].evaluation
+        assert evaluation is not None
+        assert evaluation.contract_error is True
+        assert "stale identity" in evaluation.contract_error_reason
+
+
 def test_qa_evaluator_toolbelt_is_read_only():
     tools = build_qa_review_toolbelt(
         sandbox=MagicMock(),
@@ -557,6 +663,138 @@ class TestRunIndividualInvestigations:
         assert invs["task-1"].evaluation.passed is True
         assert invs["task-2"].evaluation is not None
         assert invs["task-2"].evaluation.passed is True
+
+    def test_committed_snapshot_and_matching_worker_version_reach_prompt(self):
+        """The critic passes valid authorization and effective version to QA."""
+        group = _make_group(group_id="g1")
+        advisory = group.fix_plan.model_copy(
+            update={
+                "instruction": "Update @angular/platform-browser to 21.2.14.",
+                "fixed_version": "21.2.14",
+            }
+        )
+        group = group.model_copy(
+            update={
+                "vulnerable_component": "@angular/platform-browser",
+                "issues": [
+                    issue.model_copy(update={"package_name": "@angular/platform-browser"})
+                    for issue in group.issues
+                ],
+                "fix_plan": advisory,
+            }
+        )
+        task = _task_context(group, "task-1").task.model_copy(
+            update={
+                "current_attempt_id": "attempt-current",
+                "task_revision": 2,
+            }
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-current",
+            task_id="task-1",
+            task_revision=2,
+            selected_version="21.2.17",
+            allowed_target_versions=["21.2.17", "21.2.18"],
+            target_package_name="@angular/platform-browser",
+            instruction=(
+                'Update "@angular/platform-browser" using the committed candidate rule: '
+                "choose the lowest verified version from 21.2.17 or 21.2.18."
+            ),
+            instruction_digest="attempt-digest",
+            dispatch_node="update_subagent",
+        )
+        worker_result = WorkerAttemptResult(
+            attempt_id="attempt-current",
+            task_id="task-1",
+            task_revision=2,
+            status=AgentActionStatus.SUCCESS,
+            executed_versions=["21.2.18"],
+            instruction_digest="attempt-digest",
+            execution_diagnostics=WorkerExecutionDiagnostics(
+                effective_target_version="21.2.18",
+                executed_versions=["21.2.18"],
+            ),
+        )
+        with (
+            patch("langchain_openai.ChatOpenAI"),
+            patch(
+                "remediation_engine.orchestration.qa_evaluator.run_bounded_subagent_loop",
+                return_value=self._lr(evaluation=QACriticLLMOutput(task_id="task-1", passed=True)),
+            ) as investigator,
+            patch(
+                "remediation_engine.orchestration.qa_evaluator.build_qa_review_toolbelt",
+                return_value=[],
+            ),
+        ):
+            _run_individual_investigations(
+                task_contexts=[QATaskContext(task=task, group=group)],
+                task_strategies={"task-1": "version_bump"},
+                action_summaries=[],
+                changed_files_by_task={"task-1": ["package.json", "package-lock.json"]},
+                sandbox=MagicMock(),
+                repo_root=None,
+                results=_make_fully_populated_results(ok=True),
+                task_policies={"task-1": QAPolicy.VERSION_BUMP},
+                attempt_snapshots_by_id={"attempt-current": snapshot},
+                worker_results_by_attempt={"attempt-current": worker_result},
+            )
+
+        prompt = investigator.call_args.kwargs["initial_messages"][1].content
+        assert snapshot.instruction in prompt
+        assert "21.2.14" not in prompt
+        assert "Authorized target versions: 21.2.17, 21.2.18" in prompt
+        assert "Worker-reported effective target version: 21.2.18" in prompt
+
+    def test_worker_result_with_stale_identity_does_not_supply_effective_version(self):
+        """Worker version evidence is ignored when its revision is stale."""
+        task = _task_context(_make_group(group_id="g1"), "task-1").task.model_copy(
+            update={"current_attempt_id": "attempt-current", "task_revision": 2}
+        )
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-current",
+            task_id="task-1",
+            task_revision=2,
+            selected_version="1.2.0",
+            allowed_target_versions=["1.2.0", "1.3.0"],
+            instruction="Use 1.2.0 or the explicitly authorized compatible alternative 1.3.0.",
+            instruction_digest="attempt-digest",
+            dispatch_node="update_subagent",
+        )
+        stale_result = WorkerAttemptResult(
+            attempt_id="attempt-current",
+            task_id="task-1",
+            task_revision=1,
+            status=AgentActionStatus.SUCCESS,
+            executed_versions=["1.3.0"],
+            instruction_digest="attempt-digest",
+            execution_diagnostics=WorkerExecutionDiagnostics(effective_target_version="1.3.0"),
+        )
+        with (
+            patch("langchain_openai.ChatOpenAI"),
+            patch(
+                "remediation_engine.orchestration.qa_evaluator.run_bounded_subagent_loop",
+                return_value=self._lr(evaluation=QACriticLLMOutput(task_id="task-1", passed=True)),
+            ) as investigator,
+            patch(
+                "remediation_engine.orchestration.qa_evaluator.build_qa_review_toolbelt",
+                return_value=[],
+            ),
+        ):
+            _run_individual_investigations(
+                task_contexts=[QATaskContext(task=task, group=_make_group(group_id="g1"))],
+                task_strategies={"task-1": "version_bump"},
+                action_summaries=[],
+                changed_files_by_task={"task-1": []},
+                sandbox=MagicMock(),
+                repo_root=None,
+                results=_make_fully_populated_results(ok=True),
+                task_policies={"task-1": QAPolicy.VERSION_BUMP},
+                attempt_snapshots_by_id={"attempt-current": snapshot},
+                worker_results_by_attempt={"attempt-current": stale_result},
+            )
+
+        prompt = investigator.call_args.kwargs["initial_messages"][1].content
+        assert "Worker-reported effective target version: (not available)" in prompt
 
     def test_investigator_receives_only_its_task_scanner_projection(self):
         group = _make_group(group_id="g1")

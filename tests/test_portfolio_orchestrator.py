@@ -548,7 +548,23 @@ def test_runtime_dependency_order_is_stable(tmp_path: Path):
     first = build_portfolio_plan(tmp_path, [lodash, app], queue)
     second = build_portfolio_plan(tmp_path, [lodash, app], queue)
 
-    assert first.model_dump() == second.model_dump()
+    def without_solver_timings(value, *, parent_key=None):
+        if isinstance(value, dict):
+            return {
+                key: without_solver_timings(item, parent_key=key) for key, item in value.items()
+            }
+        if isinstance(value, list):
+            items = value
+            if parent_key == "diagnostics":
+                items = [
+                    item
+                    for item in value
+                    if not (isinstance(item, str) and item.startswith("solver stage timings "))
+                ]
+            return [without_solver_timings(item) for item in items]
+        return value
+
+    assert without_solver_timings(first.model_dump()) == without_solver_timings(second.model_dump())
     assert first.task_order.index("task-1") < first.task_order.index("task-2")
     assert {task_id for cluster in first.clusters for task_id in cluster.task_ids} == set(queue)
 

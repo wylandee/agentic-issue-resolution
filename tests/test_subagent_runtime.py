@@ -17,6 +17,7 @@ from remediation_engine.orchestration.subagent_runtime import (
     _infer_changed_files,
     _manifest_retry_recovery_instruction,
     _preferred_removal_tool_name,
+    _response_text_content,
     _validation_gate_recovery_instruction,
     has_successful_validation_gate,
     run_bounded_subagent_loop,
@@ -28,6 +29,46 @@ def test_python_workaround_selects_python_removal_tool_name():
         _preferred_removal_tool_name({"validate_python_workaround": object()})
         == "remove_no_fix_python_dependency"
     )
+
+
+def test_response_content_extracts_text_without_serializing_reasoning_blocks():
+    """Responses content preserves plain text and drops opaque provider blocks."""
+    content = [
+        {"type": "reasoning", "reasoning": "PRIVATE REASONING PAYLOAD"},
+        {"type": "encrypted_content", "encrypted_content": "OPAQUE ENCRYPTED PAYLOAD"},
+        {"type": "text", "text": "Planning answers: update lodash to 4.17.21."},
+    ]
+
+    extracted = _response_text_content(content)
+
+    assert extracted == "Planning answers: update lodash to 4.17.21."
+    assert "PRIVATE REASONING PAYLOAD" not in extracted
+    assert "OPAQUE ENCRYPTED PAYLOAD" not in extracted
+
+
+def test_list_response_text_still_marks_planning_answers_as_submitted():
+    """Text extraction keeps planning-state detection working for Responses blocks."""
+    bound_llm = MagicMock()
+    bound_llm.invoke.return_value = AIMessage(
+        content=[
+            {"type": "reasoning", "reasoning": "PRIVATE REASONING PAYLOAD"},
+            {"type": "text", "text": "Planning answers: update lodash to 4.17.21."},
+        ]
+    )
+    llm = MagicMock()
+    llm.bind_tools.return_value = bound_llm
+    planning_state = {"submitted": False}
+
+    result = run_bounded_subagent_loop(
+        llm,
+        [],
+        [HumanMessage(content="Plan the update.")],
+        set(),
+        planning_state=planning_state,
+    )
+
+    assert result.final_text == "Planning answers: update lodash to 4.17.21."
+    assert planning_state["submitted"] is True
 
 
 def test_structured_terminal_output_is_returned_without_free_text() -> None:

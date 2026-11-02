@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 
@@ -104,6 +105,26 @@ def metrics(scores=(1.0, 1.0)):
             strict=True,
         )
     ]
+
+
+def test_judge_input_token_estimate_falls_back_when_encoding_is_unavailable(monkeypatch):
+    import tiktoken
+
+    def unavailable_model(_model):
+        raise KeyError("unsupported model")
+
+    def unavailable_encoding(_name):
+        raise OSError("tokenizer cache is unavailable offline")
+
+    monkeypatch.setattr(tiktoken, "encoding_for_model", unavailable_model)
+    monkeypatch.setattr(tiktoken, "get_encoding", unavailable_encoding)
+
+    value = {"content": "Unicode café and package metadata"}
+    estimate, method = e2e._estimate_judge_input_tokens(value, "gpt-6-luna")
+    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+    assert estimate == len(serialized.encode("utf-8"))
+    assert method == "utf8_bytes_upper_bound"
 
 
 def test_complete_run_uses_original_goal_and_independent_evidence(evidence):

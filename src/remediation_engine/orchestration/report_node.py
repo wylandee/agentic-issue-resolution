@@ -2078,6 +2078,88 @@ def _attempt_qa_verdict(
     return bool(_value(evaluation, "passed", False))
 
 
+def _terminal_attempt_matches_final_task(
+    context: ReportContext,
+    attempt_id: str,
+    task_id: str,
+) -> bool:
+    """Verify a terminal successful task retains this exact latest attempt.
+
+    Args:
+        context: Normalized report context containing task, snapshot, worker,
+            and QA attempt projections.
+        attempt_id: Candidate attempt being considered for the final report.
+        task_id: Task that owns the candidate attempt.
+
+    Returns:
+        True only when a terminal QA-passed task has this attempt as its latest
+        committed snapshot and both worker and passing QA records match its
+        immutable task revision.
+    """
+    task = context.task_queue.get(task_id)
+    if (
+        task is None
+        or _text(_value(task, "status")).casefold() != "qa_passed"
+        or _text(_value(task, "current_attempt_id"))
+    ):
+        return False
+
+    matching_snapshots = [
+        snapshot
+        for snapshot in context.attempt_snapshots.values()
+        if _text(_value(snapshot, "task_id")) == task_id and _text(_value(snapshot, "attempt_id"))
+    ]
+    if not matching_snapshots:
+        return False
+
+    def snapshot_order(snapshot: Any) -> tuple[int, int, int, str]:
+        """Order snapshots by their monotonic supervisor commit metadata."""
+
+        def as_int(field_name: str) -> int:
+            try:
+                return int(_value(snapshot, field_name, -1))
+            except (TypeError, ValueError):
+                return -1
+
+        return (
+            as_int("state_revision"),
+            as_int("task_revision"),
+            as_int("attempt_number"),
+            _text(_value(snapshot, "created_at")),
+        )
+
+    latest_snapshot = max(matching_snapshots, key=snapshot_order)
+    if _text(_value(latest_snapshot, "attempt_id")) != attempt_id:
+        return False
+    snapshot_revision = _value(latest_snapshot, "task_revision")
+    try:
+        terminal_task_revision = int(_value(task, "task_revision"))
+        committed_task_revision = int(snapshot_revision)
+    except (TypeError, ValueError):
+        return False
+    if terminal_task_revision <= committed_task_revision:
+        return False
+
+    qa_result = context.qa_results.get(attempt_id)
+    evaluation = _value(qa_result, "evaluation")
+    if (
+        _text(_value(qa_result, "attempt_id")) != attempt_id
+        or _text(_value(qa_result, "task_id")) != task_id
+        or _value(qa_result, "task_revision") != snapshot_revision
+        or bool(_value(evaluation, "contract_error", False))
+        or not bool(_value(evaluation, "passed", False))
+    ):
+        return False
+
+    worker_result = context.worker_results.get(attempt_id)
+    return bool(
+        _text(_value(worker_result, "attempt_id")) == attempt_id
+        and _text(_value(worker_result, "task_id")) == task_id
+        and _value(worker_result, "task_revision") == snapshot_revision
+        and _text(_value(worker_result, "status")).casefold() == "success"
+    )
+
+
 def _attempt_has_qa_evidence(
     context: ReportContext,
     summary: Any,
@@ -2268,6 +2350,33 @@ def _scan_coverage_label(context: ReportContext) -> str:
 def _summary_group_statuses(context: ReportContext) -> dict[str, str]:
     """Return the authoritative unique-group status projection for the summary."""
     return _unique_vulnerability_statuses_by_group(context)
+
+
+def _known_new_identifier_metric(context: ReportContext) -> str:
+    """Describe observed new identifiers without implying absent evidence is zero.
+
+    Args:
+        context: Normalized report context with terminal scan scope and findings.
+
+    Returns:
+        Observed identifiers with a coverage qualifier, a scoped no-identifiers
+        statement for complete evidence, or an explicit unknown status.
+    """
+    identifiers = ", ".join(context.new_vulnerability_identifiers)
+    if identifiers:
+        if context.scan_evidence_state in {"incremental_incomplete", "failed", "not_scanned"}:
+            return f"{identifiers} (observed; terminal scan evidence is incomplete)"
+        return identifiers
+
+    if context.scan_evidence_state == "complete":
+        return "None detected in the full-workspace scan"
+    if context.scan_evidence_state == "incremental_complete":
+        return "None detected in covered dependency inputs"
+    if context.scan_evidence_state == "incremental_incomplete":
+        return "Unknown (incremental scan coverage is incomplete)"
+    if context.scan_evidence_state == "failed":
+        return "Unknown (terminal scan failed)"
+    return "Unknown (terminal scan evidence is unavailable)"
 
 
 def _finding_component_key(component: Sequence[Any], index: int) -> tuple[Any, ...]:
@@ -2604,6 +2713,12 @@ def _special_remediation_evidence(context: ReportContext) -> tuple[SpecialRemedi
                 and _text(_value(task, "current_attempt_id")) == attempt_id
                 and _text(_value(task, "status")).casefold() == "qa_passed"
             )
+            if not current_attempt and attempt_id and task_id:
+                current_attempt = _terminal_attempt_matches_final_task(
+                    context,
+                    attempt_id,
+                    task_id,
+                )
             successful_projection = _successful_remediation_evidence(
                 context,
                 _report_group_for_id(context, raw_group_id) or group,
@@ -2854,7 +2969,7 @@ def _render_summary(
         ("Dependency scan coverage", _scan_coverage_label(context)),
         (
             "Known new vulnerability identifiers",
-            ", ".join(context.new_vulnerability_identifiers) or "None",
+            _known_new_identifier_metric(context),
         ),
         ("Run duration", _format_duration(context.duration_seconds)),
         ("Total tokens", _format_token_summary(context)),

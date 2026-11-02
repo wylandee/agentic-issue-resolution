@@ -23,6 +23,7 @@ from remediation_engine.contracts.schemas import (
     ScannerExecutionStatus,
     ScratchpadScope,
     SecurityReviewVerdict,
+    TaskAttemptSnapshot,
     TestAttributionVerdict,
     VulnerabilityGroup,
 )
@@ -607,6 +608,8 @@ def _build_qa_dynamic_context(
     qa_policy: QAPolicy | None = None,
     singleton_scope: bool = False,
     task_scan_evidence: ODCScanEvidence | None = None,
+    attempt_snapshot: TaskAttemptSnapshot | None = None,
+    effective_target_version: str | None = None,
 ) -> str:
     """Build task-owned facts appended to the static evaluator prompt.
 
@@ -621,6 +624,9 @@ def _build_qa_dynamic_context(
         qa_policy: Supervisor-owned QA policy, when available.
         singleton_scope: Whether exactly one active task owns this QA run.
         task_scan_evidence: Scanner findings projected to this task's dependency closure.
+        attempt_snapshot: Current Supervisor-committed authorization for this QA task.
+        effective_target_version: Current worker result's effective dependency version,
+            when it carries matching attempt provenance.
 
     Returns:
         The bounded dynamic evaluator context.
@@ -628,10 +634,37 @@ def _build_qa_dynamic_context(
     current_strategy = (
         RoutingStrategy(strategy) if strategy in {item.value for item in RoutingStrategy} else None
     )
-    selection = select_package_fix_plan(group, current_strategy)
-    fix_plan = selection.plan
-    fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
-    fix_instruction = fix_plan.instruction if fix_plan else "(none)"
+    if attempt_snapshot is not None:
+        fix_plan_status = "supervisor-committed attempt"
+        fix_instruction = attempt_snapshot.instruction
+        authorization_lines = [
+            f"- Committed attempt ID: {attempt_snapshot.attempt_id}",
+            f"- Committed task revision: {attempt_snapshot.task_revision}",
+            f"- Authorized target package: {attempt_snapshot.target_package_name or '(not specified)'}",
+            f"- Authorized dependency type: {attempt_snapshot.target_dependency_type or '(not specified)'}",
+            "- Authorized target versions: "
+            + (", ".join(attempt_snapshot.allowed_target_versions) or "(none listed)"),
+            "- Committed selected version: " + (attempt_snapshot.selected_version or "(none)"),
+            "- Parent minimum version: " + (attempt_snapshot.parent_minimum_version or "(none)"),
+            "- Authorized dependency types: "
+            + (", ".join(attempt_snapshot.allowed_dependency_types) or "(none listed)"),
+            "- Worker-reported effective target version: "
+            + (effective_target_version or "(not available)"),
+            "- The committed instruction and candidate bounds define authorization. "
+            "Use the committed selected version unless the instruction explicitly allows a "
+            "bounded alternative; do not broaden the candidate set.",
+        ]
+        authorization_heading = "## Supervisor-Committed Attempt Authorization"
+    else:
+        selection = select_package_fix_plan(group, current_strategy)
+        fix_plan = selection.plan
+        fix_plan_status = fix_plan.status.value if fix_plan else "unknown"
+        fix_instruction = fix_plan.instruction if fix_plan else "(none)"
+        authorization_lines = [
+            "- No current committed attempt snapshot was supplied; this is a legacy context.",
+            "- Group fix-plan details are advisory only and do not authorize execution.",
+        ]
+        authorization_heading = "## Legacy Advisory Fix-Plan Context"
     cves = ", ".join(group.cve_ids) if group.cve_ids else "(none)"
     ghsas = ", ".join(group.ghsa_ids or []) or "(none)"
     install_status = _qa_status(results.install)
@@ -733,8 +766,11 @@ def _build_qa_dynamic_context(
 - Use INCONCLUSIVE when failed-test evidence cannot support responsible or exonerated attribution.
 """
 
+    authorization_block = "\n".join([authorization_heading, *authorization_lines])
+
     return f"""{policy_block}
 {scope_block}
+{authorization_block}
 ## Assigned Task
 - Task ID: {task_id}
 - Parent Group ID: {group.group_id}
@@ -810,6 +846,8 @@ def _build_individual_investigator_prompt(
     singleton_scope: bool = False,
     task_scan_evidence: ODCScanEvidence | None = None,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    attempt_snapshot: TaskAttemptSnapshot | None = None,
+    effective_target_version: str | None = None,
 ) -> str:
     """Build the lean static-plus-dynamic prompt for one QA evaluator.
 
@@ -823,6 +861,10 @@ def _build_individual_investigator_prompt(
         action_summaries: Bounded worker action summaries.
         qa_policy: Supervisor-owned QA policy, when available.
         singleton_scope: Whether exactly one active task owns this QA run.
+        task_scan_evidence: Scanner findings projected to this task's dependency closure.
+        project_language: Canonical repository language used to interpret test evidence.
+        attempt_snapshot: Current Supervisor-committed authorization, if available.
+        effective_target_version: Current worker result's effective target version.
 
     Returns:
         The complete evaluator prompt.
@@ -841,6 +883,8 @@ def _build_individual_investigator_prompt(
             qa_policy=qa_policy,
             singleton_scope=singleton_scope,
             task_scan_evidence=task_scan_evidence,
+            attempt_snapshot=attempt_snapshot,
+            effective_target_version=effective_target_version,
         )
     )
 
@@ -871,6 +915,8 @@ def _run_individual_investigations(
     task_policies: dict[str, QAPolicy | None],
     singleton_scope: bool = False,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
+    attempt_snapshots_by_id: dict[str, TaskAttemptSnapshot] | None = None,
+    worker_results_by_attempt: dict[str, Any] | None = None,
 ) -> dict[str, GroupInvestigation]:
     """Run one bounded structured evaluator independently for each task.
 
@@ -884,6 +930,9 @@ def _run_individual_investigations(
         results: Deterministic global QA results.
         task_policies: Supervisor-owned QA policy by task ID.
         singleton_scope: Whether the dispatch contains exactly one active task.
+        project_language: Canonical repository language used to interpret test evidence.
+        attempt_snapshots_by_id: Supervisor-committed attempts indexed by attempt ID.
+        worker_results_by_attempt: Worker execution results indexed by attempt ID.
 
     Returns:
         Structured investigation records keyed by task ID.
@@ -916,6 +965,61 @@ def _run_individual_investigations(
             group_remaining_ids = sorted(task_scan_evidence.remaining_target_identifiers)
         qa_policy = task_policies.get(task_id)
         relevant_summaries = _relevant_action_summaries(action_summaries, task_id, known_task_ids)
+        attempt_snapshot = None
+        effective_target_version = None
+        attempt_id = context.task.current_attempt_id
+        if attempt_id:
+            attempt_snapshot = (attempt_snapshots_by_id or {}).get(attempt_id)
+            if (
+                attempt_snapshot is None
+                or attempt_snapshot.attempt_id != attempt_id
+                or attempt_snapshot.task_id != task_id
+                or attempt_snapshot.task_revision != context.task.task_revision
+            ):
+                reason = (
+                    f"QA for task '{task_id}' cannot use committed authorization: "
+                    "the current attempt snapshot is missing or has stale identity."
+                )
+                evaluations[task_id] = GroupInvestigation(
+                    group_id=group.group_id,
+                    task_id=task_id,
+                    investigation_text="",
+                    tool_transcript="",
+                    errors=[reason],
+                    fallback=True,
+                    evaluation=QAEvaluation(
+                        task_id=task_id,
+                        passed=False,
+                        contract_error=True,
+                        contract_error_reason=reason,
+                        failure_category=FailureCategory.SECURITY_FLAG,
+                        retry_feedback=(
+                            "The current task attempt has no matching Supervisor snapshot. "
+                            "Re-establish current attempt provenance before evaluating QA."
+                        ),
+                    ),
+                )
+                continue
+
+            worker_result = (worker_results_by_attempt or {}).get(attempt_id)
+            if (
+                worker_result is not None
+                and getattr(worker_result, "attempt_id", None) == attempt_id
+                and getattr(worker_result, "task_id", None) == task_id
+                and getattr(worker_result, "task_revision", None) == context.task.task_revision
+            ):
+                diagnostics = getattr(worker_result, "execution_diagnostics", None)
+                effective_target_version = getattr(
+                    diagnostics, "effective_target_version", None
+                ) or getattr(worker_result, "effective_target_version", None)
+                if not effective_target_version:
+                    executed_versions = list(
+                        getattr(diagnostics, "executed_versions", None)
+                        or getattr(worker_result, "executed_versions", None)
+                        or []
+                    )
+                    if len(set(executed_versions)) == 1:
+                        effective_target_version = executed_versions[0]
         dynamic_context = _build_qa_dynamic_context(
             group=group,
             task_id=task_id,
@@ -927,6 +1031,8 @@ def _run_individual_investigations(
             qa_policy=qa_policy,
             singleton_scope=singleton_scope,
             task_scan_evidence=task_scan_evidence,
+            attempt_snapshot=attempt_snapshot,
+            effective_target_version=effective_target_version,
         )
         terminal_tool = _build_qa_terminal_tool()
         review_tools = [

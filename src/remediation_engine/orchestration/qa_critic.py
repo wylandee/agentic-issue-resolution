@@ -1414,6 +1414,8 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
                 task_policies=task_policies,
                 singleton_scope=singleton_scope,
                 project_language=project_language,
+                attempt_snapshots_by_id=state.get("attempt_snapshots_by_id") or {},
+                worker_results_by_attempt=state.get("worker_results_by_attempt") or {},
             )
 
     except RuntimeError as exc:

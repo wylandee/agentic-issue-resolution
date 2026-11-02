@@ -424,6 +424,134 @@ def test_qa_pass_without_retained_special_patch_is_not_described_as_qa_failure()
     assert "not accepted by final QA" not in special.outcome
 
 
+def test_terminal_success_uses_matching_latest_attempt_after_current_id_is_cleared():
+    """A terminal QA-passed task can retain its exact immutable attempt lineage."""
+    state = _state()
+    state["task_queue"]["task-1"].update(
+        {
+            "strategy": "CODE_WORKAROUND",
+            "strategy_stage": "migration_code_workaround",
+            "status": "qa_passed",
+            "task_revision": 2,
+            "current_attempt_id": None,
+        }
+    )
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "status": "success",
+            "summary": "Completed validated API migration; changed files: src/guard.ts.",
+        }
+    ]
+    state["attempt_snapshots_by_id"] = {
+        "attempt-1": {
+            "attempt_id": "attempt-1",
+            "task_id": "task-1",
+            "task_revision": 1,
+            "state_revision": 5,
+            "attempt_number": 1,
+            "dispatch_node": "workaround_subagent",
+            "strategy_stage": "migration_code_workaround",
+            "instruction": "Perform the committed API migration in src/guard.ts.",
+        }
+    }
+    state["worker_results_by_attempt"] = {
+        "attempt-1": {
+            "attempt_id": "attempt-1",
+            "task_id": "task-1",
+            "task_revision": 1,
+            "status": "success",
+            "changed_files": ["src/guard.ts"],
+        }
+    }
+    state["qa_results_by_attempt"] = {
+        "attempt-1": {
+            "attempt_id": "attempt-1",
+            "task_id": "task-1",
+            "task_revision": 1,
+            "evaluation": {"passed": True},
+        }
+    }
+    state["diff"] = (
+        "--- a/src/guard.ts\n+++ b/src/guard.ts\n"
+        "-const verify = insecure(input)\n+const verify = secure(input)\n"
+    )
+
+    evidence = _executive_summary_evidence(state)
+
+    assert evidence.special_remediations[0].outcome == "successfully accepted by final QA"
+
+
+def test_terminal_success_does_not_accept_an_older_attempt_if_a_newer_commit_exists():
+    """A prior passing attempt is stale when the task has a newer commit."""
+    state = _state()
+    state["task_queue"]["task-1"].update(
+        {
+            "strategy": "CODE_WORKAROUND",
+            "strategy_stage": "migration_code_workaround",
+            "status": "qa_passed",
+            "task_revision": 3,
+            "current_attempt_id": None,
+        }
+    )
+    state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-old",
+            "status": "success",
+            "summary": "Completed validated API migration; changed files: src/guard.ts.",
+        }
+    ]
+    state["attempt_snapshots_by_id"] = {
+        "attempt-old": {
+            "attempt_id": "attempt-old",
+            "task_id": "task-1",
+            "task_revision": 1,
+            "state_revision": 5,
+            "attempt_number": 1,
+            "dispatch_node": "workaround_subagent",
+            "strategy_stage": "migration_code_workaround",
+        },
+        "attempt-new": {
+            "attempt_id": "attempt-new",
+            "task_id": "task-1",
+            "task_revision": 2,
+            "state_revision": 8,
+            "attempt_number": 2,
+            "dispatch_node": "workaround_subagent",
+            "strategy_stage": "migration_code_workaround",
+        },
+    }
+    state["worker_results_by_attempt"] = {
+        "attempt-old": {
+            "attempt_id": "attempt-old",
+            "task_id": "task-1",
+            "task_revision": 1,
+            "status": "success",
+            "changed_files": ["src/guard.ts"],
+        }
+    }
+    state["qa_results_by_attempt"] = {
+        "attempt-old": {
+            "attempt_id": "attempt-old",
+            "task_id": "task-1",
+            "task_revision": 1,
+            "evaluation": {"passed": True},
+        }
+    }
+    state["diff"] = (
+        "--- a/src/guard.ts\n+++ b/src/guard.ts\n"
+        "-const verify = insecure(input)\n+const verify = secure(input)\n"
+    )
+
+    evidence = _executive_summary_evidence(state)
+
+    assert evidence.special_remediations[0].outcome == (
+        "QA passed for this attempt; a retained current remediation is not established"
+    )
+
+
 def test_incremental_incomplete_report_keeps_known_new_identifiers_visible():
     state = _state()
     identifier = "CVE-2026-0042"
@@ -457,10 +585,45 @@ def test_incremental_incomplete_report_keeps_known_new_identifiers_visible():
     report = generate_report(state)
 
     assert "| Dependency scan coverage | Incremental dependency inputs (incomplete) |" in report
-    assert f"| Known new vulnerability identifiers | {identifier} |" in report
+    assert (
+        f"| Known new vulnerability identifiers | {identifier} "
+        "(observed; terminal scan evidence is incomplete) |"
+    ) in report
     assert identifier in report
     assert "Incremental scan coverage is incomplete." in report
     assert "| Successfully remediated vulnerability groups | 1 |" in report
+
+
+def test_unavailable_scan_does_not_render_no_identifiers_as_none():
+    state = _state()
+    state.pop("final_full_scan_result", None)
+    state["new_vulnerability_identifiers"] = []
+    state["new_vulnerability_status"] = "not_scanned"
+
+    report = generate_report(state)
+
+    assert (
+        "| Known new vulnerability identifiers | Unknown (terminal scan evidence is unavailable) |"
+    ) in report
+
+
+def test_complete_scans_render_scoped_no_new_identifier_result():
+    state = _state()
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": True,
+        "status": "completed",
+        "coverage_scope": "full_workspace",
+        "coverage_complete": True,
+        "new_identifiers": [],
+        "found_issues": [],
+    }
+
+    report = generate_report(state)
+
+    assert (
+        "| Known new vulnerability identifiers | None detected in the full-workspace scan |"
+    ) in report
 
 
 def test_incremental_complete_report_names_its_limited_scope():

@@ -48,6 +48,39 @@ _WORKAROUND_VALIDATION_TOOL_NAMES = frozenset({"validate_workaround", "validate_
 _TARGETED_TEST_TOOL_NAMES = frozenset({"run_targeted_test", "run_targeted_python_test"})
 
 
+def _response_text_content(content: Any) -> str:
+    """Return only human-readable text from a model response content value.
+
+    Args:
+        content: LangChain message content, which may be plain text or a list of
+            provider content blocks.
+
+    Returns:
+        Plain text blocks joined with newlines. Non-text blocks, including
+        reasoning and encrypted payloads, are omitted.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    text_parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            text_parts.append(block)
+            continue
+        if not isinstance(block, Mapping) or block.get("type") not in {
+            "text",
+            "output_text",
+            "input_text",
+        }:
+            continue
+        text_value = block.get("text")
+        if isinstance(text_value, str):
+            text_parts.append(text_value)
+    return "\n".join(part for part in text_parts if part)
+
+
 def _is_serial_manifest_tool_call(tool_name: str, args: dict[str, Any]) -> bool:
     """Serialize language-specific manifest transactions without changing Node removal."""
     if tool_name in _SERIAL_MANIFEST_TOOL_NAMES:
@@ -623,7 +656,7 @@ def run_bounded_subagent_loop(
                 errors=errors,
             )
         conversation.append(response)
-        final_text = str(getattr(response, "content", "") or "")
+        final_text = _response_text_content(getattr(response, "content", ""))
         if planning_state is not None:
             lowered = final_text.lower()
             if "planning answers" in lowered or "1. what version" in lowered:

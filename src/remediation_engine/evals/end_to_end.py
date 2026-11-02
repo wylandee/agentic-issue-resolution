@@ -121,6 +121,10 @@ def _estimate_judge_input_tokens(value: Any, model: str) -> tuple[int, str]:
     except ImportError:
         # UTF-8 byte length is an upper bound on byte-fallback tokenization.
         return len(serialized.encode("utf-8")), "utf8_bytes_upper_bound"
+    except Exception:
+        # Unsupported models and cold tokenizer caches may fail while loading
+        # an encoding. Evaluation sizing must remain usable without network.
+        return len(serialized.encode("utf-8")), "utf8_bytes_upper_bound"
 
 
 def build_metrics(judge_model: str, *, judge_llm: Any | None = None) -> list[Any]:
