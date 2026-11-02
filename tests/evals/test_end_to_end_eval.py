@@ -107,6 +107,29 @@ def metrics(scores=(1.0, 1.0)):
     ]
 
 
+@pytest.fixture(autouse=True)
+def deterministic_offline_tokenizer(monkeypatch, request):
+    """Keep offline E2E unit tests from loading tokenizer data over the network."""
+    is_live_eval = request.node.get_closest_marker("eval") and request.config.getoption(
+        "--run-eval-live", default=False
+    )
+    if is_live_eval:
+        return
+
+    try:
+        import tiktoken
+    except ImportError:
+        return
+
+    class DeterministicEncoding:
+        def encode(self, text):
+            return list(range(len(text.encode("utf-8"))))
+
+    encoding = DeterministicEncoding()
+    monkeypatch.setattr(tiktoken, "encoding_for_model", lambda _model: encoding)
+    monkeypatch.setattr(tiktoken, "get_encoding", lambda _name: encoding)
+
+
 def test_judge_input_token_estimate_falls_back_when_encoding_is_unavailable(monkeypatch):
     import tiktoken
 
