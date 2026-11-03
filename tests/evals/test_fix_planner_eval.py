@@ -12,10 +12,10 @@ from typing import Any
 import pytest
 from packaging.version import InvalidVersion, Version
 
-import remediation_engine.tools.fix_planner as fix_planner
+import remediation_engine.tools.advisories as fix_planner
 from remediation_engine.evals.judge import build_judge_score_metric
 from remediation_engine.settings import AppSettings
-from remediation_engine.tools.fix_planner import SerperLLMResult
+from remediation_engine.tools.advisories import SerperLLMResult
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import measure_and_record_metric, set_pytest_item_identity
 from tests.evals.golden_schema import load_golden_dataset, offline_fixture

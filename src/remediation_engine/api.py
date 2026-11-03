@@ -7,14 +7,17 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from remediation_engine.agents.triage import run_triage_pipeline
+
 from .contracts.schemas import SystemContext, VulnerabilityGroup, VulnerabilityIssue
 from .language import ProjectLanguage, resolve_project_language
 from .orchestration.graph import run_orchestrator
-from .orchestration.runtime_context import use_runtime_settings
-from .orchestration.state import normalize_target_packages, validate_target_package_scope
-from .orchestration.task_utils import terminal_outcome_issues
-from .settings import AppSettings
-from .triage.pipeline import run_triage_pipeline
+from .orchestration.state import (
+    normalize_target_packages,
+    terminal_outcome_issues,
+    validate_target_package_scope,
+)
+from .settings import AppSettings, use_runtime_settings
 
 
 class RemediationRequest(BaseModel):

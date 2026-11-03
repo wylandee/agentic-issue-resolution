@@ -10,8 +10,8 @@ from typing import Any
 
 import pytest
 
+from remediation_engine.agents.supervisor_reasoning import _safe_relative_file_hints
 from remediation_engine.contracts.schemas import DecisionCode, TaskStatus
-from remediation_engine.orchestration.tactical_supervisor import _safe_relative_file_hints
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from remediation_engine.contracts.schemas import VulnerabilityIssue
-from remediation_engine.orchestration.issue_identity import (
+from remediation_engine.tools.identity import (
     canonical_issue_components,
     finding_occurrence_key,
 )
@@ -138,15 +138,6 @@ def normalize_findings(
         _finding_from_linked_issues(group, status=status, is_new=is_new)
         for group in canonical_issue_components(issues)
     ]
-
-
-def issue_to_finding_model(
-    issue: VulnerabilityIssue,
-    status: str = "flagged",
-    is_new: bool = False,
-) -> FindingModel:
-    """Convert one contracts issue to its canonical API finding representation."""
-    return normalize_findings([issue], status=status, is_new=is_new)[0]
 
 
 def find_odc_report(repo_root: Path) -> Path | None:

@@ -12,6 +12,7 @@ from typing import Any, Self
 
 import pytest
 
+from remediation_engine.agents.supervisor import _portfolio_plan_violations
 from remediation_engine.contracts.schemas import (
     CommandResult,
     FixPlan,
@@ -46,7 +47,15 @@ from remediation_engine.contracts.solver_models import (
     SolverStatus,
     SolverTarget,
 )
-from remediation_engine.orchestration.portfolio_certifier import (
+from remediation_engine.orchestration.state import build_initial_remediation_task
+from remediation_engine.planning.candidates import (
+    _build_evidence_domains,
+    _build_targets_and_findings,
+    _digest,
+    _prepare_portfolio_problem,
+    apply_portfolio_plan,
+)
+from remediation_engine.planning.certification import (
     _assert_workspace_matches_host,
     _AssignmentRejected,
     _AssignmentResult,
@@ -63,28 +72,15 @@ from remediation_engine.orchestration.portfolio_certifier import (
     _verify_staged_mutations,
     build_certified_portfolio_plan,
 )
-from remediation_engine.orchestration.portfolio_solver import (
-    _build_evidence_domains,
-    _build_targets_and_findings,
-    _digest,
-    _prepare_portfolio_problem,
-    apply_portfolio_plan,
-)
-from remediation_engine.orchestration.qa_test_parsing import (
-    _install_error_category,
-    parse_peer_conflict_evidence,
-)
-from remediation_engine.orchestration.supervisor_node import _portfolio_plan_violations
-from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
 from remediation_engine.solver.cpsat import solve_portfolio
-from remediation_engine.tools.npm_graph import (
+from remediation_engine.tools.npm import (
     load_npm_graph_snapshot,
     load_npm_graph_snapshot_from_documents,
     make_occurrence_id,
     resolve_lockfile_dependency_package,
 )
-from tests.fix_plan_fixtures import group_with_fix_plans
+from tests.helpers import group_with_fix_plans
 
 
 class _FakeSandboxState:
@@ -1081,7 +1077,7 @@ def test_outer_replan_does_not_reuse_prior_resolver_cuts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.planning import certification as portfolio_certifier
 
     root, files, groups, task_queue = _certifier_fixture(tmp_path)
     host_fingerprint = load_npm_graph_snapshot(root).repository_fingerprint
@@ -1190,7 +1186,7 @@ def test_maven_assignment_uses_exact_tool_and_native_resolution_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from remediation_engine.contracts.solver_models import SolverTarget
-    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.planning import certification as portfolio_certifier
 
     original_pom = """<project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
@@ -1321,14 +1317,14 @@ def test_maven_portfolio_dispatch_uses_shared_solver_and_native_certifier(
     resolved_version: str,
     expected_status: PackageResolutionStatus,
 ):
+    from remediation_engine.agents.supervisor import _portfolio_plan_is_stale
     from remediation_engine.contracts.solver_models import (
         QAPassedWorkspacePrefix,
         SolverRuntimeFingerprint,
     )
     from remediation_engine.language import ProjectLanguage
-    from remediation_engine.orchestration import portfolio_certifier
-    from remediation_engine.orchestration.supervisor_node import _portfolio_plan_is_stale
-    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+    from remediation_engine.orchestration.state import build_initial_remediation_task
+    from remediation_engine.planning import certification as portfolio_certifier
 
     pom = tmp_path / "pom.xml"
     pom.write_text(
@@ -1579,11 +1575,11 @@ def test_maven_portfolio_dispatch_uses_shared_solver_and_native_certifier(
 
 def test_maven_resolved_dependency_paths_cluster_vulnerable_targets(tmp_path: Path):
     from remediation_engine.language import ProjectLanguage
-    from remediation_engine.orchestration import portfolio_certifier
-    from remediation_engine.orchestration.portfolio_solver import maven_repository_fingerprint
-    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+    from remediation_engine.orchestration.state import build_initial_remediation_task
+    from remediation_engine.planning import certification as portfolio_certifier
+    from remediation_engine.planning.candidates import maven_repository_fingerprint
     from remediation_engine.solver.graph import cluster_packages
-    from remediation_engine.tools.npm_graph import NpmGraphSnapshot
+    from remediation_engine.tools.npm import NpmGraphSnapshot
 
     (tmp_path / "pom.xml").write_text(
         """<project xmlns="http://maven.apache.org/POM/4.0.0">
@@ -1716,7 +1712,8 @@ def test_maven_resolved_dependency_paths_cluster_vulnerable_targets(tmp_path: Pa
 
 
 def test_maven_qa_passed_snapshot_uses_pom_fingerprint(monkeypatch: pytest.MonkeyPatch):
-    from remediation_engine.orchestration import graph_wrappers, portfolio_certifier
+    import remediation_engine.orchestration.execution as graph_wrappers
+    from remediation_engine.planning import certification as portfolio_certifier
 
     documents = {
         "pom.xml": "<project><modelVersion>4.0.0</modelVersion></project>\n",
@@ -1765,11 +1762,11 @@ def test_maven_no_fix_package_removal_does_not_require_release_catalog(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    from remediation_engine.agents.supervisor import _portfolio_plan_violations
     from remediation_engine.contracts.solver_models import SolverRuntimeFingerprint
     from remediation_engine.language import ProjectLanguage
-    from remediation_engine.orchestration import portfolio_certifier
-    from remediation_engine.orchestration.supervisor_node import _portfolio_plan_violations
-    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+    from remediation_engine.orchestration.state import build_initial_remediation_task
+    from remediation_engine.planning import certification as portfolio_certifier
 
     pom = tmp_path / "pom.xml"
     pom.write_text(
@@ -1954,7 +1951,7 @@ def test_maven_no_fix_package_removal_does_not_require_release_catalog(
 
 def test_maven_no_fix_target_does_not_invalidate_version_catalogs(tmp_path: Path):
     from remediation_engine.language import ProjectLanguage
-    from remediation_engine.orchestration.task_utils import build_initial_remediation_task
+    from remediation_engine.orchestration.state import build_initial_remediation_task
 
     (tmp_path / "pom.xml").write_text(
         """<project xmlns="http://maven.apache.org/POM/4.0.0">
@@ -2396,7 +2393,7 @@ def test_exact_rejection_uses_next_optimal_candidate_without_resolving(
     remove_nested_copy: bool,
     expected_reason: SolverCandidateRejectionReason,
 ):
-    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.planning import certification as portfolio_certifier
 
     root, files, groups, task_queue = _certifier_fixture(tmp_path)
     if remove_nested_copy:
@@ -2569,96 +2566,6 @@ def test_missing_fresh_packument_stops_before_solver_dispatch(tmp_path: Path):
     assert plan.resolution_certificate.rejection_conflicts == []
     assert not any("npm install --package-lock-only" in command for command in state.commands)
     assert not any(path.startswith(".remedy-plan-cert/") for path in state.files)
-
-
-@pytest.mark.integration
-@pytest.mark.docker
-def test_strict_npm_resolution_certifies_nested_lockfile(tmp_path: Path):
-    pytest.importorskip("docker")
-    from remediation_engine.runtime.docker_client import get_docker_client
-    from remediation_engine.runtime.sandbox_mgr import DockerSandbox
-
-    try:
-        client = get_docker_client()
-    except RuntimeError as exc:
-        pytest.skip(f"Docker daemon is not available: {exc}")
-    try:
-        client.images.get("node:22")
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"node:22 image is not available locally: {exc}")
-    finally:
-        client.close()
-
-    packages = {
-        "name": "app",
-        "dependencies": {
-            "parent-a": "file:packages/parent-a",
-            "parent-b": "file:packages/parent-b",
-            "peer-host": "file:packages/peer-host",
-        },
-    }
-    _write_fixture(tmp_path, "package.json", packages)
-    _write_fixture(
-        tmp_path,
-        "packages/parent-a/package.json",
-        {
-            "name": "parent-a",
-            "version": "1.0.0",
-            "dependencies": {"child": "file:../child-v1"},
-            "peerDependencies": {"peer-host": "^2.0.0"},
-        },
-    )
-    _write_fixture(
-        tmp_path,
-        "packages/parent-b/package.json",
-        {
-            "name": "parent-b",
-            "version": "1.0.0",
-            "dependencies": {"child": "file:../child-v2"},
-        },
-    )
-    _write_fixture(
-        tmp_path, "packages/child-v1/package.json", {"name": "child", "version": "1.0.0"}
-    )
-    _write_fixture(
-        tmp_path, "packages/child-v2/package.json", {"name": "child", "version": "2.0.0"}
-    )
-    _write_fixture(
-        tmp_path, "packages/peer-host/package.json", {"name": "peer-host", "version": "1.0.0"}
-    )
-
-    with DockerSandbox(repo_root=tmp_path) as sandbox:
-        install = sandbox.run(
-            "npm install --package-lock-only --ignore-scripts --no-audit --no-fund "
-            "--legacy-peer-deps=true",
-        )
-        assert install.exit_code == 0, install.stderr or install.stdout
-        root_manifest = sandbox.read_file("package.json")
-        root_lock = sandbox.read_file("package-lock.json")
-        assert root_manifest and root_lock
-        snapshot = load_npm_graph_snapshot_from_documents(
-            {"package.json": root_manifest, "package-lock.json": root_lock}
-        )
-        child_packages = [
-            package for package in snapshot.lockfile_packages if package.package_name == "child"
-        ]
-        child_keys = {package.package_key for package in child_packages}
-        assert len(child_keys) >= 2, child_keys
-        assert any("parent-" in key and "/node_modules/child" in key for key in child_keys), (
-            child_keys
-        )
-
-        strict = sandbox.run(
-            "npm install --package-lock-only --ignore-scripts --no-audit --no-fund "
-            "--strict-peer-deps --engine-strict=true --legacy-peer-deps=false --force=false",
-            timeout=120,
-        )
-        assert strict.exit_code != 0
-        assert (
-            _install_error_category(strict.stdout, strict.stderr, strict.exit_code)
-            == "PEER_CONFLICT"
-        )
-        assert parse_peer_conflict_evidence(strict.stdout, strict.stderr)
 
 
 @pytest.mark.parametrize(
@@ -3012,7 +2919,7 @@ def test_new_pair_cut_discards_batch_remainder_and_resolves_again(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.planning import certification as portfolio_certifier
 
     root = tmp_path
     manifest = {
@@ -3160,7 +3067,7 @@ def test_later_unknown_never_certifies_a_top_k_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.planning import certification as portfolio_certifier
 
     root, files, groups, task_queue = _certifier_fixture(tmp_path)
     solver_results: list[Any] = []
@@ -3258,7 +3165,7 @@ def test_deadline_unknown_preserves_rejected_conflict_and_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.planning import certification as portfolio_certifier
 
     root, files, groups, task_queue = _certifier_fixture(tmp_path)
     deadline_expired = False
@@ -3327,7 +3234,7 @@ def test_deadline_unknown_preserves_rejected_conflict_and_summary(
 def test_exact_rejection_maps_use_full_assignment_no_goods(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.planning import certification as portfolio_certifier
 
     root, files, groups, task_queue = _certifier_fixture(tmp_path)
     solver_inputs: list[dict[str, Any]] = []
@@ -3531,11 +3438,11 @@ def test_staging_manifest_mismatch_is_unknown_without_conflict_learning() -> Non
 
 def test_pruned_override_uses_candidate_start_lockfile_after_prior_batch() -> None:
     from remediation_engine.contracts.solver_models import SolverMutation
-    from remediation_engine.orchestration.portfolio_certifier import (
+    from remediation_engine.planning.certification import (
         _pruned_override_mutations,
         _pruning_baseline_checkpoint,
     )
-    from remediation_engine.orchestration.tools_manifest import _PackageCheckpoint
+    from remediation_engine.tools.npm_mutations import _PackageCheckpoint
 
     baseline_manifest = json.dumps({"dependencies": {"express-jwt": "0.1.3"}})
     baseline_lockfile = json.dumps(
@@ -3636,7 +3543,7 @@ def test_runtime_fingerprint_discovery_failure_produces_no_conflicts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from remediation_engine.orchestration import portfolio_certifier
+    from remediation_engine.planning import certification as portfolio_certifier
 
     root, files, groups, task_queue = _certifier_fixture(tmp_path)
 
@@ -3714,14 +3621,14 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
 ):
     from unittest.mock import MagicMock
 
-    from remediation_engine.orchestration import supervisor_portfolio
-    from remediation_engine.orchestration.state import initial_orchestrator_state
-    from remediation_engine.orchestration.supervisor_node import MAX_RETRIES, run_supervisor_node
-    from remediation_engine.orchestration.tactical_supervisor import (
+    from remediation_engine.agents.supervisor import MAX_RETRIES, run_supervisor_node
+    from remediation_engine.agents.supervisor_reasoning import (
         TacticalCandidateSet,
         TacticalStrategy,
     )
-    from remediation_engine.orchestration.teardown_node import run_teardown_node
+    from remediation_engine.orchestration.state import initial_orchestrator_state
+    from remediation_engine.orchestration.workspace import run_teardown_node
+    from remediation_engine.planning import control as supervisor_portfolio
     from remediation_engine.settings import AppSettings
 
     def make_group(package_name: str, cve_id: str) -> VulnerabilityGroup:
@@ -3899,23 +3806,23 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
 
     with monkeypatch.context() as portfolio_seams:
         portfolio_seams.setattr(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            "remediation_engine.agents.supervisor._portfolio_plan_violations",
             lambda *args, **kwargs: [],
         )
         portfolio_seams.setattr(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            "remediation_engine.agents.supervisor._portfolio_plan_is_stale",
             lambda *args, **kwargs: False,
         )
         portfolio_seams.setattr(
-            "remediation_engine.orchestration.supervisor_portfolio.get_runtime_settings",
+            "remediation_engine.planning.control.get_runtime_settings",
             lambda: settings,
         )
         portfolio_seams.setattr(
-            "remediation_engine.orchestration.supervisor_portfolio.build_certified_portfolio_plan",
+            "remediation_engine.planning.control.build_certified_portfolio_plan",
             build_with_fake_workspace,
         )
         portfolio_seams.setattr(
-            "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+            "remediation_engine.agents.supervisor.run_portfolio_plan_tool",
             capture_portfolio_tool,
         )
         first_supervisor = run_supervisor_node(state)
@@ -4009,15 +3916,15 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
         )
 
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.get_runtime_settings",
+        "remediation_engine.agents.supervisor.get_runtime_settings",
         lambda: AppSettings(openai_api_key=None),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.registry_candidate_sets_for_context",
+        "remediation_engine.agents.supervisor.registry_candidate_sets_for_context",
         provide_task_candidates,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.propose_and_verify_tactical_action",
+        "remediation_engine.agents.supervisor.propose_and_verify_tactical_action",
         lambda *_args, **_kwargs: (None, None),
     )
 
@@ -4048,11 +3955,11 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
     docker_client = MagicMock()
     with monkeypatch.context() as teardown_seams:
         teardown_seams.setattr(
-            "remediation_engine.orchestration.teardown_node.DockerSandbox",
+            "remediation_engine.orchestration.workspace.DockerSandbox",
             sandbox_factory,
         )
         teardown_seams.setattr(
-            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            "remediation_engine.orchestration.workspace.get_docker_client",
             lambda: docker_client,
         )
         teardown_result = run_teardown_node(teardown_state)

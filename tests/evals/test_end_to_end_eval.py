@@ -230,7 +230,7 @@ def test_golden_expectation_reaches_judge_without_becoming_a_pass_gate(evidence)
         == hashlib.sha256(golden.fixture_path.read_bytes()).hexdigest()
     )
     assert record.additional_metadata["golden"]["fixture_path"].endswith(
-        "examples/juice_shop/fixtures/baseline_issues.jsonl"
+        "examples/juice_shop/baseline_issues.jsonl"
     )
     assert golden.expected_output in selected[0].calls[0].actual_output
     assert golden.case_id in selected[0].calls[0].actual_output

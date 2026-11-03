@@ -1,19 +1,9 @@
-"""
-Tests for remediation_engine.contracts.schemas.
-
-Coverage goals
---------------
-* All enum coercion and happy-path construction.
-* Validator rejection paths (path traversal, bad CVE format, line-range inversion,
-  negative token counts, etc.).
-* JSON round-trip fidelity for every model.
-* Property helpers: LineRange.line_count.
-* Realistic SAST + SCA end-to-end object graphs.
-"""
+"""Focused tests for contracts."""
 
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 from pydantic import ValidationError
@@ -56,12 +46,16 @@ from remediation_engine.contracts import (
     VulnerabilityIssue,
 )
 from remediation_engine.contracts.schemas import (
+    CVEEnrichment,
     CWEEntry,
     LineRange,
     QAAttemptResult,
     RemediationTask,
     SupervisorDecision,
+    SystemContext,
     TaskAttemptSnapshot,
+    TriageResult,
+    VulnerabilityGroup,
     WorkerAttemptResult,
 )
 
@@ -1030,3 +1024,379 @@ def test_workerless_remediation_action_is_normalized_and_stays_out_of_attempt_en
     assert "remediation_action" not in TaskAttemptSnapshot.model_fields
     assert "remediation_action" not in WorkerAttemptResult.model_fields
     assert "remediation_action" not in QAAttemptResult.model_fields
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_issue(
+    *,
+    issue_type: IssueType = IssueType.SCA,
+    severity: Severity = Severity.HIGH,
+    package_name: str = "lodash",
+    cve_id: str | None = "CVE-2021-23337",
+    file_path: str | None = "package.json",
+) -> VulnerabilityIssue:
+    return VulnerabilityIssue(
+        source=IssueSource.SEMGREP,
+        issue_type=issue_type,
+        severity=severity,
+        package_name=package_name,
+        cve_id=cve_id,
+        file_path=file_path,
+    )
+
+
+def _make_group(issue: VulnerabilityIssue | None = None) -> VulnerabilityGroup:
+    if issue is None:
+        issue = _make_issue()
+    return VulnerabilityGroup(
+        group_id="sca:package.json:lodash",
+        issue_type=IssueType.SCA,
+        vulnerable_component="lodash",
+        representative_issue_id=issue.id,
+        issues=[issue],
+    )
+
+
+def _make_triage_result(group: VulnerabilityGroup) -> TriageResult:
+    return TriageResult(
+        chain_of_thought="test reasoning",
+        group_id=group.group_id,
+        is_valid=True,
+        original_severity=Severity.HIGH,
+        revised_priority=Severity.HIGH,
+        is_unreachable_code=False,
+        priority_reasoning="Original severity HIGH.",
+        validity_confidence_score=1.0,
+        priority_confidence_score=1.0,
+        recommended_issue_id=group.representative_issue_id,
+        triage_method="deterministic",
+    )
+
+
+# ---------------------------------------------------------------------------
+# SystemContext
+# ---------------------------------------------------------------------------
+
+
+class TestSystemContext:
+    def test_defaults(self):
+        ctx = SystemContext()
+        assert ctx.repo_url is None
+        assert ctx.base_ref is None
+        assert ctx.environment is None
+        assert ctx.tags == {}
+        assert isinstance(ctx.scanned_at, datetime)
+
+    def test_with_fields(self):
+        ctx = SystemContext(
+            repo_url="https://github.com/org/repo",
+            base_ref="main",
+            environment="production",
+            tags={"team": "appsec"},
+        )
+        assert ctx.environment == "production"
+        assert ctx.tags["team"] == "appsec"
+
+    def test_json_round_trip(self):
+        ctx = SystemContext(environment="staging")
+        data = json.loads(ctx.model_dump_json())
+        restored = SystemContext.model_validate(data)
+        assert restored.environment == "staging"
+
+
+# ---------------------------------------------------------------------------
+# CVEEnrichment
+# ---------------------------------------------------------------------------
+
+
+class TestCVEEnrichment:
+    def test_safe_defaults(self):
+        enrichment = CVEEnrichment(cve_id="CVE-2021-44228")
+        assert enrichment.epss == 0.0
+        assert enrichment.epss_percentile == 0.0
+        assert enrichment.in_kev is False
+        assert enrichment.kev_date_added is None
+        assert enrichment.enrichment_source == "none"
+
+    def test_full_enrichment(self):
+        enrichment = CVEEnrichment(
+            cve_id="CVE-2021-44228",
+            epss=0.97,
+            epss_percentile=0.999,
+            in_kev=True,
+            kev_date_added="2021-12-10",
+            enrichment_source="epss+kev",
+        )
+        assert enrichment.in_kev is True
+        assert enrichment.epss == pytest.approx(0.97)
+
+    def test_epss_bounds(self):
+        with pytest.raises(ValidationError):
+            CVEEnrichment(cve_id="CVE-2021-44228", epss=1.5)
+        with pytest.raises(ValidationError):
+            CVEEnrichment(cve_id="CVE-2021-44228", epss=-0.1)
+
+    def test_json_round_trip(self):
+        enrichment = CVEEnrichment(
+            cve_id="CVE-2021-44228",
+            epss=0.5,
+            in_kev=True,
+        )
+        data = json.loads(enrichment.model_dump_json())
+        restored = CVEEnrichment.model_validate(data)
+        assert restored.in_kev is True
+        assert restored.epss == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# VulnerabilityGroup
+# ---------------------------------------------------------------------------
+
+
+class TestVulnerabilityGroup:
+    def test_list_fields_default_to_empty(self):
+        issue = _make_issue()
+        group = VulnerabilityGroup(
+            group_id="sca:pkg.json:lodash",
+            issue_type=IssueType.SCA,
+            representative_issue_id=issue.id,
+        )
+        assert group.cve_ids == []
+        assert group.file_paths == []
+        assert group.versions == []
+        assert group.sources == []
+        assert group.issues == []
+        assert group.localized_issues == []
+        assert group.fix_plan is None
+        assert group.enrichment is None
+        assert group.is_reachable is None
+
+    def test_with_cve_and_sources(self):
+        issue = _make_issue()
+        group = VulnerabilityGroup(
+            group_id="sca:pkg.json:lodash",
+            issue_type=IssueType.SCA,
+            vulnerable_component="lodash",
+            file_paths=["package.json", "frontend/package.json"],
+            representative_issue_id=issue.id,
+            issues=[issue],
+            cve_ids=["CVE-2021-23337"],
+            sources=[IssueSource.SEMGREP, IssueSource.ODC],
+        )
+        assert len(group.cve_ids) == 1
+        assert len(group.sources) == 2
+        assert group.file_path == "package.json"
+        assert group.file_paths == ["package.json", "frontend/package.json"]
+
+    def test_json_round_trip(self):
+        issue = _make_issue()
+        group = _make_group(issue)
+        data = json.loads(group.model_dump_json())
+        restored = VulnerabilityGroup.model_validate(data)
+        assert restored.group_id == group.group_id
+        assert restored.representative_issue_id == group.representative_issue_id
+        assert restored.file_paths == group.file_paths
+
+    def test_enrichment_can_be_attached(self):
+        issue = _make_issue()
+        group = _make_group(issue)
+        enrichment = CVEEnrichment(cve_id="CVE-2021-23337", epss=0.7, in_kev=True)
+        group.enrichment = enrichment
+        assert group.enrichment.in_kev is True
+
+    def test_localized_issues_and_fix_plan_can_be_attached(self):
+        issue = _make_issue()
+        group = _make_group(issue)
+        localized = LocalizedIssue(
+            issue=issue, manifest_file="package.json", localization_confidence=0.95
+        )
+        plan = FixPlan(
+            status=FixPlanStatus.VERSION_FOUND,
+            fixed_version="4.17.21",
+            workaround_snippets=None,
+            instruction="Update dependency.",
+            strategy_used="UPDATE_VERSION",
+        )
+        group.localized_issues = [localized]
+        group.fix_plan = plan
+        assert group.localized_issues[0].manifest_file == "package.json"
+        assert group.fix_plan.fixed_version == "4.17.21"
+
+    def test_reachability_can_be_attached(self):
+        issue = _make_issue()
+        group = _make_group(issue)
+        group.is_reachable = False
+        assert group.is_reachable is False
+
+    def test_file_path_and_file_paths_stay_in_sync(self):
+        issue = _make_issue()
+        group = VulnerabilityGroup(
+            group_id="sca:pkg.json:lodash",
+            issue_type=IssueType.SCA,
+            representative_issue_id=issue.id,
+            file_paths=["frontend/package.json"],
+        )
+        assert group.file_path == "frontend/package.json"
+        assert group.file_paths == ["frontend/package.json"]
+
+    def test_windows_style_paths_normalize_to_forward_slashes(self):
+        issue = _make_issue()
+        group = VulnerabilityGroup(
+            group_id="sca:pkg.json:lodash",
+            issue_type=IssueType.SCA,
+            representative_issue_id=issue.id,
+            file_path="frontend\\package.json",
+            file_paths=["frontend\\package.json", "\\frontend\\package.json"],
+        )
+        localized = LocalizedIssue(
+            issue=issue,
+            manifest_file="frontend\\package.json",
+            localization_confidence=1.0,
+        )
+
+        assert group.file_path == "frontend/package.json"
+        assert group.file_paths == ["frontend/package.json"]
+        assert localized.manifest_file == "frontend/package.json"
+
+
+# ---------------------------------------------------------------------------
+# TriageResult
+# ---------------------------------------------------------------------------
+
+
+class TestTriageResult:
+    def test_chain_of_thought_is_first_field(self):
+        assert next(iter(TriageResult.model_fields)) == "chain_of_thought"
+
+    def test_valid_result(self):
+        group = _make_group()
+        result = _make_triage_result(group)
+        assert result.is_valid is True
+        assert result.original_severity is Severity.HIGH
+        assert result.is_unreachable_code is False
+        assert result.triage_method == "deterministic"
+
+    def test_false_positive_requires_reason(self):
+        group = _make_group()
+        with pytest.raises(ValidationError, match="false_positive_reason is required"):
+            TriageResult(
+                chain_of_thought="test reasoning",
+                group_id=group.group_id,
+                is_valid=False,
+                # missing false_positive_reason
+                original_severity=Severity.LOW,
+                revised_priority=Severity.LOW,
+                is_unreachable_code=False,
+                priority_reasoning="Dev only.",
+                validity_confidence_score=1.0,
+                priority_confidence_score=1.0,
+                recommended_issue_id=group.representative_issue_id,
+                triage_method="deterministic",
+            )
+
+    def test_false_positive_with_reason(self):
+        group = _make_group()
+        result = TriageResult(
+            chain_of_thought="test reasoning",
+            group_id=group.group_id,
+            is_valid=False,
+            false_positive_reason="All findings are in test/ paths; dev-only dependency.",
+            original_severity=Severity.LOW,
+            revised_priority=Severity.LOW,
+            is_unreachable_code=False,
+            priority_reasoning="Dev only.",
+            validity_confidence_score=1.0,
+            priority_confidence_score=1.0,
+            recommended_issue_id=group.representative_issue_id,
+            triage_method="deterministic",
+        )
+        assert result.is_valid is False
+        assert result.false_positive_reason is not None
+
+    def test_severity_coercion_from_string(self):
+        group = _make_group()
+        result = TriageResult(
+            chain_of_thought="test reasoning",
+            group_id=group.group_id,
+            is_valid=True,
+            original_severity=Severity.HIGH,
+            revised_priority="HIGH",  # type: ignore[arg-type]
+            is_unreachable_code=False,
+            priority_reasoning="Test.",
+            validity_confidence_score=1.0,
+            priority_confidence_score=1.0,
+            recommended_issue_id=group.representative_issue_id,
+            triage_method="deterministic",
+        )
+        assert result.revised_priority is Severity.HIGH
+
+    def test_json_round_trip(self):
+        group = _make_group()
+        result = _make_triage_result(group)
+        data = json.loads(result.model_dump_json())
+        restored = TriageResult.model_validate(data)
+        assert restored.group_id == result.group_id
+        assert restored.original_severity == result.original_severity
+        assert restored.revised_priority == result.revised_priority
+
+    def test_all_severity_values_accepted(self):
+        group = _make_group()
+        for sev in Severity:
+            r = TriageResult(
+                chain_of_thought="test reasoning",
+                group_id=group.group_id,
+                is_valid=True,
+                original_severity=sev,
+                revised_priority=sev,
+                is_unreachable_code=False,
+                priority_reasoning="Test.",
+                validity_confidence_score=1.0,
+                priority_confidence_score=1.0,
+                recommended_issue_id=group.representative_issue_id,
+                triage_method="deterministic",
+            )
+            assert r.revised_priority == sev
+
+    def test_confidence_scores_are_bounded(self):
+        group = _make_group()
+        with pytest.raises(ValidationError):
+            TriageResult(
+                chain_of_thought="test reasoning",
+                group_id=group.group_id,
+                is_valid=True,
+                original_severity=Severity.HIGH,
+                revised_priority=Severity.HIGH,
+                is_unreachable_code=False,
+                priority_reasoning="Test.",
+                validity_confidence_score=1.5,
+                priority_confidence_score=1.0,
+                recommended_issue_id=group.representative_issue_id,
+                triage_method="deterministic",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Contract imports from __init__
+# ---------------------------------------------------------------------------
+
+
+def test_re_exported_from_contracts_init():
+    """Phase 1 and triage models are importable from the public package."""
+    from remediation_engine.contracts import (  # noqa: F401
+        MAX_MULTI_PACKAGE_ACTION_SIZE,
+        CVEEnrichment,
+        MultiPackageAction,
+        PackageMutation,
+        SystemContext,
+        TacticalStrategy,
+        TacticalSupervisorAction,
+        TaskCluster,
+        TaskDependency,
+        TaskDependencyKind,
+        TriageResult,
+        VulnerabilityGroup,
+    )

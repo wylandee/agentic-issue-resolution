@@ -15,6 +15,7 @@ from .schemas import (
     AgentActionStatus,
     AgentActionSummary,
     ASTNodeType,
+    AuditRecord,
     CodeWorkaroundSupervisorAction,
     # Sandbox contracts
     CommandResult,
@@ -23,6 +24,7 @@ from .schemas import (
     CWEEntry,
     DependencyEvidenceStatus,
     DependencyParentContext,
+    EligibleActions,
     FailureCategory,
     FinalFullScanResult,
     FixPlan,
@@ -51,6 +53,7 @@ from .schemas import (
     QAPolicy,
     QASemanticSecurityReview,
     QATestAttribution,
+    ReconciliationResult,
     RemediationTask,
     RoutingStrategy,
     ScanFallbackReason,
@@ -124,7 +127,6 @@ from .solver_models import (
     SolverTaskDecision,
     SolverVersionCandidate,
 )
-from .supervisor_phases import AuditRecord, EligibleActions, ReconciliationResult
 from .version_policy import (
     MavenRegistryCandidate,
     RegistryCandidate,

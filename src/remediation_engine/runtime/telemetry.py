@@ -1,0 +1,1334 @@
+"""Trace configuration, persistence, and export for Phase 5 runs.
+
+This module owns local trajectory recording, optional LangSmith integration,
+and atomic report writes. Traces use a portable Markdown and JSON format.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import tempfile
+import time
+import uuid
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import UTC, date, datetime
+from pathlib import Path
+from threading import RLock
+from typing import Any
+
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import BaseMessage
+from langchain_core.tracers.langchain import wait_for_all_tracers
+from langsmith import Client
+
+from remediation_engine.contracts.schemas import VulnerabilityGroup
+from remediation_engine.settings import (
+    MAX_SUBAGENT_TOOL_CALL_ROUNDS,
+    AppSettings,
+    get_runtime_settings,
+)
+
+log = logging.getLogger(__name__)
+
+_DEFAULT_LANGSMITH_PROJECT = "AppSec-Remediation-Engine"
+_PHASE5_RUN_NAME = "phase5_orchestrator"
+_PHASE5_TAGS = ["phase-5", "orchestrator", "langgraph"]
+
+
+def is_phase5_tracing_enabled(settings=None) -> bool:
+    """Return whether LangSmith tracing is enabled for Phase 5."""
+    return (settings or get_runtime_settings()).langsmith_tracing
+
+
+def build_phase5_runnable_config(
+    repo_root: str,
+    valid_groups: list[VulnerabilityGroup],
+    settings=None,
+    target_packages: list[str] | None = None,
+) -> tuple[dict[str, Any] | None, uuid.UUID | None]:
+    """
+    Build a RunnableConfig-like dict for the Phase 5 orchestrator.
+
+    Returns ``(None, None)`` when tracing is disabled.
+    """
+    if not is_phase5_tracing_enabled(settings):
+        return None, None
+
+    run_id = uuid.uuid4()
+    metadata = {
+        "repo_name": Path(repo_root).name,
+        "repo_root": repo_root,
+        "vulnerability_group_count": len(valid_groups),
+        "max_tool_call_rounds": MAX_SUBAGENT_TOOL_CALL_ROUNDS,
+    }
+    if target_packages:
+        metadata.update(
+            {
+                "target_packages": list(target_packages),
+                "target_package_scope_enabled": True,
+            }
+        )
+    config: dict[str, Any] = {
+        "run_id": run_id,
+        "run_name": _PHASE5_RUN_NAME,
+        "tags": list(_PHASE5_TAGS),
+        "metadata": metadata,
+    }
+    return config, run_id
+
+
+def resolve_phase5_trace_url(run_id: uuid.UUID) -> str | None:
+    """
+    Resolve a LangSmith trace URL for a completed Phase 5 run.
+
+    Any lookup failure is treated as non-fatal and returns ``None``.
+    """
+    try:
+        wait_for_all_tracers()
+        client = Client()
+        run = client.read_run(run_id)
+        project_name = get_runtime_settings().langsmith_project or _DEFAULT_LANGSMITH_PROJECT
+        return str(client.get_run_url(run=run, project_name=project_name))
+    except Exception as exc:  # pragma: no cover - defensive logging path
+        log.warning("Phase 5 LangSmith URL lookup failed for run_id=%s: %s", run_id, exc)
+        return None
+
+
+def mark_phase5_trace_failed(run_id: uuid.UUID | str, error: BaseException | str) -> None:
+    """Close an interrupted Phase 5 root run as an error in LangSmith.
+
+    Args:
+        run_id: LangSmith root run identifier.
+        error: Exception or diagnostic that interrupted the graph.
+
+    Raises:
+        Exception: Propagates LangSmith client errors to the caller, which
+            should treat this as best-effort cleanup and preserve the original
+            orchestration error.
+    """
+    message = str(error).strip() or type(error).__name__
+    settings = get_runtime_settings()
+    client_kwargs: dict[str, Any] = {
+        # This is an emergency terminal update.  Do not enqueue it behind the
+        # normal tracing worker, which may be the work that was interrupted.
+        "auto_batch_tracing": False,
+        # Keep interruption cleanup bounded so a LangSmith outage cannot keep
+        # the CLI process alive after the graph has already stopped.
+        "timeout_ms": (2_000, 5_000),
+    }
+    if settings.langsmith_endpoint:
+        client_kwargs["api_url"] = settings.langsmith_endpoint
+    if settings.langsmith_api_key:
+        client_kwargs["api_key"] = settings.langsmith_api_key
+    client = Client(**client_kwargs)
+    client.update_run(
+        run_id,
+        end_time=datetime.now(UTC),
+        error=message,
+        outputs={"status": "completed_with_errors", "error": message},
+    )
+
+
+def resolve_report_dir(settings: AppSettings, default_dir: Path) -> Path:
+    """Resolve the configured report directory without reading the environment."""
+    return settings.remediation_report_dir or default_dir
+
+
+def report_filename(run_id: str) -> str:
+    """Return a stable, filesystem-safe Markdown filename for a run ID."""
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-") or "local-run"
+    return f"remediation_{safe_id}.md"
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write UTF-8 text through an independently owned sibling temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(text)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def write_report_atomic(path: Path, markdown: str) -> None:
+    """Write report text through the shared atomic text writer."""
+    write_text_atomic(path, markdown)
+
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_TRAJECTORY_DIR = _DEFAULT_PROJECT_ROOT / "data" / "trajectories"
+_SECRET_KEY_RE = re.compile(
+    r"(?:api[_-]?key|authorization|password|passwd|secret|private[_-]?key|"
+    r"access[_-]?token|refresh[_-]?token)$",
+    re.IGNORECASE,
+)
+_SECRET_VALUE_RE = re.compile(
+    r"(?i)(?P<prefix>bearer\s+)[A-Za-z0-9._~+/=-]+|"
+    r"(?P<labeled>(?:api[_ -]?key|authorization|password|passwd|secret)\s*[:=]\s*)\S+|"
+    r"\b(?:sk|pk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9._-]{10,}"
+)
+_ACTIVE_RECORDER: ContextVar[TrajectoryRecorder | None] = ContextVar(
+    "phase5_trajectory_recorder",
+    default=None,
+)
+_LANGSMITH_SETTLE_ATTEMPTS = 20
+_LANGSMITH_SETTLE_INTERVAL_SECONDS = 0.25
+_TERMINAL_LANGSMITH_STATUSES = frozenset(
+    {"completed", "success", "succeeded", "error", "failed", "cancelled", "canceled"}
+)
+_PENDING_LANGSMITH_STATUSES = frozenset(
+    {"pending", "running", "queued", "scheduled", "in_progress"}
+)
+
+
+def _redact_string(value: str) -> str:
+    """Redact common credential formats without altering ordinary prompt text."""
+
+    def replace(match: re.Match[str]) -> str:
+        """Replace a matched secret with a redaction marker."""
+        prefix = match.group("prefix") or match.group("labeled") or ""
+        return f"{prefix}[REDACTED]"
+
+    return _SECRET_VALUE_RE.sub(replace, value)
+
+
+def _error_text(error: BaseException | str | None) -> str | None:
+    """Return a useful diagnostic even for exceptions with an empty message."""
+    if error is None:
+        return None
+    if isinstance(error, BaseException):
+        return str(error).strip() or type(error).__name__
+    return str(error).strip() or None
+
+
+def to_jsonable(value: Any, *, key: str | None = None) -> Any:
+    """Convert common LangChain/Pydantic/runtime objects into safe JSON data."""
+    if key and _SECRET_KEY_RE.search(key):
+        return "[REDACTED]"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _redact_string(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (uuid.UUID, Path)):
+        return str(value)
+    if isinstance(value, BaseMessage):
+        return {
+            "type": getattr(value, "type", value.__class__.__name__),
+            "content": to_jsonable(getattr(value, "content", "")),
+            "additional_kwargs": to_jsonable(
+                getattr(value, "additional_kwargs", {}), key="additional_kwargs"
+            ),
+            "response_metadata": to_jsonable(
+                getattr(value, "response_metadata", {}), key="response_metadata"
+            ),
+            "tool_calls": to_jsonable(getattr(value, "tool_calls", [])),
+        }
+    if hasattr(value, "model_dump"):
+        try:
+            return to_jsonable(value.model_dump(mode="json"), key=key)
+        except Exception:  # pragma: no cover - defensive serialization path
+            pass
+    if hasattr(value, "dict") and callable(value.dict):
+        try:
+            return to_jsonable(value.dict(), key=key)
+        except Exception:  # pragma: no cover - defensive serialization path
+            pass
+    if is_dataclass(value):
+        return to_jsonable(asdict(value), key=key)
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): to_jsonable(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [to_jsonable(item) for item in value]
+    if hasattr(value, "__dict__"):
+        try:
+            return to_jsonable(vars(value), key=key)
+        except Exception:  # pragma: no cover - defensive serialization path
+            pass
+    return _redact_string(str(value))
+
+
+def json_text(value: Any) -> str:
+    """Serialize a payload for a Markdown JSON code block."""
+    return json.dumps(
+        to_jsonable(value),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        default=str,
+    )
+
+
+@dataclass
+class _LocalSpan:
+    run_id: str
+    name: str
+    run_type: str
+    parent_run_id: str | None
+    started_at: datetime
+    ended_at: datetime | None = None
+    inputs: Any = None
+    outputs: Any = None
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
+    serialized: Any = None
+    sequence: int = 0
+
+
+def _identifier(value: Any) -> str:
+    return str(value) if value is not None else ""
+
+
+def _span_name(serialized: Any, fallback: str) -> str:
+    if isinstance(serialized, Mapping):
+        name = serialized.get("name") or serialized.get("id")
+        if isinstance(name, list) and name:
+            name = name[-1]
+        if name:
+            return str(name).split(".")[-1]
+    return fallback
+
+
+def _token_usage_from_response(response: Any) -> tuple[int, int, bool]:
+    """Extract prompt/completion token usage from a LangChain LLM response.
+
+    Args:
+        response: Provider response, LangChain message, or JSON-like mapping
+            containing usage metadata.
+
+    Returns:
+        A tuple of ``(prompt_tokens, completion_tokens, available)``.
+    """
+    candidates: list[Any] = []
+    if isinstance(response, Mapping):
+        response_metadata = response.get("response_metadata")
+        if isinstance(response_metadata, Mapping):
+            candidates.extend(
+                [
+                    response_metadata.get("token_usage"),
+                    response_metadata.get("usage"),
+                    response_metadata,
+                ]
+            )
+        candidates.extend(
+            [
+                response.get("usage_metadata"),
+                response.get("token_usage"),
+                response.get("usage"),
+                response,
+            ]
+        )
+
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if isinstance(usage_metadata, Mapping):
+        candidates.append(usage_metadata)
+    llm_output = getattr(response, "llm_output", None)
+    if isinstance(llm_output, Mapping):
+        candidates.extend([llm_output.get("token_usage"), llm_output.get("usage"), llm_output])
+    metadata = getattr(response, "response_metadata", None)
+    if isinstance(metadata, Mapping):
+        candidates.extend([metadata.get("token_usage"), metadata.get("usage"), metadata])
+    for generation_group in getattr(response, "generations", []) or []:
+        for generation in generation_group or []:
+            message = getattr(generation, "message", None)
+            message_usage = getattr(message, "usage_metadata", None)
+            if isinstance(message_usage, Mapping):
+                candidates.append(message_usage)
+            generation_metadata = getattr(message, "response_metadata", None)
+            if isinstance(generation_metadata, Mapping):
+                candidates.extend(
+                    [
+                        generation_metadata.get("token_usage"),
+                        generation_metadata.get("usage"),
+                        generation_metadata,
+                    ]
+                )
+
+    for usage in candidates:
+        if not isinstance(usage, Mapping):
+            continue
+        prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+        completion = usage.get("completion_tokens", usage.get("output_tokens"))
+        try:
+            prompt_value = max(0, int(prompt)) if prompt is not None else 0
+            completion_value = max(0, int(completion)) if completion is not None else 0
+        except (TypeError, ValueError):
+            continue
+        available = prompt is not None or completion is not None
+        if available:
+            return prompt_value, completion_value, True
+    return 0, 0, False
+
+
+def _cached_input_tokens_from_response(response: Any) -> int | None:
+    """Extract OpenAI cached prompt tokens from supported response metadata."""
+    candidates: list[Any] = []
+
+    def add_mapping_candidates(value: Any) -> None:
+        if isinstance(value, Mapping):
+            candidates.extend(
+                [
+                    value.get("token_usage"),
+                    value.get("usage"),
+                    value,
+                ]
+            )
+
+    if isinstance(response, Mapping):
+        add_mapping_candidates(response.get("response_metadata"))
+        add_mapping_candidates(response)
+    add_mapping_candidates(getattr(response, "usage_metadata", None))
+    add_mapping_candidates(getattr(response, "llm_output", None))
+    add_mapping_candidates(getattr(response, "response_metadata", None))
+    for generation_group in getattr(response, "generations", []) or []:
+        for generation in generation_group or []:
+            message = getattr(generation, "message", None)
+            add_mapping_candidates(getattr(message, "usage_metadata", None))
+            add_mapping_candidates(getattr(message, "response_metadata", None))
+
+    for usage in candidates:
+        if not isinstance(usage, Mapping):
+            continue
+        details = usage.get("prompt_tokens_details")
+        if not isinstance(details, Mapping):
+            continue
+        cached = details.get("cached_tokens")
+        try:
+            return max(0, int(cached)) if cached is not None else None
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _token_cost_from_response(response: Any) -> float | None:
+    """Extract a provider-reported token cost without guessing model pricing.
+
+    Args:
+        response: Provider response, LangChain message, or JSON-like mapping
+            containing an explicit token-cost field.
+
+    Returns:
+        The non-negative token cost when the provider reported one; otherwise
+        ``None``.
+    """
+    candidates: list[Any] = []
+    if isinstance(response, Mapping):
+        response_metadata = response.get("response_metadata")
+        if isinstance(response_metadata, Mapping):
+            candidates.extend(
+                [
+                    response_metadata.get("token_usage"),
+                    response_metadata.get("usage"),
+                    response_metadata,
+                ]
+            )
+        candidates.extend(
+            [
+                response.get("usage_metadata"),
+                response.get("token_usage"),
+                response.get("usage"),
+                response,
+            ]
+        )
+    for attribute in ("response_metadata", "usage_metadata", "llm_output"):
+        value = getattr(response, attribute, None)
+        if isinstance(value, Mapping):
+            candidates.extend([value.get("token_usage"), value.get("usage"), value])
+
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        for key in ("token_cost", "token_cost_usd", "cost_usd"):
+            value = candidate.get(key)
+            if value is None:
+                continue
+            try:
+                return max(0.0, float(value))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+class TrajectoryRecorder(BaseCallbackHandler):
+    """Capture callback spans for a single Phase 5 invocation.
+
+    Callback failures are intentionally swallowed so observability can never
+    change remediation behavior.
+    """
+
+    raise_error = False
+
+    def __init__(self) -> None:
+        """Initialize an empty span and token-usage recorder."""
+        super().__init__()
+        self._lock = RLock()
+        self._spans: dict[str, _LocalSpan] = {}
+        self._order: list[str] = []
+        self._sequence = 0
+        self._total_prompt_tokens = 0
+        self._total_completion_tokens = 0
+        self._token_data_available = False
+        self._token_cost: float | None = None
+        self._cached_input_tokens: int | None = None
+        self._workspace_volume: str | None = None
+        self._maven_cache_volume: str | None = None
+
+    def _start(
+        self,
+        *,
+        run_id: Any,
+        parent_run_id: Any,
+        name: str,
+        run_type: str,
+        inputs: Any = None,
+        serialized: Any = None,
+        tags: Sequence[str] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        try:
+            identifier = _identifier(run_id)
+            with self._lock:
+                self._sequence += 1
+                self._spans[identifier] = _LocalSpan(
+                    run_id=identifier,
+                    name=name,
+                    run_type=run_type,
+                    parent_run_id=_identifier(parent_run_id) or None,
+                    started_at=datetime.now(UTC),
+                    inputs=to_jsonable(inputs),
+                    serialized=to_jsonable(serialized),
+                    tags=list(tags or []),
+                    metadata=to_jsonable(dict(metadata or {})),
+                    sequence=self._sequence,
+                )
+                self._order.append(identifier)
+        except Exception:  # pragma: no cover - telemetry must not interrupt a run
+            logger.debug("trajectory recorder failed to start span", exc_info=True)
+
+    def _end(
+        self,
+        run_id: Any,
+        *,
+        outputs: Any = None,
+        error: Any | None = None,
+    ) -> None:
+        try:
+            identifier = _identifier(run_id)
+            with self._lock:
+                span = self._spans.get(identifier)
+                if span is None:
+                    self._sequence += 1
+                    span = _LocalSpan(
+                        run_id=identifier,
+                        name="unknown",
+                        run_type="chain",
+                        parent_run_id=None,
+                        started_at=datetime.now(UTC),
+                        sequence=self._sequence,
+                    )
+                    self._spans[identifier] = span
+                    self._order.append(identifier)
+                span.ended_at = datetime.now(UTC)
+                if outputs is not None:
+                    span.outputs = to_jsonable(outputs)
+                if error is not None:
+                    span.error = _redact_string(str(error))
+        except Exception:  # pragma: no cover - telemetry must not interrupt a run
+            logger.debug("trajectory recorder failed to finish span", exc_info=True)
+
+    def _record_token_usage(self, response: Any) -> None:
+        """Accumulate token counts, cache hits, and provider-reported cost."""
+        prompt_tokens, completion_tokens, available = _token_usage_from_response(response)
+        cached_input_tokens = _cached_input_tokens_from_response(response)
+        token_cost = _token_cost_from_response(response)
+        if not available and cached_input_tokens is None and token_cost is None:
+            return
+        with self._lock:
+            if available:
+                self._total_prompt_tokens += prompt_tokens
+                self._total_completion_tokens += completion_tokens
+                self._token_data_available = True
+            if cached_input_tokens is not None:
+                self._cached_input_tokens = (self._cached_input_tokens or 0) + cached_input_tokens
+            if token_cost is not None:
+                self._token_cost = (self._token_cost or 0.0) + token_cost
+
+    def record_manual(
+        self,
+        *,
+        name: str,
+        run_type: str,
+        inputs: Any = None,
+        outputs: Any = None,
+        error: Any | None = None,
+        parent_run_id: str | None = None,
+    ) -> str:
+        """Record an explicit root/state/runtime event when callbacks are absent."""
+        identifier = f"manual-{uuid.uuid4()}"
+        self._start(
+            run_id=identifier,
+            parent_run_id=parent_run_id,
+            name=name,
+            run_type=run_type,
+            inputs=inputs,
+        )
+        self._end(identifier, outputs=outputs, error=error)
+        if run_type == "llm":
+            try:
+                self._record_token_usage(outputs)
+            except Exception:  # pragma: no cover - telemetry must not interrupt a run
+                logger.debug("trajectory recorder failed to extract token usage", exc_info=True)
+        return identifier
+
+    def sequence_count(self) -> int:
+        """Return the number of spans recorded so far."""
+        with self._lock:
+            return self._sequence
+
+    @property
+    def workspace_volume(self) -> str | None:
+        """Return the run-owned volume explicitly registered by workspace setup."""
+        with self._lock:
+            return self._workspace_volume
+
+    def register_workspace_volume(self, volume_name: str) -> None:
+        """Record a volume created by this run's workspace-builder node."""
+        if volume_name.startswith("agent_workspace_"):
+            with self._lock:
+                self._workspace_volume = volume_name
+
+    def clear_workspace_volume(self, volume_name: str) -> None:
+        """Clear this run's volume record after Docker confirms its removal."""
+        with self._lock:
+            if self._workspace_volume == volume_name:
+                self._workspace_volume = None
+
+    @property
+    def maven_cache_volume(self) -> str | None:
+        """Return the run-owned Maven cache volume registered by setup."""
+        with self._lock:
+            return self._maven_cache_volume
+
+    def register_maven_cache_volume(self, volume_name: str) -> None:
+        """Record the Maven cache volume created by this run's workspace setup."""
+        if volume_name.startswith("agent_maven_repository_"):
+            with self._lock:
+                self._maven_cache_volume = volume_name
+
+    def clear_maven_cache_volume(self, volume_name: str) -> None:
+        """Clear the cache record after Docker confirms its removal."""
+        with self._lock:
+            if self._maven_cache_volume == volume_name:
+                self._maven_cache_volume = None
+
+    def has_span_since(self, sequence: int, run_type: str | None = None) -> bool:
+        """Return whether a span of the requested type started after a sequence."""
+        with self._lock:
+            return any(
+                span.sequence > sequence and (run_type is None or span.run_type == run_type)
+                for span in self._spans.values()
+            )
+
+    def on_chain_start(
+        self,
+        serialized: dict[str, Any],
+        inputs: dict[str, Any],
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Record the start of a LangChain chain callback."""
+        self._start(
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            name=_span_name(serialized, "chain"),
+            run_type="chain",
+            inputs=inputs,
+            serialized=serialized,
+            tags=tags,
+            metadata=metadata,
+        )
+
+    def on_chain_end(self, outputs: Any, *, run_id: Any, **kwargs: Any) -> None:
+        """Record successful completion of a chain callback."""
+        self._end(run_id, outputs=outputs)
+
+    def on_chain_error(self, error: BaseException, *, run_id: Any, **kwargs: Any) -> None:
+        """Record a failed chain callback."""
+        self._end(run_id, error=error)
+
+    def on_llm_start(
+        self,
+        serialized: dict[str, Any],
+        prompts: list[str],
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Record the start of an LLM callback."""
+        self._start(
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            name=_span_name(serialized, "llm"),
+            run_type="llm",
+            inputs=prompts,
+            serialized=serialized,
+            tags=tags,
+            metadata=metadata,
+        )
+
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[BaseMessage]],
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Record the start of a chat-model callback."""
+        self._start(
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            name=_span_name(serialized, "chat_model"),
+            run_type="llm",
+            inputs=messages,
+            serialized=serialized,
+            tags=tags,
+            metadata=metadata,
+        )
+
+    def on_llm_end(self, response: Any, *, run_id: Any, **kwargs: Any) -> None:
+        """Record successful completion of an LLM callback."""
+        self._end(run_id, outputs=response)
+        try:
+            self._record_token_usage(response)
+        except Exception:  # pragma: no cover - telemetry must not interrupt a run
+            logger.debug("trajectory recorder failed to extract token usage", exc_info=True)
+
+    @property
+    def total_prompt_tokens(self) -> int:
+        """Return accumulated prompt tokens from LLM callbacks."""
+        with self._lock:
+            return self._total_prompt_tokens
+
+    @property
+    def total_completion_tokens(self) -> int:
+        """Return accumulated completion tokens from LLM callbacks."""
+        with self._lock:
+            return self._total_completion_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Return accumulated prompt and completion tokens."""
+        with self._lock:
+            return self._total_prompt_tokens + self._total_completion_tokens
+
+    @property
+    def token_data_available(self) -> bool:
+        """Return whether at least one LLM callback supplied token usage."""
+        with self._lock:
+            return self._token_data_available
+
+    @property
+    def cached_input_tokens(self) -> int | None:
+        """Return provider-reported cached prompt tokens, when available."""
+        with self._lock:
+            return self._cached_input_tokens
+
+    @property
+    def token_cost(self) -> float | None:
+        """Return accumulated provider-reported token cost, when available."""
+        with self._lock:
+            return self._token_cost
+
+    def on_llm_error(self, error: BaseException, *, run_id: Any, **kwargs: Any) -> None:
+        """Record a failed LLM callback."""
+        self._end(run_id, error=error)
+
+    def on_tool_start(
+        self,
+        serialized: dict[str, Any],
+        input_str: str,
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        inputs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Record the start of a tool callback."""
+        self._start(
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            name=_span_name(serialized, "tool"),
+            run_type="tool",
+            inputs=inputs if inputs is not None else input_str,
+            serialized=serialized,
+            tags=tags,
+            metadata=metadata,
+        )
+
+    def on_tool_end(self, output: Any, *, run_id: Any, **kwargs: Any) -> None:
+        """Record successful completion of a tool callback."""
+        self._end(run_id, outputs=output)
+
+    def on_tool_error(self, error: BaseException, *, run_id: Any, **kwargs: Any) -> None:
+        """Record a failed tool callback."""
+        self._end(run_id, error=error)
+
+    def spans(self) -> list[dict[str, Any]]:
+        """Return recorded spans in deterministic insertion order."""
+        with self._lock:
+            result = []
+            for identifier in self._order:
+                span = self._spans[identifier]
+                result.append(
+                    {
+                        "run_id": span.run_id,
+                        "name": span.name,
+                        "run_type": span.run_type,
+                        "parent_run_id": span.parent_run_id,
+                        "started_at": span.started_at,
+                        "ended_at": span.ended_at,
+                        "inputs": span.inputs,
+                        "outputs": span.outputs,
+                        "error": span.error,
+                        "metadata": span.metadata,
+                        "tags": span.tags,
+                        "serialized": span.serialized,
+                        "sequence": span.sequence,
+                    }
+                )
+            return result
+
+
+@contextmanager
+def use_trajectory_recorder(recorder: TrajectoryRecorder) -> Iterator[TrajectoryRecorder]:
+    """Make the current recorder available to nested runtime helpers."""
+    token = _ACTIVE_RECORDER.set(recorder)
+    try:
+        yield recorder
+    finally:
+        _ACTIVE_RECORDER.reset(token)
+
+
+def get_active_trajectory_recorder() -> TrajectoryRecorder | None:
+    """Return the recorder bound to the current execution context, if any."""
+    return _ACTIVE_RECORDER.get()
+
+
+def invoke_with_trajectory(
+    name: str,
+    invoke: Any,
+    inputs: Any,
+    *,
+    run_type: str = "llm",
+) -> Any:
+    """Invoke a callable and add a manual span only if callbacks missed it."""
+    recorder = get_active_trajectory_recorder()
+    if recorder is None:
+        return invoke()
+    before = recorder.sequence_count()
+    try:
+        outputs = invoke()
+    except BaseException as exc:
+        if not recorder.has_span_since(before, run_type):
+            recorder.record_manual(
+                name=name,
+                run_type=run_type,
+                inputs=inputs,
+                error=exc,
+            )
+        raise
+    if not recorder.has_span_since(before, run_type):
+        recorder.record_manual(
+            name=name,
+            run_type=run_type,
+            inputs=inputs,
+            outputs=outputs,
+        )
+    return outputs
+
+
+def default_trajectory_dir() -> Path:
+    """Return the configured directory for local trajectory exports."""
+    configured = get_runtime_settings().remediation_trajectory_dir
+    return configured if configured is not None else _DEFAULT_TRAJECTORY_DIR
+
+
+def build_phase5_trajectory_path(
+    trace_id: uuid.UUID | str,
+    *,
+    timestamp: datetime | None = None,
+) -> Path:
+    """Build the canonical output path for one Phase 5 trajectory.
+
+    Args:
+        trace_id: Stable run or trace identifier used in the filename.
+        timestamp: Optional UTC timestamp used for deterministic callers and
+            tests. The current UTC time is used when omitted.
+
+    Returns:
+        The configured trajectory path. The parent directory is not created
+        until export is requested.
+    """
+    export_time = timestamp or datetime.now(UTC)
+    return default_trajectory_dir() / (
+        f"phase5_{export_time.strftime('%Y%m%dT%H%M%SZ')}_{trace_id}.md"
+    )
+
+
+def _remote_span(run: Any, sequence: int) -> dict[str, Any]:
+    return {
+        "run_id": _identifier(getattr(run, "id", "")),
+        "name": str(getattr(run, "name", "unknown")),
+        "run_type": str(getattr(run, "run_type", "chain")),
+        "parent_run_id": _identifier(getattr(run, "parent_run_id", "")) or None,
+        "started_at": getattr(run, "start_time", None),
+        "ended_at": getattr(run, "end_time", None),
+        "inputs": to_jsonable(getattr(run, "inputs", {})),
+        "outputs": to_jsonable(getattr(run, "outputs", {})),
+        "error": _redact_string(str(getattr(run, "error", "")))
+        if getattr(run, "error", None)
+        else None,
+        "metadata": to_jsonable(getattr(run, "extra", {}) or {}),
+        "tags": list(getattr(run, "tags", []) or []),
+        "serialized": to_jsonable(getattr(run, "serialized", {})),
+        "sequence": sequence,
+        "prompt_tokens": getattr(run, "prompt_tokens", None),
+        "completion_tokens": getattr(run, "completion_tokens", None),
+        "total_tokens": getattr(run, "total_tokens", None),
+        "status": getattr(run, "status", None),
+    }
+
+
+def _run_is_pending(run: Any) -> bool:
+    """Return whether a remote LangSmith run has not reached a terminal state."""
+    status = str(getattr(run, "status", "") or "").strip().lower()
+    if status in _PENDING_LANGSMITH_STATUSES:
+        return True
+    if status in _TERMINAL_LANGSMITH_STATUSES:
+        return False
+    return getattr(run, "end_time", None) is None
+
+
+def _flatten_runs(run: Any) -> list[Any]:
+    result = [run]
+    for child in getattr(run, "child_runs", None) or []:
+        result.extend(_flatten_runs(child))
+    return result
+
+
+def _list_langsmith_runs(client: Client, run_id: uuid.UUID | str) -> list[Any]:
+    """Fetch a trace and fall back to the root run's nested children."""
+    runs = list(client.list_runs(trace_id=run_id, limit=None))
+    if not runs:
+        root = client.read_run(run_id, load_child_runs=True)
+        runs = _flatten_runs(root)
+    return runs
+
+
+def _settle_langsmith_runs(client: Client, run_id: uuid.UUID | str) -> list[Any]:
+    """Wait briefly for asynchronous LangSmith child runs to finish exporting."""
+    runs = _list_langsmith_runs(client, run_id)
+    for attempt in range(_LANGSMITH_SETTLE_ATTEMPTS):
+        if not any(_run_is_pending(run) for run in runs):
+            return runs
+        if attempt == _LANGSMITH_SETTLE_ATTEMPTS - 1:
+            break
+        time.sleep(_LANGSMITH_SETTLE_INTERVAL_SECONDS)
+        runs = _list_langsmith_runs(client, run_id)
+    return runs
+
+
+def fetch_langsmith_spans(run_id: uuid.UUID | str) -> list[dict[str, Any]]:
+    """Fetch all spans for a LangSmith trace, including nested child runs."""
+    wait_for_all_tracers()
+    client = Client()
+    runs = _settle_langsmith_runs(client, run_id)
+    if not runs:
+        raise RuntimeError(f"LangSmith returned no spans for trace {run_id}")
+    unique: dict[str, Any] = {}
+    for run in runs:
+        unique[_identifier(getattr(run, "id", ""))] = run
+    spans = [_remote_span(run, index) for index, run in enumerate(unique.values(), start=1)]
+    return sorted(spans, key=lambda item: (str(item.get("started_at") or ""), item["sequence"]))
+
+
+def _format_time(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.astimezone(UTC).isoformat()
+    return str(value)
+
+
+def _duration_seconds(span: Mapping[str, Any]) -> float | None:
+    start = span.get("started_at")
+    end = span.get("ended_at")
+    if isinstance(start, datetime) and isinstance(end, datetime):
+        return round((end - start).total_seconds(), 3)
+    return None
+
+
+def _fence(payload: Any) -> str:
+    text = json_text(payload)
+    longest = max((len(match.group(0)) for match in re.finditer(r"`+", text)), default=0)
+    fence = "`" * max(4, longest + 1)
+    return f"{fence}json\n{text}\n{fence}"
+
+
+def _table_value(value: Any) -> str:
+    # Preserve meaningful false-y values such as ``False`` and ``0`` in the
+    # audit table.  Treating them as empty strings made failed QA results look
+    # like QA had not run at all.
+    return str("" if value is None else value).replace("|", "\\|").replace("\n", " ")
+
+
+def _display_span_status(span: Mapping[str, Any]) -> str:
+    """Return a status that does not hide an unfinished span as completed."""
+    if span.get("error"):
+        return "error"
+    status = str(span.get("status") or "").strip().lower()
+    if status in _PENDING_LANGSMITH_STATUSES:
+        return status
+    if span.get("ended_at") is None and status not in _TERMINAL_LANGSMITH_STATUSES:
+        return "pending"
+    return str(span.get("status") or "completed")
+
+
+def _render_markdown(
+    *,
+    trace_id: str,
+    repo_root: str,
+    initial_state: Any,
+    final_state: Any,
+    spans: list[dict[str, Any]],
+    source: str,
+    langsmith_url: str | None,
+    warnings: Sequence[str],
+    run_error: str | None,
+    trajectory_path: Path,
+) -> str:
+    root_output = dict(final_state) if isinstance(final_state, Mapping) else final_state
+    if isinstance(root_output, dict):
+        root_output["trajectory_path"] = str(trajectory_path)
+    errors = []
+    if isinstance(final_state, Mapping):
+        errors.extend(final_state.get("errors") or [])
+    if run_error:
+        errors.append(run_error)
+
+    lines = [
+        "# Phase 5 Remediation Trajectory",
+        "",
+        "## Run Metadata",
+        "",
+        f"- Trace ID: `{trace_id}`",
+        f"- Repository: `{repo_root}`",
+        f"- Export source: `{source}`",
+        f"- Span count: `{len(spans)}`",
+        f"- LangSmith trace: {langsmith_url or 'unavailable'}",
+        f"- Exported at: `{datetime.now(UTC).isoformat()}`",
+        "",
+        "## Root Input State",
+        "",
+        _fence(initial_state),
+        "",
+        "## Root Final State",
+        "",
+        _fence(root_output),
+        "",
+        "## Attempt Snapshot Summary",
+        "",
+        "| Task | Attempt | Revision | Stage | QA Policy | Policy Source | Selected Version | Dispatch | Executed Versions | Worker | QA | Final Task Status | Instruction |",
+        "|---|---|---:|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    if isinstance(final_state, Mapping):
+        task_queue = final_state.get("task_queue") or {}
+        snapshots = final_state.get("attempt_snapshots_by_id") or {}
+        worker_results = final_state.get("worker_results_by_attempt") or {}
+        qa_results = final_state.get("qa_results_by_attempt") or {}
+        ordered_snapshots = sorted(
+            snapshots.values(),
+            key=lambda snapshot: (
+                getattr(snapshot, "task_id", "")
+                if not isinstance(snapshot, Mapping)
+                else snapshot.get("task_id", ""),
+                getattr(snapshot, "attempt_number", 0)
+                if not isinstance(snapshot, Mapping)
+                else snapshot.get("attempt_number", 0),
+            ),
+        )
+        for snapshot in ordered_snapshots:
+            data = to_jsonable(snapshot)
+            attempt_id = data.get("attempt_id", "")
+            task_id = data.get("task_id", "")
+            worker = worker_results.get(attempt_id)
+            qa = qa_results.get(attempt_id)
+            task = task_queue.get(task_id)
+            worker_data = to_jsonable(worker) if worker is not None else {}
+            qa_data = to_jsonable(qa) if qa is not None else {}
+            task_data = to_jsonable(task) if task is not None else {}
+            instruction = str(data.get("instruction", ""))
+            if len(instruction) > 180:
+                instruction = instruction[:177] + "..."
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _table_value(task_id),
+                        _table_value(attempt_id),
+                        _table_value(data.get("task_revision")),
+                        _table_value(data.get("strategy_stage")),
+                        _table_value(
+                            data.get("qa_policy") or task_data.get("qa_policy") or "missing"
+                        ),
+                        _table_value(qa_data.get("qa_policy_source", "missing")),
+                        _table_value(data.get("selected_version") or "none"),
+                        _table_value(data.get("dispatch_node")),
+                        _table_value(", ".join(worker_data.get("executed_versions", []) or [])),
+                        _table_value(worker_data.get("status", "pending")),
+                        _table_value((qa_data.get("evaluation") or {}).get("passed", "pending")),
+                        _table_value(task_data.get("status", "unknown")),
+                        _table_value(instruction),
+                    ]
+                )
+                + " |"
+            )
+        if not snapshots:
+            lines.append(
+                "| none | none |  |  |  |  |  |  |  |  |  |  | No attempt snapshots recorded |"
+            )
+    else:
+        lines.append(
+            "| none | none |  |  |  |  |  |  |  |  |  |  | No attempt snapshots recorded |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Execution Timeline",
+            "",
+            "| # | Span | Type | Parent | Start | End | Duration (s) | Status | Tokens |",
+            "|---:|---|---|---|---|---|---:|---|---:|",
+        ]
+    )
+    for index, span in enumerate(spans, start=1):
+        tokens = span.get("total_tokens")
+        if tokens is None:
+            prompt = span.get("prompt_tokens")
+            completion = span.get("completion_tokens")
+            tokens = (
+                (prompt or 0) + (completion or 0)
+                if prompt is not None or completion is not None
+                else ""
+            )
+        status = _display_span_status(span)
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(index),
+                    _table_value(span.get("name")),
+                    _table_value(span.get("run_type")),
+                    _table_value(span.get("parent_run_id")),
+                    _table_value(_format_time(span.get("started_at"))),
+                    _table_value(_format_time(span.get("ended_at"))),
+                    _table_value(_duration_seconds(span)),
+                    _table_value(status),
+                    _table_value(tokens),
+                ]
+            )
+            + " |"
+        )
+
+    lines.extend(["", "## Span Details", ""])
+    for index, span in enumerate(spans, start=1):
+        lines.extend(
+            [
+                f"### {index}. {span.get('name')} (`{span.get('run_type')}`)",
+                "",
+                f"- Run ID: `{span.get('run_id')}`",
+                f"- Parent Run ID: `{span.get('parent_run_id') or 'none'}`",
+                f"- Tags: `{', '.join(span.get('tags') or []) or 'none'}`",
+                "",
+                "#### Inputs",
+                "",
+                _fence(span.get("inputs")),
+                "",
+                "#### Outputs",
+                "",
+                _fence(span.get("outputs")),
+            ]
+        )
+        if span.get("serialized"):
+            lines.extend(["", "#### Serialized Metadata", "", _fence(span["serialized"])])
+        if span.get("metadata"):
+            lines.extend(["", "#### Metadata", "", _fence(span["metadata"])])
+        if span.get("error"):
+            lines.extend(["", "#### Error", "", f"```text\n{span['error']}\n```"])
+        lines.append("")
+
+    lines.extend(["## Diagnostics and Guardrails", ""])
+    diagnostic_items = list(errors)
+    if isinstance(final_state, Mapping):
+        plans = final_state.get("retry_plans_by_task") or {}
+        for task_id, plan in plans.items():
+            plan_data = to_jsonable(plan)
+            diagnostic_items.append(
+                f"{task_id}: committed planner plan {json.dumps(plan_data, sort_keys=True)}"
+            )
+        for event in final_state.get("consistency_events") or []:
+            event_data = to_jsonable(event)
+            diagnostic_items.append("consistency event: " + json.dumps(event_data, sort_keys=True))
+    if diagnostic_items:
+        lines.extend(f"- {item}" for item in diagnostic_items)
+    else:
+        lines.append("- No explicit diagnostics recorded.")
+    if warnings:
+        lines.extend(["", "### Export Warnings", "", *[f"- {warning}" for warning in warnings]])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _write_trajectory_markdown(
+    *,
+    trace_id: str,
+    repo_root: str,
+    initial_state: Any,
+    final_state: Any,
+    spans: list[dict[str, Any]],
+    source: str,
+    langsmith_url: str | None,
+    warnings: Sequence[str],
+    run_error: BaseException | None,
+    output_file: Path,
+) -> None:
+    """Atomically write one local trajectory snapshot.
+
+    The caller may invoke this before any remote LangSmith lookup so a partial
+    local trajectory exists even when remote enrichment is interrupted.
+    """
+    markdown = _render_markdown(
+        trace_id=trace_id,
+        repo_root=repo_root,
+        initial_state=initial_state,
+        final_state=final_state,
+        spans=spans,
+        source=source,
+        langsmith_url=langsmith_url,
+        warnings=warnings,
+        run_error=_error_text(run_error),
+        trajectory_path=output_file,
+    )
+    write_text_atomic(output_file, markdown)
+
+
+def export_phase5_trajectory(
+    *,
+    trace_id: uuid.UUID | str,
+    repo_root: str,
+    initial_state: Any,
+    final_state: Any,
+    recorder: TrajectoryRecorder,
+    langsmith_enabled: bool,
+    langsmith_url: str | None = None,
+    run_error: BaseException | None = None,
+    output_path: str | Path | None = None,
+) -> Path:
+    """Write a local trajectory before optionally enriching it from LangSmith.
+
+    The first write always uses the in-process recorder and does not require
+    network access.  LangSmith retrieval and the subsequent enriched rewrite
+    are best-effort; if they fail, the initial local snapshot remains valid.
+    """
+    output_file = (
+        Path(output_path) if output_path is not None else build_phase5_trajectory_path(trace_id)
+    )
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    local_spans = recorder.spans()
+    _write_trajectory_markdown(
+        trace_id=str(trace_id),
+        repo_root=repo_root,
+        initial_state=initial_state,
+        final_state=final_state,
+        spans=local_spans,
+        source="local-fallback",
+        langsmith_url=langsmith_url,
+        warnings=(),
+        run_error=run_error,
+        output_file=output_file,
+    )
+
+    if not langsmith_enabled:
+        return output_file
+
+    warnings: list[str] = []
+    spans = local_spans
+    source = "local-fallback"
+    try:
+        spans = fetch_langsmith_spans(trace_id)
+        source = "langsmith"
+        pending_spans = [span for span in spans if _display_span_status(span) == "pending"]
+        if pending_spans:
+            warnings.append(
+                "LangSmith returned "
+                f"{len(pending_spans)} span(s) without terminal status after export settling."
+            )
+    except Exception as exc:  # noqa: BLE001 - local snapshot already exists
+        warning = f"LangSmith trace retrieval failed: {exc}"
+        warnings.append(warning)
+        logger.warning(warning)
+
+    try:
+        _write_trajectory_markdown(
+            trace_id=str(trace_id),
+            repo_root=repo_root,
+            initial_state=initial_state,
+            final_state=final_state,
+            spans=spans,
+            source=source,
+            langsmith_url=langsmith_url,
+            warnings=warnings,
+            run_error=run_error,
+            output_file=output_file,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the first local snapshot
+        logger.warning("trajectory enrichment rewrite failed: %s", exc)
+
+    return output_file

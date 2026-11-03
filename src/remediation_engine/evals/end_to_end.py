@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from remediation_engine.api import RemediationRequest, run_remediation
-from remediation_engine.orchestration.trajectory_exporter import to_jsonable
+from remediation_engine.runtime.telemetry import to_jsonable
 from remediation_engine.settings import AppSettings
 
 from .db import EvalDatabase

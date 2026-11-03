@@ -10,13 +10,13 @@ from typing import Any
 
 import pytest
 
-from remediation_engine.evals.judge import build_judge_score_metric
-from remediation_engine.orchestration.report_node import (
+from remediation_engine.agents.report import (
     _build_context,
     _build_executive_summary_evidence,
     generate_executive_summary,
     generate_report,
 )
+from remediation_engine.evals.judge import build_judge_score_metric
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import case_metadata_dict, set_pytest_item_identity
 

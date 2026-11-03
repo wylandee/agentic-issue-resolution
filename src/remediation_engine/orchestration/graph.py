@@ -44,7 +44,19 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
-from remediation_engine.contracts.accessors import model_or_dict_value
+from remediation_engine.agents.qa import (
+    run_qa_critic_node,
+    run_workspace_setup_scan_node,
+)
+from remediation_engine.agents.report import finalize_report, run_report_node
+from remediation_engine.agents.supervisor import (
+    instruction_digest,
+    run_supervisor_node,
+    supervisor_router,
+)
+from remediation_engine.agents.triage import run_triage_pipeline
+from remediation_engine.agents.update import run_update_subagent_node
+from remediation_engine.agents.workaround import run_workaround_subagent_node
 from remediation_engine.contracts.schemas import (
     IncrementalScanRecord,
     IssueSource,
@@ -53,15 +65,14 @@ from remediation_engine.contracts.schemas import (
     TaskStatus,
     VulnerabilityGroup,
     VulnerabilityIssue,
+    model_or_dict_value,
 )
 from remediation_engine.contracts.solver_models import (
     PortfolioReplanRequest,
     QAPassedWorkspacePrefix,
 )
 from remediation_engine.language import ProjectLanguage
-from remediation_engine.orchestration._qa_runtime import group_target_identifiers
-from remediation_engine.orchestration.final_full_scan import run_final_full_scan_node
-from remediation_engine.orchestration.graph_wrappers import (
+from remediation_engine.orchestration.execution import (
     _create_workspace_attempt_snapshot,
     _dispatch_boundary_rejection,
     _finalize_qa_workspace_snapshot,
@@ -83,22 +94,6 @@ from remediation_engine.orchestration.graph_wrappers import (
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
 )
-from remediation_engine.orchestration.issue_identity import stable_issue_fingerprint
-from remediation_engine.orchestration.langsmith_config import (
-    build_phase5_runnable_config,
-    mark_phase5_trace_failed,
-    resolve_phase5_trace_url,
-)
-from remediation_engine.orchestration.qa_critic import (
-    run_qa_critic_node,
-    run_workspace_setup_scan_node,
-)
-from remediation_engine.orchestration.report_node import finalize_report, run_report_node
-from remediation_engine.orchestration.runtime_context import (
-    get_bound_runtime_settings,
-    get_runtime_settings,
-    use_runtime_settings,
-)
 from remediation_engine.orchestration.state import (
     OrchestratorState,
     filter_groups_to_target_packages,
@@ -107,29 +102,32 @@ from remediation_engine.orchestration.state import (
     normalize_group_paths,
     validate_target_package_scope,
 )
-from remediation_engine.orchestration.supervisor_node import (
-    instruction_digest,
-    run_supervisor_node,
-    supervisor_router,
-)
-from remediation_engine.orchestration.teardown_node import (
+from remediation_engine.orchestration.workspace import (
     _cleanup_run_owned_maven_cache_volume,
     _cleanup_run_owned_workspace_volume,
+    run_final_full_scan_node,
     run_teardown_node,
+    run_workspace_builder_node,
 )
-from remediation_engine.orchestration.trajectory_exporter import (
+from remediation_engine.runtime.sandbox import DockerSandbox
+from remediation_engine.runtime.telemetry import (
     TrajectoryRecorder,
+    build_phase5_runnable_config,
     build_phase5_trajectory_path,
     export_phase5_trajectory,
     invoke_with_trajectory,
+    mark_phase5_trace_failed,
+    resolve_phase5_trace_url,
     use_trajectory_recorder,
 )
-from remediation_engine.orchestration.update_subagent import run_update_subagent_node
-from remediation_engine.orchestration.workaround_subagent import run_workaround_subagent_node
-from remediation_engine.orchestration.workspace_builder import run_workspace_builder_node
-from remediation_engine.runtime.sandbox_mgr import DockerSandbox
-from remediation_engine.settings import AppSettings
-from remediation_engine.triage.pipeline import run_triage_pipeline
+from remediation_engine.settings import (
+    AppSettings,
+    get_bound_runtime_settings,
+    get_runtime_settings,
+    use_runtime_settings,
+)
+from remediation_engine.tools.identity import stable_issue_fingerprint
+from remediation_engine.tools.qa_workspace import group_target_identifiers
 
 log = logging.getLogger(__name__)
 

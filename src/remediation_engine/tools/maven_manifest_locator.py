@@ -20,7 +20,7 @@ from remediation_engine.runtime.path_policy import (
     repository_relative_path,
     resolve_repository_path,
 )
-from remediation_engine.tools.package_identity import package_name_from_purl
+from remediation_engine.tools.identity import package_name_from_purl
 
 
 @dataclass(frozen=True)

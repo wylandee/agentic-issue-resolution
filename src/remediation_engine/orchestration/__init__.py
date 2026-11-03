@@ -1,11 +1,12 @@
 """Current Phase 5 task-queue orchestration API."""
 
-from .graph import build_orchestrator_graph, orchestrator_engine, run_orchestrator
-from .portfolio_orchestrator import (
+from remediation_engine.planning.portfolio import (
     apply_portfolio_plan,
     build_portfolio_plan,
     prepare_portfolio_inputs,
 )
+
+from .graph import build_orchestrator_graph, orchestrator_engine, run_orchestrator
 
 __all__ = [
     "apply_portfolio_plan",

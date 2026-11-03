@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import pytest
 
+from remediation_engine.agents.supervisor import run_supervisor_node
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
@@ -50,7 +51,7 @@ from remediation_engine.orchestration import (
     orchestrator_engine,
     run_orchestrator,
 )
-from remediation_engine.orchestration import graph_wrappers as _graph_wrappers
+from remediation_engine.orchestration import execution as _graph_wrappers
 from remediation_engine.orchestration.graph import (
     _finish_workspace_attempt_snapshot,
     route_after_workspace_builder,
@@ -58,18 +59,20 @@ from remediation_engine.orchestration.graph import (
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
 )
-from remediation_engine.orchestration.supervisor_node import instruction_digest, run_supervisor_node
-from remediation_engine.orchestration.supervisor_portfolio import (
+from remediation_engine.orchestration.state import (
+    build_initial_remediation_task,
+    instruction_digest,
+)
+from remediation_engine.orchestration.workspace import run_teardown_node
+from remediation_engine.planning.control import (
     MAX_PORTFOLIO_ITERATIONS,
     MAX_PORTFOLIO_REPLAN_ATTEMPTS,
     _record_portfolio_replan_attempt,
     route_after_portfolio,
     run_portfolio_plan_tool,
 )
-from remediation_engine.orchestration.task_utils import build_initial_remediation_task
-from remediation_engine.orchestration.teardown_node import run_teardown_node
 from remediation_engine.settings import AppSettings
-from tests.fix_plan_fixtures import group_with_fix_plans
+from tests.helpers import group_with_fix_plans
 
 
 def _issue(issue_type: IssueType, file_path: str | None = None) -> VulnerabilityIssue:
@@ -240,11 +243,11 @@ def test_supervisor_recovers_worker_result_after_portfolio_cleared_active_target
         }
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+        "remediation_engine.agents.supervisor._portfolio_plan_violations",
         lambda *args, **kwargs: ["stale committed portfolio plan"],
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+        "remediation_engine.agents.supervisor._portfolio_plan_is_stale",
         lambda *args, **kwargs: False,
     )
 
@@ -269,9 +272,7 @@ def test_portfolio_replan_guard_routes_repeated_reason_to_teardown(tmp_path):
         "task_queue": {},
     }
 
-    with patch(
-        "remediation_engine.orchestration.supervisor_portfolio.prepare_portfolio_inputs"
-    ) as prepare:
+    with patch("remediation_engine.planning.control.prepare_portfolio_inputs") as prepare:
         result = run_portfolio_plan_tool(state)
 
     prepare.assert_not_called()
@@ -296,9 +297,7 @@ def test_unfixable_replan_respects_total_iteration_guard(tmp_path):
         "task_queue": {},
     }
 
-    with patch(
-        "remediation_engine.orchestration.supervisor_portfolio.prepare_portfolio_inputs"
-    ) as prepare:
+    with patch("remediation_engine.planning.control.prepare_portfolio_inputs") as prepare:
         result = run_portfolio_plan_tool(state)
 
     prepare.assert_not_called()
@@ -368,21 +367,21 @@ def test_portfolio_node_blocks_missing_certificate_before_commit(tmp_path, monke
         }
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_portfolio.get_runtime_settings",
+        "remediation_engine.planning.control.get_runtime_settings",
         lambda: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_portfolio.prepare_portfolio_inputs",
+        "remediation_engine.planning.control.prepare_portfolio_inputs",
         lambda *args, **kwargs: ([group], {"task-1": task}, []),
     )
     build_plan = MagicMock(return_value=candidate_plan)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_portfolio.build_certified_portfolio_plan",
+        "remediation_engine.planning.control.build_certified_portfolio_plan",
         build_plan,
     )
     apply_plan = MagicMock()
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_portfolio.apply_portfolio_plan",
+        "remediation_engine.planning.control.apply_portfolio_plan",
         apply_plan,
     )
 
@@ -422,23 +421,23 @@ def test_portfolio_does_not_commit_partial_plan_around_active_attempt(tmp_path, 
         }
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_portfolio.get_runtime_settings",
+        "remediation_engine.planning.control.get_runtime_settings",
         lambda: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_portfolio.prepare_portfolio_inputs",
+        "remediation_engine.planning.control.prepare_portfolio_inputs",
         lambda *args, **kwargs: ([group], {"task-1": task}, []),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_portfolio.build_certified_portfolio_plan",
+        "remediation_engine.planning.control.build_certified_portfolio_plan",
         lambda *args, **kwargs: candidate_plan,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_portfolio._portfolio_certificate_violations",
+        "remediation_engine.planning.control._portfolio_certificate_violations",
         lambda *args, **kwargs: [],
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_portfolio.apply_portfolio_plan",
+        "remediation_engine.planning.control.apply_portfolio_plan",
         lambda *args, **kwargs: (
             [group],
             {"task-1": task.model_copy(update={"task_revision": 2})},
@@ -718,12 +717,12 @@ class TestPhase5RunOrchestrator:
         state = _initial_state(tmp_path, [])
         state["workspace_volume"] = "agent_workspace_deadbeef"
         monkeypatch.setattr(
-            "remediation_engine.orchestration.supervisor_node.reconcile_phase5_state_before_teardown",
+            "remediation_engine.orchestration.state.reconcile_phase5_state_before_teardown",
             lambda _state: (_ for _ in ()).throw(RuntimeError("state reconciliation failed")),
         )
         cleanup = MagicMock(return_value=(True, []))
         monkeypatch.setattr(
-            "remediation_engine.orchestration.teardown_node._cleanup_run_owned_workspace_volume",
+            "remediation_engine.orchestration.workspace._cleanup_run_owned_workspace_volume",
             cleanup,
         )
 
@@ -738,12 +737,12 @@ class TestPhase5RunOrchestrator:
         state = _initial_state(tmp_path, [])
         state["workspace_volume"] = "agent_workspace_deadbeef"
         monkeypatch.setattr(
-            "remediation_engine.orchestration.supervisor_node.reconcile_phase5_state_before_teardown",
+            "remediation_engine.orchestration.state.reconcile_phase5_state_before_teardown",
             lambda _state: (_ for _ in ()).throw(KeyboardInterrupt()),
         )
         cleanup = MagicMock(return_value=(True, []))
         monkeypatch.setattr(
-            "remediation_engine.orchestration.teardown_node._cleanup_run_owned_workspace_volume",
+            "remediation_engine.orchestration.workspace._cleanup_run_owned_workspace_volume",
             cleanup,
         )
 
@@ -1793,7 +1792,7 @@ class TestPhase5GraphIntegration:
         )
 
         with patch(
-            "remediation_engine.orchestration.graph_wrappers._graph_module",
+            "remediation_engine.orchestration.execution._graph_module",
             return_value=graph_module,
         ):
             cleanup_errors = _graph_wrappers._finalize_qa_workspace_snapshot(
@@ -1944,7 +1943,7 @@ class TestPhase5GraphIntegration:
                 return_value=sandbox,
             ),
             patch(
-                "remediation_engine.orchestration.graph_wrappers._qa_workspace_graph_digest",
+                "remediation_engine.orchestration.execution._qa_workspace_graph_digest",
                 return_value="qa-workspace-digest",
             ),
         ):
@@ -3134,11 +3133,7 @@ def test_delta_isolation_probe_exception_consumes_slot_before_later_failure(tmp_
 def socket_stack_delta_case(tmp_path):
     """Build one atomic three-package case from the canonical baseline issues."""
     fixture_path = (
-        Path(__file__).resolve().parents[1]
-        / "examples"
-        / "juice_shop"
-        / "fixtures"
-        / "baseline_issues.jsonl"
+        Path(__file__).resolve().parents[1] / "examples" / "juice_shop" / "baseline_issues.jsonl"
     )
     target_packages = {"socket.io", "engine.io", "socket.io-parser"}
     baseline_issues = []
@@ -3359,7 +3354,7 @@ def test_socket_stack_delta_fixture_exercises_three_task_blame_and_replan(
         return {"status": "portfolio_ready", "errors": []}
 
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        "remediation_engine.agents.supervisor.run_portfolio_plan_tool",
         run_portfolio_tool,
     )
 
@@ -3501,16 +3496,15 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
         SolverTarget,
         SolverTaskDecision,
     )
-    from remediation_engine.orchestration.graph_wrappers import (
+    from remediation_engine.orchestration.execution import (
         run_qa_critic_from_orchestrator,
         run_update_subagent_from_orchestrator,
     )
-    from remediation_engine.orchestration.portfolio_orchestrator import (
+    from remediation_engine.orchestration.state import initial_orchestrator_state
+    from remediation_engine.planning.portfolio import (
         repository_fingerprint,
     )
-    from remediation_engine.orchestration.state import initial_orchestrator_state
-    from remediation_engine.solver.graph import cluster_packages
-    from remediation_engine.solver.subgraph import _build_ancestry_edges
+    from remediation_engine.solver.graph import _build_ancestry_edges, cluster_packages
 
     package_rows = [
         ("jws", "task-jws", "3.2.2", "3.2.3", "GHSA-JWS"),
@@ -3967,7 +3961,7 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
         }
 
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        "remediation_engine.agents.supervisor.run_portfolio_plan_tool",
         replan_fixture_portfolio,
     )
     monkeypatch.setattr(
@@ -3977,15 +3971,15 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
     )
     with (
         patch(
-            "remediation_engine.orchestration.teardown_node.DockerSandbox",
+            "remediation_engine.orchestration.workspace.DockerSandbox",
             lambda **_kwargs: sandbox,
         ),
         patch(
-            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            "remediation_engine.orchestration.workspace.get_docker_client",
             lambda: fake_client,
         ),
         patch(
-            "remediation_engine.orchestration.teardown_node._close_client",
+            "remediation_engine.orchestration.workspace._close_client",
             lambda _client: None,
         ),
     ):
@@ -4072,15 +4066,15 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
     )
     with (
         patch(
-            "remediation_engine.orchestration.teardown_node.DockerSandbox",
+            "remediation_engine.orchestration.workspace.DockerSandbox",
             lambda **_kwargs: sandbox,
         ),
         patch(
-            "remediation_engine.orchestration.teardown_node.get_docker_client",
+            "remediation_engine.orchestration.workspace.get_docker_client",
             lambda: fake_client,
         ),
         patch(
-            "remediation_engine.orchestration.teardown_node._close_client",
+            "remediation_engine.orchestration.workspace._close_client",
             lambda _client: None,
         ),
     ):
@@ -4399,12 +4393,14 @@ def test_socket_stack_fixture_rejects_mutation_id_mismatch_before_snapshot(
 
 
 class TestPhase5RoutingStage2Parity:
-    def test_route_after_workspace_builder_routes_to_supervisor(self):
-        assert route_after_workspace_builder({"status": "workspace_ready"}) == "supervisor"
+    def test_route_after_workspace_builder_routes_to_setup_scan(self):
+        assert route_after_workspace_builder({"status": "workspace_ready"}) == (
+            "workspace_setup_scan"
+        )
 
 
 class TestPhase5RunOrchestratorStage2Parity:
-    def test_keyboard_interrupt_preserves_partial_state_and_writes_follow_up_report(
+    def test_keyboard_interrupt_exports_partial_state_and_writes_follow_up_report(
         self, tmp_path, monkeypatch
     ):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
@@ -4424,18 +4420,15 @@ class TestPhase5RunOrchestratorStage2Parity:
             "active_target_task_ids": ["task-1"],
         }
 
-        def interrupted_stream(*_args, **_kwargs):
-            yield partial_state
+        def interrupted_invoke(state, config):
+            state.update(partial_state)
+            recorder = config["callbacks"][0]
+            recorder.register_workspace_volume("agent_workspace_interrupted")
             raise KeyboardInterrupt()
 
         mock_engine = MagicMock()
-        mock_engine.stream.side_effect = interrupted_stream
-        teardown_update = {
-            "status": "completed_with_errors",
-            "workspace_volume": None,
-            "changed_files": [],
-            "diff": "",
-        }
+        mock_engine.invoke.side_effect = interrupted_invoke
+        cleanup_volume = MagicMock(return_value=(True, []))
 
         with (
             patch("remediation_engine.orchestration.graph.orchestrator_engine", mock_engine),
@@ -4444,19 +4437,17 @@ class TestPhase5RunOrchestratorStage2Parity:
                 return_value=(None, None),
             ),
             patch(
-                "remediation_engine.orchestration.graph.run_teardown_node",
-                return_value=teardown_update,
-            ) as mock_teardown,
+                "remediation_engine.orchestration.graph._cleanup_run_owned_workspace_volume",
+                cleanup_volume,
+            ),
             pytest.raises(KeyboardInterrupt),
         ):
             run_orchestrator(str(tmp_path), groups)
 
-        mock_engine.stream.assert_called_once()
-        assert mock_engine.stream.call_args.kwargs["stream_mode"] == "values"
-        mock_teardown.assert_called_once()
-        assert mock_teardown.call_args.args[0]["task_queue"]["task-1"].status == (
-            TaskStatus.INCONCLUSIVE
-        )
+        mock_engine.invoke.assert_called_once()
+        interrupted_input = mock_engine.invoke.call_args.args[0]
+        assert interrupted_input["task_queue"]["task-1"].status is TaskStatus.INCONCLUSIVE
+        cleanup_volume.assert_called_once_with("agent_workspace_interrupted")
 
         report_files = list(report_dir.glob("*.md"))
         assert len(report_files) == 1
@@ -4468,12 +4459,14 @@ class TestPhase5RunOrchestratorStage2Parity:
         assert len(trajectory_files) == 1
         trajectory_text = trajectory_files[0].read_text(encoding="utf-8")
         assert "task-1" in trajectory_text
-        assert "orchestrator interrupted by KeyboardInterrupt" in trajectory_text
+        assert "orchestrator failed before report phase: KeyboardInterrupt" in trajectory_text
         assert "inconclusive" in trajectory_text
 
 
 class TestPhase5GraphIntegrationStage2Parity:
-    def test_update_wrapper_preserves_exact_task_instruction_python_stage2(self, tmp_path):
+    def test_update_wrapper_preserves_exact_task_instruction_python_stage2(
+        self, tmp_path, monkeypatch
+    ):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task.instruction = 'Update "lodash" in package.json to version "4.17.22".'
@@ -4499,6 +4492,11 @@ class TestPhase5GraphIntegrationStage2Parity:
         ]
 
         update_subagent = MagicMock(return_value={"errors": [], "action_summaries": []})
+        monkeypatch.setattr(
+            _graph_wrappers,
+            "_create_workspace_attempt_snapshot",
+            lambda _state, _target_tasks: (None, []),
+        )
 
         with patch(
             "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
@@ -4517,8 +4515,8 @@ class TestPhase5GraphIntegrationStage2Parity:
         )
         assert "supervisor_instruction" not in subagent_state
 
-    def test_update_wrapper_recovers_matching_worker_result_and_rejects_stale_summary(
-        self, tmp_path
+    def test_update_wrapper_preserves_typed_result_and_supervisor_rejects_stale_attempt(
+        self, tmp_path, monkeypatch
     ):
         groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
@@ -4570,12 +4568,36 @@ class TestPhase5GraphIntegrationStage2Parity:
             effective_target_version="4.17.21",
             effective_dependency_type="dependencies",
         )
+        worker_result = WorkerAttemptResult(
+            attempt_id=snapshot.attempt_id,
+            task_id=task.task_id,
+            task_revision=snapshot.task_revision,
+            status=AgentActionStatus.SUCCESS,
+            executed_versions=["4.17.21"],
+            changed_files=["package.json"],
+            action_summary=summary,
+            execution_diagnostics=WorkerExecutionDiagnostics(
+                attempted_versions=["4.17.21"],
+                executed_versions=["4.17.21"],
+                effective_target_version="4.17.21",
+                effective_dependency_type="dependencies",
+                validation_calls=1,
+                validation_passed=True,
+            ),
+            instruction_digest=snapshot.instruction_digest,
+        )
         worker_output = {
             "errors": [],
             "action_summaries": [summary],
             "changed_files": ["package.json"],
+            "worker_results_by_attempt": {snapshot.attempt_id: worker_result},
             "retry_diagnostics_by_task": {"task-1": retry_diagnostics},
         }
+        monkeypatch.setattr(
+            _graph_wrappers,
+            "_create_workspace_attempt_snapshot",
+            lambda _state, _target_tasks: (None, []),
+        )
 
         with patch(
             "remediation_engine.orchestration.graph.run_update_subagent_node",
@@ -4590,19 +4612,23 @@ class TestPhase5GraphIntegrationStage2Parity:
         assert worker_result.executed_versions == ["4.17.21"]
         assert worker_result.changed_files == ["package.json"]
         assert worker_result.execution_diagnostics.validation_passed is True
-        assert any(
-            event.error_code == "UPDATE_WORKER_RESULT_RECOVERED"
-            for event in result["consistency_events"]
-        )
 
         supervisor_result = run_supervisor_node({**state, **result})
         assert supervisor_result["next_routing_step"] == "qa_critic"
         assert supervisor_result["task_queue"]["task-1"].status == TaskStatus.OPTIMISTICALLY_FIXED
 
         stale_summary = summary.model_copy(update={"attempt_id": "attempt-stale"})
+        stale_worker_result = worker_result.model_copy(
+            update={
+                "attempt_id": "attempt-stale",
+                "task_revision": snapshot.task_revision - 1,
+                "action_summary": stale_summary,
+            }
+        )
         stale_output = {
             **worker_output,
             "action_summaries": [stale_summary],
+            "worker_results_by_attempt": {"attempt-stale": stale_worker_result},
         }
         with patch(
             "remediation_engine.orchestration.graph.run_update_subagent_node",
@@ -4610,10 +4636,11 @@ class TestPhase5GraphIntegrationStage2Parity:
         ):
             stale_result = run_update_subagent_from_orchestrator(state)
 
-        assert "worker_results_by_attempt" not in stale_result
-        assert not any(
-            event.error_code == "UPDATE_WORKER_RESULT_RECOVERED"
-            for event in stale_result.get("consistency_events", [])
+        assert stale_result["worker_results_by_attempt"] == {"attempt-stale": stale_worker_result}
+        stale_supervisor_result = run_supervisor_node({**state, **stale_result})
+        assert any(
+            event.error_code == "STALE_WORKER_RESULT"
+            for event in stale_supervisor_result["consistency_events"]
         )
 
     def test_workaround_wrapper_preserves_typed_attempt_result_python_stage2(self, tmp_path):

@@ -19,7 +19,7 @@ from .contracts.schemas import (
     VulnerabilityIssue,
 )
 from .language import ProjectLanguage, resolve_project_language
-from .orchestration.portfolio_orchestrator import (
+from .planning.portfolio import (
     apply_portfolio_plan,
     build_portfolio_plan,
     prepare_portfolio_inputs,

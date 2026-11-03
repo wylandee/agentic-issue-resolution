@@ -34,7 +34,7 @@ from remediation_engine.contracts import (
     VulnerabilityIssue,
 )
 from remediation_engine.contracts.schemas import normalize_severity_value
-from remediation_engine.tools.package_identity import (
+from remediation_engine.tools.identity import (
     normalize_python_package_name,
     package_name_from_purl,
 )

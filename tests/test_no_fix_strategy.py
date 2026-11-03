@@ -6,6 +6,15 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+from remediation_engine.agents.supervisor import (
+    _create_attempt_snapshot,
+    _deterministic_routing,
+    _no_fix_decision_requires_fallback,
+)
+from remediation_engine.agents.workaround import (
+    _WORKAROUND_STATIC_INSTRUCTIONS,
+    _build_workaround_prompt,
+)
 from remediation_engine.contracts import NoFixMitigationStage
 from remediation_engine.contracts.schemas import (
     CommandResult,
@@ -27,26 +36,18 @@ from remediation_engine.contracts.schemas import (
     WorkaroundExecutionPhase,
     WorkaroundPhase,
 )
-from remediation_engine.orchestration._qa_runtime import _collect_group_package_state
-from remediation_engine.orchestration.remedy_tools import build_workaround_toolbelt
-from remediation_engine.orchestration.supervisor_node import (
-    _create_attempt_snapshot,
-    _deterministic_routing,
-    _no_fix_decision_requires_fallback,
+from remediation_engine.language import ProjectLanguage
+from remediation_engine.orchestration.state import (
     _no_fix_failure_transition,
     _normalize_qa_evaluations_for_tasks,
-)
-from remediation_engine.orchestration.task_utils import (
     advance_no_fix_stage,
     build_initial_remediation_task,
     build_no_fix_package_removal_instruction,
     build_no_fix_retry_instruction,
 )
-from remediation_engine.orchestration.tools_validation import _make_validate_workaround_tool
-from remediation_engine.orchestration.workaround_subagent import (
-    _WORKAROUND_STATIC_INSTRUCTIONS,
-    _build_workaround_prompt,
-)
+from remediation_engine.tools.qa_workspace import _collect_group_package_state
+from remediation_engine.tools.validation import _make_validate_workaround_tool
+from remediation_engine.tools.workers import build_workaround_toolbelt
 
 
 def _group() -> VulnerabilityGroup:
@@ -339,6 +340,31 @@ class _PackageSandbox:
     def run(self, command: str, **_kwargs):
         self.commands.append(command)
         return self.sync_result
+
+
+def test_package_removal_validator_rejects_explicit_language_mismatch():
+    sandbox = _PackageSandbox({"module/pom.xml": "<project/>"})
+    plan_state = {
+        "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
+        "no_fix_package_manager": "maven",
+        "no_fix_package_name": "org.example:widget",
+        "no_fix_manifest_paths": ["module/pom.xml"],
+        "package_removal_planned": True,
+        "no_fix_package_removed": True,
+    }
+    validate = _make_validate_workaround_tool(
+        sandbox,
+        set(),
+        plan_state,
+        [],
+        language=ProjectLanguage.NODEJS,
+    )
+
+    result = validate.invoke({"modified_files": ["module/pom.xml"]})
+
+    assert "[PACKAGE_REMOVAL]" in result
+    assert "conflicts with the explicit validation language" in result
+    assert sandbox.commands == []
 
 
 def test_maven_qa_package_state_requires_exact_pom_and_dependency_tree_evidence():

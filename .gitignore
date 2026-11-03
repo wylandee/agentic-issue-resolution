@@ -80,6 +80,7 @@ Thumbs.db
 !/demo/.env.example
 /demo/workspace/
 /demo/workspaces/
+/demo/.workspaces/
 /demo/data/workspace/
 /demo/data/workspaces/
 /demo/data/clones/

@@ -48,9 +48,9 @@ from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.state import (
     initial_update_subagent_state,
     initial_workaround_subagent_state,
+    instruction_digest,
 )
-from remediation_engine.orchestration.supervisor_policy import instruction_digest
-from remediation_engine.orchestration.trajectory_exporter import (
+from remediation_engine.runtime.telemetry import (
     TrajectoryRecorder,
     use_trajectory_recorder,
 )
@@ -559,8 +559,7 @@ def replay_triage_case(
     Returns:
         The typed triage result and any deterministic selection evidence.
     """
-    from remediation_engine.triage.agent import run_triage
-    from remediation_engine.triage.pipeline import select_issues_for_remediation
+    from remediation_engine.agents.triage import run_triage, select_issues_for_remediation
 
     group = build_vulnerability_group(case)
     context = build_system_context(case)
@@ -605,7 +604,7 @@ def replay_triage_case(
 
 def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str) -> Any:
     """Build deterministic QA results, including optional execution metadata."""
-    import remediation_engine.orchestration.qa_types as qa
+    import remediation_engine.tools.qa_scan as qa
 
     replay = _replay_input(case)
     execution = replay.get("execution_context", case.get("execution_context", {}))
@@ -962,9 +961,9 @@ def replay_qa_case(
     Returns:
         The typed QA evaluation and captured in-memory side effects.
     """
-    import remediation_engine.orchestration.qa_critic as qa
-    import remediation_engine.orchestration.qa_evaluator as qa_evaluator
-    from remediation_engine.orchestration.graph_wrappers import run_qa_critic_from_orchestrator
+    import remediation_engine.agents.qa as qa
+    import remediation_engine.agents.qa_evaluation as qa_evaluator
+    from remediation_engine.orchestration.execution import run_qa_critic_from_orchestrator
 
     group = _group_for_case(case, component="qa")
     project_language = _case_project_language(case)
@@ -1310,7 +1309,7 @@ def replay_update_case(
         The typed worker result and captured in-memory side effects.
     """
     del eval_settings
-    import remediation_engine.orchestration.update_subagent as update
+    import remediation_engine.agents.update as update
 
     replay = _replay_input(case)
     project_language = _project_language(case)
@@ -1543,8 +1542,8 @@ def replay_workaround_case(
         The typed worker result and captured in-memory side effects.
     """
     del eval_settings
-    import remediation_engine.orchestration.remedy_tools as remedy_tools
-    import remediation_engine.orchestration.workaround_subagent as workaround
+    import remediation_engine.agents.workaround as workaround
+    import remediation_engine.tools.workspace as workspace_tools
 
     group = _group_for_case(case, component="workaround")
     task = _build_task(case, group, "workaround")
@@ -1624,10 +1623,12 @@ def replay_workaround_case(
                     )
                 )
             stack.enter_context(
-                patch.object(remedy_tools, "get_runtime_settings", return_value=tool_settings)
+                patch.object(workaround, "get_runtime_settings", return_value=tool_settings)
             )
-            stack.enter_context(patch.object(remedy_tools.requests, "post", side_effect=fake_post))
-            stack.enter_context(patch.object(remedy_tools.requests, "get", side_effect=fake_get))
+            stack.enter_context(
+                patch.object(workspace_tools.requests, "post", side_effect=fake_post)
+            )
+            stack.enter_context(patch.object(workspace_tools.requests, "get", side_effect=fake_get))
             original_loop = workaround.run_bounded_subagent_loop
 
             def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
@@ -1694,8 +1695,8 @@ def replay_supervisor_case(
             committed group floor.
         ValidationError: If a Pydantic replay payload is invalid.
     """
-    import remediation_engine.orchestration.supervisor_node as supervisor_node
-    import remediation_engine.orchestration.tactical_supervisor as tactical_supervisor
+    import remediation_engine.agents.supervisor as supervisor_node
+    import remediation_engine.agents.supervisor_reasoning as tactical_supervisor
 
     replay_input = _replay_input(case)
     raw_task = replay_input.get("task")

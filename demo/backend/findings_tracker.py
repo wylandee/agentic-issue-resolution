@@ -195,24 +195,6 @@ class FindingsTracker:
                     finding.group_id = group_id
                     group_finding_ids.add(finding_id)
 
-    def mark_task_in_progress(self, task_id: str, group_id: str) -> list[DashboardUpdate]:
-        """Mark findings associated with an active task as currently remediating."""
-        updates: list[DashboardUpdate] = []
-        target_fids = self.group_to_finding_ids.get(group_id, set())
-        for fid in target_fids:
-            if fid in self.findings_by_id and self.findings_by_id[fid].status == "flagged":
-                self.findings_by_id[fid].status = "remediating"
-                self.findings_by_id[fid].task_id = task_id
-                updates.append(
-                    DashboardUpdate(
-                        type="finding_status_change",
-                        finding_id=fid,
-                        finding=self.findings_by_id[fid],
-                        **self.get_dashboard_summary(),
-                    )
-                )
-        return updates
-
     def mark_group_remediated(
         self, group_id: str, remaining_target_identifiers: list[str] | None = None
     ) -> list[DashboardUpdate]:

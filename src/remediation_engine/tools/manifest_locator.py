@@ -51,9 +51,8 @@ from remediation_engine.runtime.path_policy import (
     repository_relative_path,
     resolve_repository_path,
 )
+from remediation_engine.tools.identity import package_name_from_purl
 from remediation_engine.tools.maven_manifest_locator import locate_maven_from_issue
-from remediation_engine.tools.npm_graph import _normalize_npm_operator_whitespace
-from remediation_engine.tools.package_identity import package_name_from_purl
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +63,12 @@ _LOCKFILE_PATH_RE = re.compile(
 )
 
 _NPM_LOOSE_NUMERIC_RANGE_RE = re.compile(r"(?<![A-Za-z0-9])0+(\d+)(?=[.\-+|\s]|$)")
+_NPM_OPERATOR_SPACE_RE = re.compile(r"([<>=~^])\s+(?=[vV]?\d)")
+
+
+def _normalize_npm_operator_whitespace(value: str) -> str:
+    """Normalize npm-legal spaces between range operators and versions."""
+    return _NPM_OPERATOR_SPACE_RE.sub(r"\1", value.strip())
 
 
 # ---------------------------------------------------------------------------

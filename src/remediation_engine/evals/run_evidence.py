@@ -11,8 +11,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from remediation_engine.orchestration.task_utils import terminal_outcome_issues
-from remediation_engine.orchestration.trajectory_exporter import to_jsonable
+from remediation_engine.orchestration.state import terminal_outcome_issues
+from remediation_engine.runtime.telemetry import to_jsonable
 
 from .trajectories import TrajectoryDocument, extract_tool_calls, parse_trajectory_markdown
 

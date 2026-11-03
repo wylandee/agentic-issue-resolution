@@ -8,10 +8,10 @@
 
 - `src/remediation_engine/`: installable package and public API.
 - `tests/`: unit and integration tests; tests must not require live Docker, LLM, or network services.
-- `examples/juice_shop/`: the primary maintained end-to-end example and fixtures.
-- `examples/NodeGoat/`: a secondary, tested example and fixture set.
+- `examples/{juice_shop,nodegoat,vulnado,pygoat}/baseline_issues.jsonl`: the four canonical example finding sets.
+- `scripts/run_batch.py`: the shared, profile-scoped batch runner for those four codebases.
 - `data/`: ignored runtime state (clones, caches, trajectories, and reports).
-- `docs/`: architecture and operational documentation.
+- `README.md`: installation, architecture, configuration, evaluations, and operator commands.
 
 ## Development commands
 
@@ -65,7 +65,7 @@ Environment variable names are part of the operational interface. Preserve exist
 
 ## Testing rules
 
-Unit tests mock Docker, HTTP, LangChain, and subprocess boundaries. Live Docker/LLM runs belong in the Juice Shop or NodeGoat examples, or explicitly marked integration tests. Keep tests deterministic and assert typed contracts, state transitions, cleanup, path validation, and patch output.
+Unit tests mock Docker, HTTP, LangChain, and subprocess boundaries. Live Docker/LLM runs require explicit opt-in through the shared batch runner or marked integration/evaluation tests. Keep tests deterministic and assert typed contracts, state transitions, cleanup, path validation, and patch output.
 
 ## Code quality
 

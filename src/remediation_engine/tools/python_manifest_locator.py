@@ -22,7 +22,7 @@ from remediation_engine.runtime.path_policy import (
     repository_relative_path,
     resolve_repository_path,
 )
-from remediation_engine.tools.package_identity import (
+from remediation_engine.tools.identity import (
     normalize_python_package_name,
     package_name_from_purl,
 )

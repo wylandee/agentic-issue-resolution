@@ -16,7 +16,7 @@ from typing import Any
 import remediation_engine.orchestration.graph as graph_module
 from remediation_engine.api import RemediationRequest, RemediationResult, run_remediation
 from remediation_engine.contracts.schemas import SystemContext, VulnerabilityIssue
-from remediation_engine.orchestration.trajectory_exporter import TrajectoryRecorder, to_jsonable
+from remediation_engine.runtime.telemetry import TrajectoryRecorder, to_jsonable
 
 from .findings_tracker import FindingsTracker
 from .models import ConsoleEvent, DashboardUpdate, RunState

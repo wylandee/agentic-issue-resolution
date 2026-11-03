@@ -12,10 +12,9 @@ from uuid import uuid4
 
 import pytest
 
+from remediation_engine.agents.triage import run_triage, select_issues_for_remediation
 from remediation_engine.contracts.schemas import Severity, TriageResult
 from remediation_engine.settings import AppSettings
-from remediation_engine.triage.agent import run_triage
-from remediation_engine.triage.pipeline import select_issues_for_remediation
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,
@@ -217,7 +216,7 @@ class TestTriageEval:
         context = build_system_context(case)
         if case.get("case_id") == "triage-fallback-llm-timeout-to-deterministic":
             settings = replace(AppSettings.from_env(), triage_llm_enabled=True)
-            with patch("remediation_engine.triage.agent._llm_triage", return_value=None):
+            with patch("remediation_engine.agents.triage._llm_triage", return_value=None):
                 result = run_triage(group, context, settings=settings)
             assert result.triage_method == "deterministic"
             assert result.recommended_issue_id == group.representative_issue_id

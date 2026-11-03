@@ -1,0 +1,738 @@
+"""Focused tests for runtime."""
+
+from __future__ import annotations
+
+import io
+import tarfile
+import types
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pydantic import ValidationError
+
+from remediation_engine.contracts import CommandResult
+from remediation_engine.orchestration.state import merge_changed_files_reducer
+from remediation_engine.runtime.path_policy import (
+    WorkspacePathError,
+    normalize_workspace_path,
+    repository_relative_path,
+    resolve_repository_path,
+)
+from remediation_engine.runtime.sandbox import (
+    DockerSandbox,
+    WorkspaceReadCache,
+    _make_tar_archive,
+    _trace_read_files_inputs,
+    _trace_read_files_outputs,
+    get_docker_client,
+)
+
+
+class _ImageNotFound(Exception):
+    pass
+
+
+class _APIError(Exception):
+    pass
+
+
+class _NotFound(Exception):
+    pass
+
+
+def _docker_modules(image_found: bool = True):
+    docker_mod = MagicMock()
+    docker_errors = types.SimpleNamespace(
+        ImageNotFound=_ImageNotFound,
+        APIError=_APIError,
+        NotFound=_NotFound,
+    )
+    docker_mod.errors = docker_errors
+
+    client = MagicMock()
+    docker_mod.from_env.return_value = client
+    client.ping.return_value = True
+
+    if image_found:
+        client.images.get.return_value = MagicMock()
+    else:
+        client.images.get.side_effect = _ImageNotFound("missing")
+
+    container = MagicMock()
+    container.exec_run.return_value = (0, (b"stdout-data", b"stderr-data"))
+    container.put_archive.return_value = True
+    client.containers.run.return_value = container
+
+    return docker_mod, docker_errors, client, container
+
+
+class TestCommandResult:
+    def test_json_round_trip(self):
+        result = CommandResult(exit_code=0, stdout="ok", stderr="", duration_seconds=1.0)
+        restored = CommandResult.model_validate_json(result.model_dump_json())
+        assert restored.exit_code == 0
+        assert restored.stdout == "ok"
+
+    def test_duration_non_negative(self):
+        with pytest.raises((TypeError, ValidationError)):
+            CommandResult(exit_code=0, duration_seconds=-1.0)
+
+
+class TestDockerClientHelper:
+    def test_get_docker_client_connects_and_pings(self):
+        docker_mod, docker_errors, client, _container = _docker_modules()
+        with patch.dict(
+            "sys.modules",
+            {"docker": docker_mod, "docker.errors": docker_errors},
+        ):
+            connected = get_docker_client()
+
+        assert connected is client
+        client.ping.assert_called_once()
+
+    def test_get_docker_client_raises_on_connection_error(self):
+        docker_mod, docker_errors, client, _container = _docker_modules()
+        client.ping.side_effect = Exception("Connection refused")
+        with (
+            patch.dict(
+                "sys.modules",
+                {"docker": docker_mod, "docker.errors": docker_errors},
+            ),
+            pytest.raises(RuntimeError, match="Docker daemon unreachable"),
+        ):
+            get_docker_client()
+
+
+class TestTarArchiveHelper:
+    def test_archive_contains_repo_files(self, tmp_path):
+        (tmp_path / "index.js").write_text("console.log('hi')", encoding="utf-8")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+
+        archive = _make_tar_archive(tmp_path)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r") as tf:
+            names = tf.getnames()
+
+        assert "index.js" in names
+        assert "package.json" in names
+
+    def test_archive_ignores_host_environments_and_generated_python_files(self, tmp_path):
+        """Host virtual environments and Python caches never enter the volume archive."""
+        for dirname in (
+            ".git",
+            "node_modules",
+            ".venv",
+            "venv",
+            ".remedy-pipenv",
+            "__pycache__",
+        ):
+            directory = tmp_path / dirname
+            directory.mkdir()
+            (directory / "payload").write_text("host environment", encoding="utf-8")
+        (tmp_path / "module.pyc").write_bytes(b"bytecode")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "module.pyc").write_bytes(b"bytecode")
+        (tmp_path / "src" / "index.js").write_text("console.log('ok')", encoding="utf-8")
+
+        archive = _make_tar_archive(tmp_path)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r") as tf:
+            names = tf.getnames()
+
+        assert "src/index.js" in names
+        assert not any(
+            name.startswith(
+                (".git", "node_modules", ".venv", "venv", ".remedy-pipenv", "__pycache__")
+            )
+            for name in names
+        )
+        assert not any(name.endswith(".pyc") for name in names)
+
+    def test_java_archive_keeps_mvn_and_build_files_but_excludes_target(self, tmp_path):
+        (tmp_path / ".mvn" / "wrapper").mkdir(parents=True)
+        (tmp_path / ".mvn" / "wrapper" / "maven-wrapper.properties").write_text(
+            "distributionUrl=https://example.invalid/maven.zip",
+            encoding="utf-8",
+        )
+        (tmp_path / "target" / "classes").mkdir(parents=True)
+        (tmp_path / "target" / "classes" / "App.class").write_bytes(b"class")
+        (tmp_path / "build").mkdir()
+        (tmp_path / "build.gradle").write_text("plugins {}", encoding="utf-8")
+
+        archive = _make_tar_archive(tmp_path, frozenset({"target"}))
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r") as tf:
+            names = tf.getnames()
+
+        assert ".mvn/wrapper/maven-wrapper.properties" in names
+        assert "build" in names
+        assert "build.gradle" in names
+        assert not any(name == "target" or name.startswith("target/") for name in names)
+
+
+class TestSandboxLifecycle:
+    def test_start_without_volume_streams_repo(self, tmp_path):
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        docker_mod, docker_errors, client, container = _docker_modules()
+
+        with patch.dict(
+            "sys.modules",
+            {"docker": docker_mod, "docker.errors": docker_errors},
+        ):
+            sandbox = DockerSandbox(tmp_path)
+            sandbox.start()
+            sandbox.teardown()
+
+        assert container.put_archive.called
+        args, _kwargs = container.put_archive.call_args
+        assert args[0] == "/workspace"
+        client.images.get.assert_called_once_with("node:22")
+        assert client.containers.run.call_args.args[0] == "node:22"
+
+    def test_start_with_workspace_volume_mounts_named_volume(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+
+        with patch.dict(
+            "sys.modules",
+            {"docker": docker_mod, "docker.errors": docker_errors},
+        ):
+            sandbox = DockerSandbox(tmp_path, workspace_volume="agent_workspace_deadbeef")
+            sandbox.start()
+            sandbox.teardown()
+
+        _args, kwargs = client.containers.run.call_args
+        assert kwargs["volumes"] == {
+            "agent_workspace_deadbeef": {"bind": "/workspace", "mode": "rw"}
+        }
+
+    def test_start_mounts_separate_maven_repository_volume(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        with patch.dict(
+            "sys.modules",
+            {"docker": docker_mod, "docker.errors": docker_errors},
+        ):
+            sandbox = DockerSandbox(
+                repo_root=None,
+                image="maven:3.9-eclipse-temurin-17",
+                workspace_volume="agent_workspace_deadbeef",
+                maven_repository_volume="agent_maven_repository_deadbeef",
+            )
+            sandbox.start()
+            sandbox.teardown()
+
+        client.images.get.assert_called_once_with("maven:3.9-eclipse-temurin-17")
+        _args, kwargs = client.containers.run.call_args
+        assert kwargs["volumes"] == {
+            "agent_workspace_deadbeef": {"bind": "/workspace", "mode": "rw"},
+            "agent_maven_repository_deadbeef": {
+                "bind": "/root/.m2/repository",
+                "mode": "rw",
+            },
+        }
+
+    def test_restart_reuses_named_volume_without_recopied_host_files(self, tmp_path):
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        docker_mod, docker_errors, client, container = _docker_modules()
+
+        with patch.dict(
+            "sys.modules",
+            {"docker": docker_mod, "docker.errors": docker_errors},
+        ):
+            sandbox = DockerSandbox(tmp_path, workspace_volume="agent_workspace_deadbeef")
+            sandbox.start()
+            sandbox.restart()
+            sandbox.teardown()
+
+        assert client.containers.run.call_count == 2
+        assert container.put_archive.call_count == 1
+
+    def test_partial_startup_closes_client_and_removes_container(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        container.put_archive.side_effect = RuntimeError("archive upload failed")
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {"docker": docker_mod, "docker.errors": docker_errors},
+            ),
+            pytest.raises(RuntimeError, match="archive upload failed"),
+        ):
+            DockerSandbox(tmp_path).start()
+
+        container.kill.assert_called_once()
+        container.remove.assert_called_once_with(force=True)
+        client.close.assert_called_once()
+
+    def test_workspace_initialization_failure_is_transactional(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        container.exec_run.side_effect = [
+            (0, (b"npm pin succeeded", b"")),
+            (1, b"mkdir failed"),
+        ]
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {"docker": docker_mod, "docker.errors": docker_errors},
+            ),
+            pytest.raises(RuntimeError, match="failed to initialize /workspace"),
+        ):
+            DockerSandbox(tmp_path).start()
+
+        container.kill.assert_called_once()
+        container.remove.assert_called_once_with(force=True)
+        client.close.assert_called_once()
+
+    def test_repo_root_none_skips_archive_copy(self):
+        docker_mod, docker_errors, client, container = _docker_modules()
+
+        with patch.dict(
+            "sys.modules",
+            {"docker": docker_mod, "docker.errors": docker_errors},
+        ):
+            sandbox = DockerSandbox(
+                repo_root=None,
+                workspace_volume="agent_workspace_deadbeef",
+            )
+            sandbox.start()
+            sandbox.teardown()
+
+        container.put_archive.assert_not_called()
+
+    def test_missing_image_triggers_pull(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules(image_found=False)
+
+        with patch.dict(
+            "sys.modules",
+            {"docker": docker_mod, "docker.errors": docker_errors},
+        ):
+            sandbox = DockerSandbox(tmp_path)
+            sandbox.start()
+            sandbox.teardown()
+
+        client.images.pull.assert_called_once()
+
+
+class TestSandboxRun:
+    def _started_sandbox(self, tmp_path, client, container):
+        sandbox = DockerSandbox(tmp_path)
+        sandbox._client = client
+        sandbox._container = container
+        sandbox._alive = True
+        return sandbox
+
+    def test_run_wraps_command_in_sh_lc(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        result = sandbox.run("npm test")
+
+        args, kwargs = container.exec_run.call_args
+        assert args[0] == ["/bin/sh", "-lc", "npm test"]
+        assert kwargs["workdir"] == "/workspace"
+        assert result.exit_code == 0
+
+    def test_run_returns_timeout_result(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        container.exec_run.side_effect = Exception("request timed out")
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        result = sandbox.run("sleep 9999", timeout=1)
+
+        assert result.exit_code == 124
+        assert sandbox._alive is False
+
+    def test_run_on_dead_sandbox_returns_error(self, tmp_path):
+        sandbox = DockerSandbox(tmp_path)
+        result = sandbox.run("echo hi")
+        assert result.exit_code == 1
+        assert "not running" in result.stderr
+
+    def test_traced_methods_remain_callable_when_sandbox_is_not_running(self, tmp_path):
+        sandbox = DockerSandbox(tmp_path)
+
+        assert sandbox.run("echo hi").stderr == "Sandbox is not running."
+        assert sandbox.read_file("package.json") is None
+        with pytest.raises(RuntimeError, match="Sandbox is not running."):
+            sandbox.write_file("package.json", "{}")
+
+        with pytest.raises(RuntimeError, match="Sandbox is not running."):
+            sandbox.write_files({"package.json": "{}"})
+
+
+class TestSandboxWorkspaceSnapshots:
+    def _started_sandbox(self, tmp_path, client, container):
+        sandbox = DockerSandbox(tmp_path, workspace_volume="agent_workspace_deadbeef")
+        sandbox._client = client
+        sandbox._container = container
+        sandbox._alive = True
+        return sandbox
+
+    def test_snapshot_restore_and_cleanup_use_private_volume_paths(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        sandbox.create_workspace_snapshot("attempt-123")
+        sandbox.restore_workspace_snapshot("attempt-123")
+        sandbox.remove_workspace_snapshot("attempt-123")
+        sandbox.cleanup_workspace_snapshots()
+
+        commands = [call.args[0][2] for call in container.exec_run.call_args_list]
+        assert (
+            "tar -czf /workspace/.remedy-attempt-snapshots/attempt-123/workspace.tar.gz"
+            in (commands[0])
+        )
+        assert (
+            "test -s /workspace/.remedy-attempt-snapshots/attempt-123/workspace.tar.gz"
+            in (commands[1])
+        )
+        assert (
+            "test -s /workspace/.remedy-attempt-snapshots/attempt-123/workspace.tar.gz"
+            in (commands[2])
+        )
+        assert "find /workspace -mindepth 1 -maxdepth 1" in commands[3]
+        assert (
+            "tar -xzf /workspace/.remedy-attempt-snapshots/attempt-123/workspace.tar.gz"
+            in (commands[4])
+        )
+        assert "rm -rf -- /workspace/.remedy-attempt-snapshots/attempt-123" in commands[5]
+        assert "rm -rf -- /workspace/.remedy-attempt-snapshots" in commands[6]
+
+    def test_snapshot_creation_rejects_invalid_archive(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        container.exec_run.side_effect = [
+            (0, (b"", b"")),
+            (1, (b"", b"archive missing")),
+        ]
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(RuntimeError, match="invalid archive"):
+            sandbox.create_workspace_snapshot("attempt-invalid")
+
+        assert container.exec_run.call_count == 2
+
+    def test_snapshot_restore_rejects_missing_archive_before_cleanup(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        container.exec_run.side_effect = [(1, (b"", b""))]
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(RuntimeError, match="before workspace cleanup"):
+            sandbox.restore_workspace_snapshot("attempt-missing")
+
+        assert container.exec_run.call_count == 1
+        command = container.exec_run.call_args.args[0][2]
+        assert "test -s /workspace/.remedy-attempt-snapshots/attempt-missing" in command
+
+    def test_snapshot_restore_reports_extraction_failure(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        container.exec_run.side_effect = [
+            (0, (b"", b"")),
+            (0, (b"", b"")),
+            (2, (b"", b"tar: invalid archive")),
+        ]
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(RuntimeError, match="while extracting the archive"):
+            sandbox.restore_workspace_snapshot("attempt-corrupt")
+
+        assert container.exec_run.call_count == 3
+
+    def test_snapshot_ids_are_path_safe(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(ValueError, match="snapshot IDs"):
+            sandbox.create_workspace_snapshot("../escape")
+
+        container.exec_run.assert_not_called()
+
+
+def _tar_chunks(filename: str, content: str) -> list[bytes]:
+    buf = io.BytesIO()
+    encoded = content.encode("utf-8")
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name=filename)
+        info.size = len(encoded)
+        tf.addfile(info, io.BytesIO(encoded))
+    return [buf.getvalue()]
+
+
+class TestSandboxFileIO:
+    def _started_sandbox(self, tmp_path, client, container):
+        sandbox = DockerSandbox(tmp_path)
+        sandbox._client = client
+        sandbox._container = container
+        sandbox._alive = True
+        return sandbox
+
+    def test_write_file_puts_archive_into_parent_directory(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        sandbox.write_file("config/overrides.json", "{}")
+
+        args, _kwargs = container.put_archive.call_args
+        assert args[0] == "/workspace/config"
+
+    def test_write_files_uploads_nested_files_in_one_archive(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+        files = {
+            "package.json": "{}",
+            ".odc-targeted/000/node_modules/esbuild/package.json": (
+                '{"name":"esbuild","version":"0.28.1"}'
+            ),
+        }
+
+        sandbox.write_files(files)
+
+        container.put_archive.assert_called_once()
+        archive_path, archive_bytes = container.put_archive.call_args.args
+        assert archive_path == "/workspace"
+        container.exec_run.assert_called_once()
+        assert sandbox.read_cache_metrics()["epoch"] == 1
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+            package_json = archive.extractfile("package.json")
+            esbuild_manifest = archive.extractfile(
+                ".odc-targeted/000/node_modules/esbuild/package.json"
+            )
+            assert package_json is not None
+            assert esbuild_manifest is not None
+            assert package_json.read() == b"{}"
+            assert esbuild_manifest.read() == (b'{"name":"esbuild","version":"0.28.1"}')
+
+    def test_write_files_rejects_duplicate_normalized_paths(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        with pytest.raises(WorkspacePathError, match="duplicate normalized"):
+            sandbox.write_files({"config//overrides.json": "{}", "config/overrides.json": "{}"})
+
+        container.exec_run.assert_not_called()
+        container.put_archive.assert_not_called()
+
+    def test_read_file_uses_workspace_path(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        container.get_archive.return_value = (_tar_chunks("package.json", "{}"), {})
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        result = sandbox.read_file("package.json")
+
+        args, _kwargs = container.get_archive.call_args
+        assert args[0] == "/workspace/package.json"
+        assert result == "{}"
+
+    def test_duplicate_read_file_uses_one_container_read(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        container.get_archive.return_value = (_tar_chunks("package.json", "{}"), {})
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        assert sandbox.read_file("package.json") == "{}"
+        assert sandbox.read_file("./package.json") == "{}"
+
+        container.get_archive.assert_called_once()
+
+    def test_readonly_commands_preserve_cache_and_mutations_advance_epoch(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        container.get_archive.return_value = (_tar_chunks("package.json", "old"), {})
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        assert sandbox.read_file("package.json") == "old"
+        sandbox.run_readonly("grep -R package package.json")
+        assert sandbox.read_file("/workspace/./package.json") == "old"
+
+        container.get_archive.return_value = (_tar_chunks("package.json", "new"), {})
+        sandbox.run("npm install")
+        assert sandbox.read_file("package.json") == "new"
+
+        container.get_archive.assert_has_calls(
+            [
+                # The first call is the initial cache miss; the read after
+                # the read-only command is a cache hit; the mutation forces a
+                # second real read.
+                container.get_archive.call_args_list[0],
+                container.get_archive.call_args_list[1],
+            ]
+        )
+        assert container.get_archive.call_count == 2
+        metrics = sandbox.read_cache_metrics()
+        assert metrics["requests"] == 3
+        assert metrics["hits"] == 1
+        assert metrics["docker_reads"] == 2
+
+    def test_attempt_cache_can_be_shared_by_sandbox_wrappers(self, tmp_path):
+        _docker_mod, _docker_errors, client, container = _docker_modules()
+        container.get_archive.return_value = (_tar_chunks("package.json", "{}"), {})
+        cache = WorkspaceReadCache()
+        first = DockerSandbox(
+            tmp_path,
+            workspace_volume="agent_workspace_shared",
+            read_cache=cache,
+        )
+        second = DockerSandbox(
+            tmp_path,
+            workspace_volume="agent_workspace_shared",
+            read_cache=cache,
+        )
+        for sandbox in (first, second):
+            sandbox._client = client
+            sandbox._container = container
+            sandbox._alive = True
+
+        assert first.read_file("package.json") == "{}"
+        assert second.read_file("./package.json") == "{}"
+        container.get_archive.assert_called_once()
+        assert cache.metrics()["hits"] == 1
+
+    def test_read_file_returns_none_when_missing(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        container.get_archive.side_effect = Exception("missing")
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        assert sandbox.read_file("missing.json") is None
+
+
+def _directory_tar_chunks(filename: str) -> list[bytes]:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name=filename)
+        info.type = tarfile.DIRTYPE
+        tf.addfile(info)
+    return [buf.getvalue()]
+
+
+class TestSandboxBatchFileIO:
+    def _started_sandbox(self, tmp_path, container):
+        sandbox = DockerSandbox(tmp_path)
+        sandbox._container = container
+        sandbox._alive = True
+        return sandbox
+
+    def test_read_files_returns_complete_documents_and_summary_only_trace(self, tmp_path):
+        _docker_mod, _docker_errors, _client, container = _docker_modules()
+        container.get_archive.side_effect = [
+            (_tar_chunks("package-lock.json", '{"lockfileVersion":3}'), {}),
+            (_tar_chunks("package.json", '{"name":"app"}'), {}),
+        ]
+        sandbox = self._started_sandbox(tmp_path, container)
+
+        documents = sandbox.read_files(["package-lock.json", "package.json"])
+
+        assert documents == {
+            "package-lock.json": '{"lockfileVersion":3}',
+            "package.json": '{"name":"app"}',
+        }
+        trace_summary = _trace_read_files_outputs(documents)
+        assert trace_summary["file_count"] == 2
+        assert trace_summary["total_bytes"] == sum(
+            len(value.encode("utf-8")) for value in documents.values()
+        )
+        assert trace_summary["duration_seconds"] >= 0
+        assert trace_summary["digest"]
+        assert "app" not in repr(trace_summary)
+        assert _trace_read_files_inputs({"paths": ["private/package.json"]}) == {"file_count": 1}
+        assert container.get_archive.call_count == 2
+
+    def test_read_files_byte_limit_fails_without_returning_partial_documents(self, tmp_path):
+        _docker_mod, _docker_errors, _client, container = _docker_modules()
+        container.get_archive.return_value = (_tar_chunks("package.json", '{"large":true}'), {})
+        sandbox = self._started_sandbox(tmp_path, container)
+
+        with pytest.raises(ValueError, match="total-byte limit"):
+            sandbox.read_files(["package.json"], max_total_bytes=1)
+
+    def test_read_files_returns_none_for_missing_or_nonregular_file(self, tmp_path):
+        _docker_mod, _docker_errors, _client, container = _docker_modules()
+        container.get_archive.side_effect = [
+            (_tar_chunks("package.json", "{}"), {}),
+            (_directory_tar_chunks("nested"), {}),
+        ]
+        sandbox = self._started_sandbox(tmp_path, container)
+
+        assert sandbox.read_files(["package.json", "nested"]) is None
+
+        _docker_mod, _docker_errors, _client, missing_container = _docker_modules()
+        missing_container.get_archive.side_effect = [Exception("missing")]
+        missing_sandbox = self._started_sandbox(tmp_path, missing_container)
+        assert missing_sandbox.read_files(["missing.json"]) is None
+
+    def test_read_files_rejects_traversal_and_symlink_escape_before_reading(self, tmp_path):
+        _docker_mod, _docker_errors, _client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, container)
+
+        with pytest.raises(WorkspacePathError):
+            sandbox.read_files(["../outside.json"])
+        container.exec_run.assert_not_called()
+
+        container.exec_run.side_effect = [
+            (0, (b"", b"")),
+            (1, (b"", b"outside workspace")),
+        ]
+        with pytest.raises(WorkspacePathError, match="resolves outside the workspace"):
+            sandbox.read_files(["package.json", "linked/package.json"])
+        container.get_archive.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../outside.txt",
+        "nested/../../outside.txt",
+        "/tmp/outside.txt",
+        "C:/outside.txt",
+        r"\\server\share\outside.txt",
+        "/workspace/../outside.txt",
+    ],
+)
+def test_workspace_paths_reject_absolute_and_traversal_forms(value: str) -> None:
+    """All model/scanner path spellings fail before file I/O."""
+    with pytest.raises(WorkspacePathError):
+        normalize_workspace_path(value)
+
+
+def test_workspace_prefix_is_normalized_but_root_is_not_a_file() -> None:
+    assert normalize_workspace_path("/workspace/src/app.ts") == "src/app.ts"
+    with pytest.raises(WorkspacePathError):
+        normalize_workspace_path("/workspace")
+
+
+def test_resolve_repository_path_rejects_symlink_escape(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    link = tmp_path / "linked"
+    link.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(WorkspacePathError):
+        resolve_repository_path(tmp_path, "linked/secret.txt")
+
+
+def test_repository_relative_path_accepts_nested_and_workspace_prefixed_files(
+    tmp_path: Path,
+) -> None:
+    nested = tmp_path / "src" / "app.ts"
+    nested.parent.mkdir()
+    nested.write_text("export {}", encoding="utf-8")
+
+    assert repository_relative_path("src/app.ts", tmp_path) == "src/app.ts"
+    assert repository_relative_path(str(nested), tmp_path) == "src/app.ts"
+    assert repository_relative_path("/workspace/src/app.ts", tmp_path) == "src/app.ts"
+    assert repository_relative_path("../outside.ts", tmp_path) is None
+    assert repository_relative_path(r"C:\outside.ts", tmp_path) is None
+
+
+def test_workspace_prefixed_path_rejects_host_symlink_escape(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-workspace"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+
+    assert repository_relative_path("/workspace/linked/secret.txt", tmp_path) is None
+
+
+def test_changed_file_reducer_rejects_traversal_instead_of_dropping_it() -> None:
+    with pytest.raises(WorkspacePathError, match="rejected path"):
+        merge_changed_files_reducer([], ["../outside.ts"])
+
+
+def test_changed_file_reducer_rejects_non_string_paths() -> None:
+    with pytest.raises(WorkspacePathError, match="non-string path"):
+        merge_changed_files_reducer([], [None])  # type: ignore[list-item]

@@ -6,6 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
+from remediation_engine.agents.supervisor import (
+    _deterministic_routing,
+    run_supervisor_node,
+    supervisor_router,
+)
 from remediation_engine.contracts.schemas import (
     DependencyParentContext,
     FixPlan,
@@ -34,15 +39,12 @@ from remediation_engine.orchestration.graph import (
     post_qa_triage_node,
     run_qa_critic_from_orchestrator,
 )
-from remediation_engine.orchestration.state import initial_orchestrator_state
-from remediation_engine.orchestration.supervisor_node import (
-    _deterministic_routing,
-    run_supervisor_node,
-    supervisor_router,
+from remediation_engine.orchestration.state import (
+    build_initial_remediation_task,
+    initial_orchestrator_state,
 )
-from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
-from tests.fix_plan_fixtures import group_with_fix_plans
+from tests.helpers import group_with_fix_plans
 
 
 def _issue(cve: str, *, source: IssueSource = IssueSource.ODC) -> VulnerabilityIssue:

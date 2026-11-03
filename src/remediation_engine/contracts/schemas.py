@@ -14,6 +14,7 @@ Design principles
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import PurePosixPath, PureWindowsPath
@@ -385,7 +386,7 @@ class CommandResult(BaseModel):
     """
     Output of a command executed inside a ``DockerSandbox``.
 
-    Produced by ``remediation_engine.runtime.sandbox_mgr.DockerSandbox.run``.
+    Produced by ``remediation_engine.runtime.sandbox.DockerSandbox.run``.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -418,7 +419,7 @@ class FixPlan(BaseModel):
     """
     Structured output of the fix-planner waterfall.
 
-    Produced by ``remediation_engine.tools.fix_planner`` and consumed by the downstream
+    Produced by ``remediation_engine.tools.advisories`` and consumed by the downstream
     Remedy agent to apply the correct type of edit.
 
     Invariants (enforced by model_validator):
@@ -925,7 +926,7 @@ class CVEEnrichment(BaseModel):
     """
     External threat-intelligence enrichment for a single CVE identifier.
 
-    Populated by ``remediation_engine.triage.enrichment`` from the FIRST EPSS API and the
+    Populated by ``remediation_engine.tools.advisories`` from the FIRST EPSS API and the
     CISA Known Exploited Vulnerabilities (KEV) catalogue.  Always returned,
     even when upstream APIs fail â€” safe defaults indicate "unknown risk".
     """
@@ -983,7 +984,7 @@ class VulnerabilityGroup(BaseModel):
     A set of ``VulnerabilityIssue`` records that share the same vulnerable
     component (SCA) or code location (SAST).
 
-    Produced by ``remediation_engine.triage.grouper``.  The grouper deduplicates
+    Produced by ``remediation_engine.agents.triage``.  The grouper deduplicates
     cross-tool findings and merges overlapping CVE/component/file triples into
     a single authoritative group for downstream triage. The Supervisor may
     additionally create an ``is_synthetic`` coordination group for a direct
@@ -1173,7 +1174,7 @@ class TriageResult(BaseModel):
     """
     Deterministic or LLM-assisted triage verdict for one ``VulnerabilityGroup``.
 
-    Produced by ``remediation_engine.triage.agent``.  The triage agent may use an LLM for
+    Produced by ``remediation_engine.agents.triage``.  The triage agent may use an LLM for
     initial reasoning, but deterministic guardrails (KEV, EPSS, original
     severity) are always applied afterwards to prevent the LLM from
     under-ranking exploitable issues.
@@ -3256,3 +3257,61 @@ class RemediationTask(BaseModel):
     def _normalize_remediation_action(cls, value: Any) -> str | None:
         """Trim an optional Supervisor-authored completion action."""
         return _trim_optional_contract_text(value, "remediation_action")
+
+
+class ReconciliationResult(BaseModel):
+    """Output of worker and QA result reconciliation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_queue: dict[str, RemediationTask]
+    qa_evaluations: dict[str, QAEvaluation] = Field(default_factory=dict)
+    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] = Field(default_factory=dict)
+    consistency_events: list[StateConsistencyEvent] = Field(default_factory=list)
+    auto_constraints: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class EligibleActions(BaseModel):
+    """Pure projection of the actions currently eligible for routing."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    non_terminal_tasks: list[str] = Field(default_factory=list)
+    qa_ready_task_ids: list[str] = Field(default_factory=list)
+    workable_tasks: list[str] = Field(default_factory=list)
+    no_fix_workable: list[str] = Field(default_factory=list)
+    exhausted_pivots: list[str] = Field(default_factory=list)
+    retry_version_bumps: list[str] = Field(default_factory=list)
+    new_version_bumps: list[str] = Field(default_factory=list)
+    workaround_tasks: list[str] = Field(default_factory=list)
+    triage_required: bool = False
+
+
+class AuditRecord(BaseModel):
+    """Deterministic supervisor decision audit record."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    decision_code: DecisionCode
+    next_node: str
+    target_task_ids: list[str] = Field(default_factory=list)
+    reasoning: str = ""
+    state_revision: int = 0
+    consistency_events: list[StateConsistencyEvent] = Field(default_factory=list)
+
+
+def model_or_dict_value(item: Any, key: str, default: Any = None) -> Any:
+    """Read a field from either a Pydantic object or a mapping.
+
+    Args:
+        item: Object or mapping containing the requested field.
+        key: Field name to read.
+        default: Value returned when the field is absent.
+
+    Returns:
+        The field value, or ``default`` when it is absent.
+    """
+    if isinstance(item, Mapping):
+        return item.get(key, default)
+    return getattr(item, key, default)
