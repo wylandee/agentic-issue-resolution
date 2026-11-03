@@ -69,7 +69,7 @@ from remediation_engine.tools.test_execution import (
     _summarize_failed_test_output,
     build_targeted_test_command,
 )
-from tests.helpers import _make_group, _make_sandbox
+from tests.helpers import _make_group, _make_sandbox, qa_policy_for_task
 
 
 def test_report_dependency_paths_preserve_empty_reports_and_targeted_project_ids() -> None:
@@ -284,6 +284,7 @@ def test_unversioned_workaround_target_uses_live_version_resolution() -> None:
         parent_group_id=group.group_id,
         strategy=RoutingStrategy.CODE_WORKAROUND,
         instruction="Apply the workaround.",
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
 
     targets = _build_qa_scan_targets(
@@ -336,6 +337,8 @@ def test_qa_target_uses_attempt_execution_version_when_task_selection_was_cleare
         instruction_digest="digest",
         dispatch_node="update_subagent",
         qa_policy=QAPolicy.VERSION_BUMP,
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
     worker_result = WorkerAttemptResult(
         attempt_id=snapshot.attempt_id,

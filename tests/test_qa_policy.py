@@ -31,6 +31,7 @@ from remediation_engine.contracts.schemas import (
     IssueType,
     LocalizedIssue,
     ODCScanEvidence,
+    PackageFixPlanCandidate,
     PackageScanOccurrence,
     QAAttemptResult,
     QADependencyEvidence,
@@ -55,7 +56,6 @@ from remediation_engine.contracts.schemas import (
 )
 from remediation_engine.orchestration.state import (
     build_initial_remediation_task,
-    derive_missing_task_qa_policy,
 )
 from remediation_engine.tools.qa_scan import (
     QATaskContext,
@@ -91,12 +91,17 @@ def _group(group_id: str, identifier: str = "CVE-2025-0001") -> VulnerabilityGro
         cve_ids=[identifier],
         representative_issue_id=issue.id,
         issues=[issue],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="2.0.0",
-            instruction="Upgrade demo-package to 2.0.0.",
-            strategy_used="test",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=issue.id,
+                plan=FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version="2.0.0",
+                    instruction="Upgrade demo-package to 2.0.0.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
 
 
@@ -1029,6 +1034,7 @@ def test_attempt_version_evidence_prefers_allowed_effective_candidate() -> None:
         instruction="Update demo-package.",
         instruction_digest="digest",
         dispatch_node="update_subagent",
+        allowed_dependency_types=[],
     )
     worker_result = WorkerAttemptResult(
         attempt_id=task.current_attempt_id,
@@ -1068,6 +1074,7 @@ def test_qa_scan_target_uses_authorized_attempt_version_over_task_hint() -> None
         instruction="Update demo-package.",
         instruction_digest="digest",
         dispatch_node="update_subagent",
+        allowed_dependency_types=[],
     )
     worker_result = WorkerAttemptResult(
         attempt_id=task.current_attempt_id,
@@ -1122,6 +1129,8 @@ def test_attempt_version_evidence_rejects_foreign_snapshot() -> None:
         instruction="Update demo-package.",
         instruction_digest="digest",
         dispatch_node="update_subagent",
+        allowed_target_versions=["9.9.9"],
+        allowed_dependency_types=[],
     )
 
     version, has_evidence = _attempt_version_evidence(
@@ -1395,44 +1404,13 @@ def test_dependency_install_conflict_is_terminal(policy: QAPolicy) -> None:
     assert "tests" not in (evaluation.retry_feedback or "").lower()
 
 
-def test_missing_initial_task_policy_is_recoverable_deterministically() -> None:
-    group = _group("g1")
-    task = build_initial_remediation_task(group, "task-1").model_copy(update={"qa_policy": None})
-
-    assert derive_missing_task_qa_policy(task, group) == QAPolicy.VERSION_BUMP
-
-
-def test_missing_no_fix_policy_recovers_package_removal_stage() -> None:
-    group = _group("g1").model_copy(
-        update={
-            "fix_plan": FixPlan(
-                status=FixPlanStatus.NO_FIX,
-                instruction="Remove the vulnerable package.",
-                strategy_used="test",
-            )
-        }
-    )
-    task = RemediationTask(
-        task_id="task-1",
-        parent_group_id=group.group_id,
-        strategy=RoutingStrategy.CODE_WORKAROUND,
-        instruction="Remove the vulnerable package.",
-    )
-
-    assert derive_missing_task_qa_policy(task, group) == QAPolicy.NO_FIX_PACKAGE_REMOVAL
-
-
-def test_missing_pivot_policy_is_not_guessed() -> None:
-    group = _group("g1")
-    task = RemediationTask(
-        task_id="task-child",
-        parent_group_id=group.group_id,
-        parent_task_id="task-parent",
-        strategy=RoutingStrategy.CODE_WORKAROUND,
-        instruction="Apply workaround.",
-    )
-
-    assert derive_missing_task_qa_policy(task, group) is None
+def test_remediation_task_requires_supervisor_owned_qa_policy() -> None:
+    with pytest.raises(ValidationError, match="qa_policy"):
+        RemediationTask(
+            task_id="task-1",
+            parent_group_id="g1",
+            strategy=RoutingStrategy.VERSION_BUMP,
+        )
 
 
 def test_active_qa_policy_must_match_attempt_snapshot() -> None:

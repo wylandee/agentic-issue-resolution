@@ -44,6 +44,7 @@ from remediation_engine.contracts.schemas import (
     IssueType,
     LocalizedIssue,
     MavenTargetOperation,
+    PackageFixPlanCandidate,
     RemediationTask,
     RoutingStrategy,
     Severity,
@@ -69,7 +70,7 @@ from remediation_engine.planning.certification import build_certified_portfolio_
 from remediation_engine.planning.control import _portfolio_certificate_violations
 from remediation_engine.settings import AppSettings
 from remediation_engine.tools.advisories import _extract_fixed_from_osv_vuln
-from tests.helpers import group_with_fix_plans
+from tests.helpers import group_with_fix_plans, qa_policy_for_task
 
 
 def _python_group(
@@ -1102,6 +1103,7 @@ def _python_task(group: VulnerabilityGroup) -> RemediationTask:
         strategy=RoutingStrategy.VERSION_BUMP,
         strategy_stage=SCARemediationStage.PYPI_LATEST,
         status=TaskStatus.NEEDS_RETRY,
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
 
 
@@ -1196,12 +1198,17 @@ def _maven_group(
         parent_package_name=None if direct else "org.example:parent",
         parent_package_version=None if direct else "2.0",
         parent_declaration_type=None if direct else "dependencies",
-        fix_plan=FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="1.1",
-            instruction="Use a Supervisor-approved Maven Central candidate.",
-            strategy_used="osv_api",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=issue.id,
+                plan=FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version="1.1",
+                    instruction="Use a Supervisor-approved Maven Central candidate.",
+                    strategy_used="osv_api",
+                ),
+            )
+        ],
     )
 
 
@@ -1570,6 +1577,7 @@ def test_node_update_candidate_ordering_keeps_existing_semver_normalization() ->
         target_package_name="left-pad",
         target_dependency_type="dependencies",
         strategy=RoutingStrategy.VERSION_BUMP,
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     diagnostics = UpdateRetryDiagnostics(
         task_id=task.task_id,

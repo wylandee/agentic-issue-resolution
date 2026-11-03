@@ -25,7 +25,6 @@ from remediation_engine.agents.supervisor_reasoning import (
     build_tactical_context,
     propose_and_verify_tactical_action,
     registry_candidate_sets_for_context,
-    registry_candidates_for_context,
     verify_tactical_action,
 )
 from remediation_engine.contracts import (
@@ -53,14 +52,15 @@ from remediation_engine.contracts.schemas import (
     CodeWorkaroundSupervisorAction,
     DependencyParentContext,
     FailureCategory,
+    PackageFixPlanCandidate,
     PackageOverrideSupervisorAction,
     PortfolioEscalationSupervisorAction,
     QADeterministicGates,
     QAEvaluation,
     QAFailureEvidence,
     ScannerExecutionStatus,
-    TacticalSupervisorAction,
     TaskAttemptSnapshot,
+    VersionBumpSupervisorAction,
 )
 from remediation_engine.orchestration.state import (
     _commit_task_transition,
@@ -69,6 +69,7 @@ from remediation_engine.orchestration.state import (
     build_initial_remediation_task,
 )
 from remediation_engine.settings import AppSettings
+from tests.helpers import qa_policy_for_task
 
 
 def _group(group_id: str, severity: Severity = Severity.HIGH, *, no_fix: bool = False):
@@ -93,7 +94,7 @@ def _group(group_id: str, severity: Severity = Severity.HIGH, *, no_fix: bool = 
         sources=[IssueSource.ODC],
         representative_issue_id=issue.id,
         issues=[issue],
-        fix_plan=fix_plan,
+        fix_plan_candidates=[PackageFixPlanCandidate(issue_id=issue.id, plan=fix_plan)],
     )
 
 
@@ -114,6 +115,7 @@ def _task(
         retry_count=retry_count,
         no_fix_stage=no_fix_stage,
         instruction="update package" if strategy == RoutingStrategy.VERSION_BUMP else "work around",
+        qa_policy=qa_policy_for_task(strategy, no_fix_stage=no_fix_stage),
     )
 
 
@@ -584,14 +586,19 @@ def _tactical_group() -> VulnerabilityGroup:
         cve_ids=["CVE-2026-0001"],
         versions=["1.0.0"],
         sources=[IssueSource.SEMGREP],
-        representative_issue_id=str(uuid4()),
+        representative_issue_id=issue.id,
         issues=[issue],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="1.2.3",
-            instruction="Update the dependency.",
-            strategy_used="test",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=issue.id,
+                plan=FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version="1.2.3",
+                    instruction="Update the dependency.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
 
 
@@ -601,6 +608,7 @@ def _tactical_task() -> RemediationTask:
         parent_group_id="group-1",
         strategy=RoutingStrategy.VERSION_BUMP,
         instruction="Initial dependency update.",
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
 
 
@@ -768,7 +776,7 @@ def test_verified_noncanonical_candidate_can_be_selected_with_rationale() -> Non
             ),
         ),
     )
-    action = TacticalSupervisorAction(
+    action = VersionBumpSupervisorAction(
         diagnostic_basis="The newer verified version avoids the observed compatibility failure.",
         selected_strategy=TacticalStrategy.VERSION_BUMP,
         target_version="2.0.0",
@@ -788,7 +796,7 @@ def test_verified_version_produces_authoritative_targeted_instruction() -> None:
         candidate_versions=["1.2.3"],
         candidate_dependency_types=["dependencies"],
     )
-    action = TacticalSupervisorAction(
+    action = VersionBumpSupervisorAction(
         diagnostic_basis="Verified candidate meets the committed security floor.",
         selected_strategy=TacticalStrategy.VERSION_BUMP,
         target_version="1.2.3",
@@ -810,7 +818,7 @@ def test_unverified_version_is_rejected_before_dispatch() -> None:
         _tactical_group(),
         candidate_versions=["1.2.3"],
     )
-    action = TacticalSupervisorAction(
+    action = VersionBumpSupervisorAction(
         diagnostic_basis="The proposed version is absent from the verified candidate set.",
         selected_strategy=TacticalStrategy.VERSION_BUMP,
         target_version="9.9.9",
@@ -1540,15 +1548,9 @@ def test_package_override_stage_does_not_require_parent_version() -> None:
         context,
         registry_provider=provider,
     )
-    legacy_versions, legacy_error = registry_candidates_for_context(
-        context,
-        registry_provider=provider,
-    )
 
     assert error is None
-    assert legacy_error is None
-    assert calls == [("test-pkg", "1.2.3", set()), ("test-pkg", "1.2.3", set())]
-    assert legacy_versions == ("1.2.3",)
+    assert calls == [("test-pkg", "1.2.3", set())]
     assert len(candidate_sets) == 1
     assert candidate_sets[0].strategy == TacticalStrategy.PACKAGE_OVERRIDE
     assert candidate_sets[0].target_package_name == "test-pkg"
@@ -1599,7 +1601,7 @@ def test_package_override_stage_accepts_only_authorized_override_action() -> Non
     assert (
         verify_tactical_action(
             context,
-            TacticalSupervisorAction(
+            VersionBumpSupervisorAction(
                 diagnostic_basis="A direct update is not authorized at the override stage.",
                 selected_strategy=TacticalStrategy.VERSION_BUMP,
                 target_version="1.2.3",
@@ -1646,6 +1648,7 @@ def test_retry_registry_candidates_remain_inside_initial_approved_pool() -> None
         instruction="Update test-pkg.",
         instruction_digest="digest",
         dispatch_node="update_subagent",
+        allowed_dependency_types=["dependencies"],
     )
     diagnostics = UpdateRetryDiagnostics(
         task_id=task.task_id,

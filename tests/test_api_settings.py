@@ -52,6 +52,7 @@ from remediation_engine.settings import (
     get_runtime_settings,
 )
 from remediation_engine.tools.qa_scan import _QAExecutionResults
+from tests.helpers import qa_policy_for_task
 
 
 def _issue() -> VulnerabilityIssue:
@@ -182,7 +183,7 @@ def test_triage_issues_binds_injected_settings_and_leaves_fix_planning_to_superv
 
     assert groups
     assert observed_keys == ["injected-test-key"]
-    assert groups[0].fix_plan is None
+    assert groups[0].fix_plan_candidates == []
     assert groups[0].fix_plan_candidates == []
     planner_mock.assert_not_called()
     assert get_bound_runtime_settings() is None
@@ -1017,6 +1018,7 @@ def test_orchestrator_and_direct_subagent_states_have_node_defaults(tmp_path: Pa
         task_id="task-1",
         parent_group_id=group.group_id,
         strategy=RoutingStrategy.CODE_WORKAROUND,
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     workaround = initial_workaround_subagent_state(
         repo_root=str(tmp_path),

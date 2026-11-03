@@ -20,7 +20,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import Version
 
 from remediation_engine.contracts.schemas import (
-    FinalFullScanResult,
+    ScanCoverageResult,
     ScannerExecutionStatus,
     model_or_dict_value,
 )
@@ -1547,7 +1547,7 @@ def run_final_full_scan_node(state: Mapping[str, Any]) -> dict[str, Any]:
         and (new_identifiers or remaining_identifiers)
     )
     error = None if completed else result.summary
-    final_result = FinalFullScanResult(
+    final_result = ScanCoverageResult(
         completed=completed,
         authoritative=completed,
         coverage_scope="full_workspace",

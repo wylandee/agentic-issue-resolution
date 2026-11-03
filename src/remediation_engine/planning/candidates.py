@@ -2,8 +2,8 @@
 
 This module owns the pure data boundary between triage/task preparation and the
 occurrence-aware solver.  It deliberately does not dispatch workers or mutate a
-repository.  The legacy portfolio module re-exports the public functions below
-so existing callers keep their import path.
+repository. The Supervisor-facing portfolio orchestrator consumes these
+functions through the planning package's explicit module boundaries.
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ from remediation_engine.contracts.version_policy import (
     is_stable_maven_version,
 )
 from remediation_engine.language import ProjectLanguage
+from remediation_engine.orchestration.state import select_package_fix_plan
 from remediation_engine.settings import AppSettings
 from remediation_engine.solver.cpsat import _as_domain as _normalize_solver_candidate_domain
 from remediation_engine.solver.cpsat import solve_portfolio
@@ -1370,11 +1371,9 @@ def _representative_lockfile_package(
 def _group_fixed_version(group: VulnerabilityGroup, task: RemediationTask) -> str | None:
     if task.selected_version:
         return task.selected_version.strip().lstrip("vV")
-    if group.fix_plan and group.fix_plan.fixed_version:
-        return group.fix_plan.fixed_version.strip().lstrip("vV")
-    for candidate in group.fix_plan_candidates:
-        if candidate.plan.fixed_version:
-            return candidate.plan.fixed_version.strip().lstrip("vV")
+    selected_plan = select_package_fix_plan(group, task.strategy).plan
+    if selected_plan is not None and selected_plan.fixed_version:
+        return selected_plan.fixed_version.strip().lstrip("vV")
     for issue in group.issues:
         if issue.fixed_version:
             return issue.fixed_version.strip().lstrip("vV")
@@ -1394,12 +1393,6 @@ def _workaround_plan_ids(group: VulnerabilityGroup, issue: Any) -> list[str]:
     )
     if candidate_ids:
         return candidate_ids
-    if (
-        group.fix_plan
-        and group.fix_plan.status == FixPlanStatus.WORKAROUND_FOUND
-        and group.fix_plan.workaround_snippets
-    ):
-        return [str(issue.id)]
     return []
 
 
@@ -1524,8 +1517,9 @@ def _build_targets_and_findings(
             or task.allowed_target_versions
             or any(issue.fixed_version for issue in group.issues)
         )
+        selected_plan = select_package_fix_plan(group, task.strategy).plan
         no_fix = task.no_fix_stage is not None or (
-            group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.NO_FIX
+            selected_plan is not None and selected_plan.status == FixPlanStatus.NO_FIX
         )
         target_strategy = "no_fix" if no_fix else task.strategy.value
         group_ancestry = normalize_dependency_ancestry(group.dependency_ancestry)
@@ -1710,11 +1704,12 @@ def _build_maven_targets_and_findings(
                 if issue.cve_id or issue.ghsa_id or issue.finding_id
             }
         )
+        selected_plan = select_package_fix_plan(group, task.strategy).plan
         has_floor = any(issue.fixed_version for issue in group.issues) or bool(
-            group.fix_plan and group.fix_plan.fixed_version
+            selected_plan and selected_plan.fixed_version
         )
         no_fix = task.no_fix_stage is not None or (
-            group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.NO_FIX
+            selected_plan is not None and selected_plan.status == FixPlanStatus.NO_FIX
         )
         target = SolverTarget(
             occurrence_id=occurrence_id,
@@ -1757,9 +1752,7 @@ def _build_maven_targets_and_findings(
         for issue in sorted(group.issues, key=_issue_identity):
             if not (issue.cve_id or issue.ghsa_id or issue.finding_id):
                 continue
-            floor = issue.fixed_version or (
-                group.fix_plan.fixed_version if group.fix_plan is not None else None
-            )
+            floor = issue.fixed_version or (selected_plan.fixed_version if selected_plan else None)
             vulnerable_version = str(issue.package_version or installed_version)
             vulnerable_occurrence_id = f"{manifest_path}::maven::{coordinate}@{vulnerable_version}"
             findings.append(
@@ -1867,8 +1860,10 @@ def _transitive_child_floor(group: VulnerabilityGroup) -> str | None:
         for issue in group.issues
         if issue.fixed_version and _semver_key(str(issue.fixed_version))
     ]
-    if group.fix_plan and group.fix_plan.fixed_version:
-        value = str(group.fix_plan.fixed_version).strip().lstrip("vV")
+    for candidate in group.fix_plan_candidates:
+        if not candidate.plan.fixed_version:
+            continue
+        value = str(candidate.plan.fixed_version).strip().lstrip("vV")
         if _semver_key(value):
             versions.append(value)
     return max(versions, key=lambda value: _semver_key(value) or (0, 0, 0)) if versions else None
@@ -3480,7 +3475,6 @@ def _missing_sca_plan_diagnostic(groups: Iterable[VulnerabilityGroup]) -> str | 
         for group in groups
         if group.issue_type == IssueType.SCA
         and not group.is_synthetic
-        and group.fix_plan is None
         and not group.fix_plan_candidates
     )
     if not group_ids:
@@ -3501,7 +3495,6 @@ def _unplanned_sca_portfolio_plan(
         for group in groups
         if group.issue_type == IssueType.SCA
         and not group.is_synthetic
-        and group.fix_plan is None
         and not group.fix_plan_candidates
     ]
     digest = hashlib.sha256(
@@ -3816,9 +3809,10 @@ def _version_bump_instruction(
     parent_name = (task.parent_package_name or group.parent_package_name or "").strip()
     child_name = (group.vulnerable_component or "").strip()
     if parent_name == package_name and child_name and child_name != package_name:
+        selected_plan = select_package_fix_plan(group, task.strategy).plan
         child_floor = (
-            group.fix_plan.fixed_version.strip()
-            if group.fix_plan and group.fix_plan.fixed_version
+            selected_plan.fixed_version.strip()
+            if selected_plan is not None and selected_plan.fixed_version
             else next(
                 (
                     floor

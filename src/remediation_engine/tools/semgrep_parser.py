@@ -16,14 +16,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover
-
-    def load_dotenv(*args, **kwargs):  # type: ignore[no-redef]
-        """Provide a no-op fallback when python-dotenv is unavailable."""
-        return False
-
+from dotenv import load_dotenv
 
 from remediation_engine.contracts import (
     CWEEntry,

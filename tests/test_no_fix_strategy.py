@@ -24,6 +24,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    PackageFixPlanCandidate,
     QAEvaluation,
     QAFailureEvidence,
     QAPolicy,
@@ -48,9 +49,11 @@ from remediation_engine.orchestration.state import (
 from remediation_engine.tools.qa_workspace import _collect_group_package_state
 from remediation_engine.tools.validation import _make_validate_workaround_tool
 from remediation_engine.tools.workers import build_workaround_toolbelt
+from tests.helpers import qa_policy_for_task
 
 
 def _group() -> VulnerabilityGroup:
+    issue_id = str(uuid4())
     return VulnerabilityGroup(
         group_id="sca:package.json:notevil",
         issue_type=IssueType.SCA,
@@ -59,12 +62,17 @@ def _group() -> VulnerabilityGroup:
         file_paths=["package.json"],
         cve_ids=["CVE-2021-23771"],
         ghsa_ids=["GHSA-8G4M-CJM2-96WQ"],
-        representative_issue_id=str(uuid4()),
-        fix_plan=FixPlan(
-            status=FixPlanStatus.NO_FIX,
-            instruction="No upstream patch or workaround was found. Inform the user.",
-            strategy_used="test",
-        ),
+        representative_issue_id=issue_id,
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=issue_id,
+                plan=FixPlan(
+                    status=FixPlanStatus.NO_FIX,
+                    instruction="No upstream patch or workaround was found. Inform the user.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
 
 
@@ -93,11 +101,16 @@ def _maven_group() -> VulnerabilityGroup:
         representative_issue_id=str(issue.id),
         issues=[issue],
         localized_issues=[localized],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.NO_FIX,
-            instruction="No fix is available.",
-            strategy_used="test",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=str(issue.id),
+                plan=FixPlan(
+                    status=FixPlanStatus.NO_FIX,
+                    instruction="No fix is available.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
 
 
@@ -111,15 +124,17 @@ def _task(stage: NoFixMitigationStage, *, retry_count: int = 0) -> RemediationTa
         retry_count=retry_count,
         status=TaskStatus.PENDING,
         instruction="stage instruction",
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND, no_fix_stage=stage),
     )
 
 
-def test_no_fix_contracts_round_trip_and_defaults():
+def test_no_fix_stage_defaults_to_none():
     assert NoFixMitigationStage.PACKAGE_REMOVAL.value == "package_removal"
     task = RemediationTask(
         task_id="task-1",
         parent_group_id="group-1",
         strategy=RoutingStrategy.CODE_WORKAROUND,
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     assert task.no_fix_stage is None
     assert RemediationTask.model_validate_json(task.model_dump_json()).no_fix_stage is None
@@ -141,26 +156,38 @@ def test_initial_and_non_no_fix_task_creation_are_distinct():
     assert "PACKAGE REMOVAL" in no_fix_task.instruction
     assert "Inform the user" not in no_fix_task.instruction
 
-    version_group = _group().model_copy(
+    version_base = _group()
+    version_group = version_base.model_copy(
         update={
             "group_id": "version-group",
-            "fix_plan": FixPlan(
-                status=FixPlanStatus.VERSION_FOUND,
-                fixed_version="1.2.3",
-                instruction="update it",
-                strategy_used="test",
-            ),
+            "fix_plan_candidates": [
+                PackageFixPlanCandidate(
+                    issue_id=version_base.representative_issue_id,
+                    plan=FixPlan(
+                        status=FixPlanStatus.VERSION_FOUND,
+                        fixed_version="1.2.3",
+                        instruction="update it",
+                        strategy_used="test",
+                    ),
+                )
+            ],
         }
     )
-    workaround_group = _group().model_copy(
+    workaround_base = _group()
+    workaround_group = workaround_base.model_copy(
         update={
             "group_id": "workaround-group",
-            "fix_plan": FixPlan(
-                status=FixPlanStatus.WORKAROUND_FOUND,
-                workaround_snippets=["safe workaround"],
-                instruction="use the workaround",
-                strategy_used="test",
-            ),
+            "fix_plan_candidates": [
+                PackageFixPlanCandidate(
+                    issue_id=workaround_base.representative_issue_id,
+                    plan=FixPlan(
+                        status=FixPlanStatus.WORKAROUND_FOUND,
+                        workaround_snippets=["safe workaround"],
+                        instruction="use the workaround",
+                        strategy_used="test",
+                    ),
+                )
+            ],
         }
     )
     assert build_initial_remediation_task(version_group, "task-2").no_fix_stage is None

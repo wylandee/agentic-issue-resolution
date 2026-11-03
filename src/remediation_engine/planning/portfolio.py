@@ -32,7 +32,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityIssue,
 )
 from remediation_engine.language import ProjectLanguage
-from remediation_engine.orchestration.state import group_parent_context
+from remediation_engine.orchestration.state import group_parent_context, select_package_fix_plan
 from remediation_engine.planning.candidates import (
     apply_portfolio_plan as _apply_solver_portfolio_plan,
 )
@@ -492,8 +492,7 @@ def _scoped_peer_version_hints(group: VulnerabilityGroup) -> set[str]:
     requested upgrade. They are not committed task selections; the portfolio
     solver and Supervisor still choose the version.
     """
-    plans = [group.fix_plan]
-    plans.extend(candidate.plan for candidate in group.fix_plan_candidates or ())
+    plans = [candidate.plan for candidate in group.fix_plan_candidates or ()]
     return {
         version
         for plan in plans
@@ -651,7 +650,7 @@ def _refresh_synthetic_group(
         f'Keep "{package_name}" at the Supervisor-committed coordination version '
         f"{target_version}; do not select another version."
     )
-    old_plan = group.fix_plan
+    old_plan = select_package_fix_plan(group).plan
     plan = (
         old_plan.model_copy(
             update={
@@ -713,7 +712,6 @@ def _refresh_synthetic_group(
             "issues": updated_issues,
             "localized_issues": updated_localized,
             "fix_plan_candidates": candidates,
-            "fix_plan": plan,
         },
     )
 
@@ -923,9 +921,10 @@ def materialize_synthetic_dependency_tasks(
                 # parent. Keep its parent-first stages and let the solver
                 # choose a compatible release before considering an override.
                 continue
+            selected_plan = select_package_fix_plan(group).plan
             fixed_version = (
-                group.fix_plan.fixed_version.strip()
-                if group.fix_plan and group.fix_plan.fixed_version
+                selected_plan.fixed_version.strip()
+                if selected_plan is not None and selected_plan.fixed_version
                 else next(
                     (
                         str(issue.fixed_version).strip()
@@ -1013,10 +1012,8 @@ def materialize_synthetic_dependency_tasks(
         if existing_group is not None:
             if not existing_group.is_synthetic:
                 continue
-            if (
-                existing_group.fix_plan is not None
-                and existing_group.fix_plan.fixed_version == target_version
-            ):
+            existing_plan = select_package_fix_plan(existing_group).plan
+            if existing_plan is not None and existing_plan.fixed_version == target_version:
                 group_tasks = [
                     task
                     for task in augmented_queue.values()
@@ -1131,7 +1128,6 @@ def materialize_synthetic_dependency_tasks(
             issues=[issue],
             localized_issues=[localized],
             fix_plan_candidates=[PackageFixPlanCandidate(issue_id=issue_id, plan=plan)],
-            fix_plan=plan,
             is_synthetic=True,
         )
         augmented_groups.append(group)
@@ -1363,15 +1359,12 @@ def isolate_delta_failure(
     ranked_suspect_task_ids: Sequence[str] | None = None,
     max_canary_probes: int | None = None,
 ) -> DeltaIsolationResult:
-    """Attribute a failed package cluster with legacy or bounded canaries.
+    """Attribute a failed package cluster with bounded singleton canaries.
 
-    With both new options omitted, the legacy exhaustive subset check and
-    recursive bisection remain unchanged and are limited to ten tasks. If
-    either option is supplied, only singleton canaries run: ranked IDs retain
-    their supplied order (or normalized task IDs are sorted when only a budget
-    is given), and the default/explicit positive budget caps those callbacks.
-    Bounded mode accepts at most ``MAX_MULTI_PACKAGE_ACTION_SIZE`` tasks,
-    never probes the full subset, and does not bisect an inconclusive run.
+    Callers must supply ranked suspects or a positive probe budget. Ranked IDs
+    retain their supplied order; when only a budget is given, normalized task
+    IDs are sorted. The default/explicit budget caps the singleton callbacks.
+    The function never probes the full subset or bisects an inconclusive run.
     Its ``executions`` count singleton callbacks only.
 
     The supplied probe must start each callback from the same baseline. Neither
@@ -1381,114 +1374,54 @@ def isolate_delta_failure(
     if not ordered:
         return DeltaIsolationResult("INCONCLUSIVE", diagnostic="no package tasks supplied")
 
-    bounded_mode = ranked_suspect_task_ids is not None or max_canary_probes is not None
-    if bounded_mode:
-        if len(ordered) > MAX_MULTI_PACKAGE_ACTION_SIZE:
+    if ranked_suspect_task_ids is None and max_canary_probes is None:
+        raise ValueError("bounded delta isolation requires ranked suspects or a canary budget")
+    if len(ordered) > MAX_MULTI_PACKAGE_ACTION_SIZE:
+        return DeltaIsolationResult(
+            "INCONCLUSIVE",
+            diagnostic=(
+                f"bounded delta isolation is limited to {MAX_MULTI_PACKAGE_ACTION_SIZE} tasks"
+            ),
+        )
+    budget = DEFAULT_MAX_DELTA_CANARY_PROBES if max_canary_probes is None else max_canary_probes
+    if budget <= 0:
+        return DeltaIsolationResult(
+            "INCONCLUSIVE", diagnostic="canary probe budget must be positive"
+        )
+    if ranked_suspect_task_ids is None:
+        candidates = ordered
+    else:
+        valid_task_ids = set(ordered)
+        candidates = tuple(
+            dict.fromkeys(
+                str(task_id)
+                for task_id in ranked_suspect_task_ids
+                if str(task_id) in valid_task_ids
+            )
+        )
+        if not candidates:
             return DeltaIsolationResult(
                 "INCONCLUSIVE",
-                diagnostic=(
-                    f"bounded delta isolation is limited to {MAX_MULTI_PACKAGE_ACTION_SIZE} tasks"
-                ),
+                diagnostic="no valid ranked suspects supplied",
             )
-        budget = DEFAULT_MAX_DELTA_CANARY_PROBES if max_canary_probes is None else max_canary_probes
-        if budget <= 0:
-            return DeltaIsolationResult(
-                "INCONCLUSIVE", diagnostic="canary probe budget must be positive"
-            )
-        if ranked_suspect_task_ids is None:
-            candidates = ordered
-        else:
-            valid_task_ids = set(ordered)
-            candidates = tuple(
-                dict.fromkeys(
-                    str(task_id)
-                    for task_id in ranked_suspect_task_ids
-                    if str(task_id) in valid_task_ids
-                )
-            )
-            if not candidates:
-                return DeltaIsolationResult(
-                    "INCONCLUSIVE",
-                    diagnostic="no valid ranked suspects supplied",
-                )
 
-        tested: list[tuple[str, ...]] = []
-        for task_id in candidates[:budget]:
-            subset = (task_id,)
-            tested.append(subset)
-            if probe(subset) == "FAIL":
-                return DeltaIsolationResult(
-                    "IDENTIFIED",
-                    responsible_task_ids=subset,
-                    tested_subsets=tuple(tested),
-                    executions=len(tested),
-                    diagnostic="singleton canary failed",
-                )
-        return DeltaIsolationResult(
-            "INCONCLUSIVE",
-            tested_subsets=tuple(tested),
-            executions=len(tested),
-            diagnostic="no singleton failure found within the canary probe budget",
-        )
-
-    if len(ordered) > 10:
-        return DeltaIsolationResult(
-            "INCONCLUSIVE", diagnostic="delta isolation is bounded at ten tasks"
-        )
     tested: list[tuple[str, ...]] = []
-    outcomes: dict[tuple[str, ...], Literal["PASS", "FAIL", "INCONCLUSIVE"]] = {}
-    executions = 0
-
-    def run(subset: tuple[str, ...]) -> Literal["PASS", "FAIL", "INCONCLUSIVE"]:
-        nonlocal executions
-        if subset in outcomes:
-            return outcomes[subset]
-        executions += 1
+    for task_id in candidates[:budget]:
+        subset = (task_id,)
         tested.append(subset)
-        outcomes[subset] = probe(subset)
-        return outcomes[subset]
-
-    combined = run(ordered)
-    if combined != "FAIL":
-        return DeltaIsolationResult(
-            "INCONCLUSIVE",
-            tested_subsets=tuple(tested),
-            executions=executions,
-            diagnostic="combined cluster did not produce a reproducible failure",
-        )
-
-    def bisect(subset: tuple[str, ...]) -> DeltaIsolationResult:
-        if len(subset) == 1:
-            outcome = run(subset)
+        if probe(subset) == "FAIL":
             return DeltaIsolationResult(
-                "IDENTIFIED" if outcome == "FAIL" else "INCONCLUSIVE",
-                responsible_task_ids=subset if outcome == "FAIL" else (),
-                diagnostic="singleton canary failed"
-                if outcome == "FAIL"
-                else "singleton canary was inconclusive",
+                "IDENTIFIED",
+                responsible_task_ids=subset,
+                tested_subsets=tuple(tested),
+                executions=len(tested),
+                diagnostic="singleton canary failed",
             )
-        midpoint = len(subset) // 2
-        left, right = subset[:midpoint], subset[midpoint:]
-        left_result = run(left)
-        right_result = run(right)
-        if "INCONCLUSIVE" in {left_result, right_result}:
-            return DeltaIsolationResult("INCONCLUSIVE", diagnostic="a canary was inconclusive")
-        if left_result == "PASS" and right_result == "PASS":
-            return DeltaIsolationResult(
-                "INTERACTION_FAILURE", diagnostic="both halves passed; combined action failed"
-            )
-        if left_result == "FAIL" and right_result == "FAIL":
-            return DeltaIsolationResult("AMBIGUOUS", diagnostic="both halves failed")
-        failing_subset = left if left_result == "FAIL" else right
-        return bisect(failing_subset)
-
-    result = bisect(ordered)
-    return result.__class__(
-        status=result.status,
-        responsible_task_ids=result.responsible_task_ids,
+    return DeltaIsolationResult(
+        "INCONCLUSIVE",
         tested_subsets=tuple(tested),
-        executions=executions,
-        diagnostic=result.diagnostic,
+        executions=len(tested),
+        diagnostic="no singleton failure found within the canary probe budget",
     )
 
 

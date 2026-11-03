@@ -41,6 +41,7 @@ from remediation_engine.contracts.schemas import (
     MavenTargetOperation,
     MultiPackageAction,
     NoFixMitigationStage,
+    PackageFixPlanCandidate,
     PackageMutation,
     QAPolicy,
     RemediationTask,
@@ -59,8 +60,10 @@ from remediation_engine.orchestration.state import (
     initial_update_subagent_state,
     initial_workaround_subagent_state,
     instruction_digest,
+    select_package_fix_plan,
 )
 from remediation_engine.runtime.agent_runtime import ToolEvent
+from tests.helpers import qa_policy_for_task
 
 
 def _sca_group(
@@ -93,12 +96,17 @@ def _sca_group(
                 localization_confidence=0.9,
             )
         ],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="4.17.21",
-            instruction="Upgrade lodash to 4.17.21",
-            strategy_used="osv_api",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=issue.id,
+                plan=FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version="4.17.21",
+                    instruction="Upgrade lodash to 4.17.21",
+                    strategy_used="osv_api",
+                ),
+            )
+        ],
     )
 
 
@@ -140,12 +148,17 @@ def _maven_group(
         representative_issue_id=issue.id,
         issues=[issue],
         localized_issues=[localized],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="2.4.1",
-            instruction="Update org.example:library to the selected version.",
-            strategy_used="osv_api",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=issue.id,
+                plan=FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version="2.4.1",
+                    instruction="Update org.example:library to the selected version.",
+                    strategy_used="osv_api",
+                ),
+            )
+        ],
     )
 
 
@@ -166,12 +179,17 @@ def _sast_group(group_id: str = "sast:routes/login.ts:javascript.xss") -> Vulner
         sources=[IssueSource.SEMGREP],
         representative_issue_id=issue.id,
         issues=[issue],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.WORKAROUND_FOUND,
-            workaround_snippets=["Escape the user input before rendering."],
-            instruction="Apply an output-escaping workaround.",
-            strategy_used="serper",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=issue.id,
+                plan=FixPlan(
+                    status=FixPlanStatus.WORKAROUND_FOUND,
+                    workaround_snippets=["Escape the user input before rendering."],
+                    instruction="Apply an output-escaping workaround.",
+                    strategy_used="serper",
+                ),
+            )
+        ],
     )
 
 
@@ -195,15 +213,16 @@ def _repo_root() -> str:
 
 
 def _task_for_group(group: VulnerabilityGroup, **overrides) -> RemediationTask:
+    plan = select_package_fix_plan(group).plan
     strategy = (
         RoutingStrategy.VERSION_BUMP
         if group.issue_type == IssueType.SCA
-        and (group.fix_plan is None or group.fix_plan.status == FixPlanStatus.VERSION_FOUND)
+        and (plan is None or plan.status == FixPlanStatus.VERSION_FOUND)
         else RoutingStrategy.CODE_WORKAROUND
     )
     qa_policy = (
         QAPolicy.NO_FIX_PACKAGE_REMOVAL
-        if group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.NO_FIX
+        if plan is not None and plan.status == FixPlanStatus.NO_FIX
         else (
             QAPolicy.VERSION_BUMP
             if strategy == RoutingStrategy.VERSION_BUMP
@@ -215,7 +234,7 @@ def _task_for_group(group: VulnerabilityGroup, **overrides) -> RemediationTask:
         "parent_group_id": group.group_id,
         "strategy": strategy,
         "qa_policy": qa_policy,
-        "instruction": getattr(group.fix_plan, "instruction", "") if group.fix_plan else "",
+        "instruction": plan.instruction if plan else "",
     }
     kwargs.update(overrides)
     return RemediationTask(**kwargs)
@@ -1063,11 +1082,14 @@ class TestUpdateSubagentWrapper:
 
     def test_maven_no_fix_prompt_names_authorized_poms_without_lockfile_language(self):
         group = _maven_group()
-        group.fix_plan = FixPlan(
+        plan = FixPlan(
             status=FixPlanStatus.NO_FIX,
             instruction="Remove the committed Maven dependency if it is direct.",
             strategy_used="test",
         )
+        group.fix_plan_candidates = [
+            candidate.model_copy(update={"plan": plan}) for candidate in group.fix_plan_candidates
+        ]
         task = RemediationTask(
             task_id=group.group_id,
             parent_group_id=group.group_id,
@@ -2089,6 +2111,7 @@ def _dispatch_state(repo_root, language: ProjectLanguage, ecosystem: str, manife
         selected_version="2.0.0",
         instruction=f"Update sample in {manifest}.",
         current_attempt_id=f"attempt-{ecosystem}",
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     snapshot = TaskAttemptSnapshot(
         attempt_id=f"attempt-{ecosystem}",

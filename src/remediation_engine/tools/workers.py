@@ -941,7 +941,6 @@ def build_workaround_toolbelt(
     touched_files: set[str],
     host_repo_root: Path,
     plan_state: dict[str, Any] | None = None,
-    mandatory_search_terms: dict[str, str] | None = None,
     preferred_test_files: Sequence[str] | None = None,
     no_fix_stage: NoFixMitigationStage | None = None,
     no_fix_package_name: str | None = None,
@@ -955,8 +954,7 @@ def build_workaround_toolbelt(
 
     The optional NO_FIX arguments add one narrowly scoped package-removal
     capability. They never relax the source-edit or generic manifest guards.
-    ``mandatory_search_terms`` remains accepted for caller compatibility;
-    web queries are supplied by the worker and are not silently augmented.
+    Web queries are supplied by the worker and are not silently augmented.
     """
     if plan_state is None:
         plan_state = {}

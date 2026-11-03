@@ -20,6 +20,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    PackageFixPlanCandidate,
     PackageMutation,
     PeerConflictEvidence,
     QAAttemptResult,
@@ -80,7 +81,7 @@ from remediation_engine.tools.npm import (
     make_occurrence_id,
     resolve_lockfile_dependency_package,
 )
-from tests.helpers import group_with_fix_plans
+from tests.helpers import group_with_fix_plans, qa_policy_for_task, selected_group_plan
 
 
 class _FakeSandboxState:
@@ -377,12 +378,17 @@ def _express_jwt_coordination_group() -> VulnerabilityGroup:
         file_paths=["package.json"],
         is_synthetic=True,
         versions=["6.1.1"],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="6.1.1",
-            instruction="Coordinate express-jwt with the selected jsonwebtoken version.",
-            strategy_used="synthetic_dependency",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id="00000000-0000-0000-0000-000000000001",
+                plan=FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version="6.1.1",
+                    instruction="Coordinate express-jwt with the selected jsonwebtoken version.",
+                    strategy_used="synthetic_dependency",
+                ),
+            )
+        ],
     )
 
 
@@ -581,24 +587,28 @@ def test_last_qa_passed_prefix_obeys_phase_order_and_terminal_skips():
             parent_group_id="group-a",
             strategy="version_bump",
             status=TaskStatus.QA_PASSED,
+            qa_policy=qa_policy_for_task("version_bump"),
         ),
         "task-b": RemediationTask(
             task_id="task-b",
             parent_group_id="group-b",
             strategy="version_bump",
             status=TaskStatus.UNFIXABLE,
+            qa_policy=qa_policy_for_task("version_bump"),
         ),
         "task-c": RemediationTask(
             task_id="task-c",
             parent_group_id="group-c",
             strategy="version_bump",
             status=TaskStatus.QA_PASSED,
+            qa_policy=qa_policy_for_task("version_bump"),
         ),
         "task-d": RemediationTask(
             task_id="task-d",
             parent_group_id="group-d",
             strategy="version_bump",
             status=TaskStatus.QA_PASSED,
+            qa_policy=qa_policy_for_task("version_bump"),
         ),
     }
     batches = [
@@ -692,18 +702,21 @@ def test_inherited_qa_passed_prefix_survives_terminal_batch_projection():
             parent_group_id="group-a",
             strategy="version_bump",
             status=TaskStatus.QA_PASSED,
+            qa_policy=qa_policy_for_task("version_bump"),
         ),
         "task-b": RemediationTask(
             task_id="task-b",
             parent_group_id="group-b",
             strategy="version_bump",
             status=TaskStatus.UNFIXABLE,
+            qa_policy=qa_policy_for_task("version_bump"),
         ),
         "task-c": RemediationTask(
             task_id="task-c",
             parent_group_id="group-c",
             strategy="version_bump",
             status=TaskStatus.NEEDS_RETRY,
+            qa_policy=qa_policy_for_task("version_bump"),
         ),
     }
     batches = [
@@ -826,6 +839,7 @@ def test_qa_checkpoint_uses_attempt_revision_and_snapshot():
         strategy="version_bump",
         status=TaskStatus.QA_PASSED,
         task_revision=2,
+        qa_policy=qa_policy_for_task("version_bump"),
     )
     prior_plan = _certified_prior_plan(
         {"task-a": source_task},
@@ -899,6 +913,7 @@ def test_qa_checkpoint_survives_post_triage_reopen_without_new_attempt():
         strategy="version_bump",
         status=TaskStatus.QA_PASSED,
         task_revision=2,
+        qa_policy=qa_policy_for_task("version_bump"),
     )
     prior_plan = _certified_prior_plan(
         {"task-a": source_task},
@@ -1370,12 +1385,17 @@ def test_maven_portfolio_dispatch_uses_shared_solver_and_native_certifier(
                 localization_confidence=1.0,
             )
         ],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="2.2",
-            instruction="Update SnakeYAML to 2.2.",
-            strategy_used="osv_api",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=issue.id,
+                plan=FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version="2.2",
+                    instruction="Update SnakeYAML to 2.2.",
+                    strategy_used="osv_api",
+                ),
+            )
+        ],
     )
     task = build_initial_remediation_task(
         group,
@@ -1625,12 +1645,17 @@ def test_maven_resolved_dependency_paths_cluster_vulnerable_targets(tmp_path: Pa
                     localization_confidence=1.0,
                 )
             ],
-            fix_plan=FixPlan(
-                status=FixPlanStatus.VERSION_FOUND,
-                fixed_version="1.2.13",
-                instruction=f"Update {coordinate} to 1.2.13.",
-                strategy_used="osv_api",
-            ),
+            fix_plan_candidates=[
+                PackageFixPlanCandidate(
+                    issue_id=str(issue.id),
+                    plan=FixPlan(
+                        status=FixPlanStatus.VERSION_FOUND,
+                        fixed_version="1.2.13",
+                        instruction=f"Update {coordinate} to 1.2.13.",
+                        strategy_used="osv_api",
+                    ),
+                )
+            ],
         )
         task_id = f"task-logback-{index}"
         groups.append(group)
@@ -1811,11 +1836,16 @@ def test_maven_no_fix_package_removal_does_not_require_release_catalog(
                 localization_confidence=1.0,
             )
         ],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.NO_FIX,
-            instruction="No upstream fix is available.",
-            strategy_used="test",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=str(issue.id),
+                plan=FixPlan(
+                    status=FixPlanStatus.NO_FIX,
+                    instruction="No upstream fix is available.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
     task = build_initial_remediation_task(
         group,
@@ -2023,7 +2053,7 @@ def test_maven_no_fix_target_does_not_invalidate_version_catalogs(tmp_path: Path
                     localization_confidence=1.0,
                 )
             ],
-            fix_plan=fix_plan,
+            fix_plan_candidates=[PackageFixPlanCandidate(issue_id=str(issue.id), plan=fix_plan)],
         )
 
     update_group = group_for(
@@ -2952,12 +2982,17 @@ def test_new_pair_cut_discards_batch_remainder_and_resolves_again(
         file_paths=["package.json"],
         is_synthetic=True,
         versions=["8.5.1"],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="8.5.1",
-            instruction="Coordinate the jsonwebtoken release.",
-            strategy_used="synthetic_dependency",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id="00000000-0000-0000-0000-000000000002",
+                plan=FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version="8.5.1",
+                    instruction="Coordinate the jsonwebtoken release.",
+                    strategy_used="synthetic_dependency",
+                ),
+            )
+        ],
     )
     express_task = build_initial_remediation_task(express_group, "task-express-jwt")
     jwt_task = build_initial_remediation_task(jwt_group, "task-jsonwebtoken")
@@ -3898,7 +3933,8 @@ def test_unfixable_replan_certifies_remaining_task_and_preserves_qa_patch(
 
     def provide_task_candidates(context: Any) -> tuple[tuple[TacticalCandidateSet, ...], None]:
         package_name = context.task.target_package_name or context.group.vulnerable_component
-        version = context.task.selected_version or context.group.fix_plan.fixed_version
+        selected_plan = selected_group_plan(context.group)
+        version = context.task.selected_version or selected_plan.fixed_version
         assert package_name is not None
         assert version is not None
         return (

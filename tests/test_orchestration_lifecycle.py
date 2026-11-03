@@ -68,6 +68,7 @@ from remediation_engine.settings import (
     use_runtime_settings,
 )
 from remediation_engine.tools.python_mutations import restore_python_package_changes
+from tests.helpers import qa_policy_for_task
 
 
 def _execution_node_sandbox_mock() -> MagicMock:
@@ -100,6 +101,11 @@ def _capture_maven_subagent_state(dispatch, runner_name: str) -> dict:
         task_id="task-java",
         parent_group_id=group.group_id,
         strategy=(
+            RoutingStrategy.VERSION_BUMP
+            if runner_name == "run_update_subagent_node"
+            else RoutingStrategy.CODE_WORKAROUND
+        ),
+        qa_policy=qa_policy_for_task(
             RoutingStrategy.VERSION_BUMP
             if runner_name == "run_update_subagent_node"
             else RoutingStrategy.CODE_WORKAROUND
@@ -336,6 +342,7 @@ def test_unfixable_lockfile_candidate_is_absent_from_final_patch(tmp_path):
                     target_package_name="foo",
                     instruction="Update foo.",
                     status=TaskStatus.UNFIXABLE,
+                    qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
                 ),
                 "task-bar": RemediationTask(
                     task_id="task-bar",
@@ -344,6 +351,7 @@ def test_unfixable_lockfile_candidate_is_absent_from_final_patch(tmp_path):
                     target_package_name="bar",
                     instruction="Update bar.",
                     status=TaskStatus.QA_PASSED,
+                    qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
                 ),
             },
             "workspace_volume": "agent_workspace_lockfile",
@@ -411,6 +419,7 @@ def test_python_teardown_restores_only_unfixable_requirements_declaration(tmp_pa
                     target_package_name="foo",
                     instruction="Update foo.",
                     status=TaskStatus.UNFIXABLE,
+                    qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
                 ),
                 "task-bar": RemediationTask(
                     task_id="task-bar",
@@ -419,6 +428,7 @@ def test_python_teardown_restores_only_unfixable_requirements_declaration(tmp_pa
                     target_package_name="bar",
                     instruction="Update bar.",
                     status=TaskStatus.QA_PASSED,
+                    qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
                 ),
             },
             "workspace_volume": "agent_workspace_python_manifest",
@@ -718,6 +728,8 @@ class TestTeardownNode:
             instruction=instruction,
             instruction_digest=instruction_digest(instruction),
             dispatch_node="workaround_subagent",
+            allowed_target_versions=[],
+            allowed_dependency_types=[],
         )
         state = initial_orchestrator_state(str(tmp_path), [])
         state["task_queue"] = {
@@ -730,6 +742,7 @@ class TestTeardownNode:
                 status=TaskStatus.UNFIXABLE,
                 task_revision=1,
                 current_attempt_id=snapshot.attempt_id,
+                qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
             )
         }
         state["attempt_snapshots_by_id"] = {snapshot.attempt_id: snapshot}
@@ -751,6 +764,7 @@ class TestTeardownNode:
             strategy_stage=SCARemediationStage.NPM_LATEST,
             instruction="Update the package.",
             status=TaskStatus.QA_PASSED,
+            qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
         )
         child = RemediationTask(
             task_id="task-child",
@@ -760,6 +774,7 @@ class TestTeardownNode:
             strategy_stage=SCARemediationStage.CODE_WORKAROUND,
             instruction="Apply a workaround.",
             status=TaskStatus.UNFIXABLE,
+            qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
         )
         state = initial_orchestrator_state(str(tmp_path), [])
         state["task_queue"] = {parent.task_id: parent, child.task_id: child}

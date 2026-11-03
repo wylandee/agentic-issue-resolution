@@ -51,6 +51,7 @@ from remediation_engine.orchestration.state import (
     group_parent_context,
     instruction_digest,
     is_maven_group,
+    select_package_fix_plan,
 )
 from remediation_engine.runtime.telemetry import invoke_with_trajectory
 from remediation_engine.tools.registry import (
@@ -156,10 +157,9 @@ def _canonical_security_floor(
 ) -> tuple[str | None, str | None]:
     """Return the validated group security floor and any conflict reason.
 
-    ``VulnerabilityGroup.fix_plan.fixed_version`` is the canonical aggregate
-    floor.  Member finding versions are corroborating evidence: lower member
-    floors are subsumed by the aggregate floor, while a higher member floor or
-    malformed authoritative value is a contradiction and must fail closed.
+    The Supervisor-selected package candidate is the canonical floor. Member
+    finding versions are corroborating evidence: lower member floors are
+    subsumed, while a higher member floor or malformed value is contradictory.
 
     Args:
         group: Vulnerability group whose fix metadata is being authorized.
@@ -172,7 +172,7 @@ def _canonical_security_floor(
     if group is None:
         return None, "vulnerability group metadata is unavailable"
 
-    fix_plan = group.fix_plan
+    fix_plan = select_package_fix_plan(group).plan
     if fix_plan is not None and fix_plan.status != FixPlanStatus.VERSION_FOUND:
         return None, "the fix plan does not provide an authoritative fixed version"
 
@@ -1480,11 +1480,10 @@ def _run_deterministic_retry_planner(
                 project_language=project_language,
             )
         plans[task.task_id] = plan
+        parent_group = group_by_id.get(task.parent_group_id)
+        parent_plan = select_package_fix_plan(parent_group).plan if parent_group else None
         security_floor = diagnostics.security_floor or (
-            group_by_id[task.parent_group_id].fix_plan.fixed_version
-            if task.parent_group_id in group_by_id
-            and group_by_id[task.parent_group_id].fix_plan is not None
-            else None
+            parent_plan.fixed_version if parent_plan is not None else None
         )
         maven_registry_query_attempted = bool(
             maven_mode

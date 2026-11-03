@@ -77,7 +77,7 @@ from remediation_engine.tools.registry import (
     plan_npm_parent_version,
     select_npm_parent_version,
 )
-from tests.helpers import group_with_fix_plans
+from tests.helpers import group_with_fix_plans, qa_policy_for_task, selected_group_plan
 
 
 def _issue(cve_id: str = "CVE-2026-1000") -> VulnerabilityIssue:
@@ -127,7 +127,7 @@ def _group(*issues: VulnerabilityIssue) -> VulnerabilityGroup:
 
 def test_grouping_emits_unplanned_sca_observation_groups() -> None:
     group = _group(_issue())
-    assert group.fix_plan is None
+    assert selected_group_plan(group) is None
     assert group.fix_plan_candidates == []
     assert group.localized_issues[0].manifest_file == "package.json"
 
@@ -143,7 +143,7 @@ def test_offline_portfolio_reports_unplanned_sca_without_creating_tasks(tmp_path
     plan = build_portfolio_plan(tmp_path, prepared_groups, queue)
 
     assert queue == {}
-    assert prepared_groups[0].fix_plan is None
+    assert selected_group_plan(prepared_groups[0]) is None
     assert len(diagnostics) == 1
     assert "missing Supervisor fix plans" in diagnostics[0]
     assert plan.solver_plan.status == SolverStatus.UNKNOWN
@@ -194,9 +194,8 @@ def test_planning_keeps_one_candidate_per_finding() -> None:
     assert {candidate.issue_id for candidate in planned.fix_plan_candidates} == {
         issue.id for issue in issues
     }
-    assert planned.fix_plan is not None
-    assert planned.fix_plan.fixed_version == "1.2.0"
-    assert group.fix_plan is None
+    assert selected_group_plan(planned).fixed_version == "1.2.0"
+    assert selected_group_plan(group) is None
 
 
 def test_batch_cache_reuses_equivalent_lookup_and_skips_existing_or_out_of_scope_groups() -> None:
@@ -204,7 +203,14 @@ def test_batch_cache_reuses_equivalent_lookup_and_skips_existing_or_out_of_scope
     group = _group(issue)
     duplicate_observation = group.model_copy(update={"group_id": "same-input-other-group"})
     planned_group = group.model_copy(
-        update={"fix_plan": _plan(FixPlanStatus.NO_FIX), "fix_plan_candidates": []}
+        update={
+            "fix_plan_candidates": [
+                PackageFixPlanCandidate(
+                    issue_id=issue.id,
+                    plan=_plan(FixPlanStatus.NO_FIX),
+                )
+            ]
+        }
     )
     sast_group = VulnerabilityGroup(
         group_id="sast:test",
@@ -221,8 +227,8 @@ def test_batch_cache_reuses_equivalent_lookup_and_skips_existing_or_out_of_scope
     )
 
     assert lookup.call_count == 1
-    assert result[0].fix_plan is not None
-    assert result[1].fix_plan is not None
+    assert selected_group_plan(result[0]) is not None
+    assert selected_group_plan(result[1]) is not None
     assert result[2] is planned_group
     assert result[3] is sast_group
     again = plan_fixes_for_groups(result, lookup=lookup)
@@ -236,7 +242,6 @@ def test_targeted_workaround_lookup_preserves_version_floor_and_uses_skip_osv() 
     version_plan = _plan(FixPlanStatus.VERSION_FOUND, version="1.2.0")
     group = group.model_copy(
         update={
-            "fix_plan": version_plan,
             "fix_plan_candidates": [
                 PackageFixPlanCandidate(issue_id=issue.id, plan=version_plan),
             ],
@@ -253,8 +258,7 @@ def test_targeted_workaround_lookup_preserves_version_floor_and_uses_skip_osv() 
 
     assert lookup.call_count == 1
     assert lookup.call_args.kwargs == {"skip_osv": True}
-    assert enriched.fix_plan is not None
-    assert enriched.fix_plan.fixed_version == "1.2.0"
+    assert selected_group_plan(enriched).fixed_version == "1.2.0"
     assert any(
         candidate.plan.status == FixPlanStatus.VERSION_FOUND
         for candidate in enriched.fix_plan_candidates
@@ -270,7 +274,6 @@ def test_workaround_no_fix_result_does_not_replace_existing_candidates() -> None
     version_plan = _plan(FixPlanStatus.VERSION_FOUND, version="1.2.0")
     group = _group(issue).model_copy(
         update={
-            "fix_plan": version_plan,
             "fix_plan_candidates": [PackageFixPlanCandidate(issue_id=issue.id, plan=version_plan)],
         }
     )
@@ -280,26 +283,7 @@ def test_workaround_no_fix_result_does_not_replace_existing_candidates() -> None
 
     assert result is group
     assert len(result.fix_plan_candidates) == 1
-    assert result.fix_plan.fixed_version == "1.2.0"
-
-
-def test_summary_only_workaround_evidence_is_reused_without_another_lookup() -> None:
-    issue = _issue()
-    group = _group(issue).model_copy(
-        update={
-            "fix_plan": _plan(
-                FixPlanStatus.WORKAROUND_FOUND,
-                snippets=["Disable the affected option."],
-            ),
-            "fix_plan_candidates": [],
-        }
-    )
-    lookup = Mock(side_effect=AssertionError("existing workaround should be reused"))
-
-    result = ensure_workaround_fix_plan(group, lookup=lookup)
-
-    assert result is group
-    lookup.assert_not_called()
+    assert selected_group_plan(result).fixed_version == "1.2.0"
 
 
 def test_lookup_and_response_validation_errors_use_typed_no_fix_fallback(caplog) -> None:
@@ -314,12 +298,10 @@ def test_lookup_and_response_validation_errors_use_typed_no_fix_fallback(caplog)
         lookup=Mock(return_value={"status": "not-a-plan"}),
     )
 
-    assert failed_call.fix_plan is not None
-    assert failed_call.fix_plan.status == FixPlanStatus.NO_FIX
-    assert failed_call.fix_plan.strategy_used == "NO_FIX"
+    assert selected_group_plan(failed_call).status == FixPlanStatus.NO_FIX
+    assert selected_group_plan(failed_call).strategy_used == "NO_FIX"
     assert failed_call.fix_plan_candidates[0].plan.strategy_used == "planner_error"
-    assert invalid_response.fix_plan is not None
-    assert invalid_response.fix_plan.status == FixPlanStatus.NO_FIX
+    assert selected_group_plan(invalid_response).status == FixPlanStatus.NO_FIX
     assert "Supervisor fix planning failed" in caplog.text
 
 
@@ -348,7 +330,7 @@ def test_portfolio_entry_plans_groups_before_preparing_solver_inputs(monkeypatch
     )
 
     assert lookup.call_count == 1
-    assert observed["group"].fix_plan.status == FixPlanStatus.VERSION_FOUND
+    assert selected_group_plan(observed["group"]).status == FixPlanStatus.VERSION_FOUND
     assert result["valid_groups"][0].fix_plan_candidates
     assert result["task_queue"] == {}
 
@@ -386,7 +368,6 @@ def test_accepted_workaround_child_gets_targeted_evidence_before_selection(monke
     )
     enriched = group.model_copy(
         update={
-            "fix_plan": version_plan,
             "fix_plan_candidates": [
                 PackageFixPlanCandidate(issue_id=first_issue.id, plan=version_plan),
                 PackageFixPlanCandidate(issue_id=second_issue.id, plan=workaround_plan),
@@ -399,6 +380,7 @@ def test_accepted_workaround_child_gets_targeted_evidence_before_selection(monke
         task_id="task-parent",
         parent_group_id=group.group_id,
         strategy=RoutingStrategy.VERSION_BUMP,
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     request = TaskSpawnRequest(
         parent_task_id=parent.task_id,
@@ -440,12 +422,14 @@ def test_rejected_or_duplicate_workaround_spawns_do_not_lookup(monkeypatch) -> N
         task_id="task-parent",
         parent_group_id=group.group_id,
         strategy=RoutingStrategy.VERSION_BUMP,
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     existing_child = RemediationTask(
         task_id="task-child",
         parent_group_id=group.group_id,
         parent_task_id=parent.task_id,
         strategy=RoutingStrategy.CODE_WORKAROUND,
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     request = TaskSpawnRequest(
         parent_task_id=parent.task_id,
@@ -500,7 +484,7 @@ def test_reopened_task_refresh_preserves_identity_attempt_history_and_revision()
     )
 
     refreshed = queue[task.task_id]
-    assert planned_groups[0].fix_plan is not None
+    assert selected_group_plan(planned_groups[0]) is not None
     assert refreshed.task_id == task.task_id
     assert refreshed.task_revision == 4
     assert refreshed.parent_task_id == "task-parent"
@@ -517,6 +501,7 @@ def test_unmatched_refresh_marker_is_retained_until_a_group_is_available() -> No
         task_id="task-orphaned",
         parent_group_id="sca:manifest:missing",
         strategy=RoutingStrategy.VERSION_BUMP,
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
 
     planned_groups, queue, pending = prepare_supervisor_fix_plan_state(
@@ -706,8 +691,7 @@ def test_same_package_findings_share_one_package_group_and_retain_candidates():
     assert len(groups) == 1
     group = groups[0]
     assert group.group_id == "sca:package.json:lodash"
-    assert group.fix_plan is not None
-    assert group.fix_plan.fixed_version == "4.18.0"
+    assert selected_group_plan(group).fixed_version == "4.18.0"
     assert len(group.localized_issues) == 4
     assert {candidate.plan.status for candidate in group.fix_plan_candidates} == {
         FixPlanStatus.VERSION_FOUND,
@@ -1002,6 +986,7 @@ def test_update_worker_prompt_contains_no_planning_or_registry_phase():
         strategy=RoutingStrategy.VERSION_BUMP,
         strategy_stage=SCARemediationStage.NPM_SAME_MAJOR,
         instruction="Update package.json to exact version 4.18.0.",
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     issue = _sca_strategy_issue("CVE-2026-0001")
     group = group_with_fix_plans(
@@ -1047,6 +1032,7 @@ def test_update_worker_records_failed_exact_version_attempts_without_selecting_n
         strategy=RoutingStrategy.VERSION_BUMP,
         strategy_stage=SCARemediationStage.NPM_LATEST,
         status=TaskStatus.NEEDS_RETRY,
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     diagnostics = _build_retry_diagnostics(
         [(task, group, ["package.json"])],
@@ -1107,7 +1093,12 @@ def test_java_initial_task_uses_exact_gav_and_only_maven_declaration_targets():
             representative_issue_id=issue.id,
             issues=[issue],
             localized_issues=[localized],
-            fix_plan=_sca_strategy_plan(FixPlanStatus.VERSION_FOUND, version="2.4.1"),
+            fix_plan_candidates=[
+                PackageFixPlanCandidate(
+                    issue_id=issue.id,
+                    plan=_sca_strategy_plan(FixPlanStatus.VERSION_FOUND, version="2.4.1"),
+                )
+            ],
         )
         tasks.append(
             build_initial_remediation_task(
@@ -1177,6 +1168,7 @@ def test_qa_failure_selects_next_committed_candidate_and_preserves_security_floo
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
+        allowed_dependency_types=[],
     )
     evaluation = QAEvaluation(
         task_id=task.task_id,
@@ -1249,6 +1241,7 @@ def test_exhausted_sca_candidates_do_not_reopen_the_attempted_version():
         status=TaskStatus.NEEDS_RETRY,
         target_package_name="lodash",
         allowed_target_versions=["4.17.21"],
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     diagnostics = UpdateRetryDiagnostics(
         task_id=task.task_id,
@@ -1280,6 +1273,7 @@ def test_retry_instruction_contains_exact_selected_version_and_preserves_authori
         strategy=RoutingStrategy.VERSION_BUMP,
         strategy_stage=SCARemediationStage.NPM_LATEST,
         status=TaskStatus.NEEDS_RETRY,
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     issue = _sca_strategy_issue("CVE-2026-0001")
     group = group_with_fix_plans(

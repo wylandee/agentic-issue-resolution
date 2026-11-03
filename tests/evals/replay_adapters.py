@@ -25,6 +25,7 @@ from remediation_engine.contracts.schemas import (
     MultiPackageAction,
     NoFixMitigationStage,
     ODCScanEvidence,
+    PackageFixPlanCandidate,
     PackageMutation,
     QADependencyEvidence,
     QAEvaluation,
@@ -49,6 +50,7 @@ from remediation_engine.orchestration.state import (
     initial_update_subagent_state,
     initial_workaround_subagent_state,
     instruction_digest,
+    select_package_fix_plan,
 )
 from remediation_engine.runtime.telemetry import (
     TrajectoryRecorder,
@@ -211,31 +213,40 @@ def _group_for_case(case: Mapping[str, Any], *, component: str) -> Vulnerability
         )
 
     if str(case.get("qa_policy", "")).startswith("no_fix"):
+        plan = FixPlan(
+            status=FixPlanStatus.NO_FIX,
+            instruction="No upstream patch or workaround was found.",
+            strategy_used="NO_FIX",
+        )
         group = group.model_copy(
             update={
-                "fix_plan": FixPlan(
-                    status=FixPlanStatus.NO_FIX,
-                    instruction="No upstream patch or workaround was found.",
-                    strategy_used="NO_FIX",
-                )
+                "fix_plan_candidates": [
+                    PackageFixPlanCandidate(
+                        issue_id=group.representative_issue_id,
+                        plan=plan,
+                    )
+                ]
             }
         )
     return group
 
 
-def _policy_for_case(case: Mapping[str, Any], component: str) -> QAPolicy | None:
-    """Convert a golden policy into its typed contract."""
+def _policy_for_case(case: Mapping[str, Any], component: str) -> QAPolicy:
+    """Resolve a replay fixture's historical policy into the current contract."""
     raw = case.get("qa_policy")
     if raw:
         try:
             return raw if isinstance(raw, QAPolicy) else QAPolicy(str(raw))
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise ValueError(f"Unknown replay QA policy: {raw!r}") from exc
+    no_fix_stage = _no_fix_stage_for_case(case)
+    if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL:
+        return QAPolicy.NO_FIX_PACKAGE_REMOVAL
+    if no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL:
+        return QAPolicy.NO_FIX_CODE_REMOVAL
     if component == "update":
         return QAPolicy.VERSION_BUMP
-    if component == "workaround":
-        return QAPolicy.INITIAL_CODE_WORKAROUND
-    return None
+    return QAPolicy.INITIAL_CODE_WORKAROUND
 
 
 def _strategy_for_case(case: Mapping[str, Any], component: str) -> RoutingStrategy:
@@ -259,6 +270,36 @@ def _no_fix_stage_for_case(case: Mapping[str, Any]) -> NoFixMitigationStage | No
     if "no-fix" in case_id:
         return NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
     return None
+
+
+def _current_task_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize historical replay task fields at the fixture boundary."""
+    payload = dict(raw)
+    if payload.get("qa_policy") is None:
+        stage = payload.get("no_fix_stage")
+        strategy = payload.get("strategy")
+        if stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+            policy = QAPolicy.NO_FIX_PACKAGE_REMOVAL
+        elif stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value:
+            policy = QAPolicy.NO_FIX_CODE_REMOVAL
+        elif strategy == RoutingStrategy.VERSION_BUMP.value:
+            policy = QAPolicy.VERSION_BUMP
+        else:
+            policy = QAPolicy.INITIAL_CODE_WORKAROUND
+        payload["qa_policy"] = policy.value
+    return payload
+
+
+def _current_attempt_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize historical replay authorization fields at the fixture boundary."""
+    payload = dict(raw)
+    if not isinstance(payload.get("allowed_target_versions"), list):
+        selected_version = payload.get("selected_version")
+        payload["allowed_target_versions"] = [selected_version] if selected_version else []
+    if not isinstance(payload.get("allowed_dependency_types"), list):
+        dependency_type = payload.get("target_dependency_type")
+        payload["allowed_dependency_types"] = [dependency_type] if dependency_type else []
+    return payload
 
 
 def _build_task(
@@ -1322,14 +1363,17 @@ def replay_update_case(
     if raw_tasks is not None or raw_groups is not None:
         if not isinstance(raw_tasks, list) or not isinstance(raw_groups, list):
             raise TypeError("Batch replay requires serialized tasks and groups lists.")
-        tasks = [RemediationTask.model_validate(item) for item in raw_tasks]
+        tasks = [RemediationTask.model_validate(_current_task_payload(item)) for item in raw_tasks]
         groups = [VulnerabilityGroup.model_validate(item) for item in raw_groups]
         raw_snapshots = replay.get("attempt_snapshots")
         if not isinstance(raw_snapshots, list):
             raise TypeError("Batch replay requires serialized attempt_snapshots list.")
         snapshots = {
             item.task_id: item
-            for item in (TaskAttemptSnapshot.model_validate(raw) for raw in raw_snapshots)
+            for item in (
+                TaskAttemptSnapshot.model_validate(_current_attempt_payload(raw))
+                for raw in raw_snapshots
+            )
         }
         raw_action = replay.get("multi_package_action")
         if not isinstance(raw_action, Mapping):
@@ -1705,9 +1749,21 @@ def replay_supervisor_case(
         raise TypeError("replay.input.task must be an object")
     if not isinstance(raw_group, Mapping):
         raise TypeError("replay.input.group must be an object")
-    task = RemediationTask.model_validate(dict(raw_task))
-    group = VulnerabilityGroup.model_validate(dict(raw_group))
-    if group.fix_plan is None or not group.fix_plan.fixed_version:
+    task = RemediationTask.model_validate(_current_task_payload(raw_task))
+    group_payload = dict(raw_group)
+    # Golden replay inputs intentionally retain their historical serialization.
+    # Normalize that fixture boundary into the current candidate-only contract.
+    legacy_plan = group_payload.pop("fix_plan", None)
+    if legacy_plan is not None and not group_payload.get("fix_plan_candidates"):
+        group_payload["fix_plan_candidates"] = [
+            {
+                "issue_id": group_payload["representative_issue_id"],
+                "plan": legacy_plan,
+            }
+        ]
+    group = VulnerabilityGroup.model_validate(group_payload)
+    selected_plan = select_package_fix_plan(group).plan
+    if selected_plan is None or not selected_plan.fixed_version:
         raise ValueError("Supervisor replay group requires a committed fixed-version floor.")
 
     raw_candidate_sets = replay_input.get("candidate_sets")
@@ -1756,7 +1812,7 @@ def replay_supervisor_case(
                 f"replay.input.candidate_sets[{index}].approved_version_pool "
                 "must be a list of strings"
             )
-        if security_floor != group.fix_plan.fixed_version:
+        if security_floor != selected_plan.fixed_version:
             raise ValueError(
                 f"Candidate set {index} security floor does not match the group fix-plan floor."
             )
@@ -1792,7 +1848,8 @@ def replay_supervisor_case(
     if not isinstance(raw_prior_attempts, list):
         raise TypeError("replay.input.prior_attempts must be a list")
     prior_attempts = [
-        TaskAttemptSnapshot.model_validate(snapshot) for snapshot in raw_prior_attempts
+        TaskAttemptSnapshot.model_validate(_current_attempt_payload(snapshot))
+        for snapshot in raw_prior_attempts
     ]
 
     typed_candidate_sets = tuple(candidate_sets)
@@ -2009,7 +2066,7 @@ def replay_supervisor_case(
             "task_state_unchanged": task_before == task_after,
             "retry_diagnostics_unchanged": retry_before == retry_after,
             "staged_resolution_count": len(staged_resolutions),
-            "security_floor": group.fix_plan.fixed_version,
+            "security_floor": selected_plan.fixed_version,
             "authorized_target_versions": (
                 list(verification.allowed_target_versions) if verification is not None else []
             ),

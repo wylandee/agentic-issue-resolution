@@ -32,7 +32,7 @@ from remediation_engine.agents.supervisor_policy import (
 from remediation_engine.contracts.schemas import (
     MAX_ANCESTRY_DEPTH,
     MAX_TASK_QUEUE_SIZE,
-    TACTICAL_SUPERVISOR_ACTION_ADAPTER,
+    SUPERVISOR_TACTICAL_ACTION_ADAPTER,
     CodeWorkaroundSupervisorAction,
     FailureCategory,
     FixPlan,
@@ -51,8 +51,6 @@ from remediation_engine.contracts.schemas import (
     StateConsistencyEvent,
     SupervisorRetryPlan,
     TacticalStrategy,
-    TacticalSupervisorAction,
-    TacticalSupervisorDecision,
     TaskAttemptSnapshot,
     TaskSpawnRequest,
     TaskStatus,
@@ -84,100 +82,19 @@ from remediation_engine.runtime.telemetry import invoke_with_trajectory
 from remediation_engine.settings import AppSettings, get_runtime_settings
 from remediation_engine.tools.advisories import plan_fix
 
-try:
-    from semantic_version import Version as SemanticVersion
-except ImportError:  # pragma: no cover - optional runtime fallback
-    SemanticVersion = None
-
-
 logger = logging.getLogger(__name__)
-
-
-def _normalise_semver_text(version: str) -> str | None:
-    """Extract a semver-like token and coerce partial versions for comparison."""
-    match = re.search(
-        r"(?i)v?\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?",
-        version.strip(),
-    )
-    if not match:
-        return None
-    cleaned = match.group(0).lstrip("vV").split("+", 1)[0]
-    core, separator, suffix = cleaned.partition("-")
-    parts = core.split(".")
-    while len(parts) < 3:
-        parts.append("0")
-    normalized = ".".join(parts[:3])
-    return f"{normalized}-{suffix}" if separator else normalized
-
-
-def _semver_sort_key(version: str) -> tuple[int, object]:
-    """Return the existing deterministic comparison key for fixed versions."""
-    normalized = _normalise_semver_text(version)
-    if not normalized:
-        return (0, version)
-    if SemanticVersion is not None:
-        try:
-            return (2, SemanticVersion.coerce(normalized))
-        except ValueError:
-            logger.warning("Failed to coerce semantic version %s", version)
-    core, _, prerelease = normalized.partition("-")
-    parts = tuple(int(part) for part in core.split("."))
-    return (1, (*parts, 0 if prerelease else 1, prerelease))
-
-
-def _highest_fixed_version(pairs: list[tuple[LocalizedIssue, FixPlan]]) -> FixPlan | None:
-    """Return the plan carrying the highest fixed version in the group."""
-    candidates = [plan for _, plan in pairs if plan.fixed_version]
-    return max(
-        candidates, key=lambda plan: _semver_sort_key(plan.fixed_version or ""), default=None
-    )
-
-
-def _merge_workaround_snippets(pairs: list[tuple[LocalizedIssue, FixPlan]]) -> list[str] | None:
-    """Merge workaround snippets in stable first-seen order."""
-    snippets: list[str] = []
-    for _, plan in pairs:
-        for snippet in plan.workaround_snippets or []:
-            if snippet not in snippets:
-                snippets.append(snippet)
-    return snippets or None
-
-
-def _build_group_fix_plan(pairs: list[tuple[LocalizedIssue, FixPlan]]) -> FixPlan | None:
-    """Build the legacy group summary while retaining all member candidates."""
-    if not pairs:
-        return None
-    version_pairs = [pair for pair in pairs if pair[1].status == FixPlanStatus.VERSION_FOUND]
-    workaround_pairs = [pair for pair in pairs if pair[1].status == FixPlanStatus.WORKAROUND_FOUND]
-    if version_pairs:
-        source = _highest_fixed_version(version_pairs) or version_pairs[0][1]
-        return source.model_copy(
-            update={"workaround_snippets": None, "strategy_used": "UPDATE_VERSION"}
-        )
-    if workaround_pairs:
-        source = workaround_pairs[0][1]
-        return source.model_copy(
-            update={
-                "fixed_version": None,
-                "workaround_snippets": _merge_workaround_snippets(workaround_pairs),
-                "strategy_used": "WORKAROUND",
-            }
-        )
-    return pairs[0][1].model_copy(
-        update={"fixed_version": None, "workaround_snippets": None, "strategy_used": "NO_FIX"}
-    )
 
 
 def _build_fix_plan_candidates(
     pairs: list[tuple[LocalizedIssue, FixPlan]],
 ) -> list[PackageFixPlanCandidate]:
-    """Retain unique issue-level plans in deterministic order."""
+    """Retain unique issue-level plans in stable input order."""
     candidates: dict[tuple[str, str], PackageFixPlanCandidate] = {}
     for localized, plan in pairs:
         issue_id = localized.issue.id
         key = (str(issue_id), plan.model_dump_json())
         candidates.setdefault(key, PackageFixPlanCandidate(issue_id=issue_id, plan=plan))
-    return [candidates[key] for key in sorted(candidates)]
+    return list(candidates.values())
 
 
 def apply_issue_fix_plans_to_group(
@@ -191,36 +108,30 @@ def apply_issue_fix_plans_to_group(
         pairs: Localized findings and their typed advisory results.
 
     Returns:
-        A copied group containing one candidate per unique finding/result and
-        the compatibility summary plan, or empty plan fields when ``pairs`` is
-        empty.
+        A copied group containing one candidate per unique finding/result.
     """
     return group.model_copy(
         update={
             "fix_plan_candidates": _build_fix_plan_candidates(pairs),
-            "fix_plan": _build_group_fix_plan(pairs),
         }
     )
 
 
 def has_workaround_fix_plan(group: VulnerabilityGroup) -> bool:
-    """Return whether a group has workaround evidence in candidates or summary.
+    """Return whether a group has workaround evidence in its candidates.
 
     Args:
         group: SCA group to inspect.
 
     Returns:
-        Whether at least one candidate is a workaround, or the legacy summary
-        plan is a workaround when no candidates were serialized.
+        Whether at least one candidate is a workaround.
     """
     candidates = group.fix_plan_candidates or []
     if candidates:
         return any(
             candidate.plan.status == FixPlanStatus.WORKAROUND_FOUND for candidate in candidates
         )
-    return bool(
-        group.fix_plan is not None and group.fix_plan.status == FixPlanStatus.WORKAROUND_FOUND
-    )
+    return False
 
 
 def _fallback_localized_issue(group: VulnerabilityGroup, issue: Any) -> LocalizedIssue:
@@ -315,7 +226,7 @@ def ensure_group_fix_plans(
     """
     if group.issue_type != IssueType.SCA or group.is_synthetic:
         return group
-    if group.fix_plan is not None or group.fix_plan_candidates:
+    if group.fix_plan_candidates:
         return group
     localized_by_id = {item.issue.id: item for item in group.localized_issues or []}
     localized_issues = [
@@ -371,8 +282,6 @@ def ensure_workaround_fix_plan(
         return group
     localized_by_id = {item.issue.id: item for item in group.localized_issues or []}
     candidates = list(group.fix_plan_candidates or [])
-    if not candidates and has_workaround_fix_plan(group):
-        return group
     workaround_issue_ids = {
         item.issue_id for item in candidates if item.plan.status == FixPlanStatus.WORKAROUND_FOUND
     }
@@ -507,7 +416,7 @@ TacticalAction = (
     | PortfolioEscalationSupervisorAction
 )
 
-# Keep the provider boundary flat.  Passing ``TacticalSupervisorDecision`` to
+# Keep the provider boundary flat. Passing the discriminated action union to
 # ``with_structured_output`` serializes the discriminated union as a root
 # ``oneOf`` schema, which OpenAI rejects for the response format used by the
 # production LangChain adapter.  The four concrete contracts are still
@@ -1267,7 +1176,7 @@ def _build_supervisor_dynamic_context(
     execution = context.worker_result.execution_diagnostics if context.worker_result else None
     _exact, tests, locations, files, failure_summary = _evidence_lines(context)
     gates = evaluation.deterministic_gates if evaluation else None
-    fix_plan = getattr(group, "fix_plan", None)
+    fix_plan = select_package_fix_plan(group, task.strategy).plan
     parent_name, parent_version, parent_type = group_parent_context(group)
     maven_mode = is_maven_group(group, context.project_language)
     # are facts about unavailable actions, not actions that should be exposed to
@@ -1487,95 +1396,6 @@ def build_supervisor_messages(
         SystemMessage(content=_SUPERVISOR_STATIC_INSTRUCTIONS),
         HumanMessage(content=_build_supervisor_dynamic_context(context)),
     ]
-
-
-def registry_candidates_for_context(
-    context: TacticalDiagnosticContext,
-    *,
-    registry_provider: Callable[..., Sequence[RegistryCandidate | MavenRegistryCandidate]]
-    | None = None,
-) -> tuple[tuple[str, ...], str | None]:
-    """Fetch the bounded candidate whitelist for one tactical context."""
-    if context.task.strategy == RoutingStrategy.CODE_WORKAROUND:
-        return (), None
-    maven_mode = is_maven_group(context.group, context.project_language)
-    if maven_mode and context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-        return (), "Maven targets never use package overrides."
-    if not maven_mode and context.task.strategy_stage == SCARemediationStage.PACKAGE_OVERRIDE:
-        if not is_transitive_group(context.group) or not context.group.vulnerable_component:
-            return (), "Package override requires a transitive vulnerable child."
-        package_name = context.group.vulnerable_component
-        dependency_type = _override_dependency_type(context.group)
-    else:
-        package_name = _target_package_name(
-            context.task,
-            context.group,
-            context.project_language,
-        )
-        dependency_type = _target_dependency_type(
-            context.task,
-            context.group,
-            context.project_language,
-        )
-    floor = _security_floor(context.task, context.group, context.project_language)
-    floor_error = _security_floor_error(context.group, context.project_language)
-    if not package_name or not floor or floor_error is not None:
-        return (), (
-            "A registry target or security floor is unavailable."
-            if not floor_error
-            else f"Security floor verification failed: {floor_error}."
-        )
-    ecosystem = (
-        "maven" if maven_mode else "pypi" if _task_uses_pypi(context.task, context.group) else "npm"
-    )
-    approved_pool = _approved_candidate_pool(
-        context,
-        package_name,
-        dependency_type,
-        maven_mode=maven_mode,
-    )
-    attempts = _candidate_query_attempts(
-        approved_pool,
-        context.attempted_versions,
-        maven_mode=maven_mode,
-    )
-    try:
-        if registry_provider is not None:
-            if ecosystem == "pypi":
-                candidates = registry_provider(package_name, floor, attempts, ecosystem)
-            else:
-                candidates = registry_provider(package_name, floor, attempts)
-        elif maven_mode:
-            candidates = _supervisor_fetch_registry_candidates(
-                package_name,
-                floor,
-                attempts,
-                project_language=ProjectLanguage.JAVA,
-                maven_mode=True,
-            )
-        else:
-            candidates = _supervisor_fetch_registry_candidates(
-                package_name,
-                floor,
-                attempts,
-                project_language=context.project_language,
-                ecosystem=ecosystem,
-            )
-    except Exception as exc:  # noqa: BLE001
-        return (), f"Registry verification unavailable: {exc}"
-    versions = _current_candidate_versions(
-        candidates,
-        approved_pool=approved_pool,
-        attempted_versions=context.attempted_versions,
-        project_language=context.project_language,
-        maven_mode=maven_mode,
-        stage=context.task.strategy_stage,
-        security_floor=floor,
-        ecosystem=ecosystem,
-    )
-    if ecosystem == "pypi" and not is_transitive_group(context.group):
-        versions = _python_stage_versions(candidates, versions, context.task.strategy_stage)
-    return versions, None
 
 
 def _eligible_candidate_versions(
@@ -2420,11 +2240,7 @@ def _coerce_model_action(result: Any) -> TacticalAction:
             arguments = call["function"].get("arguments", {})
         return contract.model_validate(_coerce_tool_call_arguments(arguments))
 
-    # These branches are retained for deterministic unit doubles and callers
-    # that already return a concrete Pydantic action.  They are not used by
-    # the live provider boundary.
-    if isinstance(result, TacticalSupervisorDecision):
-        return result.root
+    # Deterministic tests may return one of the concrete action contracts.
     if isinstance(
         result,
         (
@@ -2435,22 +2251,10 @@ def _coerce_model_action(result: Any) -> TacticalAction:
         ),
     ):
         return result
-    if isinstance(result, TacticalSupervisorAction):
-        # Historical test doubles returned the retired envelope.  Normalize
-        # it into the strategy-specific contract when possible; retaining the
-        # legacy object only keeps direct callers source-compatible and never
-        # changes the structured-output schema used by the real model.
-        payload = result.model_dump(exclude_none=True)
-        if not payload.get("target_files_hint"):
-            payload.pop("target_files_hint", None)
-        return TACTICAL_SUPERVISOR_ACTION_ADAPTER.validate_python(payload)
     if isinstance(result, dict):
-        payload = dict(result)
-        if set(payload) == {"root"}:
-            payload = payload["root"]
-        return TACTICAL_SUPERVISOR_ACTION_ADAPTER.validate_python(payload)
+        return SUPERVISOR_TACTICAL_ACTION_ADAPTER.validate_python(result)
     if hasattr(result, "model_dump"):
-        return TACTICAL_SUPERVISOR_ACTION_ADAPTER.validate_python(result.model_dump())
+        return SUPERVISOR_TACTICAL_ACTION_ADAPTER.validate_python(result.model_dump())
     raise TypeError("The tactical model did not return a structured Supervisor action.")
 
 

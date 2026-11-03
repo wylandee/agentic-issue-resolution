@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
 from langgraph.graph.message import AnyMessage, add_messages
+from semantic_version import Version as SemanticVersion
 from typing_extensions import TypedDict
 
 from remediation_engine.contracts.decision_codes import (
@@ -42,7 +43,6 @@ from remediation_engine.contracts.decision_codes import (
 from remediation_engine.contracts.schemas import (
     AgentActionSummary,
     AuditRecord,
-    FinalFullScanResult,
     FixPlan,
     FixPlanStatus,
     IncrementalScanRecord,
@@ -57,6 +57,7 @@ from remediation_engine.contracts.schemas import (
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
+    ScanCoverageResult,
     SCARemediationStage,
     StateConsistencyEvent,
     SupervisorRetryPlan,
@@ -83,11 +84,6 @@ from remediation_engine.runtime.path_policy import (
     repository_relative_path,
 )
 from remediation_engine.tools.manifest_locator import expand_dependency_ancestry_from_repository
-
-try:
-    from semantic_version import Version as SemanticVersion
-except ImportError:  # pragma: no cover - optional runtime fallback
-    SemanticVersion = None
 
 _logger = logging.getLogger(__name__)
 
@@ -386,7 +382,6 @@ def normalize_group_paths(
         group_id = group.group_id.replace("\\", "/")
         for old, new in replacements.items():
             group_id = group_id.replace(str(old).replace("\\", "/"), new)
-        fix_plan = group.fix_plan
         fix_plan_candidates = list(group.fix_plan_candidates or [])
         if replacements:
             replacement_items = tuple(replacements.items())
@@ -402,10 +397,6 @@ def normalize_group_paths(
                     )
                 return rewritten
 
-            if fix_plan is not None:
-                fix_plan = fix_plan.model_copy(
-                    update={"instruction": _rewrite_instruction(fix_plan.instruction)}
-                )
             fix_plan_candidates = [
                 candidate.model_copy(
                     update={
@@ -423,7 +414,6 @@ def normalize_group_paths(
             and localized_issues == list(group.localized_issues or [])
             and expanded_group_ancestry == list(group.dependency_ancestry)
             and expanded_group_versions == dict(group.dependency_versions)
-            and fix_plan is group.fix_plan
             and fix_plan_candidates == list(group.fix_plan_candidates or [])
         ):
             # Keep object identity for already-canonical groups.  Some graph
@@ -439,7 +429,6 @@ def normalize_group_paths(
                     "localized_issues": localized_issues,
                     "dependency_ancestry": expanded_group_ancestry,
                     "dependency_versions": expanded_group_versions,
-                    "fix_plan": fix_plan,
                     "fix_plan_candidates": fix_plan_candidates,
                 }
             )
@@ -563,9 +552,6 @@ class OrchestratorState(TypedDict, total=False):
     # replan loops without making ordinary one-off replans terminal.
     portfolio_replan_history: Annotated[dict[str, int], replace_dict_reducer]
     portfolio_dirty: bool
-    # Legacy dictionary retained at the migration boundary. New callers should
-    # use ``portfolio_replan_request``.
-    portfolio_escalation: dict[str, Any] | None
     active_cluster_id: str | None
     active_dispatch_batch_id: str | None
     active_multi_package_action: MultiPackageAction | None
@@ -589,7 +575,7 @@ class OrchestratorState(TypedDict, total=False):
     post_remediation_scan_issues: list[VulnerabilityIssue]
     new_vulnerability_identifiers: list[str]
     new_vulnerability_status: str
-    final_full_scan_result: FinalFullScanResult | None
+    final_full_scan_result: ScanCoverageResult | None
     final_full_scan_enabled: bool
     triage_required: bool
     post_qa_triage_enabled: bool
@@ -727,7 +713,6 @@ def initial_orchestrator_state(
         "portfolio_replan_request": None,
         "portfolio_replan_history": {},
         "portfolio_dirty": True,
-        "portfolio_escalation": None,
         "active_cluster_id": None,
         "active_dispatch_batch_id": None,
         "active_multi_package_action": None,
@@ -901,7 +886,7 @@ class PackageFixPlanSelection:
 
 
 def _candidate_pairs(group: VulnerabilityGroup) -> list[tuple[str, FixPlan]]:
-    """Return retained package plans, with a legacy summary fallback."""
+    """Return retained package plans in the group's stable issue order."""
     candidates = getattr(group, "fix_plan_candidates", None) or []
     pairs: list[tuple[str, FixPlan]] = []
     if not isinstance(candidates, (list, tuple)):
@@ -911,12 +896,7 @@ def _candidate_pairs(group: VulnerabilityGroup) -> list[tuple[str, FixPlan]]:
         plan = _task_value(candidate, "plan")
         if issue_id and plan is not None:
             pairs.append((issue_id, plan))
-    if pairs:
-        return sorted(pairs, key=lambda pair: pair[0])
-    legacy_plan = getattr(group, "fix_plan", None)
-    return (
-        [(str(getattr(group, "representative_issue_id", "")), legacy_plan)] if legacy_plan else []
-    )
+    return pairs
 
 
 def _has_plan_status(plan: Any, status: FixPlanStatus) -> bool:
@@ -935,11 +915,10 @@ def _copy_selected_plan(plan: Any, **updates: Any) -> Any:
 
 def _plan_version_key(version: str) -> tuple[int, object]:
     """Return a stable comparison key for a fixed-version candidate."""
-    if SemanticVersion is not None:
-        try:
-            return (2, SemanticVersion.coerce(version))
-        except ValueError:
-            pass
+    try:
+        return (2, SemanticVersion.coerce(version))
+    except ValueError:
+        pass
     parts: list[int] = []
     for token in version.lstrip("vV").split(".")[:3]:
         digits = "".join(character for character in token if character.isdigit())
@@ -1492,41 +1471,6 @@ def derive_initial_qa_policy(group: VulnerabilityGroup) -> QAPolicy:
     ):
         return QAPolicy.VERSION_BUMP
     return QAPolicy.INITIAL_CODE_WORKAROUND
-
-
-def derive_missing_task_qa_policy(
-    task: RemediationTask,
-    group: VulnerabilityGroup | None,
-) -> QAPolicy | None:
-    """Derive a safe QA policy when a task lacks committed policy provenance.
-
-    Only evidence that is deterministic from the task and its current
-    vulnerability group is accepted. A pivoted child whose policy cannot be
-    reconstructed returns ``None`` so the caller can fail closed.
-
-    Args:
-        task: Existing task whose policy may be absent.
-        group: Current vulnerability group, when available.
-
-    Returns:
-        A deterministically recoverable policy, or ``None`` when provenance is
-        ambiguous.
-    """
-    if task.no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL:
-        return QAPolicy.NO_FIX_PACKAGE_REMOVAL
-    if task.no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL:
-        return QAPolicy.NO_FIX_CODE_REMOVAL
-    if group is not None and is_no_fix_group(group):
-        return QAPolicy.NO_FIX_PACKAGE_REMOVAL
-    if task.strategy == RoutingStrategy.VERSION_BUMP:
-        return QAPolicy.VERSION_BUMP
-    if (
-        task.parent_task_id is None
-        and task.strategy == RoutingStrategy.CODE_WORKAROUND
-        and (group is None or not is_no_fix_group(group))
-    ):
-        return QAPolicy.INITIAL_CODE_WORKAROUND
-    return None
 
 
 def is_maven_group(
@@ -2445,20 +2389,6 @@ def _normalize_target_task_ids_for_node(
             if task_queue[task_id].current_attempt_id is None
         ][:1]
     return []
-
-
-def _resolve_task_id_from_identifier(
-    identifier: str,
-    task_queue: dict[str, RemediationTask],
-    active_target_task_ids: list[str],
-) -> str | None:
-    """Resolve an identifier only when it is an exact task ID.
-
-    Supervisor projections are task-keyed. Parent group IDs are intentionally
-    not accepted here because a group can own multiple independent tasks.
-    """
-    del active_target_task_ids
-    return identifier if identifier in task_queue else None
 
 
 def _normalize_qa_evaluations_for_tasks(

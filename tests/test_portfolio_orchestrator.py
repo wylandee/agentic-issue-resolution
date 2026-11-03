@@ -69,7 +69,7 @@ from remediation_engine.solver.graph import cluster_packages, extract_solver_sub
 from remediation_engine.tools.npm import load_npm_graph_snapshot, make_occurrence_id
 from remediation_engine.tools.registry import RegistryPackumentCache
 from remediation_engine.tools.test_execution import parse_peer_conflict_evidence
-from tests.helpers import group_with_fix_plans
+from tests.helpers import group_with_fix_plans, selected_group_plan
 
 
 def _group(
@@ -680,9 +680,9 @@ def test_missing_namespace_dependency_gets_a_coordination_task(tmp_path: Path):
     }
     assert all(not group.cve_ids and not group.ghsa_ids for group in synthetic)
     assert {
-        group.vulnerable_component: group.fix_plan.fixed_version
+        group.vulnerable_component: selected_group_plan(group).fixed_version
         for group in synthetic
-        if group.fix_plan is not None
+        if selected_group_plan(group) is not None
     } == {
         "@angular/common": "21.2.14",
         "@angular/platform-browser": "21.2.14",
@@ -770,8 +770,7 @@ def test_unflagged_direct_dependency_gets_a_synthetic_task_without_a_seed(tmp_pa
     synthetic_task = next(task for task in queue.values() if task.is_synthetic)
     assert diagnostics == []
     assert synthetic.group_id == "sca:package.json:unflagged-package"
-    assert synthetic.fix_plan is not None
-    assert synthetic.fix_plan.fixed_version == "1.2.3"
+    assert selected_group_plan(synthetic).fixed_version == "1.2.3"
     assert synthetic_task.selected_version is None
     assert synthetic_task.parent_group_id == synthetic.group_id
 
@@ -1406,8 +1405,7 @@ def test_runtime_related_synthetic_package_keeps_its_resolved_version(tmp_path: 
     app_b = next(group for group in groups if group.vulnerable_component == "app-b")
     assert diagnostics == []
     assert app_b.is_synthetic
-    assert app_b.fix_plan is not None
-    assert app_b.fix_plan.fixed_version == "1.0.0"
+    assert selected_group_plan(app_b).fixed_version == "1.0.0"
     assert queue["task-2"].selected_version is None
 
 
@@ -1489,8 +1487,7 @@ def test_synthetic_target_refresh_keeps_group_identity(tmp_path: Path):
     synthetic_task = next(task for task in refreshed_queue.values() if task.is_synthetic)
     assert diagnostics == []
     assert synthetic_group.group_id == "sca:package.json:@angular/common"
-    assert synthetic_group.fix_plan is not None
-    assert synthetic_group.fix_plan.fixed_version == "3.0.0"
+    assert selected_group_plan(synthetic_group).fixed_version == "3.0.0"
     assert synthetic_task.selected_version is None
     assert synthetic_task.task_revision == 1
 
@@ -1603,27 +1600,9 @@ def test_unrelated_package_groups_remain_singletons(tmp_path: Path):
     }
 
 
-def test_delta_isolation_identifies_a_unique_failing_package():
-    result = isolate_delta_failure(
-        ["task-b", "task-a"],
-        lambda subset: "FAIL" if "task-a" in subset else "PASS",
-    )
-
-    assert result.status == "IDENTIFIED"
-    assert result.responsible_task_ids == ("task-a",)
-    assert result.executions == 3
-
-
-def test_delta_isolation_preserves_interaction_and_ambiguity():
-    interaction = isolate_delta_failure(
-        ["a", "b"], lambda subset: "FAIL" if len(subset) == 2 else "PASS"
-    )
-    ambiguous = isolate_delta_failure(["a", "b"], lambda _subset: "FAIL")
-
-    assert interaction.status == "INTERACTION_FAILURE"
-    assert ambiguous.status == "AMBIGUOUS"
-    assert interaction.executions <= 3
-    assert ambiguous.executions <= 3
+def test_delta_isolation_requires_bounded_options():
+    with pytest.raises(ValueError, match="ranked suspects or a canary budget"):
+        isolate_delta_failure(["task-a", "task-b"], lambda _subset: "FAIL")
 
 
 def test_bounded_delta_isolation_probes_only_the_ranked_budgeted_singletons():
@@ -1755,15 +1734,13 @@ def test_bounded_delta_isolation_rejects_above_contract_task_limit_without_probi
     assert probed == []
 
 
-def test_legacy_delta_isolation_keeps_ten_task_guard_without_new_options():
+def test_delta_isolation_requires_bounded_options_even_for_large_clusters():
     probed = []
-    result = isolate_delta_failure(
-        [f"task-{index:02}" for index in range(11)],
-        lambda subset: probed.append(subset) or "FAIL",
-    )
-
-    assert result.status == "INCONCLUSIVE"
-    assert result.executions == 0
+    with pytest.raises(ValueError, match="ranked suspects or a canary budget"):
+        isolate_delta_failure(
+            [f"task-{index:02}" for index in range(11)],
+            lambda subset: probed.append(subset) or "FAIL",
+        )
     assert probed == []
 
 
@@ -2289,6 +2266,8 @@ def test_certified_plan_continues_after_breaking_change_workaround_pivot(
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
         portfolio_plan_id=portfolio_plan_id,
+        allowed_target_versions=[attempted_version] if attempted_version is not None else [],
+        allowed_dependency_types=[],
     )
     evaluation = QAEvaluation(
         task_id="task-1",

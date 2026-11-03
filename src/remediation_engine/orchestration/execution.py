@@ -25,7 +25,10 @@ from remediation_engine.contracts.schemas import (
     StateConsistencyEvent,
     TaskStatus,
 )
-from remediation_engine.contracts.solver_models import QAPassedWorkspacePrefix
+from remediation_engine.contracts.solver_models import (
+    PortfolioReplanRequest,
+    QAPassedWorkspacePrefix,
+)
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.state import (
     OrchestratorState,
@@ -2205,16 +2208,16 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         if delta_isolation.get("status") == "IDENTIFIED":
             responsible_task_ids = list(delta_isolation.get("responsible_task_ids", []))
             blamed_task_id = responsible_task_ids[0] if len(responsible_task_ids) == 1 else None
-            out["portfolio_escalation"] = {
-                "reason": "DELTA_ISOLATION_ATTRIBUTION",
-                "forced_singleton_task_ids": responsible_task_ids,
-                "triggering_attempt_id": (
+            out["portfolio_replan_request"] = PortfolioReplanRequest(
+                reason="DELTA_ISOLATION_ATTRIBUTION",
+                forced_singleton_task_ids=responsible_task_ids,
+                triggering_attempt_id=(
                     (delta_isolation.get("attempt_ids_by_task") or {}).get(blamed_task_id)
                     if blamed_task_id is not None
                     else None
                 ),
-                "source_portfolio_plan_id": delta_isolation.get("source_portfolio_plan_id"),
-            }
+                source_portfolio_plan_id=delta_isolation.get("source_portfolio_plan_id"),
+            )
             out["portfolio_dirty"] = True
             out["portfolio_plan"] = None
     qa_results_by_attempt: dict[str, QAAttemptResult] = {}

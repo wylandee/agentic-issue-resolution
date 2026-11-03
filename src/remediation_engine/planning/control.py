@@ -40,33 +40,9 @@ def _fetch_fresh_registry_packument(package_name: str) -> Mapping[str, Any]:
 
 
 def _portfolio_replan_request(state: OrchestratorState) -> PortfolioReplanRequest | None:
-    """Normalize typed and legacy outer-replan state for the portfolio tool."""
+    """Return the typed outer-replan request, when present."""
     request = state.get("portfolio_replan_request")
-    if isinstance(request, PortfolioReplanRequest):
-        return request
-
-    # ``portfolio_escalation`` was the pre-contract dictionary.  Accept it
-    # during migration, but validate only the fields in the typed boundary
-    # rather than leaking arbitrary evidence into solver state.
-    legacy = request if isinstance(request, dict) else state.get("portfolio_escalation")
-    if not isinstance(legacy, dict):
-        return None
-    fields = (
-        "reason",
-        "peer_conflict_pairs",
-        "forced_singleton_task_ids",
-        "triggering_attempt_id",
-        "triggering_scan_id",
-        "source_portfolio_plan_id",
-    )
-    payload = {key: legacy[key] for key in fields if key in legacy}
-    if not payload.get("reason"):
-        payload["reason"] = "PORTFOLIO_REPLAN"
-    try:
-        return PortfolioReplanRequest.model_validate(payload)
-    except Exception as exc:  # noqa: BLE001 - migration input is best effort
-        log.warning("Ignoring invalid legacy portfolio escalation: %s", exc)
-        return None
+    return request if isinstance(request, PortfolioReplanRequest) else None
 
 
 def _stable_portfolio_replan_reason(reason: str) -> str:
@@ -101,8 +77,7 @@ def _record_portfolio_replan_attempt(
 
     ``run_portfolio_plan_tool`` is the state boundary that consumes a
     ``PortfolioReplanRequest``.  Keeping the ledger here means every source
-    of a replan, including the legacy escalation projection, gets the same
-    bounded fail-closed behavior.
+    of a replan gets the same bounded fail-closed behavior.
 
     Args:
         state: Current orchestrator state containing the prior ledger.
@@ -273,7 +248,6 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "portfolio_replan_request": None,
             "portfolio_replan_history": replan_history,
             "portfolio_dirty": False,
-            "portfolio_escalation": None,
             "active_target_task_ids": [],
             "active_cluster_id": None,
             "active_dispatch_batch_id": None,
@@ -330,7 +304,6 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
                 "portfolio_iteration": iteration,
                 "portfolio_replan_request": None,
                 "portfolio_replan_history": replan_history,
-                "portfolio_escalation": None,
                 "portfolio_dirty": False,
                 "valid_groups": prepared_groups,
                 "task_queue": prepared_queue,
@@ -536,7 +509,6 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "portfolio_replan_request": reconcile_request,
             "portfolio_replan_history": replan_history,
             "portfolio_dirty": True,
-            "portfolio_escalation": state.get("portfolio_escalation"),
             "valid_groups": prepared_groups,
             "task_queue": portfolio_queue,
             "active_target_task_ids": active_attempt_task_ids,
@@ -557,7 +529,6 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
         "portfolio_replan_request": None,
         "portfolio_replan_history": replan_history,
         "portfolio_dirty": False,
-        "portfolio_escalation": None,
         "valid_groups": committed_groups,
         "task_queue": committed_queue,
         "active_target_task_ids": [],

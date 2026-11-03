@@ -27,6 +27,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     ODCScanEvidence,
+    PackageFixPlanCandidate,
     PackageScanOccurrence,
     QAEvaluation,
     QAPolicy,
@@ -119,12 +120,17 @@ def _target_qa_context() -> QATaskContext:
         cve_ids=["CVE-2026-0001"],
         representative_issue_id=issue.id,
         issues=[issue],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.VERSION_FOUND,
-            fixed_version="2.0.0",
-            instruction="Upgrade a to 2.0.0.",
-            strategy_used="test",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=issue.id,
+                plan=FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version="2.0.0",
+                    instruction="Upgrade a to 2.0.0.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
     task = RemediationTask(
         task_id="task-1",

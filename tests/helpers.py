@@ -18,6 +18,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    PackageFixPlanCandidate,
     QAPolicy,
     RemediationTask,
     RoutingStrategy,
@@ -32,6 +33,7 @@ from remediation_engine.contracts.solver_models import (
     PackageResolutionStatus,
     SolverRuntimeFingerprint,
 )
+from remediation_engine.orchestration.state import select_package_fix_plan
 from remediation_engine.planning.portfolio import (
     apply_portfolio_plan,
     build_portfolio_plan,
@@ -41,6 +43,24 @@ from remediation_engine.tools.qa_scan import _QAExecutionResults, _QALogRecord, 
 from remediation_engine.tools.test_execution import _QAInstallOutcome, _QATestExecutionOutcome
 
 _MISSING = object()
+
+
+def qa_policy_for_task(strategy, no_fix_stage=None) -> QAPolicy:
+    """Return the explicit QA policy expected for a test task fixture."""
+    stage = getattr(no_fix_stage, "value", no_fix_stage)
+    if stage == "package_removal":
+        return QAPolicy.NO_FIX_PACKAGE_REMOVAL
+    if stage == "vulnerable_code_removal":
+        return QAPolicy.NO_FIX_CODE_REMOVAL
+    strategy_value = getattr(strategy, "value", strategy)
+    if strategy_value == RoutingStrategy.VERSION_BUMP.value:
+        return QAPolicy.VERSION_BUMP
+    return QAPolicy.INITIAL_CODE_WORKAROUND
+
+
+def selected_group_plan(group: VulnerabilityGroup) -> FixPlan | None:
+    """Return the plan selected from a group's typed issue candidates."""
+    return select_package_fix_plan(group).plan
 
 
 def attach_test_resolution_certificate(plan):
@@ -172,7 +192,7 @@ def _make_group(
         ghsa_ids=ghsa_ids,
         representative_issue_id=issue.id,
         issues=[issue],
-        fix_plan=fix_plan,
+        fix_plan_candidates=[PackageFixPlanCandidate(issue_id=issue.id, plan=fix_plan)],
     )
 
 
@@ -295,7 +315,9 @@ def _make_minimal_state(
             status=TaskStatus.OPTIMISTICALLY_FIXED,
             current_attempt_id=attempt_id,
             target_package_name=group.vulnerable_component,
-            selected_version=group.fix_plan.fixed_version if group.fix_plan else None,
+            selected_version=(
+                selected_group_plan(group).fixed_version if selected_group_plan(group) else None
+            ),
             instruction=instruction,
         )
         task_queue[task_id] = task
@@ -308,6 +330,10 @@ def _make_minimal_state(
             instruction=instruction,
             instruction_digest=f"digest-{task_id}",
             dispatch_node="qa_critic",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
     worker_results_by_attempt = {
         task.current_attempt_id: {"changed_files": list(changed_files or [])}

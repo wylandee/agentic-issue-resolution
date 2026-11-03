@@ -25,7 +25,10 @@ from remediation_engine.agents.workaround import (
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     FailureCategory,
+    FixPlan,
+    FixPlanStatus,
     IssueType,
+    PackageFixPlanCandidate,
     QAAttemptResult,
     QAEvaluation,
     QAFailureEvidence,
@@ -76,6 +79,7 @@ from remediation_engine.tools.workspace import (
     _is_authoritative_evidence_source,
     _is_infrastructure_failure,
 )
+from tests.helpers import qa_policy_for_task
 
 
 def _attempt_snapshot(task: RemediationTask) -> TaskAttemptSnapshot:
@@ -86,6 +90,8 @@ def _attempt_snapshot(task: RemediationTask) -> TaskAttemptSnapshot:
         instruction=task.instruction,
         instruction_digest="test-digest",
         dispatch_node="workaround_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
 
 
@@ -121,6 +127,7 @@ def test_failed_qa_evidence_is_correlated_to_committed_attempt():
         instruction="Apply workaround",
         current_attempt_id="attempt-7",
         task_revision=4,
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     evaluations = {
         "task-1": QAEvaluation(
@@ -161,6 +168,7 @@ def test_failure_evidence_is_dropped_for_task_without_current_snapshot():
         instruction="Apply workaround one.",
         current_attempt_id="attempt-1",
         task_revision=1,
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     task_two = task_one.model_copy(
         update={
@@ -202,6 +210,7 @@ def test_deterministic_qa_evidence_replaces_llm_source_locations():
         instruction="Apply workaround",
         current_attempt_id="attempt-7",
         task_revision=4,
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     evaluations = {
         "task-1": QAEvaluation(
@@ -251,6 +260,7 @@ def test_invalid_deterministic_qa_source_locations_are_discarded():
         instruction="Apply workaround",
         current_attempt_id="attempt-7",
         task_revision=4,
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     evaluations = {
         "task-1": QAEvaluation(
@@ -291,6 +301,7 @@ def test_supervisor_creates_workaround_context():
         parent_group_id="group-1",
         strategy=RoutingStrategy.CODE_WORKAROUND,
         instruction="Mitigate express-jwt vulnerability",
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     snapshots = {}
     evidence = QAFailureEvidence(
@@ -501,6 +512,7 @@ def test_build_workaround_prompt_biphasic():
         parent_group_id="g-1",
         strategy=RoutingStrategy.CODE_WORKAROUND,
         instruction="Fix vulnerability",
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     group = VulnerabilityGroup(
         group_id="g-1",
@@ -554,18 +566,11 @@ def test_workaround_toolbelt_ast_gate_and_search_enrichment():
         ],
         "local_investigation_complete": True,
     }
-    terms = {
-        "component": "express-jwt",
-        "cve": "CVE-2026-1234",
-        "qa_diagnostic": "is not a function",
-    }
-
     tools = build_workaround_toolbelt(
         mock_sandbox,
         touched,
         host_repo_root=MagicMock(),
         plan_state=plan_state,
-        mandatory_search_terms=terms,
     )
 
     tool_dict = {t.name: t for t in tools}
@@ -602,6 +607,7 @@ def test_express_jwt_mocked_end_to_end_scenario():
         parent_group_id="group-jwt",
         strategy=RoutingStrategy.CODE_WORKAROUND,
         instruction="Fix express-jwt import",
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     group = VulnerabilityGroup(
         group_id="group-jwt",
@@ -625,6 +631,8 @@ def test_express_jwt_mocked_end_to_end_scenario():
         instruction="Fix express-jwt",
         instruction_digest="digest1",
         workaround_context=ctx_initial,
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
 
     state1 = {
@@ -839,6 +847,7 @@ def test_targeted_search_query_generation_in_prompt() -> None:
         parent_group_id="grp-1",
         strategy=RoutingStrategy.CODE_WORKAROUND,
         instruction="Fix express-jwt missing algorithms",
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     group = VulnerabilityGroup(
         group_id="grp-1",
@@ -870,6 +879,7 @@ def test_supervisor_commits_matching_replay_plan_and_ignores_stale() -> None:
         status=TaskStatus.PENDING,
         current_attempt_id="att-1",
         task_revision=1,
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     snapshot = TaskAttemptSnapshot(
         attempt_id="att-1",
@@ -878,6 +888,8 @@ def test_supervisor_commits_matching_replay_plan_and_ignores_stale() -> None:
         instruction="Fix express-jwt missing algorithms",
         instruction_digest="digest-1",
         dispatch_node="workaround_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
     edit_obj = WorkaroundEdit(
         file_path="file.js",
@@ -1142,9 +1154,17 @@ def test_compact_initial_mitigation_prompt():
         vulnerable_component="express-jwt",
         cve_ids=["CVE-2026-1234"],
         ghsa_ids=[],
-        fix_plan=MagicMock(
-            status=MagicMock(value="no_fix"), fixed_version=None, workaround_snippets=["snippet1"]
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=str(uuid4()),
+                plan=FixPlan(
+                    status=FixPlanStatus.WORKAROUND_FOUND,
+                    workaround_snippets=["snippet1"],
+                    instruction="Use the advisory workaround.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
     group.issues = []
 
@@ -1171,7 +1191,6 @@ def test_supervisor_task_instruction_is_not_truncated():
         vulnerable_component="express-jwt",
         cve_ids=[],
         ghsa_ids=[],
-        fix_plan=MagicMock(status=MagicMock(value="no_fix"), workaround_snippets=[]),
     )
     group.issues = []
 
@@ -1206,7 +1225,6 @@ def test_compact_qa_regression_repair_prompt():
         vulnerable_component="express-jwt",
         cve_ids=["CVE-2026-9999"],
         ghsa_ids=[],
-        fix_plan=MagicMock(status=MagicMock(value="in_progress")),
     )
     qa_ev = QAFailureEvidence(
         attempt_id="att-123",
@@ -1258,7 +1276,17 @@ def test_search_recommendation_precedence():
         vulnerable_component="lodash",
         cve_ids=["CVE-2025-1111"],
         ghsa_ids=[],
-        fix_plan=MagicMock(status=MagicMock(value="in_progress")),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=str(uuid4()),
+                plan=FixPlan(
+                    status=FixPlanStatus.VERSION_FOUND,
+                    fixed_version="2.0.0",
+                    instruction="Upgrade lodash to 2.0.0.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
     group.issues = []
 
@@ -1285,7 +1313,16 @@ def test_search_recommendation_precedence():
         vulnerable_component="lodash",
         cve_ids=["CVE-2025-1111"],
         ghsa_ids=[],
-        fix_plan=MagicMock(status=MagicMock(value="no_fix")),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=str(uuid4()),
+                plan=FixPlan(
+                    status=FixPlanStatus.NO_FIX,
+                    instruction="No upstream fix is available.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
     rec_nofix = _workaround_search_recommendation(task, group_nofix, context_scanner, None)
     assert rec_nofix.scenario == "no_update_available_to_resolve_cve"
@@ -1301,7 +1338,6 @@ def test_search_recommendation_uses_test_details_instead_of_runner_status():
         vulnerable_component="sanitize-html",
         cve_ids=[],
         ghsa_ids=[],
-        fix_plan=MagicMock(status=MagicMock(value="in_progress")),
     )
     group.issues = []
     context = WorkaroundContext(
@@ -1334,7 +1370,6 @@ def test_search_recommendation_keeps_api_exception_detail():
         vulnerable_component="jsonwebtoken",
         cve_ids=[],
         ghsa_ids=[],
-        fix_plan=MagicMock(status=MagicMock(value="in_progress")),
     )
     group.issues = []
     context = WorkaroundContext(
@@ -2039,6 +2074,7 @@ def test_supervisor_refuses_optimistic_fixed_for_skipped_or_blocked_gates():
         strategy=RoutingStrategy.CODE_WORKAROUND,
         instruction="Workaround",
         current_attempt_id="att-1",
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     snapshot = MagicMock(
         attempt_id="att-1",
@@ -2088,6 +2124,7 @@ def test_supervisor_accepts_optimistic_fixed_when_alternative_test_fully_replace
         strategy=RoutingStrategy.CODE_WORKAROUND,
         instruction="Workaround",
         current_attempt_id="att-1",
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     snapshot = MagicMock(
         attempt_id="att-1",

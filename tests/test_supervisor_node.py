@@ -103,7 +103,7 @@ from remediation_engine.orchestration.state import (
     reconcile_phase5_state_before_teardown,
 )
 from remediation_engine.settings import AppSettings
-from tests.helpers import commit_test_portfolio_plan
+from tests.helpers import commit_test_portfolio_plan, qa_policy_for_task
 
 
 @pytest.fixture(autouse=True)
@@ -241,7 +241,6 @@ def _sca_group(group_id="g1", fix_status=FixPlanStatus.VERSION_FOUND) -> Vulnera
         issues=[issue],
         localized_issues=[localized],
         fix_plan_candidates=[PackageFixPlanCandidate(issue_id=issue.id, plan=fix_plan)],
-        fix_plan=fix_plan,
     )
 
 
@@ -272,6 +271,7 @@ def _rename_sca_group_package(
 
 
 def _sast_group(group_id="g2") -> VulnerabilityGroup:
+    issue = _issue()
     fix_plan = FixPlan(
         status=FixPlanStatus.WORKAROUND_FOUND,
         fixed_version=None,
@@ -287,9 +287,9 @@ def _sast_group(group_id="g2") -> VulnerabilityGroup:
         cve_ids=[],
         versions=[],
         sources=[IssueSource.SEMGREP],
-        representative_issue_id=str(uuid4()),
-        issues=[_issue()],
-        fix_plan=fix_plan,
+        representative_issue_id=issue.id,
+        issues=[issue],
+        fix_plan_candidates=[PackageFixPlanCandidate(issue_id=issue.id, plan=fix_plan)],
     )
 
 
@@ -306,6 +306,7 @@ def _make_task(
         strategy=strategy,
         status=status,
         retry_count=retry_count,
+        qa_policy=qa_policy_for_task(strategy),
     )
 
 
@@ -563,6 +564,10 @@ def _base_state(groups, **overrides) -> dict:
                 if task.strategy == RoutingStrategy.CODE_WORKAROUND
                 else "update_subagent"
             ),
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         tagged_summary = summary.model_copy(
             update={
@@ -837,19 +842,6 @@ def test_registry_verification_pending_reenters_supervisor_without_forcing_final
     assert result["task_queue"][task.task_id].retry_count == task.retry_count
 
 
-def test_attempt_snapshot_allowlists_default_for_legacy_payloads():
-    """New candidate fields remain readable when historical snapshots omit them."""
-    snapshot = TaskAttemptSnapshot(
-        task_id="task-1",
-        instruction="Update test-pkg.",
-        instruction_digest=instruction_digest("Update test-pkg."),
-        dispatch_node="update_subagent",
-    )
-
-    assert snapshot.allowed_target_versions == []
-    assert snapshot.allowed_dependency_types == []
-
-
 def test_ordered_update_candidates_excludes_attempted_versions_and_types():
     """A committed retry snapshot contains only unattempted Supervisor candidates."""
     task = _make_task("task-1", "g1").model_copy(
@@ -1051,6 +1043,8 @@ def test_committed_state_rejects_active_empty_update_authorization():
         instruction=task.instruction,
         instruction_digest=instruction_digest(task.instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
 
     events, errors = _validate_committed_state(
@@ -1084,6 +1078,8 @@ def test_committed_state_refuses_snapshot_revision_rewind():
         instruction="Update test-pkg to 1.0.0.",
         instruction_digest=instruction_digest("Update test-pkg to 1.0.0."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["1.0.0"],
+        allowed_dependency_types=[],
     )
     queue = {"task-1": task}
 
@@ -1116,6 +1112,8 @@ def test_committed_state_rejects_foreign_task_snapshot_identity():
         instruction="Update test-pkg to 9.9.9.",
         instruction_digest=instruction_digest("Update test-pkg to 9.9.9."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["9.9.9"],
+        allowed_dependency_types=[],
     )
     queue = {"task-1": task}
 
@@ -1148,6 +1146,8 @@ def test_committed_state_repairs_mutated_inputs_for_same_snapshot_revision():
         instruction=committed_instruction,
         instruction_digest=instruction_digest(committed_instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["1.0.0"],
+        allowed_dependency_types=[],
     )
     queue = {"task-1": task}
 
@@ -1182,7 +1182,7 @@ class TestDeriveInitialStrategy:
 
     def test_missing_fix_plan_yields_code_workaround(self):
         g = _sast_group()
-        g.fix_plan = None
+        g.fix_plan_candidates = []
         assert derive_initial_strategy(g) == RoutingStrategy.CODE_WORKAROUND
 
 
@@ -1826,6 +1826,10 @@ class TestRunSupervisorNodeToQA:
                 instruction=instruction,
                 instruction_digest=instruction_digest(instruction),
                 dispatch_node="update_subagent",
+                allowed_target_versions=[task.selected_version]
+                if task.selected_version is not None
+                else [],
+                allowed_dependency_types=["dependencies"],
             )
             tasks[task_id] = task
             snapshots[attempt_id] = snapshot
@@ -2144,6 +2148,8 @@ class TestRunSupervisorNodeQAUpdates:
             instruction=instruction,
             instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=["1.2.3"],
+            allowed_dependency_types=["overrides"],
         )
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
             update={
@@ -2217,6 +2223,8 @@ class TestRunSupervisorNodeQAUpdates:
             instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
             qa_policy=QAPolicy.VERSION_BUMP,
+            allowed_target_versions=["1.2.3"],
+            allowed_dependency_types=[],
         )
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
             update={
@@ -2278,6 +2286,8 @@ class TestRunSupervisorNodeQAUpdates:
             instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
             qa_policy=QAPolicy.VERSION_BUMP,
+            allowed_target_versions=["1.2.3"],
+            allowed_dependency_types=[],
         )
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
             update={
@@ -2728,6 +2738,8 @@ def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
         instruction="Update test-pkg to 1.0.0.",
         instruction_digest=instruction_digest("Update test-pkg to 1.0.0."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["1.0.0"],
+        allowed_dependency_types=[],
     )
     new_snapshot = TaskAttemptSnapshot(
         attempt_id="attempt-new",
@@ -2739,6 +2751,8 @@ def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
         instruction="Update test-pkg to 2.0.0.",
         instruction_digest=instruction_digest("Update test-pkg to 2.0.0."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     task = _make_task(
         "task-1",
@@ -2799,6 +2813,8 @@ def test_worker_result_under_current_key_must_carry_current_attempt_id():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
         update={
@@ -2880,6 +2896,8 @@ def test_worker_result_persists_attempts_by_target_and_override_usage():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["1.2.3"],
+        allowed_dependency_types=["overrides"],
     )
     task = _make_task("task-1", "g1").model_copy(
         update={
@@ -3069,6 +3087,8 @@ def test_successful_no_fix_package_removal_routes_to_qa_without_odc(mock_chat):
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="workaround_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
     task = _make_task(
         "task-1",
@@ -3213,6 +3233,8 @@ def test_stale_qa_result_does_not_increment_retry_count():
         instruction="Update test-pkg to 2.0.0.",
         instruction_digest=instruction_digest("Update test-pkg to 2.0.0."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     stale_qa = QAAttemptResult(
         attempt_id="attempt-old",
@@ -3269,6 +3291,8 @@ def test_qa_envelope_attempt_id_must_match_current_attempt_map_key() -> None:
         instruction="Update test-pkg to 2.0.0.",
         instruction_digest=instruction_digest("Update test-pkg to 2.0.0."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     occurrence = PackageScanOccurrence(
         source_input_path="package-lock.json",
@@ -3355,6 +3379,8 @@ def test_missing_qa_result_cannot_dispatch_same_attempt_forever():
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
         qa_policy=QAPolicy.VERSION_BUMP,
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
         update={
@@ -3426,6 +3452,8 @@ def test_inconclusive_active_qa_attempt_is_rechecked_before_other_tasks():
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
         qa_policy=QAPolicy.VERSION_BUMP,
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     active_task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
         update={
@@ -3500,6 +3528,8 @@ def test_teardown_barrier_detaches_terminal_attempt_and_is_idempotent():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="workaround_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
     task = _make_task(
         "task-1",
@@ -4666,6 +4696,7 @@ class TestBugFixes:
             strategy_stage=SCARemediationStage.CODE_WORKAROUND,
             status=TaskStatus.NEEDS_RETRY,
             instruction="Bump express",
+            qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
         )
         task_queue = {"task-1": task}
         group_by_id = {group_id: g}
@@ -4848,6 +4879,7 @@ class TestBugFixes:
             strategy=RoutingStrategy.CODE_WORKAROUND,
             status=TaskStatus.PENDING,
             instruction="Apply workaround",
+            qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
         )
         task_queue = {parent_task.task_id: parent_task, existing_child.task_id: existing_child}
         spawn_req = TaskSpawnRequest(
@@ -4984,6 +5016,7 @@ class TestBugFixes:
             strategy=RoutingStrategy.CODE_WORKAROUND,
             status=TaskStatus.NEEDS_RETRY,
             instruction="Workaround",
+            qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
         )
         task_queue = {"task-1": parent_task}
         spawn_req = TaskSpawnRequest(
@@ -5016,6 +5049,7 @@ class TestBugFixes:
             status=TaskStatus.NEEDS_RETRY,
             retry_count=3,  # MAX_RETRIES
             instruction="Workaround",
+            qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
         )
         task_queue = {"task-1": task}
 
@@ -5060,6 +5094,7 @@ class TestBugFixes:
             retry_count=1,
             instruction="Workaround",
             portfolio_plan_id="portfolio-current",
+            qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
         )
         task_queue = {"task-2": task}
         qa_evaluations = {
@@ -5148,6 +5183,9 @@ def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
             instruction=instruction,
             instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
+            allowed_dependency_types=[task.target_dependency_type]
+            if task.target_dependency_type is not None
+            else [],
         )
         evaluation = QAEvaluation(
             task_id=task_id,
@@ -5195,22 +5233,22 @@ def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
         "source_portfolio_plan_id": source_plan_id,
         "attempt_ids_by_task": attempt_ids_by_task,
     }
-    escalation = {
-        "reason": "DELTA_ISOLATION_ATTRIBUTION",
-        "forced_singleton_task_ids": ["task-b"],
-        "triggering_attempt_id": "attempt-b",
-        "source_portfolio_plan_id": source_plan_id,
-    }
+    escalation = PortfolioReplanRequest(
+        reason="DELTA_ISOLATION_ATTRIBUTION",
+        forced_singleton_task_ids=["task-b"],
+        triggering_attempt_id="attempt-b",
+        source_portfolio_plan_id=source_plan_id,
+    )
     if delta_case == "stale_attempt":
         record["attempt_ids_by_task"] = {
             **attempt_ids_by_task,
             "task-b": "attempt-old",
         }
     elif delta_case == "foreign_forced_task":
-        escalation["forced_singleton_task_ids"] = ["task-foreign"]
+        escalation = escalation.model_copy(update={"forced_singleton_task_ids": ["task-foreign"]})
     elif delta_case == "stale_source":
         record["source_portfolio_plan_id"] = "portfolio-old"
-        escalation["source_portfolio_plan_id"] = "portfolio-old"
+        escalation = escalation.model_copy(update={"source_portfolio_plan_id": "portfolio-old"})
 
     state = _base_state(
         [group_a, group_b],
@@ -5225,7 +5263,7 @@ def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
         delta_isolation_by_cluster=(
             {cluster_id: record} if delta_case != "ordinary_failure" else {}
         ),
-        portfolio_escalation=(escalation if delta_case != "ordinary_failure" else None),
+        portfolio_replan_request=(escalation if delta_case != "ordinary_failure" else None),
     )
     return state, tasks, snapshots
 
@@ -5322,7 +5360,6 @@ def test_delta_isolation_requeues_unblamed_peer_for_authoritative_singleton_qa(
             "portfolio_solver_plan": None,
             "portfolio_iteration": 1,
             "portfolio_replan_request": None,
-            "portfolio_escalation": None,
             "portfolio_dirty": False,
             "valid_groups": portfolio_input["valid_groups"],
             "task_queue": task_queue,
@@ -5448,7 +5485,6 @@ def test_atomic_cluster_stale_delta_provenance_retries_every_member(delta_case):
         assert committed.retry_count == task.retry_count + 1
         assert committed.current_attempt_id is None
         assert committed.task_revision > task.task_revision
-    assert result["portfolio_escalation"]["forced_singleton_task_ids"] == []
     request = result["portfolio_replan_request"]
     assert request.forced_singleton_task_ids == []
     assert request.triggering_attempt_id is None
@@ -5471,6 +5507,8 @@ def test_supervisor_commits_complete_passing_scan_into_ledgers():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     old_occurrence = PackageScanOccurrence(
         source_input_path="package-lock.json",
@@ -5658,6 +5696,8 @@ def _workerless_absence_state(
         instruction=source_instruction,
         instruction_digest=instruction_digest(source_instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     source_scan_evidence = ODCScanEvidence(
         requested_scope=ScanScope.TARGETED,
@@ -6030,6 +6070,8 @@ def test_retained_regression_candidate_does_not_commit_batch_scan_findings():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     task_evidence = ODCScanEvidence(
         requested_scope=ScanScope.TARGETED,
@@ -6806,6 +6848,8 @@ def test_setup_scan_findings_persist_until_accepted_task_scan_replaces_them():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="workaround_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
     clean_evidence = ODCScanEvidence(
         requested_scope=ScanScope.TARGETED,
@@ -6977,6 +7021,8 @@ class TestRunSupervisorNodeQAUpdatesStage2Parity:
             instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
             qa_policy=QAPolicy.VERSION_BUMP,
+            allowed_target_versions=["1.2.3"],
+            allowed_dependency_types=[],
         )
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
             update={

@@ -324,20 +324,16 @@ def _verify_lockfile_mutations(
 def _sync_package_manifests(
     sandbox: DockerSandbox,
     manifest_paths: Sequence[str],
-    package_specs_by_manifest: Mapping[str, Iterable[str]] | None = None,
 ) -> tuple[bool, str]:
     """Validate and synchronize package manifests.
 
     Args:
         sandbox: Running Docker workspace sandbox.
         manifest_paths: Repository-relative manifests to synchronize.
-        package_specs_by_manifest: Optional legacy parameter retained for compatibility.
-
     Returns:
         ``(True, "")`` when every synchronization succeeds, otherwise a
         stable tool error and ``False``.
     """
-    del package_specs_by_manifest
 
     def build_command(manifest_path: str, *, dry_run: bool) -> str:
         """Build one deterministic npm manifest validation or sync command."""

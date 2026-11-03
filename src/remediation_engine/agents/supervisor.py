@@ -88,7 +88,6 @@ from remediation_engine.contracts.schemas import (
     AgentActionStatus,
     AgentActionSummary,
     FailureCategory,
-    FinalFullScanResult,
     IncrementalScanRecord,
     IssueType,
     MavenTargetOperation,
@@ -102,6 +101,7 @@ from remediation_engine.contracts.schemas import (
     QAFailureEvidence,
     RemediationTask,
     RoutingStrategy,
+    ScanCoverageResult,
     SCARemediationStage,
     StateConsistencyEvent,
     SupervisorDecision,
@@ -151,7 +151,6 @@ from remediation_engine.orchestration.state import (
     _validate_committed_state,
     build_no_fix_package_removal_instruction,
     build_no_fix_retry_instruction,
-    derive_missing_task_qa_policy,
     group_parent_context,
     instruction_digest,
     is_maven_group,
@@ -3009,7 +3008,7 @@ def _commit_staged_tactical_resolutions(
 
 
 def _validated_delta_isolation_blame(
-    portfolio_escalation: Mapping[str, Any] | None,
+    portfolio_replan_request: PortfolioReplanRequest | None,
     delta_isolation_by_cluster: Mapping[str, Any],
     atomic_cluster_task_ids: list[str],
     task_queue: Mapping[str, RemediationTask],
@@ -3017,8 +3016,8 @@ def _validated_delta_isolation_blame(
 ) -> str | None:
     """Return one blamed task only when delta provenance matches the attempts."""
     if (
-        not isinstance(portfolio_escalation, Mapping)
-        or portfolio_escalation.get("reason") != "DELTA_ISOLATION_ATTRIBUTION"
+        not isinstance(portfolio_replan_request, PortfolioReplanRequest)
+        or portfolio_replan_request.reason != "DELTA_ISOLATION_ATTRIBUTION"
         or len(atomic_cluster_task_ids) <= 1
         or len(atomic_cluster_task_ids) != len(set(atomic_cluster_task_ids))
     ):
@@ -3080,7 +3079,7 @@ def _validated_delta_isolation_blame(
         return None
 
     responsible_task_ids = record.get("responsible_task_ids")
-    forced_singleton_task_ids = portfolio_escalation.get("forced_singleton_task_ids")
+    forced_singleton_task_ids = portfolio_replan_request.forced_singleton_task_ids
     if (
         not isinstance(responsible_task_ids, (list, tuple))
         or len(responsible_task_ids) != 1
@@ -3093,8 +3092,8 @@ def _validated_delta_isolation_blame(
     if not isinstance(blamed_task_id, str) or blamed_task_id not in set(atomic_cluster_task_ids):
         return None
     if (
-        portfolio_escalation.get("triggering_attempt_id") != attempt_ids_by_task[blamed_task_id]
-        or portfolio_escalation.get("source_portfolio_plan_id") != source_portfolio_plan_id
+        portfolio_replan_request.triggering_attempt_id != attempt_ids_by_task[blamed_task_id]
+        or portfolio_replan_request.source_portfolio_plan_id != source_portfolio_plan_id
     ):
         return None
     return blamed_task_id
@@ -3359,29 +3358,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
     task_queue: dict[str, RemediationTask] = {
         task_id: task.model_copy() for task_id, task in raw_task_queue.items()
     }
-    # Legacy task records may predate Supervisor-owned QA policy provenance.
-    # Recover policy only before a portfolio plan exists; planned task inputs
-    # remain immutable and are revalidated by the portfolio boundary.
-    if state.get("portfolio_plan") is None:
-        for task_id, task in list(task_queue.items()):
-            if (
-                task.qa_policy is not None
-                or task.current_attempt_id is not None
-                or task.status in _TERMINAL_STATUSES
-                or task.portfolio_plan_id is not None
-            ):
-                continue
-            recovered_policy = derive_missing_task_qa_policy(
-                task,
-                group_by_id.get(task.parent_group_id),
-            )
-            if recovered_policy is not None:
-                task_queue[task_id] = task.model_copy(
-                    update={
-                        "qa_policy": recovered_policy,
-                        "task_revision": task.task_revision + 1,
-                    }
-                )
     pending_request_at_entry = state.get("portfolio_replan_request")
     unfixable_replan_cleared = bool(
         isinstance(pending_request_at_entry, PortfolioReplanRequest)
@@ -4108,7 +4084,9 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         if not qa_requires_rerun:
             processed_qa_attempt_ids.add(task.current_attempt_id)
             new_qa_attempt_ids.append(task.current_attempt_id)
-    portfolio_escalation = state.get("portfolio_escalation")
+    portfolio_replan_request = state.get("portfolio_replan_request")
+    if not isinstance(portfolio_replan_request, PortfolioReplanRequest):
+        portfolio_replan_request = None
     validated_delta_blame_task_id: str | None = None
     if atomic_cluster_task_ids and state.get("status") in {"qa_completed", "qa_failed"}:
         cluster_evaluations = {
@@ -4167,7 +4145,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 )
         else:
             peer_pairs: set[tuple[str, str]] = set()
-            peer_evidence: dict[str, dict[str, Any]] = {}
             unresolved_peer_diagnostics: list[str] = []
             for task_id, evaluation in cluster_evaluations.items():
                 if evaluation is None:
@@ -4182,33 +4159,34 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 if escalation is None:
                     continue
                 peer_pairs.update(tuple(pair) for pair in escalation["peer_conflict_pairs"])
-                for evidence in escalation.get("evidence", []):
-                    peer_evidence[json.dumps(evidence, sort_keys=True)] = evidence
             errors.extend(unresolved_peer_diagnostics)
             if peer_pairs:
-                portfolio_escalation = {
-                    "reason": "PEER_CONFLICT_ESCALATION",
-                    "peer_conflict_pairs": sorted(peer_pairs),
-                    "evidence": [peer_evidence[key] for key in sorted(peer_evidence)],
-                }
+                portfolio_replan_request = PortfolioReplanRequest(
+                    reason="PEER_CONFLICT_ESCALATION",
+                    peer_conflict_pairs=sorted(peer_pairs),
+                    source_portfolio_plan_id=(
+                        committed_plan.portfolio_plan_id if committed_plan is not None else None
+                    ),
+                )
             validated_delta_blame_task_id = _validated_delta_isolation_blame(
-                portfolio_escalation if isinstance(portfolio_escalation, Mapping) else None,
+                portfolio_replan_request,
                 delta_isolation_by_cluster,
                 atomic_cluster_task_ids,
                 task_queue,
                 attempt_snapshots_by_id,
             )
             if (
-                isinstance(portfolio_escalation, Mapping)
-                and portfolio_escalation.get("reason") == "DELTA_ISOLATION_ATTRIBUTION"
+                portfolio_replan_request is not None
+                and portfolio_replan_request.reason == "DELTA_ISOLATION_ATTRIBUTION"
                 and validated_delta_blame_task_id is None
             ):
-                portfolio_escalation = {
-                    **portfolio_escalation,
-                    "forced_singleton_task_ids": [],
-                    "triggering_attempt_id": None,
-                    "source_portfolio_plan_id": None,
-                }
+                portfolio_replan_request = portfolio_replan_request.model_copy(
+                    update={
+                        "forced_singleton_task_ids": [],
+                        "triggering_attempt_id": None,
+                        "source_portfolio_plan_id": None,
+                    }
+                )
             validated_delta_cluster_id = next(
                 (
                     snapshot.cluster_id
@@ -4261,41 +4239,17 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     "supervisor: atomic package-cluster QA failure kept every member non-passed."
                 )
     if (
-        isinstance(portfolio_escalation, Mapping)
-        and portfolio_escalation.get("reason") == "DELTA_ISOLATION_ATTRIBUTION"
+        portfolio_replan_request is not None
+        and portfolio_replan_request.reason == "DELTA_ISOLATION_ATTRIBUTION"
+        and validated_delta_blame_task_id is None
     ):
-        if validated_delta_blame_task_id is None:
-            portfolio_escalation = {
-                **portfolio_escalation,
+        portfolio_replan_request = portfolio_replan_request.model_copy(
+            update={
                 "forced_singleton_task_ids": [],
                 "triggering_attempt_id": None,
                 "source_portfolio_plan_id": None,
             }
-        portfolio_replan_request = None
-    else:
-        portfolio_replan_request = state.get("portfolio_replan_request")
-    if not isinstance(portfolio_replan_request, PortfolioReplanRequest):
-        escalation = portfolio_escalation
-        if isinstance(escalation, dict) and escalation.get("reason"):
-            try:
-                portfolio_replan_request = PortfolioReplanRequest(
-                    reason=str(escalation["reason"]),
-                    peer_conflict_pairs=escalation.get("peer_conflict_pairs", []),
-                    forced_singleton_task_ids=escalation.get("forced_singleton_task_ids", []),
-                    triggering_attempt_id=escalation.get("triggering_attempt_id"),
-                    triggering_scan_id=escalation.get("triggering_scan_id"),
-                    source_portfolio_plan_id=(
-                        escalation.get("source_portfolio_plan_id")
-                        if escalation.get("reason") == "DELTA_ISOLATION_ATTRIBUTION"
-                        else (
-                            committed_plan.portfolio_plan_id
-                            if committed_plan is not None
-                            else escalation.get("source_portfolio_plan_id")
-                        )
-                    ),
-                )
-            except Exception:  # noqa: BLE001
-                portfolio_replan_request = None
+        )
 
     auto_new_constraints: list[str] = []
 
@@ -4371,7 +4325,13 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 if unresolved_peer_diagnostics:
                     errors.extend(unresolved_peer_diagnostics)
                 if peer_escalation is not None:
-                    portfolio_escalation = peer_escalation
+                    portfolio_replan_request = PortfolioReplanRequest(
+                        reason=str(peer_escalation["reason"]),
+                        peer_conflict_pairs=peer_escalation.get("peer_conflict_pairs", []),
+                        source_portfolio_plan_id=(
+                            committed_plan.portfolio_plan_id if committed_plan is not None else None
+                        ),
+                    )
                     _commit_task_transition(
                         task_queue,
                         resolved_t_id,
@@ -4538,26 +4498,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             and bool(_final_full_scan_value(prior_final_scan, "triage_required", False))
         )
 
-    # ------------------------------------------------------------------
-    # Normalize any escalation emitted while reconciling the final QA result.
-    if not isinstance(portfolio_replan_request, PortfolioReplanRequest):
-        escalation = portfolio_escalation
-        if isinstance(escalation, dict) and escalation.get("reason"):
-            try:
-                portfolio_replan_request = PortfolioReplanRequest(
-                    reason=str(escalation["reason"]),
-                    peer_conflict_pairs=escalation.get("peer_conflict_pairs", []),
-                    forced_singleton_task_ids=escalation.get("forced_singleton_task_ids", []),
-                    triggering_attempt_id=escalation.get("triggering_attempt_id"),
-                    triggering_scan_id=escalation.get("triggering_scan_id"),
-                    source_portfolio_plan_id=(
-                        committed_plan.portfolio_plan_id
-                        if committed_plan is not None
-                        else escalation.get("source_portfolio_plan_id")
-                    ),
-                )
-            except Exception:  # noqa: BLE001
-                portfolio_replan_request = None
     verified_absent_package_tasks = _verified_absent_package_tasks(
         task_queue,
         group_by_id,
@@ -5086,14 +5026,14 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         # The deterministic choice is still clamped to the immutable snapshot
         # before it is exposed as a worker route.
         decision = deterministic_decision
-    elif portfolio_escalation and portfolio_escalation.get("reason") in {
+    elif portfolio_replan_request is not None and portfolio_replan_request.reason in {
         "PEER_CONFLICT_ESCALATION",
         "DELTA_ISOLATION_ATTRIBUTION",
     }:
         decision = SupervisorDecision(
             decision_code=(
                 DecisionCode.PEER_CONFLICT_ESCALATION
-                if portfolio_escalation.get("reason") == "PEER_CONFLICT_ESCALATION"
+                if portfolio_replan_request.reason == "PEER_CONFLICT_ESCALATION"
                 else DecisionCode.PORTFOLIO_PLAN_REQUIRED
             ),
             next_node="portfolio",
@@ -6050,8 +5990,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
     if (
         suppress_unfixable_replan_without_sca
         and resolved_next_node == "portfolio"
-        and not portfolio_escalation
-        and not isinstance(portfolio_replan_request, PortfolioReplanRequest)
+        and portfolio_replan_request is None
     ):
         decision = _deterministic_routing(
             task_queue,
@@ -6672,7 +6611,11 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             valid_groups,
             state.get("repo_root"),
         )
-    if unfixable_replan_cleared and not portfolio_dispatch_rejected and not portfolio_escalation:
+    if (
+        unfixable_replan_cleared
+        and not portfolio_dispatch_rejected
+        and portfolio_replan_request is None
+    ):
         portfolio_dirty = False
     if portfolio_dirty and not isinstance(portfolio_replan_request, PortfolioReplanRequest):
         stale_reasons = _portfolio_plan_violations(
@@ -6710,7 +6653,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
     if final_full_scan_result is None and all(
         task.status in _TERMINAL_STATUSES for task in task_queue.values()
     ):
-        final_full_scan_result = FinalFullScanResult(
+        final_full_scan_result = ScanCoverageResult(
             completed=incremental_scan_coverage_complete,
             authoritative=False,
             coverage_scope="incremental_dependency_inputs",
@@ -6749,7 +6692,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         "active_multi_package_action": active_multi_package_action,
         "portfolio_dirty": portfolio_dirty,
         "portfolio_replan_request": portfolio_replan_request,
-        "portfolio_escalation": portfolio_escalation,
         "feedback_by_task": feedback_by_task,
         "feedback_by_group": feedback_by_group,
         "supervisor_instructions": decision.instructions,

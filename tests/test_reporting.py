@@ -46,7 +46,6 @@ def _state() -> dict:
                 "sources": ["odc"],
                 "file_path": "package.json",
                 "issues": [{"severity": "high", "source": "odc"}],
-                "fix_plan": {"status": "version_found"},
             }
         ],
         "valid_groups": [],

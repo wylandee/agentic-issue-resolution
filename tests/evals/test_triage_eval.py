@@ -67,11 +67,6 @@ _DETERMINISTIC_ONLY_CASE_IDS = frozenset(
 _LIVE_CACHE: dict[tuple[str, str], ReplayCapture] = {}
 
 
-def _as_output_text(value: Any) -> str:
-    """Keep the historical helper name while using shared serialization."""
-    return as_output_text(value)
-
-
 def build_triage_test_case(
     case: dict[str, Any],
     observed_output: Any | None = None,

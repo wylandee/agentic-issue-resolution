@@ -60,6 +60,7 @@ from remediation_engine.language import (
 from remediation_engine.orchestration.state import (
     TERMINAL_TASK_STATUSES,
     effective_group_status,
+    select_package_fix_plan,
 )
 from remediation_engine.planning.candidates import (
     _digest,
@@ -2203,8 +2204,9 @@ def _vulnerable_fixed_version(
                 continue
             if identity == finding.finding_id and issue.fixed_version:
                 return issue.fixed_version
-        if group.fix_plan and group.fix_plan.fixed_version:
-            return group.fix_plan.fixed_version
+        selected_plan = select_package_fix_plan(group).plan
+        if selected_plan is not None and selected_plan.fixed_version:
+            return selected_plan.fixed_version
     return finding.fixed_version
 
 

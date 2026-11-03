@@ -694,7 +694,6 @@ def _group_sca(localized_issues: list[LocalizedIssue]) -> dict[str, Vulnerabilit
             issues=member_issues,
             localized_issues=list(members),
             fix_plan_candidates=[],
-            fix_plan=None,
         )
     return groups
 

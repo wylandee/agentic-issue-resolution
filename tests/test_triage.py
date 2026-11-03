@@ -39,7 +39,7 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.settings import AppSettings
 from remediation_engine.tools.advisories import _fetch_epss_chunk, enrich_cves
-from tests.helpers import group_with_fix_plans
+from tests.helpers import group_with_fix_plans, selected_group_plan
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -636,7 +636,7 @@ class TestRunTriagePipeline:
 
         mock_prepare.assert_called_once()
         mock_plan.assert_not_called()
-        assert result[0][0].fix_plan is None
+        assert result[0][0].fix_plan_candidates == []
         assert result[0][0].localized_issues
 
     def test_group_triage_failure_is_explicit_instead_of_dropping_group(
@@ -1351,9 +1351,10 @@ class TestSCAGrouping:
         g = groups[0]
         assert set(g.cve_ids) == {"CVE-2021-23337", "CVE-2020-28500"}
         assert g.issue_type == IssueType.SCA
-        assert g.fix_plan is not None
-        assert g.fix_plan.fixed_version == "4.17.22"
-        assert g.fix_plan.strategy_used == "UPDATE_VERSION"
+        selected = selected_group_plan(g)
+        assert selected is not None
+        assert selected.fixed_version == "4.17.22"
+        assert selected.strategy_used == "UPDATE_VERSION"
 
     def test_duplicate_cve_same_component_is_deduped(self):
         """Same CVE appearing twice (e.g. from the same scanner run) â†’ one CVE ID."""
@@ -1402,9 +1403,10 @@ class TestSCAGrouping:
         assert IssueSource.ODC in g.sources
         assert g.sources == sorted(g.sources, key=lambda source: source.value)
         assert len(g.issues) == 2
-        assert g.fix_plan is not None
-        assert g.fix_plan.strategy_used == "WORKAROUND"
-        assert g.fix_plan.workaround_snippets == ["Workaround A", "Workaround B"]
+        selected = selected_group_plan(g)
+        assert selected is not None
+        assert selected.strategy_used == "WORKAROUND"
+        assert selected.workaround_snippets == ["Workaround A", "Workaround B"]
 
     def test_different_packages_different_files_make_separate_groups(self):
         issues = [
@@ -1596,8 +1598,7 @@ class TestSCAGrouping:
             ],
         )
         assert len(groups) == 1
-        assert groups[0].fix_plan is not None
-        assert groups[0].fix_plan.fixed_version == "1.2.5"
+        assert selected_group_plan(groups[0]).fixed_version == "1.2.5"
         assert len(groups[0].localized_issues) == 2
 
     def test_highest_fixed_version_ignores_build_metadata(self):
@@ -1615,8 +1616,7 @@ class TestSCAGrouping:
             ],
         )
 
-        assert groups[0].fix_plan is not None
-        assert groups[0].fix_plan.fixed_version == "1.2.3+build.1"
+        assert selected_group_plan(groups[0]).fixed_version == "1.2.3+build.1"
 
         # ---------------------------------------------------------------------------
         # SAST grouping

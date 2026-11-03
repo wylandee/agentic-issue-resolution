@@ -104,10 +104,8 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
         _issue("CVE-2026-0004", source=IssueSource.ODC),
     )
     new_group = _group("sca:package.json:new", new_issue)
-    candidate_unchanged = unchanged.model_copy(update={"fix_plan": None, "fix_plan_candidates": []})
-    changed_candidate = changed_candidate.model_copy(
-        update={"fix_plan": None, "fix_plan_candidates": []}
-    )
+    candidate_unchanged = unchanged.model_copy(update={"fix_plan_candidates": []})
+    changed_candidate = changed_candidate.model_copy(update={"fix_plan_candidates": []})
 
     changed_task = build_initial_remediation_task(changed, "task-changed").model_copy(
         update={
@@ -222,7 +220,6 @@ def test_stable_group_fingerprint_ignores_plan_and_generated_issue_id_but_tracks
             "issues": [regenerated_issue],
             "representative_issue_id": regenerated_issue.id,
             "localized_issues": [regenerated_localized],
-            "fix_plan": None,
             "fix_plan_candidates": [],
         }
     )

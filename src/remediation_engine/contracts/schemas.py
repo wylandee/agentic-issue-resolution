@@ -25,7 +25,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    RootModel,
     TypeAdapter,
     field_serializer,
     field_validator,
@@ -1108,13 +1107,6 @@ class VulnerabilityGroup(BaseModel):
             "alternative strategies."
         ),
     )
-    fix_plan: FixPlan | None = Field(
-        None,
-        description=(
-            "Compatibility summary of the package plans. New orchestration code "
-            "must use fix_plan_candidates for strategy selection."
-        ),
-    )
 
     # Enrichment (attached after grouping, before triage)
     enrichment: CVEEnrichment | None = Field(
@@ -1349,96 +1341,6 @@ class WorkaroundValidationResult(BaseModel):
     infrastructure_diagnostics: str | None = None
 
 
-class TacticalSupervisorAction(BaseModel):
-    """Legacy input compatibility envelope for tactical actions.
-
-    New Supervisor model calls use the strategy-specific contracts below.  This
-    permissive envelope remains importable for callers that construct historical
-    decisions directly; it is not passed to ``with_structured_output`` and does
-    not authorize a worker or identify the active task.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    diagnostic_basis: str = Field(
-        ...,
-        min_length=10,
-        max_length=1200,
-        description=(
-            "Bounded evidence-to-rule summary. This is not a hidden reasoning transcript "
-            "and is never used as a worker instruction."
-        ),
-    )
-    selected_strategy: TacticalStrategy
-    target_version: str | None = None
-    workaround_hypothesis: str | None = None
-    target_files_hint: list[str] = Field(
-        default_factory=list,
-        max_length=5,
-        description="Normalized relative path hints, not worker authorization.",
-    )
-    rationale: str = Field(..., min_length=1, max_length=600)
-
-    @field_validator("selected_strategy", mode="before")
-    @classmethod
-    def _normalize_tactical_strategy(cls, value: Any) -> Any:
-        """Trim a tactical strategy string before enum validation."""
-        return value.strip() if isinstance(value, str) else value
-
-    @field_validator("target_version", "workaround_hypothesis", mode="before")
-    @classmethod
-    def _normalize_tactical_optional_text(cls, value: Any, info: Any) -> str | None:
-        """Normalize optional tactical action text fields."""
-        return _trim_optional_contract_text(value, info.field_name)
-
-    @field_validator("target_files_hint", mode="before")
-    @classmethod
-    def _normalize_tactical_file_hints(cls, value: Any) -> list[str]:
-        """Normalize safe relative file hints and reject duplicates."""
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            raise ValueError("target_files_hint must be a list of relative paths.")
-        result = [_normalize_relative_file_hint(item) for item in value]
-        if len(result) != len(set(result)):
-            raise ValueError("target_files_hint must not contain duplicates.")
-        return result
-
-    @field_validator("diagnostic_basis", "rationale", mode="before")
-    @classmethod
-    def _normalize_tactical_text(cls, value: Any, info: Any) -> str:
-        """Require trimmed tactical diagnostic and rationale text."""
-        return _trim_required_contract_text(value, info.field_name)
-
-    @model_validator(mode="after")
-    def _validate_tactical_strategy_fields(self) -> TacticalSupervisorAction:
-        """Reject strategy fields that contradict the selected action."""
-        if self.selected_strategy == TacticalStrategy.CODE_WORKAROUND:
-            if self.target_version is not None:
-                raise ValueError("code_workaround actions must not specify target_version.")
-            if self.workaround_hypothesis is None:
-                raise ValueError("code_workaround actions require workaround_hypothesis.")
-        elif self.selected_strategy in {
-            TacticalStrategy.VERSION_BUMP,
-            TacticalStrategy.PACKAGE_OVERRIDE,
-        }:
-            if self.target_version is None:
-                raise ValueError(f"{self.selected_strategy.value} actions require target_version.")
-            if self.workaround_hypothesis is not None:
-                raise ValueError(
-                    f"{self.selected_strategy.value} actions must not specify "
-                    "workaround_hypothesis."
-                )
-        else:
-            if self.target_version is not None:
-                raise ValueError("escalation actions must not specify target_version.")
-            if self.workaround_hypothesis is not None:
-                raise ValueError("escalation actions must not specify workaround_hypothesis.")
-            if self.target_files_hint:
-                raise ValueError("escalation actions must not specify target_files_hint.")
-        return self
-
-
 class _TacticalSupervisorActionBase(BaseModel):
     """Common bounded fields shared by the four model-output contracts."""
 
@@ -1526,17 +1428,7 @@ SupervisorTacticalAction = Annotated[
 ]
 
 
-class TacticalSupervisorDecision(RootModel[SupervisorTacticalAction]):
-    """Internal compatibility adapter for discriminated tactical actions.
-
-    This root union remains useful for validating persisted or legacy callers,
-    but it must not be passed to an OpenAI response-format schema. The live
-    Supervisor provider boundary binds each concrete action contract as a
-    separate function tool so the provider never receives a root ``oneOf``.
-    """
-
-
-TACTICAL_SUPERVISOR_ACTION_ADAPTER = TypeAdapter(SupervisorTacticalAction)
+SUPERVISOR_TACTICAL_ACTION_ADAPTER = TypeAdapter(SupervisorTacticalAction)
 
 
 class QAFailureEvidence(BaseModel):
@@ -1842,15 +1734,15 @@ class IncrementalScanRecord(BaseModel):
     recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
-class FinalFullScanResult(BaseModel):
-    """Legacy-shaped projection of full or incremental ODC findings."""
+class ScanCoverageResult(BaseModel):
+    """Typed evidence describing the coverage of a completed or failed scan."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    completed: bool = False
-    authoritative: bool = True
-    coverage_scope: Literal["full_workspace", "incremental_dependency_inputs"] = "full_workspace"
-    coverage_complete: bool | None = None
+    completed: bool
+    authoritative: bool
+    coverage_scope: Literal["full_workspace", "incremental_dependency_inputs"]
+    coverage_complete: bool | None
     found_identifiers: list[str] = Field(default_factory=list)
     remaining_target_identifiers: list[str] = Field(default_factory=list)
     new_identifiers: list[str] = Field(default_factory=list)
@@ -2048,7 +1940,7 @@ class TaskAttemptSnapshot(BaseModel):
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
     no_fix_stage: NoFixMitigationStage | None = Field(default=None)
     selected_version: str | None = None
-    allowed_target_versions: list[str] = Field(default_factory=list)
+    allowed_target_versions: list[str]
     target_package_name: str | None = None
     target_dependency_type: str | None = None
     maven_target_operation: MavenTargetOperation | None = Field(
@@ -2063,7 +1955,7 @@ class TaskAttemptSnapshot(BaseModel):
         default_factory=list,
         description="Repository-relative Maven POM targets committed for this attempt.",
     )
-    allowed_dependency_types: list[str] = Field(default_factory=list)
+    allowed_dependency_types: list[str]
     parent_minimum_version: str | None = None
     instruction: str = Field(..., min_length=1)
     instruction_digest: str = Field(..., min_length=1)
@@ -3150,12 +3042,8 @@ class RemediationTask(BaseModel):
             "None for initial (depth-0) tasks."
         ),
     )
-    qa_policy: QAPolicy | None = Field(
-        default=None,
-        description=(
-            "Supervisor-owned QA gate policy. None is retained only for legacy "
-            "state so missing provenance can fail closed."
-        ),
+    qa_policy: QAPolicy = Field(
+        ..., description="Supervisor-owned QA gate policy committed for this task."
     )
     strategy: RoutingStrategy = Field(
         ...,

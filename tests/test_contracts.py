@@ -10,13 +10,13 @@ from pydantic import ValidationError
 
 from remediation_engine.contracts import (
     MAX_MULTI_PACKAGE_ACTION_SIZE,
+    SUPERVISOR_TACTICAL_ACTION_ADAPTER,
     AgentActionStatus,
     AgentActionSummary,
     ASTNodeType,
     CodeWorkaroundSupervisorAction,
     DecisionCode,
     FailureCategory,
-    FinalFullScanResult,
     FixPlan,
     FixPlanStatus,
     IssueSource,
@@ -32,11 +32,10 @@ from remediation_engine.contracts import (
     QAFailureEvidence,
     QATestAttribution,
     RoutingStrategy,
+    ScanCoverageResult,
     ScanScope,
     Severity,
     TacticalStrategy,
-    TacticalSupervisorAction,
-    TacticalSupervisorDecision,
     TaskCluster,
     TaskDependency,
     TaskDependencyKind,
@@ -49,6 +48,7 @@ from remediation_engine.contracts.schemas import (
     CVEEnrichment,
     CWEEntry,
     LineRange,
+    PackageFixPlanCandidate,
     QAAttemptResult,
     RemediationTask,
     SupervisorDecision,
@@ -58,6 +58,7 @@ from remediation_engine.contracts.schemas import (
     VulnerabilityGroup,
     WorkerAttemptResult,
 )
+from tests.helpers import qa_policy_for_task
 
 # ===========================================================================
 # Helpers
@@ -326,19 +327,25 @@ def test_incremental_scan_contracts_round_trip_and_reject_invalid_occurrences():
         )
 
 
-def test_final_scan_result_defaults_to_legacy_full_workspace_scope():
-    legacy = FinalFullScanResult(completed=True)
-    incremental = FinalFullScanResult(
+def test_scan_coverage_contract_requires_explicit_coverage():
+    with pytest.raises(ValidationError):
+        ScanCoverageResult(completed=True)
+    full = ScanCoverageResult(
+        completed=True,
+        authoritative=True,
+        coverage_scope="full_workspace",
+        coverage_complete=True,
+    )
+    incremental = ScanCoverageResult(
         completed=True,
         authoritative=False,
         coverage_scope="incremental_dependency_inputs",
         coverage_complete=True,
     )
 
-    assert legacy.authoritative is True
-    assert legacy.coverage_scope == "full_workspace"
-    assert legacy.coverage_complete is None
-    assert FinalFullScanResult.model_validate_json(incremental.model_dump_json()) == incremental
+    assert full.authoritative is True
+    assert full.coverage_scope == "full_workspace"
+    assert ScanCoverageResult.model_validate_json(incremental.model_dump_json()) == incremental
 
 
 class TestAgentActionSummary:
@@ -635,113 +642,6 @@ class TestFixPlan:
 
 
 @pytest.mark.parametrize(
-    ("strategy", "fields"),
-    [
-        (
-            TacticalStrategy.VERSION_BUMP,
-            {"target_version": " 1.2.3 ", "target_files_hint": [r" src\\package.json "]},
-        ),
-        (
-            TacticalStrategy.PACKAGE_OVERRIDE,
-            {"target_version": " 2.0.0 "},
-        ),
-        (
-            TacticalStrategy.CODE_WORKAROUND,
-            {"workaround_hypothesis": " Add input validation ", "target_version": None},
-        ),
-        (
-            TacticalStrategy.ESCALATE_TO_PORTFOLIO,
-            {},
-        ),
-    ],
-)
-def test_tactical_supervisor_action_strategies_normalize_and_round_trip(strategy, fields):
-    action = TacticalSupervisorAction(
-        diagnostic_basis="The selected value follows the deterministic policy.",
-        selected_strategy=strategy,
-        rationale=" Explain the evidence ",
-        **fields,
-    )
-
-    assert action.rationale == "Explain the evidence"
-    if action.target_version is not None:
-        assert action.target_version in {"1.2.3", "2.0.0"}
-    if action.workaround_hypothesis is not None:
-        assert action.workaround_hypothesis == "Add input validation"
-    assert (
-        action.target_files_hint == ["src/package.json"]
-        if strategy == TacticalStrategy.VERSION_BUMP
-        else True
-    )
-    assert TacticalSupervisorAction.model_validate_json(action.model_dump_json()) == action
-
-
-@pytest.mark.parametrize(
-    "fields",
-    [
-        {"selected_strategy": TacticalStrategy.VERSION_BUMP},
-        {
-            "selected_strategy": TacticalStrategy.PACKAGE_OVERRIDE,
-            "target_version": "1.2.3",
-            "workaround_hypothesis": "also change code",
-        },
-        {
-            "selected_strategy": TacticalStrategy.CODE_WORKAROUND,
-            "target_version": "1.2.3",
-            "workaround_hypothesis": "change call site",
-        },
-        {"selected_strategy": TacticalStrategy.CODE_WORKAROUND},
-    ],
-)
-def test_tactical_supervisor_action_rejects_invalid_strategy_fields(fields):
-    with pytest.raises(ValidationError):
-        TacticalSupervisorAction(
-            diagnostic_basis="The evidence does not support these fields.",
-            rationale="reason",
-            **fields,
-        )
-
-
-def test_tactical_supervisor_action_rejects_unsafe_or_duplicate_file_hints():
-    for hint in ("/absolute/file.js", r"..\secret.js", "C:/absolute/file.js"):
-        with pytest.raises(ValidationError):
-            TacticalSupervisorAction(
-                diagnostic_basis="The target path is not safe.",
-                selected_strategy=TacticalStrategy.CODE_WORKAROUND,
-                workaround_hypothesis="sanitize input",
-                target_files_hint=[hint],
-                rationale="reason",
-            )
-    with pytest.raises(ValidationError):
-        TacticalSupervisorAction(
-            diagnostic_basis="The target path is duplicated.",
-            selected_strategy=TacticalStrategy.CODE_WORKAROUND,
-            workaround_hypothesis="sanitize input",
-            target_files_hint=["src/app.js", r"src\app.js"],
-            rationale="reason",
-        )
-
-
-def test_phase1_models_are_frozen_and_forbid_extra_fields():
-    action = TacticalSupervisorAction(
-        diagnostic_basis="The selected value follows the deterministic policy.",
-        selected_strategy=TacticalStrategy.VERSION_BUMP,
-        target_version="1.2.3",
-        rationale="reason",
-    )
-    with pytest.raises(ValidationError):
-        action.rationale = "changed"
-    with pytest.raises(ValidationError):
-        TacticalSupervisorAction(
-            diagnostic_basis="The selected value follows the deterministic policy.",
-            selected_strategy=TacticalStrategy.VERSION_BUMP,
-            target_version="1.2.3",
-            rationale="reason",
-            unexpected="rejected",
-        )
-
-
-@pytest.mark.parametrize(
     ("strategy", "payload_type", "payload"),
     [
         (
@@ -777,19 +677,19 @@ def test_tactical_model_output_uses_mandatory_strategy_contracts(strategy, paylo
         **payload,
     }
 
-    action = TacticalSupervisorDecision.model_validate(common).root
+    action = SUPERVISOR_TACTICAL_ACTION_ADAPTER.validate_python(common)
 
     assert isinstance(action, payload_type)
     assert "instruction" not in action.model_dump()
     with pytest.raises(ValidationError):
-        TacticalSupervisorDecision.model_validate(
+        SUPERVISOR_TACTICAL_ACTION_ADAPTER.validate_python(
             {key: value for key, value in common.items() if key != "rationale"}
         )
 
 
 def test_tactical_model_output_rejects_instruction_and_missing_strategy_fields():
     with pytest.raises(ValidationError):
-        TacticalSupervisorDecision.model_validate(
+        SUPERVISOR_TACTICAL_ACTION_ADAPTER.validate_python(
             {
                 "selected_strategy": TacticalStrategy.VERSION_BUMP,
                 "diagnostic_basis": "The evidence supports a version bump.",
@@ -798,7 +698,7 @@ def test_tactical_model_output_rejects_instruction_and_missing_strategy_fields()
             }
         )
     with pytest.raises(ValidationError):
-        TacticalSupervisorDecision.model_validate(
+        SUPERVISOR_TACTICAL_ACTION_ADAPTER.validate_python(
             {
                 "selected_strategy": TacticalStrategy.CODE_WORKAROUND,
                 "diagnostic_basis": "The evidence supports a workaround.",
@@ -1010,6 +910,7 @@ def test_workerless_remediation_action_is_normalized_and_stays_out_of_attempt_en
         parent_group_id="group-1",
         strategy=RoutingStrategy.VERSION_BUMP,
         remediation_action="  Removed after another package upgrade.  ",
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     assert task.remediation_action == "Removed after another package upgrade."
     assert (
@@ -1018,6 +919,7 @@ def test_workerless_remediation_action_is_normalized_and_stays_out_of_attempt_en
             parent_group_id="group-1",
             strategy=RoutingStrategy.VERSION_BUMP,
             remediation_action="  ",
+            qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
         ).remediation_action
         is None
     )
@@ -1171,7 +1073,7 @@ class TestVulnerabilityGroup:
         assert group.sources == []
         assert group.issues == []
         assert group.localized_issues == []
-        assert group.fix_plan is None
+        assert group.fix_plan_candidates == []
         assert group.enrichment is None
         assert group.is_reachable is None
 
@@ -1222,9 +1124,9 @@ class TestVulnerabilityGroup:
             strategy_used="UPDATE_VERSION",
         )
         group.localized_issues = [localized]
-        group.fix_plan = plan
+        group.fix_plan_candidates = [PackageFixPlanCandidate(issue_id=issue.id, plan=plan)]
         assert group.localized_issues[0].manifest_file == "package.json"
-        assert group.fix_plan.fixed_version == "4.17.21"
+        assert group.fix_plan_candidates[0].plan.fixed_version == "4.17.21"
 
     def test_reachability_can_be_attached(self):
         issue = _make_issue()
@@ -1393,7 +1295,6 @@ def test_re_exported_from_contracts_init():
         PackageMutation,
         SystemContext,
         TacticalStrategy,
-        TacticalSupervisorAction,
         TaskCluster,
         TaskDependency,
         TaskDependencyKind,

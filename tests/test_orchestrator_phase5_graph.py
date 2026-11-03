@@ -25,6 +25,7 @@ from remediation_engine.contracts.schemas import (
     LocalizedIssue,
     MultiPackageAction,
     ODCScanEvidence,
+    PackageFixPlanCandidate,
     PackageMutation,
     QADeterministicGates,
     QAEvaluation,
@@ -115,7 +116,7 @@ def _fix_plan(status: FixPlanStatus) -> FixPlan:
 def _group(
     issue_type: IssueType,
     *,
-    fix_plan: FixPlan | None = None,
+    plan: FixPlan | None = None,
     file_path: str | None = None,
 ) -> VulnerabilityGroup:
     issue = _issue(issue_type, file_path=file_path)
@@ -129,7 +130,9 @@ def _group(
         sources=[issue.source],
         representative_issue_id=issue.id,
         issues=[issue],
-        fix_plan=fix_plan,
+        fix_plan_candidates=(
+            [PackageFixPlanCandidate(issue_id=issue.id, plan=plan)] if plan is not None else []
+        ),
     )
 
 
@@ -172,6 +175,10 @@ def _committed_dispatch(task, *, dispatch_node: str):
         instruction=committed_task.instruction,
         instruction_digest=instruction_digest(committed_task.instruction),
         dispatch_node=dispatch_node,
+        allowed_target_versions=[committed_task.selected_version]
+        if committed_task.selected_version is not None
+        else [],
+        allowed_dependency_types=[],
     )
     return committed_task, snapshot
 
@@ -194,7 +201,7 @@ def test_supervisor_recovers_worker_result_after_portfolio_cleared_active_target
     monkeypatch,
 ):
     """A stale portfolio pointer must not strand a valid current attempt."""
-    group = _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
+    group = _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
     task = build_initial_remediation_task(group, "task-1").model_copy(
         update={
             "task_revision": 1,
@@ -335,7 +342,7 @@ def test_portfolio_reconciliation_status_routes_back_to_supervisor():
 
 
 def test_portfolio_node_blocks_missing_certificate_before_commit(tmp_path, monkeypatch):
-    group = _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
+    group = _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
     task = build_initial_remediation_task(group, "task-1")
     candidate_plan = SimpleNamespace(
         plan_id="portfolio-new",
@@ -396,7 +403,7 @@ def test_portfolio_node_blocks_missing_certificate_before_commit(tmp_path, monke
 
 
 def test_portfolio_does_not_commit_partial_plan_around_active_attempt(tmp_path, monkeypatch):
-    group = _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
+    group = _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
     task = build_initial_remediation_task(group, "task-1").model_copy(
         update={"current_attempt_id": "attempt-1"}
     )
@@ -456,7 +463,7 @@ def test_portfolio_does_not_commit_partial_plan_around_active_attempt(tmp_path, 
 
 class TestPhase5RunOrchestrator:
     def test_run_orchestrator_builds_initial_state_and_invokes_graph(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         mock_engine = MagicMock()
         mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
 
@@ -478,7 +485,7 @@ class TestPhase5RunOrchestrator:
         assert result["status"] == "completed"
 
     def test_run_orchestrator_passes_config_and_surfaces_trace_metadata(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         mock_engine = MagicMock()
         mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
         run_id = uuid4()
@@ -511,7 +518,7 @@ class TestPhase5RunOrchestrator:
         )
 
     def test_run_orchestrator_succeeds_when_trace_url_lookup_fails(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         mock_engine = MagicMock()
         mock_engine.invoke.return_value = {"status": "completed", "workspace_volume": None}
         run_id = uuid4()
@@ -535,7 +542,7 @@ class TestPhase5RunOrchestrator:
         assert "langsmith_trace_url" not in result
 
     def test_run_orchestrator_surfaces_local_trajectory_path(self, tmp_path, monkeypatch):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         trajectory_dir = tmp_path / "trajectories"
         monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
         report_dir = tmp_path / "reports"
@@ -567,7 +574,7 @@ class TestPhase5RunOrchestrator:
     def test_failed_orchestration_still_writes_trajectory_and_preserves_error(
         self, tmp_path, monkeypatch
     ):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         trajectory_dir = tmp_path / "trajectories"
         monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
         report_dir = tmp_path / "reports"
@@ -596,7 +603,7 @@ class TestPhase5RunOrchestrator:
     def test_graph_exception_cleans_volume_reported_by_completed_setup_node(
         self, tmp_path, monkeypatch
     ):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(tmp_path / "trajectories"))
         monkeypatch.setenv("REMEDIATION_REPORT_DIR", str(tmp_path / "reports"))
         volume_name = "agent_workspace_deadbeef"
@@ -631,7 +638,7 @@ class TestPhase5RunOrchestrator:
     def test_failed_langsmith_run_is_closed_without_waiting_for_remote_spans(
         self, tmp_path, monkeypatch
     ):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         trajectory_dir = tmp_path / "trajectories"
         monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
         run_id = uuid4()
@@ -660,7 +667,7 @@ class TestPhase5RunOrchestrator:
     def test_keyboard_interrupt_persists_local_snapshot_before_closing_trace(
         self, tmp_path, monkeypatch
     ):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         trajectory_dir = tmp_path / "trajectories"
         monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
         run_id = uuid4()
@@ -754,7 +761,7 @@ class TestPhase5RunOrchestrator:
 
 class TestPhase5GraphIntegration:
     def test_update_wrapper_preserves_exact_task_instruction(self, tmp_path, monkeypatch):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task.instruction = 'Update "lodash" in package.json to version "4.17.22".'
         task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
@@ -807,7 +814,7 @@ class TestPhase5GraphIntegration:
         assert "supervisor_instruction" not in subagent_state
 
     def test_update_wrapper_surfaces_retry_diagnostics(self, tmp_path, monkeypatch):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
         state = _initial_state(tmp_path, groups)
@@ -860,7 +867,7 @@ class TestPhase5GraphIntegration:
     def test_update_wrapper_rejects_diagnostics_with_foreign_task_identity(
         self, tmp_path, monkeypatch
     ):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
         state = _initial_state(tmp_path, groups)
@@ -895,7 +902,7 @@ class TestPhase5GraphIntegration:
         assert "retry_diagnostics_by_task" not in result
 
     def test_workaround_wrapper_preserves_typed_attempt_result(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.WORKAROUND_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.WORKAROUND_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task.instruction = "Apply the source workaround."
         snapshot = TaskAttemptSnapshot(
@@ -909,6 +916,8 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="workaround_subagent",
+            allowed_target_versions=[],
+            allowed_dependency_types=[],
         )
         task = task.model_copy(
             update={
@@ -956,7 +965,7 @@ class TestPhase5GraphIntegration:
         assert result["worker_results_by_attempt"][snapshot.attempt_id] == worker_result
 
     def test_update_wrapper_rejects_contradictory_snapshot_before_worker(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={
                 "task_revision": 1,
@@ -975,6 +984,8 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=["4.17.21"],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -997,7 +1008,7 @@ class TestPhase5GraphIntegration:
         )
 
     def test_dispatch_rejects_missing_qa_policy_provenance(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={
                 "task_revision": 1,
@@ -1016,6 +1027,10 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1037,7 +1052,7 @@ class TestPhase5GraphIntegration:
         )
 
     def test_failed_worker_restores_attempt_workspace_snapshot(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 1, "current_attempt_id": "attempt-update"}
         )
@@ -1052,6 +1067,10 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1110,7 +1129,7 @@ class TestPhase5GraphIntegration:
         ]
 
     def test_successful_worker_keeps_snapshot_until_qa_accepts_candidate(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 1, "current_attempt_id": "attempt-handoff"}
         )
@@ -1125,6 +1144,10 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1180,7 +1203,7 @@ class TestPhase5GraphIntegration:
 
     def test_workspace_builder_success_routes_through_supervisor_to_teardown(self, tmp_path):
         """Setup scanning routes to Supervisor before ordinary dispatch."""
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
 
         workspace_builder = MagicMock(
             return_value={
@@ -1254,7 +1277,7 @@ class TestPhase5GraphIntegration:
 
     def test_supervisor_routes_to_update_subagent_then_back(self, tmp_path):
         """Supervisor routes to update_subagent once, then supervisor routes to teardown."""
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         gid = groups[0].group_id
 
         workspace_builder = MagicMock(
@@ -1312,7 +1335,7 @@ class TestPhase5GraphIntegration:
 
     def test_supervisor_routes_to_qa_critic_then_back(self, tmp_path):
         """Supervisor routes to qa_critic once, then to teardown."""
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
 
         workspace_builder = MagicMock(
             return_value={
@@ -1382,8 +1405,8 @@ class TestPhase5GraphIntegration:
 
     def test_qa_wrapper_scopes_valid_groups_to_active_batch(self, tmp_path):
         groups = [
-            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
-            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+            _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+            _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
         ]
         tasks = []
         snapshots = {}
@@ -1418,7 +1441,7 @@ class TestPhase5GraphIntegration:
         assert result["status"] == "qa_completed"
 
     def test_qa_wrapper_rejects_policyless_task(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"qa_policy": None}
         )
@@ -1441,8 +1464,8 @@ class TestPhase5GraphIntegration:
 
     def test_qa_wrapper_scopes_one_active_task_to_one_parent_group(self, tmp_path):
         groups = [
-            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
-            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+            _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+            _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
         ]
         task = build_initial_remediation_task(groups[1], "task-2").model_copy(
             update={"status": TaskStatus.OPTIMISTICALLY_FIXED}
@@ -1471,7 +1494,7 @@ class TestPhase5GraphIntegration:
         assert result["status"] == "qa_completed"
 
     def test_breaking_change_qa_retains_pre_update_snapshot_for_workaround(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 1, "current_attempt_id": "attempt-qa"}
         )
@@ -1486,6 +1509,10 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1543,7 +1570,7 @@ class TestPhase5GraphIntegration:
 
     def test_inconclusive_qa_retains_candidate_workspace_for_rerun(self, tmp_path):
         """Evidence-only QA reruns must not restore the pre-worker baseline."""
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 1, "current_attempt_id": "attempt-qa-inconclusive"}
         )
@@ -1558,6 +1585,10 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1628,7 +1659,7 @@ class TestPhase5GraphIntegration:
 
     def test_qa_failed_contract_error_retains_candidate_workspace(self, tmp_path):
         """Infrastructure QA failures retain the candidate for the same attempt."""
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 1, "current_attempt_id": "attempt-qa-contract"}
         )
@@ -1643,6 +1674,10 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1689,7 +1724,7 @@ class TestPhase5GraphIntegration:
         assert result["qa_results_by_attempt"]["attempt-qa-contract"].evaluation.contract_error
 
     def test_security_failure_restores_and_removes_attempt_workspace_snapshot(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 1, "current_attempt_id": "attempt-security"}
         )
@@ -1704,6 +1739,10 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1815,7 +1854,7 @@ class TestPhase5GraphIntegration:
         assert rollback_anchors == {}
 
     def test_workaround_regression_restores_to_original_pre_update_workspace(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={
                 "task_revision": 1,
@@ -1838,6 +1877,8 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="workaround_subagent",
+            allowed_target_versions=[],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1887,7 +1928,7 @@ class TestPhase5GraphIntegration:
         assert result["qa_results_by_attempt"]["attempt-workaround"].evaluation.passed is False
 
     def test_passed_qa_keeps_candidate_and_only_removes_attempt_snapshot(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 1, "current_attempt_id": "attempt-pass"}
         )
@@ -1903,6 +1944,10 @@ class TestPhase5GraphIntegration:
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
             portfolio_plan_id="plan-qa",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -1960,7 +2005,7 @@ class TestPhase5GraphIntegration:
         assert qa_result.batch_scan_candidate_retained is True
 
     def test_regression_retries_keep_first_pre_task_baseline(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         first_task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 1, "current_attempt_id": "attempt-first"}
         )
@@ -1980,6 +2025,10 @@ class TestPhase5GraphIntegration:
                 instruction=task.instruction,
                 instruction_digest=instruction_digest(task.instruction),
                 dispatch_node="update_subagent",
+                allowed_target_versions=[task.selected_version]
+                if task.selected_version is not None
+                else [],
+                allowed_dependency_types=[],
             )
 
         first_snapshot = snapshot(first_task, "attempt-first", 1)
@@ -2042,7 +2091,7 @@ class TestPhase5GraphIntegration:
         sandbox.remove_workspace_snapshot.assert_not_called()
 
     def test_failed_retry_worker_restores_baseline_not_rejected_candidate(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 2, "current_attempt_id": "attempt-second"}
         )
@@ -2057,6 +2106,10 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         second_snapshot = first_snapshot.model_copy(
             update={"attempt_id": "attempt-second", "state_revision": 2, "task_revision": 2}
@@ -2096,8 +2149,8 @@ class TestPhase5GraphIntegration:
     def test_unrelated_dispatch_restores_retained_failed_task_workspace(self, tmp_path):
         """A failed task's candidate must not leak into the next task."""
         groups = [
-            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
-            _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+            _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+            _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
         ]
         task_a = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"status": TaskStatus.UNFIXABLE}
@@ -2140,7 +2193,7 @@ class TestPhase5GraphIntegration:
         assert result["workspace_rollback_anchors_by_task"] == {}
 
     def test_successful_retry_discards_baseline_anchor(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={"task_revision": 2, "current_attempt_id": "attempt-pass"}
         )
@@ -2155,6 +2208,10 @@ class TestPhase5GraphIntegration:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -2199,7 +2256,7 @@ class TestPhase5Exports:
         assert graph is not None
 
     def test_successful_workaround_promotes_code_and_dependency_candidate(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-workaround").model_copy(
             update={
                 "task_revision": 2,
@@ -2221,6 +2278,8 @@ class TestPhase5Exports:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="workaround_subagent",
+            allowed_target_versions=[],
+            allowed_dependency_types=[],
         )
         state = _initial_state(tmp_path, groups)
         state.update(
@@ -2336,8 +2395,8 @@ class _DeltaSandbox:
 
 def _delta_test_setup(tmp_path, *, batch_id="batch-delta", attempt_prefix="attempt-delta"):
     groups = [
-        _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
-        _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+        _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+        _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
     ]
     cluster_id = "cluster-delta"
     portfolio_plan_id = "portfolio-delta"
@@ -2389,6 +2448,10 @@ def _delta_test_setup(tmp_path, *, batch_id="batch-delta", attempt_prefix="attem
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         snapshots[snapshot.attempt_id] = snapshot
     decisions = [
@@ -2928,12 +2991,12 @@ def test_qa_delta_isolation_attribution_projects_provenance_and_escalates_only_a
     assert isolation["responsible_task_ids"] == ["task-b"]
     assert isolation["candidate_restored"] is True
     assert isolation["executions"] == 2
-    assert result["portfolio_escalation"] == {
-        "reason": "DELTA_ISOLATION_ATTRIBUTION",
-        "forced_singleton_task_ids": ["task-b"],
-        "triggering_attempt_id": "attempt-delta-task-b",
-        "source_portfolio_plan_id": "portfolio-delta",
-    }
+    replan_request = result["portfolio_replan_request"]
+    assert isinstance(replan_request, PortfolioReplanRequest)
+    assert replan_request.reason == "DELTA_ISOLATION_ATTRIBUTION"
+    assert replan_request.forced_singleton_task_ids == ["task-b"]
+    assert replan_request.triggering_attempt_id == "attempt-delta-task-b"
+    assert replan_request.source_portfolio_plan_id == "portfolio-delta"
     assert result["portfolio_dirty"] is True
     assert result["portfolio_plan"] is None
     assert all(
@@ -3237,6 +3300,12 @@ def socket_stack_delta_case(tmp_path):
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[task.target_dependency_type]
+            if task.target_dependency_type is not None
+            else [],
         )
         snapshots[snapshot.attempt_id] = snapshot
         worker_results[snapshot.attempt_id] = WorkerAttemptResult(
@@ -3596,7 +3665,7 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
     groups = []
     tasks_by_package = {}
     for package, task_id, installed, target_version, finding_id in package_rows:
-        base_group = _group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
+        base_group = _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
         issue = base_group.issues[0].model_copy(
             update={
                 "package_name": package,
@@ -3615,12 +3684,17 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
                 "versions": [installed],
                 "representative_issue_id": issue.id,
                 "issues": [issue],
-                "fix_plan": FixPlan(
-                    status=FixPlanStatus.VERSION_FOUND,
-                    fixed_version=target_version,
-                    instruction=f"Update {package} to {target_version}.",
-                    strategy_used="osv_api",
-                ),
+                "fix_plan_candidates": [
+                    PackageFixPlanCandidate(
+                        issue_id=issue.id,
+                        plan=FixPlan(
+                            status=FixPlanStatus.VERSION_FOUND,
+                            fixed_version=target_version,
+                            instruction=f"Update {package} to {target_version}.",
+                            strategy_used="osv_api",
+                        ),
+                    )
+                ],
             }
         )
         task = build_initial_remediation_task(group, task_id).model_copy(
@@ -3951,7 +4025,6 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
             "portfolio_replan_request": None,
             "portfolio_replan_history": tool_input.get("portfolio_replan_history", {}),
             "portfolio_dirty": False,
-            "portfolio_escalation": None,
             "valid_groups": tool_input["valid_groups"],
             "task_queue": tool_input["task_queue"],
             "active_target_task_ids": [],
@@ -4126,6 +4199,12 @@ def _socket_stack_new_dispatch(case, *, batch_id, attempt_prefix):
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[task.target_dependency_type]
+            if task.target_dependency_type is not None
+            else [],
         )
         snapshots[snapshot.attempt_id] = snapshot
         decisions.append(
@@ -4403,7 +4482,7 @@ class TestPhase5RunOrchestratorStage2Parity:
     def test_keyboard_interrupt_exports_partial_state_and_writes_follow_up_report(
         self, tmp_path, monkeypatch
     ):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         trajectory_dir = tmp_path / "trajectories"
         report_dir = tmp_path / "reports"
         monkeypatch.setenv("REMEDIATION_TRAJECTORY_DIR", str(trajectory_dir))
@@ -4467,7 +4546,7 @@ class TestPhase5GraphIntegrationStage2Parity:
     def test_update_wrapper_preserves_exact_task_instruction_python_stage2(
         self, tmp_path, monkeypatch
     ):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task.instruction = 'Update "lodash" in package.json to version "4.17.22".'
         task, snapshot = _committed_dispatch(task, dispatch_node="update_subagent")
@@ -4518,7 +4597,7 @@ class TestPhase5GraphIntegrationStage2Parity:
     def test_update_wrapper_preserves_typed_result_and_supervisor_rejects_stale_attempt(
         self, tmp_path, monkeypatch
     ):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1").model_copy(
             update={
                 "task_revision": 1,
@@ -4644,7 +4723,7 @@ class TestPhase5GraphIntegrationStage2Parity:
         )
 
     def test_workaround_wrapper_preserves_typed_attempt_result_python_stage2(self, tmp_path):
-        groups = [_group(IssueType.SCA, fix_plan=_fix_plan(FixPlanStatus.WORKAROUND_FOUND))]
+        groups = [_group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.WORKAROUND_FOUND))]
         task = build_initial_remediation_task(groups[0], "task-1")
         task.instruction = "Apply the source workaround."
         snapshot = TaskAttemptSnapshot(
@@ -4658,6 +4737,8 @@ class TestPhase5GraphIntegrationStage2Parity:
             instruction=task.instruction,
             instruction_digest=instruction_digest(task.instruction),
             dispatch_node="workaround_subagent",
+            allowed_target_versions=[],
+            allowed_dependency_types=[],
         )
         task = task.model_copy(
             update={

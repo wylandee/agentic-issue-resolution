@@ -23,6 +23,7 @@ from remediation_engine.contracts.schemas import (
     FixPlanStatus,
     IssueSource,
     IssueType,
+    PackageFixPlanCandidate,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -42,6 +43,7 @@ from remediation_engine.contracts.version_policy import (
 )
 from remediation_engine.orchestration.state import _is_exhausted_update_pivot_candidate
 from remediation_engine.tools.registry import fetch_maven_registry_candidates
+from tests.helpers import qa_policy_for_task
 
 
 class _Response:
@@ -650,7 +652,7 @@ def _group(
         issue_type=IssueType.SCA,
         representative_issue_id=issue.id or uuid4(),
         issues=[issue],
-        fix_plan=plan,
+        fix_plan_candidates=[PackageFixPlanCandidate(issue_id=issue.id or uuid4(), plan=plan)],
     )
 
 
@@ -688,6 +690,7 @@ def test_exhausted_pypi_latest_parent_can_pivot_but_npm_parent_cannot():
         strategy_stage=SCARemediationStage.PYPI_LATEST,
         status=TaskStatus.NEEDS_RETRY,
         parent_package_name="direct-parent",
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     npm_task = pypi_task.model_copy(
         update={
@@ -718,7 +721,12 @@ def test_canonical_security_floor_uses_stable_pep440_for_pypi():
     )
     assert _canonical_security_floor(group) == ("1.4.0", None)
 
-    group.fix_plan = group.fix_plan.model_copy(update={"fixed_version": "1.4.0rc1"})
+    group.fix_plan_candidates = [
+        candidate.model_copy(
+            update={"plan": candidate.plan.model_copy(update={"fixed_version": "1.4.0rc1"})}
+        )
+        for candidate in group.fix_plan_candidates
+    ]
     floor, error = _canonical_security_floor(group)
     assert floor is None
     assert error is not None and "PEP 440" in error

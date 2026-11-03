@@ -58,6 +58,8 @@ from tests.helpers import (
     _make_minimal_state,
     _scan_outcome,
     _test_outcome,
+    qa_policy_for_task,
+    selected_group_plan,
 )
 
 
@@ -69,7 +71,8 @@ def _add_verified_package_evidence(
     for task_id, group in task_groups.items():
         if task_id in results.package_state_by_task:
             continue
-        version = getattr(getattr(group, "fix_plan", None), "fixed_version", None)
+        selected_plan = selected_group_plan(group)
+        version = selected_plan.fixed_version if selected_plan else None
         package = str(getattr(group, "vulnerable_component", "") or "").strip()
         if not package or not version:
             continue
@@ -111,9 +114,9 @@ def _commit_tasks(state, tasks):
             selected_version is None
             and task.qa_policy == QAPolicy.VERSION_BUMP
             and group is not None
-            and group.fix_plan is not None
+            and selected_group_plan(group) is not None
         ):
-            selected_version = group.fix_plan.fixed_version
+            selected_version = selected_group_plan(group).fixed_version
         committed_task = task.model_copy(
             update={
                 "current_attempt_id": attempt_id,
@@ -132,6 +135,10 @@ def _commit_tasks(state, tasks):
             instruction=committed_task.instruction or "QA test instruction.",
             instruction_digest=f"digest-{task.task_id}",
             dispatch_node="qa_critic",
+            allowed_target_versions=[committed_task.selected_version]
+            if committed_task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
     state["task_queue"] = committed_tasks
     state["active_target_task_ids"] = list(committed_tasks)
@@ -809,12 +816,13 @@ def _task_context(
 ) -> QATaskContext:
     """Build one task-owned QA context for policy/evaluator tests."""
     resolved_task_id = task_id or f"{group.group_id}-task"
+    resolved_policy = qa_policy or qa_policy_for_task(strategy, no_fix_stage=no_fix_stage)
     return QATaskContext(
         task=RemediationTask(
             task_id=resolved_task_id,
             parent_group_id=group.group_id,
             strategy=strategy,
-            qa_policy=qa_policy,
+            qa_policy=resolved_policy,
             no_fix_stage=no_fix_stage,
             status=TaskStatus.OPTIMISTICALLY_FIXED,
             instruction="Test remediation instruction.",
@@ -944,7 +952,7 @@ def test_dynamic_context_renders_install_and_test_tuple_statuses():
 def test_dynamic_context_uses_committed_instruction_and_allows_authorized_alternative():
     """QA sees the sealed attempt rule rather than stale group advice."""
     group = _make_group(group_id="group-a")
-    advisory = group.fix_plan.model_copy(
+    advisory = selected_group_plan(group).model_copy(
         update={
             "instruction": "Update @angular/platform-browser to 21.2.14.",
             "fixed_version": "21.2.14",
@@ -957,7 +965,10 @@ def test_dynamic_context_uses_committed_instruction_and_allows_authorized_altern
                 issue.model_copy(update={"package_name": "@angular/platform-browser"})
                 for issue in group.issues
             ],
-            "fix_plan": advisory,
+            "fix_plan_candidates": [
+                candidate.model_copy(update={"plan": advisory})
+                for candidate in group.fix_plan_candidates
+            ],
         }
     )
     snapshot = TaskAttemptSnapshot(
@@ -1282,6 +1293,7 @@ def test_stale_or_missing_attempt_snapshot_is_rejected_before_qa_model_invocatio
         instruction="Current committed instruction.",
         current_attempt_id="attempt-current",
         task_revision=2,
+        qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
     )
     snapshot = TaskAttemptSnapshot(
         attempt_id="attempt-current",
@@ -1290,6 +1302,8 @@ def test_stale_or_missing_attempt_snapshot_is_rejected_before_qa_model_invocatio
         instruction="Stale committed instruction.",
         instruction_digest="stale-digest",
         dispatch_node="update_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
 
     for snapshots in ({"attempt-current": snapshot}, {}):
@@ -1408,7 +1422,7 @@ class TestRunIndividualInvestigations:
     def test_committed_snapshot_and_matching_worker_version_reach_prompt(self):
         """The critic passes valid authorization and effective version to QA."""
         group = _make_group(group_id="g1")
-        advisory = group.fix_plan.model_copy(
+        advisory = selected_group_plan(group).model_copy(
             update={
                 "instruction": "Update @angular/platform-browser to 21.2.14.",
                 "fixed_version": "21.2.14",
@@ -1421,7 +1435,10 @@ class TestRunIndividualInvestigations:
                     issue.model_copy(update={"package_name": "@angular/platform-browser"})
                     for issue in group.issues
                 ],
-                "fix_plan": advisory,
+                "fix_plan_candidates": [
+                    candidate.model_copy(update={"plan": advisory})
+                    for candidate in group.fix_plan_candidates
+                ],
             }
         )
         task = _task_context(group, "task-1").task.model_copy(
@@ -1443,6 +1460,7 @@ class TestRunIndividualInvestigations:
             ),
             instruction_digest="attempt-digest",
             dispatch_node="update_subagent",
+            allowed_dependency_types=[],
         )
         worker_result = WorkerAttemptResult(
             attempt_id="attempt-current",
@@ -1500,6 +1518,7 @@ class TestRunIndividualInvestigations:
             instruction="Use 1.2.0 or the explicitly authorized compatible alternative 1.3.0.",
             instruction_digest="attempt-digest",
             dispatch_node="update_subagent",
+            allowed_dependency_types=[],
         )
         stale_result = WorkerAttemptResult(
             attempt_id="attempt-current",
@@ -1815,6 +1834,10 @@ class TestApplyGuardrails:
             strategy=RoutingStrategy.CODE_WORKAROUND,
             no_fix_stage=NoFixMitigationStage.VULNERABLE_CODE_REMOVAL,
             status=TaskStatus.OPTIMISTICALLY_FIXED,
+            qa_policy=qa_policy_for_task(
+                RoutingStrategy.CODE_WORKAROUND,
+                no_fix_stage=NoFixMitigationStage.VULNERABLE_CODE_REMOVAL,
+            ),
         )
 
         strategies = _derive_qa_task_strategies(
