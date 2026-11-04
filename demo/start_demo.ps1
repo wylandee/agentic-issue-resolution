@@ -5,11 +5,14 @@
     Launches the FastAPI backend (and optionally Vite dev server) for the demo web UI.
 .PARAMETER Dev
     If specified, launches both FastAPI and Vite dev server with hot reload.
+.PARAMETER Reload
+    If specified, enables auto-reload on backend code changes.
 .PARAMETER Port
     Backend port (default: 8000).
 #>
 param(
     [switch]$Dev,
+    [switch]$Reload,
     [int]$Port = 8000
 )
 
@@ -34,8 +37,8 @@ Write-Host "Backend URL: http://localhost:$Port"
 if ($Dev) {
     Write-Host "Starting in DEVELOPMENT mode (FastAPI + Vite dev server)..." -ForegroundColor Yellow
     
-    # Start FastAPI backend in a background job or separate process
-    $backendProcess = Start-Process -FilePath $PythonExe -ArgumentList "-m", "uvicorn", "demo.backend.main:app", "--host", "127.0.0.1", "--port", "$Port", "--reload" -PassThru
+    # Start FastAPI backend scoped to demo/backend to avoid restarting on data/workspace changes
+    $backendProcess = Start-Process -FilePath $PythonExe -ArgumentList "-m", "uvicorn", "demo.backend.main:app", "--host", "127.0.0.1", "--port", "$Port", "--reload", "--reload-dir", "demo/backend" -PassThru
     
     Write-Host "FastAPI started (PID $($backendProcess.Id)). Starting Vite dev server..." -ForegroundColor Green
     
@@ -47,5 +50,9 @@ if ($Dev) {
     Write-Host "Opening http://localhost:$Port in browser..." -ForegroundColor Yellow
     Start-Process "http://localhost:$Port"
     
-    & $PythonExe -m uvicorn demo.backend.main:app --host 127.0.0.1 --port $Port --reload
+    $uvicornArgs = @("-m", "uvicorn", "demo.backend.main:app", "--host", "127.0.0.1", "--port", "$Port")
+    if ($Reload) {
+        $uvicornArgs += @("--reload", "--reload-dir", "demo/backend")
+    }
+    & $PythonExe $uvicornArgs
 }

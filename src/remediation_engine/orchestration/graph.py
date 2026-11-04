@@ -121,6 +121,7 @@ from remediation_engine.orchestration.trajectory_exporter import (
     TrajectoryRecorder,
     build_phase5_trajectory_path,
     export_phase5_trajectory,
+    get_active_trajectory_recorder,
     invoke_with_trajectory,
     use_trajectory_recorder,
 )
@@ -1054,7 +1055,7 @@ def run_orchestrator(
         target_packages=normalized_target_packages,
         settings=settings,
     )
-    recorder = TrajectoryRecorder()
+    recorder = get_active_trajectory_recorder() or TrajectoryRecorder()
     langsmith_enabled = config is not None and run_id is not None
     trace_id = run_id if run_id is not None else uuid.uuid4()
     initial_state["run_id"] = str(trace_id)

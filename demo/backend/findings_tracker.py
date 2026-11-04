@@ -371,23 +371,38 @@ class FindingsTracker:
                 if status_val == "qa_passed" and parent_group_id:
                     qa_passed_group_ids.add(parent_group_id)
 
-        # 2. Mark findings whose group passed QA and are not in remaining_target_identifiers
+        # 2. Restore findings prematurely marked remediated if their group did not pass QA
+        for group_id, target_fids in self.group_to_finding_ids.items():
+            if group_id not in qa_passed_group_ids:
+                for fid in target_fids:
+                    if fid in self.remediated_findings_by_id:
+                        model = self.remediated_findings_by_id.pop(fid)
+                        model.status = "unresolved"
+                        self.findings_by_id[fid] = model
+
+        # 3. Mark findings whose group passed QA and are not in remaining_target_identifiers
         for group_id in qa_passed_group_ids:
             target_fids = set(self.group_to_finding_ids.get(group_id, set()))
             for fid in target_fids:
-                if fid in self.findings_by_id:
+                if fid in self.remediated_findings_by_id:
+                    model = self.remediated_findings_by_id[fid]
+                    if self._finding_identifiers(model).intersection(remaining_target_ids):
+                        self.remediated_findings_by_id.pop(fid)
+                        model.status = "unresolved"
+                        self.findings_by_id[fid] = model
+                elif fid in self.findings_by_id:
                     model = self.findings_by_id[fid]
                     if not self._finding_identifiers(model).intersection(remaining_target_ids):
                         model.status = "remediated"
                         self.remediated_findings_by_id[fid] = model
                         del self.findings_by_id[fid]
 
-        # 3. Any remaining findings that failed QA are marked 'unresolved'
+        # 4. Any remaining findings that failed QA are marked 'unresolved'
         for model in self.findings_by_id.values():
             if not model.is_new and model.status != "remediated":
                 model.status = "unresolved"
 
-        # 4. Check for any final newly detected issues
+        # 5. Check for any final newly detected issues
         final_scan = final_raw_state.get("final_full_scan_result")
         if final_scan is not None:
             found_issues = getattr(final_scan, "found_issues", None) or []

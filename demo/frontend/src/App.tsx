@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import type {
   ConsoleEvent,
   FindingModel,
@@ -31,23 +31,163 @@ function getTargetPackageOptions(findings: FindingModel[]): { name: string; find
   return [...packages.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
 
+const SESSION_STORAGE_KEY = "remediation-engine-demo-session-v1";
+
+interface PersistedDemoState {
+  version: 1;
+  workspace: WorkspaceInfo | null;
+  runId: string | null;
+  runStatus: RunStatus;
+  currentNode: string | null;
+  activeFindings: FindingModel[];
+  remediatedCount: number;
+  newCount: number;
+  logs: ConsoleEvent[];
+  reportAvailable: boolean;
+  errorMessage: string | null;
+  selectedTargetPackages: string[];
+  packageFilter: string;
+}
+
+function loadPersistedDemoState(): PersistedDemoState | null {
+  if (typeof window === "undefined") return null;
+
+  try {
+    const value = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
+    if (!value) return null;
+
+    const parsed = JSON.parse(value) as PersistedDemoState;
+    return parsed.version === 1 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 export const App: React.FC = () => {
-  const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
-  const [runId, setRunId] = useState<string | null>(null);
-  const [runStatus, setRunStatus] = useState<RunStatus>("pending");
-  const [currentNode, setCurrentNode] = useState<string | null>(null);
-  const [activeFindings, setActiveFindings] = useState<FindingModel[]>([]);
-  const [remediatedCount, setRemediatedCount] = useState<number>(0);
-  const [newCount, setNewCount] = useState<number>(0);
-  const [logs, setLogs] = useState<ConsoleEvent[]>([]);
-  const [reportAvailable, setReportAvailable] = useState<boolean>(false);
+  const [persistedState] = useState(loadPersistedDemoState);
+  const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(
+    persistedState?.workspace ?? null,
+  );
+  const [runId, setRunId] = useState<string | null>(persistedState?.runId ?? null);
+  const [runStatus, setRunStatus] = useState<RunStatus>(persistedState?.runStatus ?? "pending");
+  const [currentNode, setCurrentNode] = useState<string | null>(
+    persistedState?.currentNode ?? null,
+  );
+  const [activeFindings, setActiveFindings] = useState<FindingModel[]>(
+    persistedState?.activeFindings ?? [],
+  );
+  const [remediatedCount, setRemediatedCount] = useState<number>(
+    persistedState?.remediatedCount ?? 0,
+  );
+  const [newCount, setNewCount] = useState<number>(persistedState?.newCount ?? 0);
+  const [logs, setLogs] = useState<ConsoleEvent[]>(persistedState?.logs ?? []);
+  const [reportAvailable, setReportAvailable] = useState<boolean>(
+    persistedState?.reportAvailable ?? false,
+  );
   const [reportModalData, setReportModalData] = useState<ReportResponse | null>(null);
   const [isLoadingReport, setIsLoadingReport] = useState<boolean>(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [selectedTargetPackages, setSelectedTargetPackages] = useState<string[]>([]);
-  const [packageFilter, setPackageFilter] = useState("");
+  const [errorMessage, setErrorMessage] = useState<string | null>(
+    persistedState?.errorMessage ?? null,
+  );
+  const [selectedTargetPackages, setSelectedTargetPackages] = useState<string[]>(
+    () =>
+      persistedState?.selectedTargetPackages ??
+      (persistedState?.workspace
+        ? getTargetPackageOptions(persistedState.workspace.findings).map((option) => option.name)
+        : []),
+  );
+  const [packageFilter, setPackageFilter] = useState<string>(persistedState?.packageFilter ?? "");
 
   const isRunning = runStatus === "running";
+
+  useEffect(() => {
+    if (!runId) return;
+
+    return subscribeRunStream(runId, {
+      onInitialSync: (state) => {
+        setActiveFindings(state.active_findings);
+        setRemediatedCount(state.remediated_count);
+        setNewCount(state.new_count);
+        setLogs(state.logs);
+        setRunStatus(state.status);
+        setCurrentNode(state.current_node ?? null);
+        setReportAvailable(state.report_available);
+      },
+      onConsoleEvent: (event) => {
+        setLogs((previous) => {
+          const existingIndex = previous.findIndex((entry) => entry.id === event.id);
+          if (existingIndex < 0) return [...previous, event];
+          const updated = previous.slice();
+          updated[existingIndex] = event;
+          return updated;
+        });
+      },
+      onDashboardUpdate: (update) => {
+        setActiveFindings(update.active_findings);
+        setRemediatedCount(update.remediated_count);
+        setNewCount(update.new_count);
+      },
+      onRunStatus: (statusData) => {
+        setRunStatus(statusData.status as RunStatus);
+        setCurrentNode(statusData.current_node ?? null);
+        if (statusData.report_available) {
+          setReportAvailable(true);
+        }
+      },
+      onError: () => {
+        console.warn("SSE connection error or completed");
+      },
+    });
+  }, [runId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    if (!workspace && !runId) {
+      try {
+        window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
+      } catch {
+        // Storage is optional when browser privacy settings disable it.
+      }
+      return;
+    }
+
+    const snapshot: PersistedDemoState = {
+      version: 1,
+      workspace,
+      runId,
+      runStatus,
+      currentNode,
+      activeFindings,
+      remediatedCount,
+      newCount,
+      logs,
+      reportAvailable,
+      errorMessage,
+      selectedTargetPackages,
+      packageFilter,
+    };
+
+    try {
+      window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+    } catch {
+      // Storage is only a recovery aid; the live run does not depend on it.
+    }
+  }, [
+    workspace,
+    runId,
+    runStatus,
+    currentNode,
+    activeFindings,
+    remediatedCount,
+    newCount,
+    logs,
+    reportAvailable,
+    errorMessage,
+    selectedTargetPackages,
+    packageFilter,
+  ]);
+
   const targetPackageOptions = useMemo(
     () => getTargetPackageOptions(workspace?.findings ?? []),
     [workspace],
@@ -81,45 +221,6 @@ export const App: React.FC = () => {
       setRunStatus("running");
       const { run_id } = await startRun(workspace.workspace_id, selectedTargetPackages);
       setRunId(run_id);
-
-      // Subscribe to real-time events
-      subscribeRunStream(run_id, {
-        onInitialSync: (state) => {
-          setActiveFindings(state.active_findings);
-          setRemediatedCount(state.remediated_count);
-          setNewCount(state.new_count);
-          setLogs(state.logs);
-          setRunStatus(state.status);
-          setCurrentNode(state.current_node ?? null);
-          setReportAvailable(state.report_available);
-        },
-        onConsoleEvent: (event) => {
-          setLogs((previous) => {
-            const existingIndex = previous.findIndex((entry) => entry.id === event.id);
-            if (existingIndex < 0) return [...previous, event];
-            const updated = previous.slice();
-            updated[existingIndex] = event;
-            return updated;
-          });
-        },
-        onDashboardUpdate: (update) => {
-          setActiveFindings(update.active_findings);
-          setRemediatedCount(update.remediated_count);
-          setNewCount(update.new_count);
-        },
-        onRunStatus: (statusData) => {
-          setRunStatus(statusData.status as RunStatus);
-          if (statusData.current_node) {
-            setCurrentNode(statusData.current_node);
-          }
-          if (statusData.report_available) {
-            setReportAvailable(true);
-          }
-        },
-        onError: () => {
-          console.warn("SSE connection error or completed");
-        },
-      });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Failed to start remediation run";
       setErrorMessage(msg);
