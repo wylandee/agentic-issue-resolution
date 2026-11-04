@@ -22,6 +22,7 @@ from tests.evals.eval_case_helpers import (
     measure_diagnostic,
     measure_expected,
     observations,
+    task_completion_input,
 )
 from tests.evals.golden_schema import load_golden_dataset
 from tests.evals.replay_adapters import replay_workaround_case
@@ -104,7 +105,7 @@ def build_workaround_test_case(
     )
     return LLMTestCase(
         name=f"{case['case_id']} [Workaround Subagent]",
-        input=str(case["input"]),
+        input=task_completion_input(case),
         actual_output=f"{final_output}\n\n{_format_tool_trace(tool_trace)}",
         expected_output=str(case["expected_output"]),
         context=context_strings(

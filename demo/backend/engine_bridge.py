@@ -13,10 +13,13 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 
-import remediation_engine.orchestration.graph as graph_module
 from remediation_engine.api import RemediationRequest, RemediationResult, run_remediation
 from remediation_engine.contracts.schemas import SystemContext, VulnerabilityIssue
-from remediation_engine.orchestration.trajectory_exporter import TrajectoryRecorder, to_jsonable
+from remediation_engine.orchestration.trajectory_exporter import (
+    TrajectoryRecorder,
+    to_jsonable,
+    use_trajectory_recorder,
+)
 
 from .findings_tracker import FindingsTracker
 from .models import ConsoleEvent, DashboardUpdate, RunState
@@ -416,7 +419,14 @@ class DemoTelemetryRecorder(TrajectoryRecorder):
             metadata=metadata,
         )
         try:
-            self._handle_span_start(str(run_id), name, run_type, inputs, metadata)
+            self._handle_span_start(
+                str(run_id),
+                name,
+                run_type,
+                inputs,
+                metadata,
+                parent_run_id=str(parent_run_id) if parent_run_id is not None else None,
+            )
         except Exception as exc:
             logger.debug("Demo telemetry start handler failed: %s", exc)
 
@@ -427,11 +437,53 @@ class DemoTelemetryRecorder(TrajectoryRecorder):
         except Exception as exc:
             logger.debug("Demo telemetry end handler failed: %s", exc)
 
+    def _find_active_tool_ancestor(self, parent_run_id: str | None) -> str | None:
+        """Find the run_id of an enclosing active tool span, if one exists."""
+        curr = parent_run_id
+        visited: set[str] = set()
+        while curr and curr not in visited:
+            visited.add(curr)
+            span_info = self._active_spans.get(curr)
+            if span_info is not None and span_info.get("kind") == "tool":
+                return curr
+            local_span = self._spans.get(curr)
+            curr = local_span.parent_run_id if local_span else None
+        return None
+
     def _handle_span_start(
-        self, run_id: str, name: str, run_type: str, inputs: Any, metadata: Any
+        self,
+        run_id: str,
+        name: str,
+        run_type: str,
+        inputs: Any,
+        metadata: Any,
+        parent_run_id: str | None = None,
     ) -> None:
+        if parent_run_id is None:
+            local_span = self._spans.get(run_id)
+            if local_span is not None and local_span.parent_run_id:
+                parent_run_id = local_span.parent_run_id
+
+        # Internal container infrastructure operations are not user-facing agent tools
+        if name.startswith("docker_sandbox.") or name == "docker_sandbox":
+            self._active_spans[run_id] = {
+                "kind": "internal_sandbox",
+                "name": name,
+            }
+            return
+
         if str(run_type).casefold() == "tool" or name.startswith("tool."):
             tool_name = name.removeprefix("tool.")
+            # Prevent layered execution from emitting duplicate console rows
+            active_tool_ancestor = self._find_active_tool_ancestor(parent_run_id)
+            if active_tool_ancestor is not None:
+                self._active_spans[run_id] = {
+                    "kind": "nested_tool",
+                    "name": tool_name,
+                    "parent_tool_id": active_tool_ancestor,
+                }
+                return
+
             arguments = _concise_tool_arguments(inputs)
             task_label = self.session.resolve_tool_task_label(inputs, metadata)
             event = self.session.emit_console(
@@ -524,9 +576,12 @@ class DemoTelemetryRecorder(TrajectoryRecorder):
             return
 
         kind = span_info["kind"]
-        name = span_info["name"]
+        name = span_info.get("name", "unknown")
         if kind == "tool":
             self._complete_tool_span(span_info, outputs=outputs, error=error)
+            return
+
+        if kind in {"nested_tool", "internal_sandbox"}:
             return
 
         if error is not None:
@@ -556,9 +611,12 @@ class DemoTelemetryRecorder(TrajectoryRecorder):
     def finish_incomplete_tool_spans(self) -> None:
         """Mark any started tool events without a completion callback as incomplete."""
         for run_id, span_info in list(self._active_spans.items()):
-            if span_info.get("kind") == "tool":
+            kind = span_info.get("kind")
+            if kind == "tool":
                 self._active_spans.pop(run_id, None)
                 self._complete_tool_span(span_info, incomplete=True)
+            elif kind in {"nested_tool", "internal_sandbox"}:
+                self._active_spans.pop(run_id, None)
 
     def _emit_node_key_results(self, node_name: str, patch: dict[str, Any]) -> None:
         """Format and emit key milestone summaries."""
@@ -642,6 +700,7 @@ class ScopedEngineLogHandler(logging.Handler):
         """
         super().__init__()
         self.session = session
+        self._run_thread_id = threading.get_ident()
 
     def emit(self, record: logging.LogRecord) -> None:
         """Emit selected remediation-engine milestones to the run console.
@@ -649,6 +708,9 @@ class ScopedEngineLogHandler(logging.Handler):
         Args:
             record: Logging record produced by the remediation engine.
         """
+        if record.thread != self._run_thread_id:
+            return
+
         try:
             msg = self.format(record)
             if any(phrase in msg for phrase in self.KEY_PHRASES):
@@ -663,10 +725,9 @@ class ScopedEngineLogHandler(logging.Handler):
 
 def _execute_run_thread(session: RunSession) -> None:
     """Target function executed in background thread for run_remediation."""
-    original_recorder_cls = graph_module.TrajectoryRecorder
     scoped_handler = ScopedEngineLogHandler(session)
     root_logger = logging.getLogger("remediation_engine")
-    recorders: list[DemoTelemetryRecorder] = []
+    recorder = DemoTelemetryRecorder(session)
     try:
         session.emit_run_status("running", current_node="initial_triage")
         session.emit_console(
@@ -678,13 +739,6 @@ def _execute_run_thread(session: RunSession) -> None:
             ),
         )
 
-        # Non-intrusively bind DemoTelemetryRecorder to graph_module.TrajectoryRecorder
-        class BoundRecorder(DemoTelemetryRecorder):
-            def __init__(self) -> None:
-                super().__init__(session)
-                recorders.append(self)
-
-        graph_module.TrajectoryRecorder = BoundRecorder  # type: ignore[misc]
         root_logger.addHandler(scoped_handler)
 
         request = RemediationRequest(
@@ -701,7 +755,8 @@ def _execute_run_thread(session: RunSession) -> None:
             ),
         )
 
-        result = run_remediation(request)
+        with use_trajectory_recorder(recorder):
+            result = run_remediation(request)
         session.result = result
 
         # Reconcile final findings with raw state
@@ -741,13 +796,10 @@ def _execute_run_thread(session: RunSession) -> None:
         )
         session.emit_run_status("failed", current_node="error")
     finally:
-        for recorder in recorders:
-            try:
-                recorder.finish_incomplete_tool_spans()
-            except Exception:
-                logger.debug("Failed to close incomplete demo tool spans.", exc_info=True)
-        # Restore original recorder class
-        graph_module.TrajectoryRecorder = original_recorder_cls  # type: ignore[misc]
+        try:
+            recorder.finish_incomplete_tool_spans()
+        except Exception:
+            logger.debug("Failed to close incomplete demo tool spans.", exc_info=True)
         root_logger.removeHandler(scoped_handler)
         # Sentinel to signal end of stream to subscribers
         session.event_queue.put(None)

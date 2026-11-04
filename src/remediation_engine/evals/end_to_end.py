@@ -617,19 +617,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
         else:
-            for golden in goldens:
+            total_goldens = len(goldens)
+            for idx, golden in enumerate(goldens, 1):
+                print(
+                    f"\n[{idx}/{total_goldens}] Starting golden eval: {golden.case_id}...",
+                    flush=True,
+                )
+                case_t0 = time.monotonic()
                 try:
-                    records.append(
-                        evaluate_golden(
-                            golden,
-                            settings=settings,
-                            judge_model=judge_model,
-                            judge_llm=judge_llm,
-                            strict=args.strict,
-                            secrets=secrets,
-                        )
+                    record = evaluate_golden(
+                        golden,
+                        settings=settings,
+                        judge_model=judge_model,
+                        judge_llm=judge_llm,
+                        strict=args.strict,
+                        secrets=secrets,
                     )
+                    records.append(record)
+                    elapsed = time.monotonic() - case_t0
+                    comp = record.additional_metadata.get("assessment", {}).get(
+                        "remediation_complete", "unknown"
+                    )
+                    print(
+                        f"[{idx}/{total_goldens}] Completed {golden.case_id}: status={record.status} (remediation_complete={comp}, elapsed={elapsed:.1f}s)",
+                        flush=True,
+                    )
+                    for m in record.metrics:
+                        print(
+                            f"    {m.metric_name}: {m.score:.2f} (threshold {m.threshold:.2f}, success={m.success}) - {m.reason}",
+                            flush=True,
+                        )
+                    if record.error_message:
+                        print(f"    Errors: {record.error_message}", flush=True)
                 except Exception as exc:
+                    elapsed = time.monotonic() - case_t0
                     records.append(
                         EvalTestCaseRecord(
                             case_id=golden.case_id,
@@ -646,6 +667,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 }
                             },
                         )
+                    )
+                    print(
+                        f"[{idx}/{total_goldens}] Failed {golden.case_id} with ERROR (elapsed={elapsed:.1f}s): {_safe(str(exc), secrets)}",
+                        flush=True,
                     )
     else:
         sources = args.trajectory if args.command == "score" else [args.input]

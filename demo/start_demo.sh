@@ -85,7 +85,7 @@ if [[ "${DEV_MODE}" == true ]]; then
   trap cleanup SIGINT SIGTERM EXIT
 
   # Start FastAPI backend in background
-  "${PYTHON_EXE}" -m uvicorn demo.backend.main:app --host 127.0.0.1 --port "${PORT}" --reload &
+  "${PYTHON_EXE}" -m uvicorn demo.backend.main:app --host 127.0.0.1 --port "${PORT}" --reload --reload-dir demo/backend &
   BACKEND_PID=$!
   echo "FastAPI started (PID ${BACKEND_PID})."
 
@@ -96,5 +96,5 @@ if [[ "${DEV_MODE}" == true ]]; then
 else
   echo "Starting in PRODUCTION mode (FastAPI serving pre-built UI)..."
   open_browser "http://localhost:${PORT}" &
-  exec "${PYTHON_EXE}" -m uvicorn demo.backend.main:app --host 127.0.0.1 --port "${PORT}" --reload
+  exec "${PYTHON_EXE}" -m uvicorn demo.backend.main:app --host 127.0.0.1 --port "${PORT}"
 fi

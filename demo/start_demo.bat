@@ -11,4 +11,4 @@ echo ==========================================================
 echo Opening http://localhost:8000 in browser...
 start http://localhost:8000
 
-"%PYTHON_EXE%" -m uvicorn demo.backend.main:app --host 127.0.0.1 --port 8000 --reload
+"%PYTHON_EXE%" -m uvicorn demo.backend.main:app --host 127.0.0.1 --port 8000

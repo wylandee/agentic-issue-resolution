@@ -985,7 +985,7 @@
     "golden_kind": "historical_notevil_no_fix_pivot_with_validation_recovery",
     "provenance": "Historical trajectory phase5_20260819T052618Z_bc2db34f-0eca-4492-ba6e-4dd2bd4293a8, task-4 initial no_fix_package_removal attempt 88ee0e54-9807-5c50-96a8-017815a12aee (revision 1) pivoted to no_fix_code_removal attempt fd151bb4-674d-597d-945c-c5e16d027308 (revision 4). The source-only worker chain is documented in spans 190-258, including tool spans 202, 205, 207, 210, 217, 219, 222, 224, 230, 232, 234, and 258. The exporter recorded empty inputs/outputs for §222 record_plan, so its plan arguments are reconstructed from the exact edit set in §224.",
     "evaluation_note": "This replaces the synthetic swig example with the real notevil pivot. The historical trace keeps notevil installed and removes its vulnerable VM execution path from routes/b2bOrder.ts. It also preserves the observed guard and recovery errors: premature web search, compiled-file inspection, compiled test input, phase violation, and wrong test hint. The §222 record_plan payload was not captured by the exporter; this golden reconstructs it from the observed exact §224 edit set and marks the observed erroneous calls separately from the expected correct trace.\nThe negative tool trace is a recorded historical failure. Live worker replays are allowed to recover; deterministic replay tests enforce that historical trace separately.",
-    "supervisor_instruction": "After the notevil package-removal attempt, pivot to NO_FIX VULNERABLE-CODE REMOVAL. Keep notevil installed; remove the vulnerable execution path from routes/b2bOrder.ts without editing manifests or tests.",
+    "supervisor_instruction": "After the notevil package-removal attempt, pivot to NO_FIX VULNERABLE-CODE REMOVAL. Keep notevil installed; remove the vulnerable execution path from routes/b2bOrder.ts without editing manifests or tests. Validate runtime smoke with app.ts and targeted tests with test/server/b2bOrderSpec.ts.",
     "completion_task": "Execute the committed source-only notevil pivot, recover from validation-input and phase errors, remove the vulnerable route path, and finish with validation PASS.",
     "target_package_name": "notevil",
     "attempt_id": "fd151bb4-674d-597d-945c-c5e16d027308",
@@ -999,7 +999,7 @@
     "action_status": "APPLIED",
     "expected_completion_pass": true,
     "expected_tool_correctness_pass": false,
-    "input": "After the notevil package-removal attempt, pivot to NO_FIX VULNERABLE-CODE REMOVAL. Keep notevil installed; remove the vulnerable execution path from routes/b2bOrder.ts without editing manifests or tests.",
+    "input": "After the notevil package-removal attempt, pivot to NO_FIX VULNERABLE-CODE REMOVAL. Keep notevil installed; remove the vulnerable execution path from routes/b2bOrder.ts without editing manifests or tests. Validate runtime smoke with app.ts and targeted tests with test/server/b2bOrderSpec.ts.",
     "context": [
       "Completion task:\nExecute the committed source-only notevil pivot, recover from validation-input and phase errors, remove the vulnerable route path, and finish with validation PASS.",
       "Golden provenance:\nHistorical trajectory phase5_20260819T052618Z_bc2db34f-0eca-4492-ba6e-4dd2bd4293a8, task-4 initial no_fix_package_removal attempt 88ee0e54-9807-5c50-96a8-017815a12aee (revision 1) pivoted to no_fix_code_removal attempt fd151bb4-674d-597d-945c-c5e16d027308 (revision 4). The source-only worker chain is documented in spans 190-258, including tool spans 202, 205, 207, 210, 217, 219, 222, 224, 230, 232, 234, and 258. The exporter recorded empty inputs/outputs for §222 record_plan, so its plan arguments are reconstructed from the exact edit set in §224.",
@@ -3589,6 +3589,7 @@
     "action_status": "SURRENDER",
     "terminal_error_code": "VALIDATION_INPUT_LIMIT_REACHED",
     "expected_completion_pass": false,
+    "task_completion_applicable": false,
     "expected_tool_correctness_pass": false,
     "input": "Apply the committed Angular workaround in lib/angular.ts and validate it using a safe source smoke module and a source targeted test.",
     "context": [
@@ -3843,6 +3844,7 @@
     "action_status": "SURRENDER",
     "terminal_error_code": "VALIDATION_LIMIT_REACHED",
     "expected_completion_pass": false,
+    "task_completion_applicable": false,
     "expected_tool_correctness_pass": true,
     "input": "Apply the sanitize-html workaround in routes/sanitize.ts and validate the resulting behavior.",
     "context": [
