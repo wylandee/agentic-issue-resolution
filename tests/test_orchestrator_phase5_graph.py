@@ -53,8 +53,8 @@ from remediation_engine.orchestration import (
     run_orchestrator,
 )
 from remediation_engine.orchestration import execution as _graph_wrappers
+from remediation_engine.orchestration.execution import _finish_workspace_attempt_snapshot
 from remediation_engine.orchestration.graph import (
-    _finish_workspace_attempt_snapshot,
     route_after_workspace_builder,
     run_qa_critic_from_orchestrator,
     run_update_subagent_from_orchestrator,
@@ -141,7 +141,6 @@ def _initial_state(tmp_path, groups):
         "repo_root": str(tmp_path),
         "valid_groups": groups,
         "constraints_ledger": [],
-        "retry_counts": {},
         "group_strategies": {},
         "qa_evaluations": {},
         "action_summaries": [],
@@ -149,7 +148,6 @@ def _initial_state(tmp_path, groups):
         "workspace_volume": None,
         "status": "pending",
         "next_routing_step": "",
-        "feedback_by_group": {},
         "supervisor_instructions": "",
         "eval_status": "",
         "errors": [],
@@ -371,6 +369,10 @@ def test_portfolio_node_blocks_missing_certificate_before_commit(tmp_path, monke
         {
             "portfolio_plan": previous_plan,
             "portfolio_replan_request": request,
+            "active_target_task_ids": ["stale-task"],
+            "active_cluster_id": "stale-cluster",
+            "active_dispatch_batch_id": "stale-batch",
+            "active_multi_package_action": object(),
         }
     )
     monkeypatch.setattr(
@@ -399,7 +401,62 @@ def test_portfolio_node_blocks_missing_certificate_before_commit(tmp_path, monke
     assert result["status"] == "portfolio_unknown"
     assert result["next_routing_step"] == "teardown"
     assert any("missing its package-resolution certificate" in error for error in result["errors"])
+    assert result["active_target_task_ids"] == []
+    assert result["active_cluster_id"] is None
+    assert result["active_dispatch_batch_id"] is None
+    assert result["active_multi_package_action"] is None
     apply_plan.assert_not_called()
+
+
+def test_portfolio_ready_keeps_diagnostics_out_of_errors(tmp_path, monkeypatch):
+    group = _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND))
+    task = build_initial_remediation_task(group, "task-1")
+    solver_plan = SimpleNamespace(
+        status="OPTIMAL",
+        diagnostics=["CP-SAT optimal status", "solver elapsed 0.2 seconds"],
+    )
+    candidate_plan = SimpleNamespace(
+        diagnostics=["candidate plan was constructed"],
+        clusters=[],
+        solver_plan=solver_plan,
+        resolution_certificate=None,
+    )
+    state = _initial_state(tmp_path, [group])
+    state["task_queue"] = {"task-1": task}
+    monkeypatch.setattr(
+        "remediation_engine.planning.control.get_runtime_settings",
+        lambda: SimpleNamespace(solver_accept_feasible=True),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.planning.control.prepare_supervisor_fix_plan_state",
+        lambda *args, **kwargs: ([group], {"task-1": task}, []),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.planning.control.prepare_portfolio_inputs",
+        lambda *args, **kwargs: ([group], {"task-1": task}, ["preparation note"]),
+    )
+    monkeypatch.setattr(
+        "remediation_engine.planning.control.build_certified_portfolio_plan",
+        lambda *args, **kwargs: candidate_plan,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.planning.control._portfolio_certificate_violations",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "remediation_engine.planning.control.apply_portfolio_plan",
+        lambda *args, **kwargs: ([group], {"task-1": task}, ["application note"]),
+    )
+
+    result = run_portfolio_plan_tool(state)
+
+    assert result["status"] == "portfolio_ready"
+    assert result["errors"] == []
+    assert result["portfolio_plan"].diagnostics == ["candidate plan was constructed"]
+    assert result["portfolio_solver_plan"].diagnostics == [
+        "CP-SAT optimal status",
+        "solver elapsed 0.2 seconds",
+    ]
 
 
 def test_portfolio_does_not_commit_partial_plan_around_active_attempt(tmp_path, monkeypatch):
@@ -797,9 +854,7 @@ class TestPhase5GraphIntegration:
 
         update_subagent = MagicMock(return_value={"errors": [], "action_summaries": []})
 
-        with patch(
-            "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
-        ):
+        with patch("remediation_engine.agents.update.run_update_subagent_node", update_subagent):
             run_update_subagent_from_orchestrator(state)
 
         subagent_state = update_subagent.call_args[0][0]
@@ -856,9 +911,7 @@ class TestPhase5GraphIntegration:
             }
         )
 
-        with patch(
-            "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
-        ):
+        with patch("remediation_engine.agents.update.run_update_subagent_node", update_subagent):
             result = run_update_subagent_from_orchestrator(state)
 
         assert result["retry_diagnostics_by_task"]["task-1"] == diagnostics
@@ -891,7 +944,7 @@ class TestPhase5GraphIntegration:
         )
 
         with patch(
-            "remediation_engine.orchestration.graph.run_update_subagent_node",
+            "remediation_engine.agents.update.run_update_subagent_node",
             return_value={
                 "errors": [],
                 "retry_diagnostics_by_task": {"task-1": foreign_diagnostics},
@@ -950,7 +1003,7 @@ class TestPhase5GraphIntegration:
             }
         )
         with patch(
-            "remediation_engine.orchestration.graph.run_workaround_subagent_node",
+            "remediation_engine.agents.workaround.run_workaround_subagent_node",
             return_value={
                 "action_summaries": [summary],
                 "action_summary": summary,
@@ -997,7 +1050,7 @@ class TestPhase5GraphIntegration:
             }
         )
         worker = MagicMock()
-        with patch("remediation_engine.orchestration.graph.run_update_subagent_node", worker):
+        with patch("remediation_engine.agents.update.run_update_subagent_node", worker):
             result = run_update_subagent_from_orchestrator(state)
 
         worker.assert_not_called()
@@ -1042,7 +1095,7 @@ class TestPhase5GraphIntegration:
             }
         )
         worker = MagicMock()
-        with patch("remediation_engine.orchestration.graph.run_update_subagent_node", worker):
+        with patch("remediation_engine.agents.update.run_update_subagent_node", worker):
             result = run_update_subagent_from_orchestrator(state)
 
         worker.assert_not_called()
@@ -1091,11 +1144,11 @@ class TestPhase5GraphIntegration:
 
         with (
             patch(
-                "remediation_engine.orchestration.graph.run_update_subagent_node",
+                "remediation_engine.agents.update.run_update_subagent_node",
                 return_value={"action_summaries": [summary], "errors": ["validation failed"]},
             ),
             patch(
-                "remediation_engine.orchestration.graph.DockerSandbox",
+                "remediation_engine.runtime.sandbox.DockerSandbox",
                 return_value=sandbox,
             ),
         ):
@@ -1114,7 +1167,7 @@ class TestPhase5GraphIntegration:
         sandbox.restore_workspace_snapshot.side_effect = RuntimeError("archive missing")
 
         with patch(
-            "remediation_engine.orchestration.graph.DockerSandbox",
+            "remediation_engine.runtime.sandbox.DockerSandbox",
             return_value=sandbox,
         ):
             errors = _finish_workspace_attempt_snapshot(
@@ -1163,16 +1216,29 @@ class TestPhase5GraphIntegration:
             status=AgentActionStatus.SUCCESS,
             summary="The dependency update passed worker validation.",
         )
+        success_result = WorkerAttemptResult(
+            attempt_id=snapshot.attempt_id,
+            task_id=task.task_id,
+            task_revision=snapshot.task_revision,
+            status=AgentActionStatus.SUCCESS,
+            action_summary=success_summary,
+            execution_diagnostics=WorkerExecutionDiagnostics(validation_passed=True),
+            instruction_digest=snapshot.instruction_digest,
+        )
         sandbox = MagicMock()
         sandbox.__enter__.return_value = sandbox
 
         with (
             patch(
-                "remediation_engine.orchestration.graph.run_update_subagent_node",
-                return_value={"action_summaries": [success_summary], "errors": []},
+                "remediation_engine.agents.update.run_update_subagent_node",
+                return_value={
+                    "action_summaries": [success_summary],
+                    "worker_results_by_attempt": {snapshot.attempt_id: success_result},
+                    "errors": [],
+                },
             ),
             patch(
-                "remediation_engine.orchestration.graph.DockerSandbox",
+                "remediation_engine.runtime.sandbox.DockerSandbox",
                 return_value=sandbox,
             ),
         ):
@@ -1185,7 +1251,7 @@ class TestPhase5GraphIntegration:
         evaluation = QAEvaluation(task_id=task.task_id, passed=True)
         with (
             patch(
-                "remediation_engine.orchestration.graph.run_qa_critic_node",
+                "remediation_engine.agents.qa.run_qa_critic_node",
                 return_value={
                     "qa_evaluations": {task.task_id: evaluation},
                     "status": "qa_completed",
@@ -1193,7 +1259,7 @@ class TestPhase5GraphIntegration:
                 },
             ),
             patch(
-                "remediation_engine.orchestration.graph.DockerSandbox",
+                "remediation_engine.runtime.sandbox.DockerSandbox",
                 return_value=sandbox,
             ),
         ):
@@ -1217,9 +1283,7 @@ class TestPhase5GraphIntegration:
                 "status": "supervisor_routed",
                 "next_routing_step": "teardown",
                 "group_strategies": {},
-                "retry_counts": {},
                 "constraints_ledger": [],
-                "feedback_by_group": {},
                 "supervisor_instructions": "done",
             }
         )
@@ -1297,18 +1361,14 @@ class TestPhase5GraphIntegration:
                     "next_routing_step": "update_subagent",
                     "active_target_task_ids": [gid],
                     "group_strategies": {},
-                    "retry_counts": {},
                     "constraints_ledger": [],
-                    "feedback_by_group": {},
                     "supervisor_instructions": "bump it",
                 }
             return {
                 "status": "supervisor_routed",
                 "next_routing_step": "teardown",
                 "group_strategies": {},
-                "retry_counts": {},
                 "constraints_ledger": [],
-                "feedback_by_group": {},
                 "supervisor_instructions": "done",
             }
 
@@ -1322,9 +1382,7 @@ class TestPhase5GraphIntegration:
                 workspace_builder,
             ),
             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
-            patch(
-                "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
-            ),
+            patch("remediation_engine.agents.update.run_update_subagent_node", update_subagent),
             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
         ):
             graph = build_orchestrator_graph()
@@ -1353,18 +1411,14 @@ class TestPhase5GraphIntegration:
                     "status": "supervisor_routed",
                     "next_routing_step": "qa_critic",
                     "group_strategies": {},
-                    "retry_counts": {},
                     "constraints_ledger": [],
-                    "feedback_by_group": {},
                     "supervisor_instructions": "run qa",
                 }
             return {
                 "status": "supervisor_routed",
                 "next_routing_step": "teardown",
                 "group_strategies": {},
-                "retry_counts": {},
                 "constraints_ledger": [],
-                "feedback_by_group": {},
                 "supervisor_instructions": "done",
             }
 
@@ -1390,7 +1444,7 @@ class TestPhase5GraphIntegration:
                 workspace_builder,
             ),
             patch("remediation_engine.orchestration.graph.run_supervisor_node", supervisor),
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
             patch("remediation_engine.orchestration.graph.run_teardown_node", teardown),
         ):
             graph = build_orchestrator_graph()
@@ -1433,7 +1487,7 @@ class TestPhase5GraphIntegration:
             }
         )
 
-        with patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic):
+        with patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic):
             result = run_qa_critic_from_orchestrator(state)
 
         scoped_state = qa_critic.call_args[0][0]
@@ -1452,7 +1506,7 @@ class TestPhase5GraphIntegration:
         state["attempt_snapshots_by_id"] = {snapshot.attempt_id: snapshot}
 
         qa_critic = MagicMock()
-        with patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic):
+        with patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic):
             result = run_qa_critic_from_orchestrator(state)
 
         qa_critic.assert_not_called()
@@ -1486,7 +1540,7 @@ class TestPhase5GraphIntegration:
             }
         )
 
-        with patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic):
+        with patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic):
             result = run_qa_critic_from_orchestrator(state)
 
         scoped_state = qa_critic.call_args[0][0]
@@ -1552,9 +1606,9 @@ class TestPhase5GraphIntegration:
         sandbox.__enter__.return_value = sandbox
 
         with (
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
             patch(
-                "remediation_engine.orchestration.graph.DockerSandbox",
+                "remediation_engine.runtime.sandbox.DockerSandbox",
                 return_value=sandbox,
             ),
         ):
@@ -1618,9 +1672,9 @@ class TestPhase5GraphIntegration:
         sandbox.__enter__.return_value = sandbox
 
         with (
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
             patch(
-                "remediation_engine.orchestration.graph.DockerSandbox",
+                "remediation_engine.runtime.sandbox.DockerSandbox",
                 return_value=sandbox,
             ),
         ):
@@ -1645,7 +1699,7 @@ class TestPhase5GraphIntegration:
             "workspace_rollback_anchors_by_task": result["workspace_rollback_anchors_by_task"],
         }
         with patch(
-            "remediation_engine.orchestration.graph.DockerSandbox",
+            "remediation_engine.runtime.sandbox.DockerSandbox",
             return_value=sandbox,
         ):
             prepared_state, errors = _graph_wrappers._prepare_workspace_for_dispatch(
@@ -1708,9 +1762,9 @@ class TestPhase5GraphIntegration:
         sandbox.__enter__.return_value = sandbox
 
         with (
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
             patch(
-                "remediation_engine.orchestration.graph.DockerSandbox",
+                "remediation_engine.runtime.sandbox.DockerSandbox",
                 return_value=sandbox,
             ),
         ):
@@ -1771,9 +1825,9 @@ class TestPhase5GraphIntegration:
         sandbox.__enter__.return_value = sandbox
 
         with (
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
             patch(
-                "remediation_engine.orchestration.graph.DockerSandbox",
+                "remediation_engine.runtime.sandbox.DockerSandbox",
                 return_value=sandbox,
             ),
         ):
@@ -1826,13 +1880,10 @@ class TestPhase5GraphIntegration:
         snapshot_id = "batch-atomic"
         sandbox = MagicMock()
         sandbox.__enter__.return_value = sandbox
-        graph_module = SimpleNamespace(
-            DockerSandbox=MagicMock(return_value=sandbox),
-        )
 
         with patch(
-            "remediation_engine.orchestration.execution._graph_module",
-            return_value=graph_module,
+            "remediation_engine.runtime.sandbox.DockerSandbox",
+            return_value=sandbox,
         ):
             cleanup_errors = _graph_wrappers._finalize_qa_workspace_snapshot(
                 state,
@@ -1910,9 +1961,9 @@ class TestPhase5GraphIntegration:
         sandbox.__enter__.return_value = sandbox
 
         with (
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
             patch(
-                "remediation_engine.orchestration.graph.DockerSandbox",
+                "remediation_engine.runtime.sandbox.DockerSandbox",
                 return_value=sandbox,
             ),
         ):
@@ -1982,9 +2033,9 @@ class TestPhase5GraphIntegration:
         sandbox.__enter__.return_value = sandbox
 
         with (
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
             patch(
-                "remediation_engine.orchestration.graph.DockerSandbox",
+                "remediation_engine.runtime.sandbox.DockerSandbox",
                 return_value=sandbox,
             ),
             patch(
@@ -2059,8 +2110,8 @@ class TestPhase5GraphIntegration:
             }
         )
         with (
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
-            patch("remediation_engine.orchestration.graph.DockerSandbox", return_value=sandbox),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.runtime.sandbox.DockerSandbox", return_value=sandbox),
         ):
             first_result = run_qa_critic_from_orchestrator(state)
         retry_state = dict(state)
@@ -2077,8 +2128,8 @@ class TestPhase5GraphIntegration:
             }
         )
         with (
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
-            patch("remediation_engine.orchestration.graph.DockerSandbox", return_value=sandbox),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.runtime.sandbox.DockerSandbox", return_value=sandbox),
         ):
             second_result = run_qa_critic_from_orchestrator(retry_state)
         assert first_result["workspace_rollback_anchors_by_task"] == {
@@ -2136,10 +2187,10 @@ class TestPhase5GraphIntegration:
         sandbox.__enter__.return_value = sandbox
         with (
             patch(
-                "remediation_engine.orchestration.graph.run_update_subagent_node",
+                "remediation_engine.agents.update.run_update_subagent_node",
                 return_value={"action_summaries": [summary], "errors": ["validation failed"]},
             ),
-            patch("remediation_engine.orchestration.graph.DockerSandbox", return_value=sandbox),
+            patch("remediation_engine.runtime.sandbox.DockerSandbox", return_value=sandbox),
         ):
             run_update_subagent_from_orchestrator(state)
         sandbox.create_workspace_snapshot.assert_called_once_with("attempt-attempt-second")
@@ -2174,15 +2225,28 @@ class TestPhase5GraphIntegration:
             status=AgentActionStatus.SUCCESS,
             summary="The unrelated task completed its worker transaction.",
         )
+        worker_result = WorkerAttemptResult(
+            attempt_id=snapshot_b.attempt_id,
+            task_id=task_b.task_id,
+            task_revision=snapshot_b.task_revision,
+            status=AgentActionStatus.SUCCESS,
+            action_summary=summary,
+            execution_diagnostics=WorkerExecutionDiagnostics(validation_passed=True),
+            instruction_digest=snapshot_b.instruction_digest,
+        )
         sandbox = MagicMock()
         sandbox.__enter__.return_value = sandbox
 
         with (
             patch(
-                "remediation_engine.orchestration.graph.run_update_subagent_node",
-                return_value={"action_summaries": [summary], "errors": []},
+                "remediation_engine.agents.update.run_update_subagent_node",
+                return_value={
+                    "action_summaries": [summary],
+                    "worker_results_by_attempt": {snapshot_b.attempt_id: worker_result},
+                    "errors": [],
+                },
             ) as worker,
-            patch("remediation_engine.orchestration.graph.DockerSandbox", return_value=sandbox),
+            patch("remediation_engine.runtime.sandbox.DockerSandbox", return_value=sandbox),
         ):
             result = run_update_subagent_from_orchestrator(state)
 
@@ -2234,8 +2298,8 @@ class TestPhase5GraphIntegration:
         sandbox = MagicMock()
         sandbox.__enter__.return_value = sandbox
         with (
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
-            patch("remediation_engine.orchestration.graph.DockerSandbox", return_value=sandbox),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.runtime.sandbox.DockerSandbox", return_value=sandbox),
         ):
             result = run_qa_critic_from_orchestrator(state)
         assert result["workspace_rollback_anchors_by_task"] == {}
@@ -2306,9 +2370,9 @@ class TestPhase5Exports:
         sandbox.__enter__.return_value = sandbox
 
         with (
-            patch("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic),
+            patch("remediation_engine.agents.qa.run_qa_critic_node", qa_critic),
             patch(
-                "remediation_engine.orchestration.graph.DockerSandbox",
+                "remediation_engine.runtime.sandbox.DockerSandbox",
                 return_value=sandbox,
             ),
         ):
@@ -2543,7 +2607,7 @@ def test_delta_isolation_canaries_probe_baseline_singletons_and_restore_full_can
     sandbox = _DeltaSandbox(candidate.copy(), archives)
     observations = []
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
@@ -2598,15 +2662,15 @@ def test_delta_isolation_candidate_restore_failure_rolls_back_original_qa_failur
     sandbox = _DeltaSandbox(candidate.copy(), archives, fail_candidate_restore=True)
     original_qa = _failed_delta_qa_result(tasks)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        "remediation_engine.agents.qa.run_qa_critic_node",
         lambda _state: original_qa,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.get_runtime_settings",
+        "remediation_engine.settings.get_runtime_settings",
         lambda: AppSettings(
             max_delta_canary_probes=1,
             remedy_disable_post_qa_triage=True,
@@ -2660,7 +2724,7 @@ def test_delta_isolation_archive_removal_failure_clears_attribution(tmp_path, mo
     archives = {"batch-delta": baseline.copy()}
     sandbox = _DeltaSandbox(candidate.copy(), archives, fail_candidate_remove=True)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
@@ -2697,7 +2761,7 @@ def test_destructive_final_candidate_restore_failure_clears_attribution(tmp_path
         destroy_before_candidate_restore_failure=True,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
@@ -2726,7 +2790,7 @@ def test_delta_isolation_snapshot_creation_failure_never_probes(tmp_path, monkey
     sandbox = _DeltaSandbox(candidate.copy(), archives, fail_snapshot_create=True)
     qa_calls = []
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
@@ -2829,7 +2893,7 @@ def test_delta_isolation_accepts_skipped_scan_and_preserves_provenance(tmp_path,
     monkeypatch.setattr(_graph_wrappers, "rank_suspect_tasks_by_suspicion", ranker)
     monkeypatch.setattr(_graph_wrappers, "run_delta_isolation_canaries", canaries)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.get_runtime_settings",
+        "remediation_engine.settings.get_runtime_settings",
         lambda: AppSettings(max_delta_canary_probes=1),
     )
 
@@ -2918,7 +2982,7 @@ def test_delta_isolation_action_task_id_mismatch_is_rejected_before_any_probe(
     monkeypatch.setattr(_graph_wrappers, "run_delta_isolation_canaries", canaries)
     monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", apply_action)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
 
@@ -2946,15 +3010,15 @@ def test_qa_delta_isolation_attribution_projects_provenance_and_escalates_only_a
     sandbox = _DeltaSandbox(candidate.copy(), archives)
     qa_result = _failed_delta_qa_result(tasks)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        "remediation_engine.agents.qa.run_qa_critic_node",
         lambda _state: qa_result,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.get_runtime_settings",
+        "remediation_engine.settings.get_runtime_settings",
         lambda: AppSettings(
             max_delta_canary_probes=2,
             remedy_disable_post_qa_triage=True,
@@ -3033,13 +3097,13 @@ def test_same_dispatch_delta_isolation_qa_rerun_reuses_isolation_and_new_dispatc
         apply_calls.append(tuple(mutation.task_id for mutation in action.package_mutations))
         return _apply_fake_delta_action(active_sandbox, action, touched_files)
 
-    monkeypatch.setattr("remediation_engine.orchestration.graph.run_qa_critic_node", qa_critic)
+    monkeypatch.setattr("remediation_engine.agents.qa.run_qa_critic_node", qa_critic)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.get_runtime_settings",
+        "remediation_engine.settings.get_runtime_settings",
         lambda: AppSettings(
             max_delta_canary_probes=1,
             remedy_disable_post_qa_triage=True,
@@ -3125,7 +3189,7 @@ def test_delta_isolation_preworker_restore_failure_consumes_slot_and_continues(
     )
     qa_subsets = []
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
@@ -3162,7 +3226,7 @@ def test_delta_isolation_probe_exception_consumes_slot_before_later_failure(tmp_
     sandbox = _DeltaSandbox(candidate.copy(), archives)
     qa_subsets = []
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(_graph_wrappers, "apply_multi_package_action", _apply_fake_delta_action)
@@ -3428,15 +3492,15 @@ def test_socket_stack_delta_fixture_exercises_three_task_blame_and_replan(
     )
 
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        "remediation_engine.agents.qa.run_qa_critic_node",
         lambda _state: qa_result,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.get_runtime_settings",
+        "remediation_engine.settings.get_runtime_settings",
         lambda: AppSettings(
             max_delta_canary_probes=2,
             remedy_disable_post_qa_triage=True,
@@ -3782,7 +3846,7 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
         )
 
     class FixtureDiffSandbox(_DeltaSandbox):
-        def read_file(self, relative_path):
+        def read_file(self, relative_path, **_kwargs):
             if relative_path != "package.json":
                 return None
             return (
@@ -3798,7 +3862,7 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
 
     sandbox = FixtureDiffSandbox(baseline.copy(), {})
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
 
@@ -3908,7 +3972,7 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
             "portfolio_dirty": False,
         }
         with patch(
-            "remediation_engine.orchestration.graph.run_update_subagent_node",
+            "remediation_engine.agents.update.run_update_subagent_node",
             side_effect=worker_node,
         ):
             worker_projection = run_update_subagent_from_orchestrator(dispatch_state)
@@ -3960,11 +4024,11 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
         volumes=SimpleNamespace(get=lambda _name: SimpleNamespace(remove=lambda **_kwargs: None)),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.get_runtime_settings",
+        "remediation_engine.settings.get_runtime_settings",
         lambda: AppSettings(max_delta_canary_probes=2, remedy_disable_post_qa_triage=True),
     )
     monkeypatch.setattr(
@@ -3990,7 +4054,7 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
         ),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        "remediation_engine.agents.qa.run_qa_critic_node",
         lambda _state: {
             "qa_evaluations": failed_evaluations,
             "eval_status": "some_failed",
@@ -4105,7 +4169,7 @@ def test_four_package_fixture_restores_replans_and_preserves_accepted_patch(tmp_
             for task_id in dispatch_state["active_target_task_ids"]
         }
         monkeypatch.setattr(
-            "remediation_engine.orchestration.graph.run_qa_critic_node",
+            "remediation_engine.agents.qa.run_qa_critic_node",
             lambda _state, evaluations=passing: {
                 "qa_evaluations": evaluations,
                 "eval_status": "all_passed",
@@ -4259,15 +4323,15 @@ def test_socket_stack_fixture_reuses_same_attempt_budget_and_resets_for_new_disp
         return _apply_fake_delta_action(active_sandbox, action, touched_files)
 
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        "remediation_engine.agents.qa.run_qa_critic_node",
         qa_critic,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.get_runtime_settings",
+        "remediation_engine.settings.get_runtime_settings",
         lambda: AppSettings(
             max_delta_canary_probes=2,
             remedy_disable_post_qa_triage=True,
@@ -4354,15 +4418,15 @@ def test_socket_stack_candidate_restore_failure_clears_blame(socket_stack_delta_
     )
     qa_result = _socket_stack_failed_qa_result(case.tasks)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        "remediation_engine.agents.qa.run_qa_critic_node",
         lambda _state: qa_result,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.get_runtime_settings",
+        "remediation_engine.settings.get_runtime_settings",
         lambda: AppSettings(
             max_delta_canary_probes=2,
             remedy_disable_post_qa_triage=True,
@@ -4451,7 +4515,7 @@ def test_socket_stack_fixture_rejects_mutation_id_mismatch_before_snapshot(
         apply_action,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.graph.DockerSandbox",
+        "remediation_engine.runtime.sandbox.DockerSandbox",
         lambda **_kwargs: sandbox,
     )
 
@@ -4469,13 +4533,6 @@ def test_socket_stack_fixture_rejects_mutation_id_mismatch_before_snapshot(
     canaries.assert_not_called()
     apply_action.assert_not_called()
     sandbox.create_workspace_snapshot.assert_not_called()
-
-
-class TestPhase5RoutingStage2Parity:
-    def test_route_after_workspace_builder_routes_to_setup_scan(self):
-        assert route_after_workspace_builder({"status": "workspace_ready"}) == (
-            "workspace_setup_scan"
-        )
 
 
 class TestPhase5RunOrchestratorStage2Parity:
@@ -4577,9 +4634,7 @@ class TestPhase5GraphIntegrationStage2Parity:
             lambda _state, _target_tasks: (None, []),
         )
 
-        with patch(
-            "remediation_engine.orchestration.graph.run_update_subagent_node", update_subagent
-        ):
+        with patch("remediation_engine.agents.update.run_update_subagent_node", update_subagent):
             run_update_subagent_from_orchestrator(state)
 
         subagent_state = update_subagent.call_args[0][0]
@@ -4679,7 +4734,7 @@ class TestPhase5GraphIntegrationStage2Parity:
         )
 
         with patch(
-            "remediation_engine.orchestration.graph.run_update_subagent_node",
+            "remediation_engine.agents.update.run_update_subagent_node",
             return_value=worker_output,
         ):
             result = run_update_subagent_from_orchestrator(state)
@@ -4710,7 +4765,7 @@ class TestPhase5GraphIntegrationStage2Parity:
             "worker_results_by_attempt": {"attempt-stale": stale_worker_result},
         }
         with patch(
-            "remediation_engine.orchestration.graph.run_update_subagent_node",
+            "remediation_engine.agents.update.run_update_subagent_node",
             return_value=stale_output,
         ):
             stale_result = run_update_subagent_from_orchestrator(state)
@@ -4720,6 +4775,54 @@ class TestPhase5GraphIntegrationStage2Parity:
         assert any(
             event.error_code == "STALE_WORKER_RESULT"
             for event in stale_supervisor_result["consistency_events"]
+        )
+
+    def test_stale_worker_success_restores_workspace_before_result_rejection(self):
+        task = build_initial_remediation_task(
+            _group(IssueType.SCA, plan=_fix_plan(FixPlanStatus.VERSION_FOUND)),
+            "task-1",
+        ).model_copy(update={"task_revision": 2, "current_attempt_id": "attempt-current"})
+        snapshot = TaskAttemptSnapshot(
+            attempt_id="attempt-current",
+            task_id=task.task_id,
+            state_revision=2,
+            task_revision=task.task_revision,
+            allowed_target_versions=[],
+            allowed_dependency_types=[],
+            instruction=task.instruction,
+            instruction_digest=instruction_digest(task.instruction),
+            dispatch_node="update_subagent",
+        )
+        state = {
+            "workspace_volume": "agent_workspace_deadbeef",
+            "task_queue": {task.task_id: task},
+            "attempt_snapshots_by_id": {snapshot.attempt_id: snapshot},
+        }
+        stale_result = {
+            "attempt_id": "attempt-old",
+            "task_id": task.task_id,
+            "task_revision": 1,
+            "status": "success",
+            "instruction_digest": snapshot.instruction_digest,
+        }
+        result = {"worker_results_by_attempt": {"attempt-old": stale_result}}
+
+        with patch(
+            "remediation_engine.orchestration.execution._finish_workspace_attempt_snapshot",
+            return_value=[],
+        ) as finish_snapshot:
+            errors = _graph_wrappers._finalize_worker_workspace_snapshot(
+                state,
+                [task],
+                "attempt-attempt-current",
+                result,
+            )
+
+        assert errors == []
+        finish_snapshot.assert_called_once_with(
+            state,
+            "attempt-attempt-current",
+            restore=True,
         )
 
     def test_workaround_wrapper_preserves_typed_attempt_result_python_stage2(self, tmp_path):
@@ -4780,7 +4883,7 @@ class TestPhase5GraphIntegrationStage2Parity:
             }
         )
         with patch(
-            "remediation_engine.orchestration.graph.run_workaround_subagent_node",
+            "remediation_engine.agents.workaround.run_workaround_subagent_node",
             workaround_subagent,
         ):
             result = run_workaround_subagent_from_orchestrator(state)

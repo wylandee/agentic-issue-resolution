@@ -728,16 +728,11 @@ def extract_qa_failure_evidence(
     )
 
 
-def detect_test_runner(sandbox: DockerSandbox, test_file: str | None = None) -> str:
-    """Detect the source test runner for a targeted test file."""
-    return _detect_targeted_test_context(sandbox, test_file)[0]
-
-
 def _normalise_test_path(path: str) -> str:
     """Normalize one repository-relative test path for runner selection."""
-    normalized = (path or "").replace("\\", "/").strip().lstrip("/")
-    if normalized.startswith("/workspace/"):
-        normalized = normalized[len("/workspace/") :]
+    normalized = _normalise_workspace_file_path(path)
+    if normalized is None:
+        return ""
     if normalized.startswith("build/"):
         normalized = normalized[len("build/") :]
     return normalized

@@ -94,7 +94,6 @@ from remediation_engine.contracts.version_policy import MavenRegistryCandidate, 
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.state import (
     TERMINAL_TASK_STATUSES,
-    _build_consistency_event,
     _normalize_target_task_ids_for_node,
     _validate_committed_state,
     build_initial_remediation_task,
@@ -435,7 +434,6 @@ def _base_state(groups, **overrides) -> dict:
         "qa_evaluations": {},
         "action_summaries": [],
         "constraints_ledger": [],
-        "feedback_by_group": {},
         "feedback_by_task": {},
         "consistency_events": [],
         "eval_status": "",
@@ -800,19 +798,6 @@ class TestSupervisorDecisionSchema:
                 instructions="test",
                 decision_reason="test",
             )
-
-
-def test_deferred_consistency_action_is_mapped_to_typed_rejection():
-    event = _build_consistency_event(
-        error_code="REGISTRY_VERIFICATION_PENDING",
-        task_id="task-1",
-        expected_attempt_id=None,
-        received_attempt_id=None,
-        action="deferred",
-        details="registry lookup is pending",
-    )
-
-    assert event.action == "rejected"
 
 
 def test_registry_verification_pending_reenters_supervisor_without_forcing_final_scan(
@@ -1322,7 +1307,7 @@ def test_supervisor_overlays_replan_patch_on_portfolio_tool_input(
 
 
 # ===========================================================================
-# run_supervisor_node â€” task initialization
+# run_supervisor_node — task initialization
 # ===========================================================================
 
 
@@ -1388,7 +1373,7 @@ class TestRunSupervisorNodeNormalization:
 
 
 # ===========================================================================
-# run_supervisor_node â€” routing decisions
+# run_supervisor_node — routing decisions
 # ===========================================================================
 
 
@@ -1873,7 +1858,7 @@ class TestRunSupervisorNodeToQA:
         state = _base_state(
             [g1, g2],
             task_queue={"task-1": task1, "task-2": task2},
-            # No active_target_task_ids â€” all tasks are already optimistically fixed
+            # No active_target_task_ids — all tasks are already optimistically fixed
             active_target_task_ids=[],
         )
 
@@ -2051,7 +2036,7 @@ class TestRunSupervisorNodeToTeardown:
 
 
 # ===========================================================================
-# run_supervisor_node â€” QA evaluation updates
+# run_supervisor_node — QA evaluation updates
 # ===========================================================================
 
 
@@ -3712,7 +3697,7 @@ def test_pivot_detaches_previous_update_attempt_before_child_dispatch(monkeypatc
 
 
 # ===========================================================================
-# run_supervisor_node â€” action summary updates
+# run_supervisor_node — action summary updates
 # ===========================================================================
 
 
@@ -3851,7 +3836,7 @@ class TestRunSupervisorNodeActionSummaryUpdates:
             portfolio_plan=None,
         )
         result = run_supervisor_node(state)
-        # QA_PASSED is terminal â€” must not be overwritten
+        # QA_PASSED is terminal — must not be overwritten
         assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
 
     def test_does_not_update_non_active_targets_from_action_summary(self):
@@ -3879,7 +3864,7 @@ class TestRunSupervisorNodeActionSummaryUpdates:
 
 
 # ===========================================================================
-# run_supervisor_node â€” max retries / unfixable marking
+# run_supervisor_node — max retries / unfixable marking
 # ===========================================================================
 
 
@@ -4364,7 +4349,7 @@ def test_early_stale_plan_route_preserves_typed_pending_request(monkeypatch):
 
 
 # ===========================================================================
-# run_supervisor_node â€” strategy pivots
+# run_supervisor_node — strategy pivots
 # ===========================================================================
 
 
@@ -4478,34 +4463,6 @@ class TestRunSupervisorNodePeerConflict:
 
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
-        assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
-
-    @patch("langchain_openai.ChatOpenAI")
-    def test_strategy_pivot_without_child_instruction_fails_closed(self, mock_chat):
-        g1 = _sca_group("g1")
-        task = _make_task(
-            "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
-        )
-        state = _base_state(
-            [g1],
-            task_queue={"task-1": task},
-        )
-
-        mock_llm = MagicMock()
-        mock_chat.return_value = mock_llm
-        mock_llm.with_structured_output.return_value.invoke.return_value = SupervisorDecision(
-            next_node="workaround_subagent",
-            target_task_ids=["task-1"],
-            updated_task_strategies={"task-1": RoutingStrategy.CODE_WORKAROUND},
-            instructions="retry with a workaround",
-            decision_reason="pivot the task after the retry failed",
-        )
-
-        result = run_supervisor_node(state)
-
-        assert result["next_routing_step"] == "update_subagent"
-        assert result["active_target_task_ids"] == ["task-1"]
-        assert "task-2" not in result["task_queue"]
         assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
 
     @patch("langchain_openai.ChatOpenAI")
@@ -4670,7 +4627,7 @@ class TestRunSupervisorNodePeerConflict:
 
 
 # ===========================================================================
-# run_supervisor_node â€” deterministic routing
+# run_supervisor_node — deterministic routing
 # ===========================================================================
 
 
@@ -5126,7 +5083,6 @@ class TestBugFixes:
         portfolio_tool.assert_not_called()
         assert result["next_routing_step"] == "workaround_subagent"
         assert result["feedback_by_task"]["task-2"] == "Real feedback from QA"
-        assert result["feedback_by_group"][group_id] == "Real feedback from QA"
 
 
 def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
@@ -6961,24 +6917,6 @@ class TestSupervisorDecisionSchemaStage2Parity:
 
         assert len(normalized_targets) == 1
         assert normalized_targets[0] in task_ids
-
-
-class TestRunSupervisorNodeToQAStage2Parity:
-    def test_all_optimistically_fixed_tasks_route_to_qa_within_dispatch_limit(self):
-        g1 = _sca_group("g1")
-        g2 = _rename_sca_group_package(_sca_group("g2"), "other-pkg")
-        task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
-        task2 = _make_task("task-2", "g2", status=TaskStatus.OPTIMISTICALLY_FIXED)
-        state = _base_state(
-            [g1, g2],
-            task_queue={"task-1": task1, "task-2": task2},
-            # No active_target_task_ids â€” all tasks are already optimistically fixed
-            active_target_task_ids=[],
-        )
-
-        result = run_supervisor_node(state)
-        assert result["next_routing_step"] == "qa_critic"
-        assert result["active_target_task_ids"] == ["task-1", "task-2"]
 
 
 class TestRunSupervisorNodeQAUpdatesStage2Parity:

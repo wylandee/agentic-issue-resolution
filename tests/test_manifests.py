@@ -51,7 +51,6 @@ from remediation_engine.tools.npm_mutations import (
 )
 from remediation_engine.tools.python_manifest_locator import (
     RequirementEntry,
-    find_dependency_in_requirements,
     locate_from_issue,
     locate_python_manifests,
     parse_requirements_txt,
@@ -470,8 +469,6 @@ def test_requirements_parser_retains_lines_and_ignores_directives(tmp_path: Path
     assert first.raw_line == "  Requests_Toolkit >= 2.0  # keep this note"
     assert second.line_number == 5
     assert second.name == "other"
-    assert find_dependency_in_requirements("requests-toolkit", path) == first
-    assert find_dependency_in_requirements("not-present", path) is None
 
 
 def test_requirements_include_directives_are_ignored_without_escaping_repo(
@@ -526,7 +523,6 @@ def test_requirements_lookup_fails_closed_for_ambiguous_names(tmp_path: Path) ->
     path = tmp_path / "requirements.txt"
     path.write_text("Requests_toolkit==1.0\nrequests-toolkit==2.0\n", encoding="utf-8")
 
-    assert find_dependency_in_requirements("requests.toolkit", path) is None
     with pytest.raises(ValueError, match="exactly one"):
         update_requirements_dependency(path, "requests.toolkit", "3.0")
 
@@ -1816,10 +1812,14 @@ def test_pipfile_rollback_restore_failure_is_reported_explicitly():
         return _result()
 
     sandbox = _files_sandbox(files, run_handler=run, write_handler=write)
+    execution_state = {}
+    package_checkpoints = {}
     tool = _python_update_tool(
         sandbox,
         manifest="Pipfile",
         allowed_types={"requests": ["packages"]},
+        execution_state=execution_state,
+        package_checkpoints=package_checkpoints,
     )
 
     result = tool.invoke(
@@ -1834,6 +1834,17 @@ def test_pipfile_rollback_restore_failure_is_reported_explicitly():
     assert "Rollback failed" in result
     assert "lock restore denied" in result
     assert "Pipenv rollback sync failed" in result
+    assert "requests" in package_checkpoints
+    assert execution_state["restoration_failed"] is True
+    blocked = tool.invoke(
+        {
+            "package_name": "requests",
+            "target_version": "2.32.0",
+            "dependency_type": "packages",
+            "manifest_path": "Pipfile",
+        }
+    )
+    assert "further dependency edits are blocked" in blocked
 
 
 def test_pipfile_manifest_removal_is_direct_only_and_runs_lock_sync():

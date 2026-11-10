@@ -9,8 +9,8 @@ from remediation_engine.agents.qa import _run_global_execution, run_qa_critic_no
 from remediation_engine.agents.qa_evaluation import (
     GroupInvestigation,
     _apply_guardrails,
-    _build_individual_investigator_prompt,
     _build_qa_dynamic_context,
+    _build_qa_evaluator_system_prompt,
     _build_qa_terminal_tool,
     _run_individual_investigations,
     build_qa_review_toolbelt,
@@ -50,7 +50,7 @@ from remediation_engine.tools.qa_scan import (
     _QAPackageState,
     _SecurityScanResult,
 )
-from remediation_engine.tools.qa_workspace import _derive_qa_task_strategies, _group_scan_status
+from remediation_engine.tools.qa_workspace import _derive_qa_task_strategies
 from tests.helpers import (
     _install_outcome,
     _make_fully_populated_results,
@@ -173,8 +173,6 @@ class TestRunQACriticNode:
         investigations = {
             task_id: GroupInvestigation(
                 group_id=group.group_id,
-                task_id=task_id,
-                investigation_text="",
                 tool_transcript="",
                 errors=[],
                 evaluation=evaluation,
@@ -568,8 +566,6 @@ class TestRunQACriticNode:
         investigations = {
             "task-1": GroupInvestigation(
                 group_id=group.group_id,
-                task_id="task-1",
-                investigation_text="partial",
                 tool_transcript="",
                 errors=["Subagent exceeded max rounds."],
             )
@@ -610,8 +606,6 @@ class TestQAMissingExecutionTools:
         investigations = {
             "task-1": GroupInvestigation(
                 group_id=group.group_id,
-                task_id="task-1",
-                investigation_text="partial",
                 tool_transcript="",
                 errors=[],
             )
@@ -693,8 +687,6 @@ class TestRunQACriticNodeMapReduce:
             investigations = {
                 task_id: GroupInvestigation(
                     group_id=group.group_id,
-                    task_id=task_id,
-                    investigation_text="",
                     tool_transcript="",
                     evaluation=evaluations_by_task.get(task_id),
                 )
@@ -746,8 +738,8 @@ class TestRunQACriticNodeMapReduce:
     def test_individual_investigations_called_once(self):
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {
-            "task-1": GroupInvestigation("g1", "ok", "", task_id="task-1"),
-            "task-2": GroupInvestigation("g2", "ok", "", task_id="task-2"),
+            "task-1": GroupInvestigation(group_id="g1", tool_transcript="ok"),
+            "task-2": GroupInvestigation(group_id="g2", tool_transcript="ok"),
         }
         evals = [
             QAEvaluation(task_id="task-1", passed=True),
@@ -766,8 +758,8 @@ class TestRunQACriticNodeMapReduce:
     def test_all_passed_status(self):
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {
-            "task-1": GroupInvestigation("g1", "ok", "", task_id="task-1"),
-            "task-2": GroupInvestigation("g2", "ok", "", task_id="task-2"),
+            "task-1": GroupInvestigation(group_id="g1", tool_transcript="ok"),
+            "task-2": GroupInvestigation(group_id="g2", tool_transcript="ok"),
         }
         evals = [
             QAEvaluation(task_id="task-1", passed=True),
@@ -781,8 +773,8 @@ class TestRunQACriticNodeMapReduce:
     def test_guardrails_fill_missing_eval(self):
         g1, g2 = _make_group("g1"), _make_group("g2")
         invs = {
-            "task-1": GroupInvestigation("g1", "ok", "", task_id="task-1"),
-            "task-2": GroupInvestigation("g2", "ok", "", task_id="task-2"),
+            "task-1": GroupInvestigation(group_id="g1", tool_transcript="ok"),
+            "task-2": GroupInvestigation(group_id="g2", tool_transcript="ok"),
         }
         evals = [QAEvaluation(task_id="task-1", passed=True)]
         result, _, _ = self._run([g1, g2], investigations=invs, evaluations=evals)
@@ -795,10 +787,8 @@ class TestRunQACriticNodeMapReduce:
         g = _make_group()
         invs = {
             "task-1": GroupInvestigation(
-                g.group_id,
-                "fallback",
-                "",
-                task_id="task-1",
+                group_id=g.group_id,
+                tool_transcript="fallback",
                 errors=["investigator timed out"],
             )
         }
@@ -832,20 +822,6 @@ def _task_context(
 
 
 class TestGroupScanAttribution:
-    def test_group_scan_status_is_cleared_when_other_group_is_still_flagged(self):
-        group_a = _make_group(group_id="group-a", cve_ids=["CVE-2021-1111"], ghsa_ids=[])
-        group_b = _make_group(group_id="group-b", cve_ids=["CVE-2021-2222"], ghsa_ids=[])
-        scan_result = _SecurityScanResult(
-            ok=False,
-            summary="target vulnerabilities remain",
-            remaining_identifiers={"CVE-2021-1111"},
-            found_identifiers={"CVE-2021-1111"},
-            new_identifiers=set(),
-        )
-
-        assert _group_scan_status(scan_result, group_a) == "still_flagged"
-        assert _group_scan_status(scan_result, group_b) == "cleared"
-
     def test_investigator_prompt_excludes_unrelated_global_findings(self):
         group = _make_group(group_id="group-a")
         results = _make_fully_populated_results(ok=True)
@@ -865,7 +841,7 @@ class TestGroupScanAttribution:
             complete=True,
         )
 
-        investigator_prompt = _build_individual_investigator_prompt(
+        investigator_prompt = _build_qa_dynamic_context(
             task_id="task-a",
             group=group,
             strategy="version_bump",
@@ -1146,12 +1122,12 @@ class TestRunGlobalExecution:
         assert results.tests is not None
 
 
-class TestBuildIndividualInvestigatorPrompt:
+class TestBuildQADynamicContext:
     def _prompt(self, group=None, remaining=None):
         if group is None:
             group = _make_group()
         results = _make_fully_populated_results(ok=True)
-        return _build_individual_investigator_prompt(
+        return _build_qa_dynamic_context(
             task_id=f"{group.group_id}-task",
             group=group,
             strategy="version_bump",
@@ -1166,16 +1142,7 @@ class TestBuildIndividualInvestigatorPrompt:
         assert "my-group" in self._prompt(group=g)
 
     def test_python_language_and_pytest_evidence_are_explicit(self):
-        prompt = _build_individual_investigator_prompt(
-            task_id="task-python",
-            group=_make_group(),
-            strategy="code_workaround",
-            results=_make_fully_populated_results(ok=False),
-            group_remaining_ids=[],
-            candidate_changed_files=["src/app.py"],
-            action_summaries=[],
-            project_language=ProjectLanguage.PYTHON,
-        )
+        prompt = _build_qa_evaluator_system_prompt(ProjectLanguage.PYTHON)
 
         assert "Canonical project language: python (Python)." in prompt
         assert "Interpret pytest failures as Python unit-test evidence." in prompt
@@ -1187,18 +1154,15 @@ class TestBuildIndividualInvestigatorPrompt:
         assert "package.json" in p
 
     def test_instructs_not_to_call_execution_tools(self):
-        prompt = self._prompt(
-            group=_make_group(),
-            remaining=["CVE-2021-23337"],
-        )
+        prompt = _build_qa_evaluator_system_prompt(ProjectLanguage.NODEJS)
         lower = prompt.lower()
         assert "never execute" in lower
         assert "free-form" in lower
         assert "emit_qa_evaluation" in lower
         assert "use responsible, exonerated, or inconclusive" not in lower
-        assert "responsible_group_ids must be a non-empty list" in lower
-        assert "exact failed test names" in lower
-        assert "do not blame every group in a batch" in lower
+        assert "exact failed test names" in self._prompt().lower()
+        assert "do not blame every group in a batch" in self._prompt().lower()
+        assert "responsible_group_ids must be a non-empty list" in self._prompt().lower()
 
         description = _build_qa_terminal_tool().description
         for enum_type in (FailureCategory, SecurityReviewVerdict, TestAttributionVerdict):
@@ -1226,7 +1190,7 @@ class TestBuildIndividualInvestigatorPrompt:
         results.install_error_category = "PEER_CONFLICT"
         results.install_raw_stdout = "RAW INSTALL STDOUT " * 100
         results.install_raw_stderr = "RAW INSTALL STDERR " * 100
-        prompt = _build_individual_investigator_prompt(
+        prompt = _build_qa_dynamic_context(
             task_id="task-1",
             group=_make_group(),
             strategy="version_bump",
@@ -1246,7 +1210,7 @@ class TestBuildIndividualInvestigatorPrompt:
 
     def test_prompt_reports_tuple_execution_statuses_and_singleton_scope(self):
         results = _make_fully_populated_results(ok=True)
-        prompt = _build_individual_investigator_prompt(
+        prompt = _build_qa_dynamic_context(
             task_id="task-1",
             group=_make_group(),
             strategy="version_bump",
@@ -1269,7 +1233,7 @@ class TestBuildIndividualInvestigatorPrompt:
             summary="large action summary " * 500,
         )
         prompt = self._prompt()
-        bounded_prompt = _build_individual_investigator_prompt(
+        bounded_prompt = _build_qa_dynamic_context(
             task_id="task-1",
             group=_make_group(),
             strategy="version_bump",
@@ -1672,10 +1636,9 @@ class TestRunIndividualInvestigations:
                 task_policies={"task-1": None},
             )
         assert invs["task-1"].errors
-        assert "Fallback" in invs["task-1"].investigation_text
         assert invs["task-1"].evaluation is not None
         assert invs["task-1"].evaluation.contract_error is True
-        assert invs["task-1"].evaluation.contract_error_reason
+        assert "crashed" in invs["task-1"].evaluation.contract_error_reason
 
     def test_empty_output_triggers_fallback(self):
         group = _make_group(group_id="g1")
@@ -1703,7 +1666,6 @@ class TestRunIndividualInvestigations:
                 task_policies={"task-1": None},
             )
         assert invs["task-1"].errors
-        assert invs["task-1"].investigation_text == ""
         assert invs["task-1"].fallback is True
         assert invs["task-1"].evaluation is not None
         assert invs["task-1"].evaluation.contract_error is True
@@ -1954,8 +1916,6 @@ class TestApplyGuardrails:
         )
         investigation = GroupInvestigation(
             group_id=group.group_id,
-            task_id="task-1",
-            investigation_text="source review",
             tool_transcript="read_file_context",
             source_review_evidence=True,
             structured_review_verdict=SecurityReviewVerdict.PASS,

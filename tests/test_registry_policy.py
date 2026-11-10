@@ -16,7 +16,6 @@ import remediation_engine.tools.registry as pypi
 from remediation_engine.agents.supervisor_policy import (
     _canonical_security_floor,
     _next_sca_stage,
-    _selection_for_stage,
 )
 from remediation_engine.contracts.schemas import (
     FixPlan,
@@ -288,7 +287,12 @@ def test_attempted_versions_are_normalized_before_candidate_role_selection():
             "1.4.0",
             {"1.4.0", "v1.4.1"},
         )
-        safe_version = pypi.select_python_safe_version("demo", "1.4.0", {"1.4.0"})
+        safe_candidates = pypi.fetch_pypi_registry_candidates("demo", "1.4.0", {"1.4.0"})
+        safe_version = select_version(
+            safe_candidates,
+            SCARemediationStage.OSV_MINIMUM,
+            set(),
+        )
 
     assert [candidate.version for candidate in candidates] == ["2.0.0"]
     assert candidates[0].selection_roles == ("osv_minimum", "pypi_latest")
@@ -336,12 +340,19 @@ def test_version_helpers_and_requires_dist_normalize_the_release_request():
         "get",
         side_effect=[
             _response(package_metadata),
-            _response(package_metadata),
             _response(release_metadata),
         ],
     ) as get:
-        assert pypi.get_pypi_versions("Example_Pkg.Name")[0] == "1.3.9"
-        assert pypi.get_pypi_latest_version("Example_Pkg.Name") == "2.0.0"
+        candidates = pypi.fetch_pypi_registry_candidates("Example_Pkg.Name", "1.4.0")
+        assert candidates[0].version == "1.4.0"
+        assert (
+            next(
+                candidate.version
+                for candidate in candidates
+                if "pypi_latest" in candidate.selection_roles
+            )
+            == "2.0.0"
+        )
         assert pypi.get_pypi_release_requires_dist("Example_Pkg.Name", "1.0") == ["child_pkg>=2.0"]
 
     assert get.call_args_list[-1].args[0] == "https://pypi.org/pypi/example-pkg-name/1.0/json"
@@ -669,8 +680,6 @@ def test_pypi_stage_chain_never_enters_npm_override():
     assert _next_sca_stage(SCARemediationStage.PACKAGE_OVERRIDE, ecosystem="pypi") == (
         SCARemediationStage.CODE_WORKAROUND
     )
-    assert _selection_for_stage(SCARemediationStage.PYPI_SAME_MAJOR) == "same_major"
-    assert _selection_for_stage(SCARemediationStage.PYPI_LATEST) == "latest"
 
 
 def test_default_npm_stage_progression_is_unchanged():

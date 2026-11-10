@@ -54,7 +54,6 @@ from remediation_engine.contracts.version_policy import (
     compare_maven_versions,
     is_stable_maven_version,
 )
-from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.state import select_package_fix_plan
 from remediation_engine.settings import AppSettings
 from remediation_engine.solver.cpsat import _as_domain as _normalize_solver_candidate_domain
@@ -579,79 +578,6 @@ def _active_tasks(task_queue: Mapping[str, RemediationTask]) -> list[Remediation
         else:
             result.append(max(tasks, key=lambda task: (task.task_revision, task.task_id)))
     return sorted(result, key=lambda task: task.task_id)
-
-
-def prepare_portfolio_inputs(
-    repo_root: str | Path,
-    groups: Iterable[VulnerabilityGroup],
-    task_queue: Mapping[str, RemediationTask],
-    target_packages: Iterable[str] | None = None,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
-) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
-    """Create missing finding tasks and synthetic direct-dependency tasks copy-on-write.
-
-    Args:
-        repo_root: Repository whose manifests and lockfiles define the portfolio scope.
-        groups: Post-triage groups to prepare.
-        task_queue: Existing immutable task projection.
-        target_packages: Optional development package allowlist. ``None`` or an
-            empty iterable preserves full-repository synthetic discovery.
-        project_language: Language selected by the workspace setup boundary.
-
-    Returns:
-        ``(groups, task_queue, diagnostics)`` containing detached Pydantic objects.
-    """
-    prepared_groups = [group.model_copy(deep=True) for group in groups]
-    prepared_queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
-    missing_plan_diagnostic = _missing_sca_plan_diagnostic(prepared_groups)
-    if missing_plan_diagnostic:
-        return prepared_groups, prepared_queue, [missing_plan_diagnostic]
-
-    from remediation_engine.orchestration.state import build_initial_remediation_task
-
-    represented = {task.parent_group_id for task in prepared_queue.values()}
-    next_index = 1
-    for group in sorted(prepared_groups, key=lambda item: item.group_id):
-        if group.group_id in represented:
-            continue
-        while f"task-{next_index}" in prepared_queue:
-            next_index += 1
-        task_id = f"task-{next_index}"
-        language = (
-            ProjectLanguage.JAVA if _group_manager(group) == "maven" else ProjectLanguage.NODEJS
-        )
-        prepared_queue[task_id] = build_initial_remediation_task(
-            group, task_id, project_language=language
-        )
-        represented.add(group.group_id)
-        next_index += 1
-
-    if project_language == ProjectLanguage.PYTHON:
-        # Python portfolio discovery is finding-backed and declaration-scoped.
-        # Do not pass a requirements-only repository through the npm synthetic
-        # dependency materializer or invent package-lock occurrence identities.
-        return prepared_groups, prepared_queue, []
-
-    # A pure SAST portfolio must stay on the existing code-remediation path.
-    # Synthetic npm coordination is meaningful only when triage supplied an SCA
-    # seed; otherwise a package.json would accidentally turn a SAST-only run
-    # into a dependency portfolio.
-    if not any(group.issue_type == IssueType.SCA for group in prepared_groups):
-        return prepared_groups, prepared_queue, []
-
-    # The retained helper is copy-on-write and preserves synthetic identity,
-    # refresh deferral, and idempotence.  It is invoked only at this outer
-    # boundary; the inner Supervisor never calls it.
-    from remediation_engine.planning.portfolio import (
-        materialize_synthetic_dependency_tasks,
-    )
-
-    return materialize_synthetic_dependency_tasks(
-        repo_root,
-        prepared_groups,
-        prepared_queue,
-        target_packages=target_packages,
-    )
 
 
 def _issue_identity(issue: Any) -> str:
@@ -4214,4 +4140,4 @@ def apply_portfolio_plan(
     return prepared_groups, committed, sorted(set(diagnostics))
 
 
-__all__ = ["apply_portfolio_plan", "build_portfolio_plan", "prepare_portfolio_inputs"]
+__all__ = ["apply_portfolio_plan", "build_portfolio_plan"]

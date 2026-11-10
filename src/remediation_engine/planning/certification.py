@@ -1711,31 +1711,6 @@ def _last_qa_passed_prefix_provenance(
     )
 
 
-def _last_qa_passed_prefix_digest(
-    prior_plan: PortfolioPlan | None,
-    task_queue: Mapping[str, RemediationTask],
-    request: PortfolioReplanRequest | None,
-    host_repository_fingerprint: str,
-    *,
-    qa_results_by_attempt: Mapping[str, QAAttemptResult] | None = None,
-    attempt_snapshots_by_id: Mapping[str, Any] | None = None,
-    qa_passed_workspace_prefix: QAPassedWorkspacePrefix | None = None,
-    diagnostics: list[str] | None = None,
-) -> str | None:
-    """Return only the graph digest from verified QA-passed prefix provenance."""
-    prefix = _last_qa_passed_prefix_provenance(
-        prior_plan,
-        task_queue,
-        request,
-        host_repository_fingerprint,
-        qa_results_by_attempt=qa_results_by_attempt,
-        attempt_snapshots_by_id=attempt_snapshots_by_id,
-        qa_passed_workspace_prefix=qa_passed_workspace_prefix,
-        diagnostics=diagnostics,
-    )
-    return prefix.graph_digest if prefix is not None else None
-
-
 def _assert_workspace_matches_host(
     host_snapshot: NpmGraphSnapshot,
     workspace_snapshot: NpmGraphSnapshot,
@@ -2564,22 +2539,39 @@ def _certify_assignment(
             batch_id for batch_id in sorted(batches_by_id) if batch_id not in set(ordered_batch_ids)
         )
         audit_only_batch_ids: set[str] = set()
+        has_active_audit_only_batch = False
         executable_batch_count = 0
         for batch in selected_plan.batches:
             if batch.dispatchable:
                 executable_batch_count += 1
                 continue
-            terminal_only_batch = bool(batch.task_ids) and all(
-                (target := targets_by_task.get(task_id)) is not None and target.is_terminal
+            audit_only_batch = bool(batch.task_ids) and all(
+                (target := targets_by_task.get(task_id)) is not None
+                and (
+                    target.is_terminal
+                    or (
+                        not target.eligible_for_atomic_update
+                        and target.strategy in {"code_workaround", "no_fix"}
+                    )
+                )
                 for task_id in batch.task_ids
             )
-            if batch.mutations or not terminal_only_batch:
+            if batch.mutations or not audit_only_batch:
                 raise _CertificationUnknown(
                     "selected plan contains a non-dispatchable batch that is not terminal-only"
                 )
             audit_only_batch_ids.add(batch.batch_id)
+            has_active_audit_only_batch = has_active_audit_only_batch or any(
+                (target := targets_by_task.get(task_id)) is not None
+                and not target.is_terminal
+                and not target.eligible_for_atomic_update
+                and target.strategy in {"code_workaround", "no_fix"}
+                for task_id in batch.task_ids
+            )
         if executable_batch_count == 0:
-            raise _CertificationUnknown("selected plan contains no executable package batch")
+            if not has_active_audit_only_batch:
+                raise _CertificationUnknown("selected plan contains no executable package batch")
+            resolved_snapshot = archived_snapshot
 
         for batch_id in ordered_batch_ids:
             if batch_id in audit_only_batch_ids:
@@ -4247,6 +4239,8 @@ def build_certified_portfolio_plan(
                     for target in prepared.targets
                     if target.eligible_for_atomic_update
                 }
+                rejected_count_before = len(rejected_digests)
+                candidate_plan_diagnostics: list[str] = []
                 restart_after_learned_cut = False
                 for candidate in solver_plan.candidate_plans:
                     if candidate.status not in accepted_solver_statuses:
@@ -4375,6 +4369,14 @@ def build_certified_portfolio_plan(
                         break
 
                     if result.status == PackageResolutionStatus.UNKNOWN:
+                        if any(
+                            "selected plan contains a non-dispatchable batch that is not terminal-only"
+                            in diagnostic
+                            for diagnostic in result.diagnostics
+                        ):
+                            candidate_plan_diagnostics.extend(result.diagnostics)
+                            last_rejected_plan_id = selected_plan.candidate_plan_id
+                            continue
                         return unknown_certificate(
                             candidate_solver_plan,
                             result.diagnostics,
@@ -4408,6 +4410,14 @@ def build_certified_portfolio_plan(
 
                 if restart_after_learned_cut:
                     continue
+                if len(rejected_digests) > rejected_count_before:
+                    continue
+                if candidate_plan_diagnostics:
+                    return unknown_certificate(
+                        solver_plan,
+                        candidate_plan_diagnostics,
+                        candidate_plan_id=last_rejected_plan_id,
+                    )
     except _CertificationUnknown as exc:
         metrics["unknown_count"] += 1
         last_rejection_summary = locals().get("last_rejection_summary")

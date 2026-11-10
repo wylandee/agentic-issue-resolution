@@ -189,10 +189,14 @@ def test_triage_issues_binds_injected_settings_and_leaves_fix_planning_to_superv
     assert get_bound_runtime_settings() is None
 
 
-def test_run_remediation_reports_completed_with_errors(tmp_path: Path) -> None:
+@pytest.mark.parametrize("initial_status", ["completed", "triage_completed_no_work"])
+def test_run_remediation_reports_completed_with_errors(
+    tmp_path: Path,
+    initial_status: str,
+) -> None:
     """A teardown completion with worker errors is not reported as success."""
     request = RemediationRequest(repo_root=tmp_path)
-    state = {"status": "completed", "errors": ["worker surrendered"]}
+    state = {"status": initial_status, "errors": ["worker surrendered"]}
     with patch("remediation_engine.api.run_orchestrator", return_value=state):
         result = run_remediation(request)
 

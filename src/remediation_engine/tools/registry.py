@@ -25,13 +25,11 @@ from requests import RequestException
 from semantic_version import NpmSpec
 from semantic_version import Version as NpmVersion
 
-from remediation_engine.contracts.schemas import SCARemediationStage
 from remediation_engine.contracts.version_policy import (
     MavenRegistryCandidate,
     RegistryCandidate,
     compare_maven_versions,
     is_stable_maven_version,
-    select_version,
 )
 from remediation_engine.tools.identity import normalize_python_package_name
 from remediation_engine.tools.npm import _normalize_npm_operator_whitespace
@@ -1209,34 +1207,6 @@ def _candidates_from_data(
     return candidates[:_MAX_CANDIDATE_RELEASES]
 
 
-def get_pypi_versions(package_name: str) -> list[str]:
-    """Return raw release keys advertised by the normalized PyPI project."""
-    data = _fetch_json(package_name)
-    releases = data.get("releases")
-    if not isinstance(releases, dict):
-        raise ValueError("MALFORMED PYPI METADATA: 'releases' must be an object.")
-    return [str(version) for version in releases]
-
-
-def get_pypi_latest_version(package_name: str) -> str | None:
-    """Return the highest stable release with at least one non-yanked file."""
-    data = _fetch_json(package_name)
-    release_files = _release_file_evidence(data)
-    if not release_files:
-        return None
-    return str(max(Version(version) for version in release_files))
-
-
-def select_python_safe_version(
-    package_name: str,
-    security_floor: str,
-    attempted_versions: set[str] | None = None,
-) -> str | None:
-    """Return the lowest unattempted stable PyPI version meeting the floor."""
-    candidates = fetch_pypi_registry_candidates(package_name, security_floor, attempted_versions)
-    return select_version(candidates, SCARemediationStage.OSV_MINIMUM, set())
-
-
 def fetch_pypi_registry_candidates(
     package_name: str,
     security_floor: str,
@@ -1435,9 +1405,6 @@ __all__ = [
     "plan_npm_parent_version",
     "fetch_maven_registry_candidates",
     "fetch_pypi_registry_candidates",
-    "get_pypi_latest_version",
     "get_pypi_release_requires_dist",
-    "get_pypi_versions",
     "plan_python_parent_version",
-    "select_python_safe_version",
 ]

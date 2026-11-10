@@ -104,8 +104,6 @@ _DIFF_EXCLUDE_DIRS = frozenset(
 _DIFF_EXCLUDE_SUFFIXES = frozenset({".map", ".lock"})
 _DIFF_EXCLUDE_NAMES = frozenset({_ODC_REPORT_NAME, _ODC_HTML_REPORT_NAME})
 _QA_ACTION_SUMMARY_MAX_CHARS = 1_200
-_BULLET_LABEL_RE = re.compile(r"^- ([^:]+):\s*(.*)$")
-_REPORT_PREFIX = "# INVESTIGATIVE REPORT"
 _MAVEN_DEPENDENCY_TREE_TIMEOUT_SECONDS = 120
 _MAVEN_DEPENDENCY_TREE_GOAL = "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree"
 _MAVEN_DEPENDENCY_COPY_TIMEOUT_SECONDS = 180
@@ -514,7 +512,7 @@ def _generate_workspace_diff(
     full_diff = "\n".join(diff_parts)
     if not full_diff:
         empty_diff = (
-            "(diff is empty â€” workspace matches host baseline for all candidate files)",
+            "(diff is empty — workspace matches host baseline for all candidate files)",
             changed_files,
         )
         if blocked_paths:
@@ -539,46 +537,6 @@ def _generate_workspace_diff(
         )
 
     return full_diff, changed_files
-
-
-def _workspace_remediation_fingerprint(
-    host_repo_root: str | None,
-    sandbox: DockerSandbox,
-    candidate_changed_files: Sequence[str],
-) -> str:
-    """Return a stable digest of candidate files changed inside the workspace.
-
-    Args:
-        host_repo_root: Optional repository baseline used for the file diff.
-        sandbox: Active remediation workspace volume.
-        candidate_changed_files: Repository-relative candidate paths reported by workers.
-
-    Returns:
-        SHA-256 digest of the changed-path list and bounded unified diff.
-
-    Side Effects:
-        Reads candidate files from the sandbox and host repository; neither is modified.
-    """
-    candidates = [path for path in candidate_changed_files if isinstance(path, str)]
-    if host_repo_root:
-        try:
-            diff_text, changed_files = _generate_workspace_diff(
-                host_repo_root,
-                sandbox,
-                candidates,
-            )
-        except Exception as exc:  # noqa: BLE001 - fingerprinting must not abort QA
-            logger.warning("qa_runtime: workspace fingerprint failed: %s", exc)
-            diff_text = ""
-            changed_files = sorted(set(candidates))
-    else:
-        diff_text = ""
-        changed_files = sorted(set(candidates))
-
-    payload = {"changed_files": sorted(set(changed_files)), "diff": diff_text}
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
 
 
 def _collect_target_identifiers(groups: list[VulnerabilityGroup]) -> set[str]:
@@ -3503,29 +3461,6 @@ def _derive_qa_task_policies(
         else:
             policies[task_id] = normalized_snapshot_policy
     return policies
-
-
-def _group_scan_status(
-    scan_result: _SecurityScanResult | None,
-    group: VulnerabilityGroup,
-    *,
-    scan_skipped: bool = False,
-) -> str:
-    """Classify the scanner outcome for one group from deterministic results."""
-    if scan_skipped:
-        return "skipped"
-    if scan_result is None:
-        return "scan_failed"
-
-    scan_ok = bool(_scan_result_value(scan_result, "ok", False))
-    remaining_identifiers = set(
-        _scan_result_value(scan_result, "remaining_identifiers", set()) or set()
-    )
-    if group_target_identifiers(group) & remaining_identifiers:
-        return "still_flagged"
-    if remaining_identifiers or scan_ok:
-        return "cleared"
-    return "scan_failed"
 
 
 def _targeted_extra_args_conflict() -> bool:

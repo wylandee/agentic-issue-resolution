@@ -305,11 +305,11 @@ def test_all_golden_datasets_load_and_validate() -> None:
         if name == "supervisor_cases":
             supervisor_cases = cases
 
-    assert counts["fix_planner_cases"] == 18
+    assert len(GOLDEN_DATASET_NAMES) == 7
     assert counts["qa_cases"] == 31
     assert counts["triage_cases"] == 20
     assert counts["update_subagent_cases"] == 22
-    assert counts["supervisor_cases"] == 17
+    assert counts["supervisor_cases"] == 20
     supervisor_ids = {case["case_id"] for case in supervisor_cases}
     assert {
         "supervisor-direct-version-bump-clean",
@@ -334,7 +334,7 @@ def test_all_golden_datasets_load_and_validate() -> None:
         "python-supervisor-pyjwt-workaround-pivot",
         "python-supervisor-inconclusive-qa-suppressed",
     } <= supervisor_ids
-    assert len(supervisor_ids) == 17
+    assert len(supervisor_ids) == 20
 
 
 def test_live_replay_datasets_have_structured_replay_inputs() -> None:

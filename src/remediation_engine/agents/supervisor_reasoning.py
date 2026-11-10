@@ -451,7 +451,6 @@ def _supervisor_plan_parent_version(inputs: dict[str, Any], ecosystem: str) -> s
     return _supervisor_plan_npm_parent_version(inputs)
 
 
-_MAX_DIAGNOSTIC_BASIS_CHARS = 1200
 _FORBIDDEN_WORKAROUND_TARGET_BASENAMES = frozenset(
     {
         "package.json",
@@ -3021,7 +3020,7 @@ def _materialize_spawn_requests(
 ) -> tuple[dict[str, RemediationTask], dict[str, list[str]]]:
     """Validate and materialize spawn requests into new RemediationTask objects.
 
-    Returns a dict of new task_id â†’ RemediationTask to be merged into task_queue.
+    Returns a dict of new task_id → RemediationTask to be merged into task_queue.
     Rejected requests are logged to errors.  A repeated parent/strategy pivot
     reuses its existing child and is not treated as an error.
     """
@@ -3038,21 +3037,21 @@ def _materialize_spawn_requests(
         # Guard: unknown parent task
         if req.parent_task_id not in task_queue:
             errors.append(
-                f"supervisor: spawn rejected â€” parent task '{req.parent_task_id}' not in queue."
+                f"supervisor: spawn rejected — parent task '{req.parent_task_id}' not in queue."
             )
             continue
 
         parent_task = task_queue[req.parent_task_id]
 
         # Guard: CODE_WORKAROUND tasks must not spawn CODE_WORKAROUND children.
-        # Workaround tasks are terminal remediation strategies â€” exhausted
+        # Workaround tasks are terminal remediation strategies — exhausted
         # workarounds should be marked UNFIXABLE, not recursively respawned.
         if (
             parent_task.strategy == RoutingStrategy.CODE_WORKAROUND
             and req.strategy == RoutingStrategy.CODE_WORKAROUND
         ):
             errors.append(
-                f"supervisor: spawn rejected â€” CODE_WORKAROUND parent '{req.parent_task_id}' "
+                f"supervisor: spawn rejected — CODE_WORKAROUND parent '{req.parent_task_id}' "
                 f"cannot spawn another CODE_WORKAROUND child. Workaround tasks are terminal "
                 f"remediation strategies."
             )
@@ -3090,7 +3089,7 @@ def _materialize_spawn_requests(
         child_depth = parent_task.ancestry_depth + 1
         if child_depth > MAX_ANCESTRY_DEPTH:
             errors.append(
-                f"supervisor: spawn rejected â€” parent '{req.parent_task_id}' at depth "
+                f"supervisor: spawn rejected — parent '{req.parent_task_id}' at depth "
                 f"{parent_task.ancestry_depth}, child would be depth {child_depth} "
                 f"which exceeds MAX_ANCESTRY_DEPTH={MAX_ANCESTRY_DEPTH}."
             )
@@ -3099,7 +3098,7 @@ def _materialize_spawn_requests(
         # Guard: queue size cap
         if current_queue_size + len(new_tasks) + 1 > MAX_TASK_QUEUE_SIZE:
             errors.append(
-                f"supervisor: spawn rejected â€” queue would exceed MAX_TASK_QUEUE_SIZE="
+                f"supervisor: spawn rejected — queue would exceed MAX_TASK_QUEUE_SIZE="
                 f"{MAX_TASK_QUEUE_SIZE}. Rejected spawn for parent '{req.parent_task_id}'."
             )
             continue
@@ -3201,7 +3200,7 @@ def _materialize_spawn_requests(
         new_tasks[child_task_id] = new_task
         child_ids_by_parent.setdefault(req.parent_task_id, []).append(child_task_id)
         logger.info(
-            "supervisor: spawned child task '%s' (parent='%s', depth=%d, strategy=%s) â€” %s",
+            "supervisor: spawned child task '%s' (parent='%s', depth=%d, strategy=%s) — %s",
             child_task_id,
             req.parent_task_id,
             child_depth,

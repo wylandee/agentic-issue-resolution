@@ -2,6 +2,7 @@ import type {
   ConsoleEvent,
   DashboardUpdate,
   ReportResponse,
+  RunStatus,
   RunState,
   WorkspaceInfo,
 } from "./types";
@@ -149,7 +150,11 @@ export interface StreamHandlers {
   onInitialSync?: (state: RunState) => void;
   onConsoleEvent?: (event: ConsoleEvent) => void;
   onDashboardUpdate?: (update: DashboardUpdate) => void;
-  onRunStatus?: (statusData: { status: string; current_node?: string; report_available?: boolean }) => void;
+  onRunStatus?: (statusData: {
+    status: RunStatus;
+    current_node?: string;
+    report_available?: boolean;
+  }) => void;
   onError?: (err: Event) => void;
 }
 

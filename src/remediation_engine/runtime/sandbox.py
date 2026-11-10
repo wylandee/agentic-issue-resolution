@@ -45,10 +45,16 @@ def get_docker_client() -> Any:
         ) from exc
 
     logger.info("Docker: connecting to Docker daemon.")
+    client = None
     try:
         client = docker.from_env()
         client.ping()
     except Exception as exc:  # noqa: BLE001 - normalize SDK boundary failures
+        if client is not None:
+            try:
+                close_docker_client(client)
+            except Exception as close_exc:  # noqa: BLE001 - preserve the connection error
+                logger.warning("Docker client close failed after connection error: %s", close_exc)
         logger.error("Docker daemon unreachable: %s", exc)
         raise RuntimeError(f"Docker daemon unreachable: {exc}") from exc
     return client
@@ -493,6 +499,7 @@ class DockerSandbox:
         """
         container = self._container
         client = self._client
+        removed = container is None
         try:
             if container is not None:
                 try:
@@ -502,17 +509,24 @@ class DockerSandbox:
                 try:
                     container.remove(force=True)
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("DockerSandbox: container removal skipped: %s", exc)
-                logger.info("DockerSandbox: container %r removed.", self._container_name)
+                    logger.warning(
+                        "DockerSandbox: container %r removal failed; cleanup can be retried: %s",
+                        self._container_name,
+                        exc,
+                    )
+                else:
+                    removed = True
+                    logger.info("DockerSandbox: container %r removed.", self._container_name)
         finally:
-            self._container = None
             self._alive = False
-            self._client = None
             self.invalidate_read_cache("sandbox_teardown")
-            try:
-                close_docker_client(client)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("DockerSandbox: Docker client close failed: %s", exc)
+            if removed:
+                self._container = None
+                self._client = None
+                try:
+                    close_docker_client(client)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("DockerSandbox: Docker client close failed: %s", exc)
 
     def __enter__(self) -> DockerSandbox:
         self.start()
@@ -641,7 +655,7 @@ class DockerSandbox:
 
         if thread.is_alive():
             logger.error(
-                "DockerSandbox: command %r timed out after %ds â€” killing container.",
+                "DockerSandbox: command %r timed out after %ds — killing container.",
                 command,
                 timeout,
             )
@@ -658,7 +672,7 @@ class DockerSandbox:
             err_msg = str(exc)
             if "timed out" in err_msg.lower() or "timeout" in err_msg.lower():
                 logger.error(
-                    "DockerSandbox: command %r timed out after %ds â€” killing container.",
+                    "DockerSandbox: command %r timed out after %ds — killing container.",
                     command,
                     timeout,
                 )
@@ -670,7 +684,7 @@ class DockerSandbox:
                     duration_seconds=round(duration, 3),
                 )
 
-            logger.error("DockerSandbox: unexpected error running %r â€” %s", command, exc)
+            logger.error("DockerSandbox: unexpected error running %r — %s", command, exc)
             return CommandResult(
                 exit_code=1,
                 stdout="",
@@ -833,10 +847,13 @@ class DockerSandbox:
         *,
         containment_checked: bool = False,
         regular_only: bool = False,
+        strict_read: bool = False,
     ) -> bytes | None:
         """Read one normalized file without creating a trace span."""
         if not self._alive or self._container is None:
             logger.warning("DockerSandbox.read_file: sandbox is not running.")
+            if strict_read:
+                raise RuntimeError("DockerSandbox: cannot read patch input from a stopped sandbox.")
             return None
         abs_path = f"/workspace/{relative_path}"
         try:
@@ -846,6 +863,19 @@ class DockerSandbox:
         except WorkspacePathError:
             raise
         except Exception as exc:  # noqa: BLE001
+            if strict_read:
+                error_name = exc.__class__.__name__.replace("_", "").lower()
+                status_code = getattr(exc, "status_code", None)
+                detail = str(exc).lower()
+                if (
+                    error_name == "notfound"
+                    or status_code == 404
+                    or "no such file or directory" in detail
+                ):
+                    return None
+                raise RuntimeError(
+                    f"DockerSandbox: failed to read patch input {relative_path}: {exc}"
+                ) from exc
             logger.warning("DockerSandbox.read_file: could not retrieve %s — %s", abs_path, exc)
             return None
         raw = b"".join(chunk for chunk in stream)
@@ -854,20 +884,39 @@ class DockerSandbox:
                 members = tf.getmembers()
                 member = members[0] if members else None
                 if member is None or (regular_only and not member.isfile()):
+                    if strict_read:
+                        raise RuntimeError(
+                            f"DockerSandbox: patch input archive did not contain a regular file: {relative_path}"
+                        )
                     logger.warning("DockerSandbox.read_file: %s is not a regular file.", abs_path)
                     return None
                 extracted = tf.extractfile(member)
                 if extracted is None:
+                    if strict_read:
+                        raise RuntimeError(
+                            f"DockerSandbox: patch input is not a regular file: {relative_path}"
+                        )
                     logger.warning("DockerSandbox.read_file: %s is not a regular file.", abs_path)
                     return None
                 return extracted.read()
         except Exception as exc:  # noqa: BLE001
+            if strict_read:
+                raise RuntimeError(
+                    f"DockerSandbox: failed to extract patch input {relative_path}: {exc}"
+                ) from exc
             logger.warning("DockerSandbox.read_file: failed to extract %s — %s", abs_path, exc)
             return None
 
-    def read_file(self, file_path: str) -> str | None:
+    def read_file(self, file_path: str, *, strict: bool = False) -> str | None:
         """Read one workspace file through the bounded, revision-aware cache."""
         relative_path = normalize_workspace_path(file_path)
+        if strict:
+            content = self._read_file_bytes_untraced(
+                relative_path,
+                regular_only=True,
+                strict_read=True,
+            )
+            return content.decode("utf-8", errors="replace") if content is not None else None
         return self._read_cache.get_or_load(
             self._read_scope,
             relative_path,

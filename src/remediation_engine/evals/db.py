@@ -636,9 +636,18 @@ class EvalDatabase:
             status_a = ca["status"] if ca else "N/A"
             status_b = cb["status"] if cb else "N/A"
 
-            # Primary metric scores if available
-            score_a = ca["metrics"][0]["score"] if ca and ca.get("metrics") else None
-            score_b = cb["metrics"][0]["score"] if cb and cb.get("metrics") else None
+            metrics_a = ca["metrics"] if ca else []
+            metrics_b = cb["metrics"] if cb else []
+            metric_names_a = {metric["metric_name"] for metric in metrics_a}
+            common_metric_b = next(
+                (metric for metric in metrics_b if metric["metric_name"] in metric_names_a), None
+            )
+            metric_name = common_metric_b["metric_name"] if common_metric_b else None
+            score_a = next(
+                (metric["score"] for metric in metrics_a if metric["metric_name"] == metric_name),
+                None,
+            )
+            score_b = common_metric_b["score"] if common_metric_b else None
             score_delta = (
                 round(score_b - score_a, 4)
                 if (score_a is not None and score_b is not None)
@@ -650,6 +659,7 @@ class EvalDatabase:
                 "suite": (cb or ca)["suite"],
                 "status_a": status_a,
                 "status_b": status_b,
+                "metric_name": metric_name,
                 "score_a": score_a,
                 "score_b": score_b,
                 "score_delta": score_delta,

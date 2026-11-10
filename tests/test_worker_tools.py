@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -21,16 +22,13 @@ from remediation_engine.language import ProjectLanguage
 from remediation_engine.tools.npm_mutations import _is_prohibited_target
 from remediation_engine.tools.validation import (
     _make_run_targeted_python_test_tool,
-    _make_validate_python_syntax_tool,
-    _make_validate_python_workaround_tool,
-)
-from remediation_engine.tools.workers import (
-    _make_deterministic_replace_ast_symbol_tool,
-    _make_deterministic_search_replace_tool,
-    _make_read_repository_map_tool,
     _make_run_targeted_test_tool,
     _make_validate_code_syntax_tool,
+    _make_validate_python_syntax_tool,
+    _make_validate_python_workaround_tool,
     _make_validate_workaround_tool,
+)
+from remediation_engine.tools.workers import (
     build_multi_package_update_toolbelt,
     build_update_toolbelt,
     build_workaround_toolbelt,
@@ -38,7 +36,9 @@ from remediation_engine.tools.workers import (
 from remediation_engine.tools.workspace import (
     _is_authoritative_evidence_source,
     _is_test_file_path,
+    _make_read_repository_map_tool,
     _make_read_web_page_tool,
+    _make_read_workspace_file_tool,
     _runtime_smoke_bootstrap_reason,
     _runtime_smoke_path_error,
 )
@@ -833,68 +833,6 @@ class TestToolbeltFactories:
         assert "jwksRsa is not defined" in result
         assert sandbox.run.call_count == 3
 
-    def test_ast_tool_accepts_complete_arrow_declaration_replacement(self):
-        """Arrow symbols may be replaced with their complete exported declaration."""
-
-        class FakeNode:
-            def __init__(self, node_type, start_byte, end_byte, text, children=None):
-                self.type = node_type
-                self.start_byte = start_byte
-                self.end_byte = end_byte
-                self.text = text
-                self.children = children or []
-
-        source = "export const isAuthorized = () => expressjwt({});\n"
-        arrow_start = source.index("()")
-        arrow = FakeNode("arrow_function", arrow_start, len(source) - 1, "() => expressjwt({});")
-        export = FakeNode("export_statement", 0, len(source) - 1, source, [arrow])
-        root = FakeNode("program", 0, len(source), source, [export])
-
-        sandbox = MagicMock()
-        sandbox.read_file.return_value = source
-        sandbox.run.return_value.exit_code = 0
-        touched = set()
-        plan_state = {
-            "recorded": True,
-            "planned_files": ["lib/insecurity.ts"],
-            "inspected_files": set(),
-            "fallback_files": set(),
-        }
-        tool = _make_deterministic_replace_ast_symbol_tool(sandbox, touched, plan_state)
-
-        with (
-            patch("remediation_engine.tools.source.language_for_path", return_value="typescript"),
-            patch(
-                "remediation_engine.tools.source.parse_source",
-                return_value=MagicMock(root_node=root),
-            ),
-            patch(
-                "remediation_engine.tools.source.find_named_symbol",
-                return_value={
-                    "symbol_name": "isAuthorized",
-                    "node_type": "arrow_function",
-                    "start_line": 1,
-                    "end_line": 1,
-                    "start_byte": arrow_start,
-                    "end_byte": len(source) - 1,
-                    "text": arrow.text,
-                },
-            ),
-        ):
-            result = tool.invoke(
-                {
-                    "file_path": "lib/insecurity.ts",
-                    "symbol_name": "isAuthorized",
-                    "replacement": "const isAuthorized = () => expressjwt({ algorithms: ['RS256'] });",
-                }
-            )
-
-        assert result.startswith("SUCCESS:")
-        assert "lib/insecurity.ts" in touched
-        written = sandbox.write_file.call_args.args[1]
-        assert "export const isAuthorized = const" not in written
-        assert "const isAuthorized = () => expressjwt" in written
-
 
 class TestModifyAndValidateNpmDependency:
     @staticmethod
@@ -1622,6 +1560,20 @@ class TestReadWebPage:
 
         assert "ERROR: Failed to read web page" in res
 
+    def test_empty_page_does_not_record_inspected_evidence(self):
+        plan_state = {"local_investigation_complete": True, "web_search_performed": True}
+        response = MagicMock()
+        response.text = ""
+        response.raise_for_status = MagicMock()
+        tool = _make_read_web_page_tool(plan_state)
+
+        with patch("remediation_engine.tools.workspace.requests.get", return_value=response):
+            result = tool.invoke({"url": "https://example.com/empty"})
+
+        assert "ERROR: Failed to read web page" in result
+        assert not plan_state.get("evidence_ledger")
+        assert plan_state.get("has_authoritative_evidence") is not True
+
     def test_github_urls_use_github_api_instead_of_jina(self):
         mock_resp = MagicMock()
         mock_resp.text = "# Migration Guide\nUse expressjwt from the named export."
@@ -1828,10 +1780,10 @@ class TestToolbeltFactoriesStage2Parity:
         ):
             with (
                 patch(
-                    "remediation_engine.tools.workers._make_modify_and_validate_npm_dependency_tool"
+                    "remediation_engine.tools.npm_mutations._make_modify_and_validate_npm_dependency_tool"
                 ) as npm_factory,
                 patch(
-                    "remediation_engine.tools.workers._make_modify_and_validate_python_dependency_tool"
+                    "remediation_engine.tools.python_mutations._make_modify_and_validate_python_dependency_tool"
                 ) as python_factory,
                 pytest.raises(
                     ValueError,
@@ -2226,66 +2178,6 @@ class TestToolbeltFactoriesStage2Parity:
 
 
 class TestPythonWorkaroundSupportStage2Parity:
-    def test_python_ast_replacement_requires_prior_file_inspection(self):
-        sandbox = MagicMock()
-        plan_state = {
-            "recorded": True,
-            "phase": "EXECUTE",
-            "planned_files": ["src/module.py"],
-            "inspected_files": set(),
-            "fallback_files": set(),
-        }
-        tool = _make_deterministic_replace_ast_symbol_tool(
-            sandbox,
-            set(),
-            plan_state,
-        )
-
-        result = tool.invoke(
-            {
-                "file_path": "src/module.py",
-                "symbol_name": "target",
-                "replacement": "return True",
-            }
-        )
-        assert "[MISSING_INSPECTION]" in result
-
-    def test_python_search_replace_rolls_back_syntax_errors(self):
-        original = "def helper():\n    return 1\n"
-        files = {"src/helper.py": original}
-        sandbox = MagicMock()
-        sandbox.read_file.side_effect = lambda path: files.get(path)
-        sandbox.write_file.side_effect = lambda path, content: files.__setitem__(path, content)
-        state = {
-            "recorded": True,
-            "phase": "EXECUTE",
-            "planned_files": ["src/helper.py"],
-            "inspected_files": {"src/helper.py"},
-            "fallback_files": set(),
-        }
-        tool = _make_deterministic_search_replace_tool(sandbox, set(), state)
-
-        with patch(
-            "remediation_engine.tools.validation._run_readonly",
-            return_value=CommandResult(
-                exit_code=1,
-                stdout="",
-                stderr="SyntaxError: '(' was never closed",
-                duration_seconds=0.1,
-            ),
-        ) as syntax_run:
-            result = tool.invoke(
-                {
-                    "file_path": "src/helper.py",
-                    "old_text": "return 1",
-                    "new_text": "return (",
-                }
-            )
-
-        assert "invalid syntax" in result.lower()
-        assert files["src/helper.py"] == original
-        assert ".venv/bin/python -c" in syntax_run.call_args.args[1]
-
     def test_python_syntax_and_runtime_smoke_accept_only_importable_python_sources(self):
         sandbox = MagicMock()
         sandbox.run.return_value = CommandResult(
@@ -2656,6 +2548,24 @@ def test_python_bare_package_uses_normalized_bounded_pypi_json(monkeypatch) -> N
     assert "A useful package" in result
     assert plan_state["has_authoritative_evidence"] is True
     assert plan_state["evidence_source"] == "https://pypi.org/project/some-package/"
+    assert plan_state["evidence_source"] in plan_state["evidence_ledger"]
+
+
+def test_workspace_evidence_is_recorded_only_after_successful_read() -> None:
+    path = "node_modules/example/README.md"
+    plan_state: dict[str, Any] = {}
+    sandbox = MagicMock()
+    tool = _make_read_workspace_file_tool(sandbox, plan_state)
+
+    sandbox.read_file.return_value = None
+    assert "ERROR:" in tool.invoke({"file_path": path})
+    assert not plan_state.get("evidence_ledger")
+    assert plan_state.get("has_authoritative_evidence") is not True
+
+    sandbox.read_file.return_value = "package documentation"
+    assert "package documentation" in tool.invoke({"file_path": path})
+    assert plan_state["has_authoritative_evidence"] is True
+    assert path in plan_state["evidence_ledger"]
 
 
 def test_python_pypi_project_url_uses_json_then_bounded_page_fallback(monkeypatch) -> None:

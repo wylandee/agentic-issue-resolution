@@ -64,13 +64,6 @@ logger = logging.getLogger(__name__)
 
 _FILE_READ_MAX_CHARS = 8_000
 _LOG_QUERY_MAX_CHARS = 6_000
-_QA_ACTION_SUMMARY_MAX_CHARS = 1_200
-_STRUCTURED_REVIEW_VERDICT_RE = re.compile(
-    r"^\s*[*_#` -]*(?:structured\s+)?"
-    r"(?:(?:semantic\s+security\s+)?review\s+)?verdict\s*[:\-]\s*"
-    r"[*_#` -]*(PASS|FAIL|INCONCLUSIVE)\b",
-    re.IGNORECASE,
-)
 
 
 def _has_successful_review_tool_evidence(name: str, content: str) -> bool:
@@ -93,11 +86,8 @@ class GroupInvestigation:
     """Structured evaluator output and review provenance for one task."""
 
     group_id: str
-    investigation_text: str
     tool_transcript: str
-    task_id: str = ""
     errors: list[str] = field(default_factory=list)
-    review_tools_used: list[str] = field(default_factory=list)
     source_review_evidence: bool = False
     fallback: bool = False
     structured_review_verdict: SecurityReviewVerdict | None = None
@@ -767,61 +757,6 @@ Python owns deterministic_gates, failure_evidence, scan_evidence, and
 contract/provenance fields. Do not fill those fields."""
 
 
-def _build_individual_investigator_prompt(
-    group: VulnerabilityGroup,
-    task_id: str,
-    strategy: str,
-    results: _QAExecutionResults,
-    group_remaining_ids: list[str],
-    candidate_changed_files: list[str],
-    action_summaries: list[AgentActionSummary],
-    qa_policy: QAPolicy | None = None,
-    singleton_scope: bool = False,
-    task_scan_evidence: ODCScanEvidence | None = None,
-    project_language: ProjectLanguage = ProjectLanguage.NODEJS,
-    attempt_snapshot: TaskAttemptSnapshot | None = None,
-    effective_target_version: str | None = None,
-) -> str:
-    """Build the lean static-plus-dynamic prompt for one QA evaluator.
-
-    Args:
-        group: Vulnerability group under review.
-        task_id: Active remediation task identifier.
-        strategy: Supervisor-selected routing strategy.
-        results: Deterministic QA execution results.
-        group_remaining_ids: Target identifiers still present for this group.
-        candidate_changed_files: Worker-reported files for this task.
-        action_summaries: Bounded worker action summaries.
-        qa_policy: Supervisor-owned QA policy, when available.
-        singleton_scope: Whether exactly one active task owns this QA run.
-        task_scan_evidence: Scanner findings projected to this task's dependency closure.
-        project_language: Canonical repository language used to interpret test evidence.
-        attempt_snapshot: Current Supervisor-committed authorization, if available.
-        effective_target_version: Current worker result's effective target version.
-
-    Returns:
-        The complete evaluator prompt.
-    """
-    return (
-        _build_qa_evaluator_system_prompt(project_language)
-        + "\n\n"
-        + _build_qa_dynamic_context(
-            group=group,
-            task_id=task_id,
-            strategy=strategy,
-            results=results,
-            group_remaining_ids=group_remaining_ids,
-            candidate_changed_files=candidate_changed_files,
-            action_summaries=action_summaries,
-            qa_policy=qa_policy,
-            singleton_scope=singleton_scope,
-            task_scan_evidence=task_scan_evidence,
-            attempt_snapshot=attempt_snapshot,
-            effective_target_version=effective_target_version,
-        )
-    )
-
-
 def _sanitize_llm_evaluation(
     evaluation: QACriticLLMOutput,
     task_id: str,
@@ -915,8 +850,6 @@ def _run_individual_investigations(
                 )
                 evaluations[task_id] = GroupInvestigation(
                     group_id=group.group_id,
-                    task_id=task_id,
-                    investigation_text="",
                     tool_transcript="",
                     errors=[reason],
                     fallback=True,
@@ -1027,20 +960,11 @@ def _run_individual_investigations(
                 sort_keys=True,
                 default=str,
             )
-            review_tools_used: list[str] = []
             source_review_evidence = False
             for event in loop_result.tool_events:
-                if event.name in {
-                    "generate_workspace_diff",
-                    "read_file_context",
-                    "search_codebase_pattern",
-                    "inspect_ast_symbol",
-                }:
-                    review_tools_used.append(event.name)
-                    source_review_evidence = (
-                        source_review_evidence
-                        or _has_successful_review_tool_evidence(event.name, event.content)
-                    )
+                if _has_successful_review_tool_evidence(event.name, event.content):
+                    source_review_evidence = True
+                    break
 
             errors = list(loop_result.errors)
             structured_output = loop_result.structured_output
@@ -1075,11 +999,8 @@ def _run_individual_investigations(
 
             evaluations[task_id] = GroupInvestigation(
                 group_id=group.group_id,
-                task_id=task_id,
-                investigation_text="",
                 tool_transcript=tool_transcript,
                 errors=list(dict.fromkeys(errors)),
-                review_tools_used=sorted(set(review_tools_used)),
                 source_review_evidence=source_review_evidence,
                 fallback=fallback,
                 structured_review_verdict=(
@@ -1105,8 +1026,6 @@ def _run_individual_investigations(
             )
             evaluations[task_id] = GroupInvestigation(
                 group_id=group.group_id,
-                task_id=task_id,
-                investigation_text="Fallback: structured QA result unavailable.",
                 tool_transcript="",
                 errors=[err],
                 fallback=True,
@@ -1352,9 +1271,7 @@ def _evaluate_policy_gates(
             else scanner_status
         )
         remaining = (
-            sorted(group_target_identifiers(group) & remaining_global)
-            if target_package_absent
-            else sorted(task_scan_evidence.remaining_target_identifiers)
+            sorted(task_scan_evidence.remaining_target_identifiers)
             if task_scan_evidence is not None
             else []
             if results.scan_evidence is not None

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remediation-engine"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agentic AppSec vulnerability remediation engine"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,10 +30,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "fastapi>=0.115,<1",
   "pytest>=8,<9",
   "pytest-asyncio>=0.23,<2",
   "pytest-mock>=3,<4",
   "ruff>=0.15,<1",
+  "sse-starlette>=2,<4",
 ]
 eval = ["deepeval>=4.3.1,<5", "openai>=2,<3", "pandas>=2,<3", "streamlit>=1.30,<2"]
 

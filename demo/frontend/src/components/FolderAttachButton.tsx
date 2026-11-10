@@ -17,7 +17,7 @@ export const FolderAttachButton: React.FC<FolderAttachButtonProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [showPathInput, setShowPathInput] = useState(false);
-  const [localPath, setLocalPath] = useState("examples/juice_shop");
+  const [localPath, setLocalPath] = useState("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -101,16 +101,6 @@ export const FolderAttachButton: React.FC<FolderAttachButtonProps> = ({
           <span className="text-[11px] text-slate-500">Quick load:</span>
           <button
             type="button"
-            onClick={() => handleQuickSelect("examples/juice_shop")}
-            disabled={disabled || isUploading}
-            className="hover:underline text-blue-400 font-medium text-[11px] transition disabled:opacity-50"
-            title="Attach examples/juice_shop scoped fixture"
-          >
-            examples/juice_shop
-          </button>
-          <span className="text-slate-600">·</span>
-          <button
-            type="button"
             onClick={() => handleQuickSelect("data/clones/juice-shop")}
             disabled={disabled || isUploading}
             className="hover:underline text-blue-400 font-medium text-[11px] transition disabled:opacity-50"
@@ -151,7 +141,7 @@ export const FolderAttachButton: React.FC<FolderAttachButtonProps> = ({
             type="text"
             value={localPath}
             onChange={(e) => setLocalPath(e.target.value)}
-            placeholder="e.g. examples/juice_shop or absolute path"
+            placeholder="e.g. data/clones/juice-shop or absolute path"
             className="flex-1 max-w-md px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
           />
           <button

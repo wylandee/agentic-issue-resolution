@@ -102,6 +102,7 @@ class TestDockerClientHelper:
             pytest.raises(RuntimeError, match="Docker daemon unreachable"),
         ):
             get_docker_client()
+        client.close.assert_called_once_with()
 
 
 class TestTarArchiveHelper:
@@ -259,6 +260,32 @@ class TestSandboxLifecycle:
 
         container.kill.assert_called_once()
         container.remove.assert_called_once_with(force=True)
+        client.close.assert_called_once()
+
+    def test_failed_container_removal_retains_handle_for_retry(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        container.remove.side_effect = [RuntimeError("daemon busy"), None]
+
+        with patch.dict(
+            "sys.modules",
+            {"docker": docker_mod, "docker.errors": docker_errors},
+        ):
+            sandbox = DockerSandbox(tmp_path)
+            sandbox._client = client
+            sandbox._container = container
+            sandbox._alive = True
+
+            sandbox.teardown()
+
+            assert sandbox._container is container
+            assert sandbox._client is client
+            client.close.assert_not_called()
+
+            sandbox.teardown()
+
+        assert sandbox._container is None
+        assert sandbox._client is None
+        assert container.remove.call_count == 2
         client.close.assert_called_once()
 
     def test_workspace_initialization_failure_is_transactional(self, tmp_path):
@@ -588,6 +615,17 @@ class TestSandboxFileIO:
         sandbox = self._started_sandbox(tmp_path, client, container)
 
         assert sandbox.read_file("missing.json") is None
+
+    def test_strict_read_distinguishes_absence_from_docker_failure(self, tmp_path):
+        docker_mod, docker_errors, client, container = _docker_modules()
+        sandbox = self._started_sandbox(tmp_path, client, container)
+
+        container.get_archive.side_effect = _NotFound("no such file or directory")
+        assert sandbox.read_file("missing.json", strict=True) is None
+
+        container.get_archive.side_effect = _APIError("daemon unavailable")
+        with pytest.raises(RuntimeError, match="failed to read patch input"):
+            sandbox.read_file("existing.json", strict=True)
 
 
 def _directory_tar_chunks(filename: str) -> list[bytes]:

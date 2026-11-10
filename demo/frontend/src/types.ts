@@ -1,6 +1,6 @@
 export type SeverityLevel = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO" | "UNKNOWN";
 
-export type FindingStatus = "flagged" | "remediating" | "remediated" | "newly_detected" | "unresolved";
+export type FindingStatus = "flagged" | "remediated" | "newly_detected" | "unresolved";
 
 export interface FindingModel {
   id: string;
@@ -15,7 +15,6 @@ export interface FindingModel {
   status: FindingStatus;
   is_new: boolean;
   group_id?: string | null;
-  task_id?: string | null;
 }
 
 export interface WorkspaceInfo {
@@ -46,7 +45,7 @@ export interface ConsoleEvent {
 }
 
 export interface DashboardUpdate {
-  type: "finding_removed" | "finding_added" | "finding_status_change" | "finding_updated" | "full_refresh";
+  type: "finding_removed" | "finding_added" | "finding_updated" | "full_refresh";
   finding_id?: string | null;
   finding?: FindingModel | null;
   active_findings: FindingModel[];
@@ -55,7 +54,13 @@ export interface DashboardUpdate {
   severity_counts: Record<string, number>;
 }
 
-export type RunStatus = "pending" | "running" | "completed" | "completed_with_errors" | "failed";
+export type RunStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "completed_with_errors"
+  | "failed"
+  | "triage_completed_no_work";
 
 export interface RunState {
   run_id: string;
@@ -77,5 +82,5 @@ export interface ReportResponse {
   report_path?: string | null;
   diff: string;
   changed_files: string[];
-  status: string;
+  status: RunStatus;
 }

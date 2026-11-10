@@ -164,11 +164,11 @@ class TestDeterministicTriage:
         assert result.is_valid is True  # KEV overrides any FP decision
 
     def test_kev_in_staging_falls_through_to_epss_rule(self):
-        """In staging, KEV alone does not force CRITICAL; EPSS 0.9 â‰¥ 0.36 clamps to HIGH."""
+        """In staging, KEV alone does not force CRITICAL; EPSS 0.9 ≥ 0.36 clamps to HIGH."""
         issue = _issue(severity=Severity.MEDIUM)
         group = _group(issue, enrichment=_kev_enrichment())  # epss=0.9, in_kev=True
         result = run_triage(group, _context(environment="staging"))
-        # Not production â†’ KEV rule skipped; EPSS 0.9 â‰¥ 0.36 rule fires â†’ at least HIGH
+        # Not production → KEV rule skipped; EPSS 0.9 ≥ 0.36 rule fires → at least HIGH
         assert result.revised_priority in (Severity.HIGH, Severity.CRITICAL)
 
     def test_high_epss_clamps_to_at_least_high(self):
@@ -243,7 +243,7 @@ class TestDevScopeFalsePositive:
         assert result.false_positive_reason is not None
 
     def test_dev_env_but_prod_path_stays_valid(self):
-        """Dev environment alone is not enough â€” the file paths must also be dev/test."""
+        """Dev environment alone is not enough — the file paths must also be dev/test."""
         issue = _issue(file_path="src/utils.js")  # Not a dev path
         group = _group(issue)
         result = run_triage(group, _context(environment="dev"))
@@ -1357,7 +1357,7 @@ class TestSCAGrouping:
         assert selected.strategy_used == "UPDATE_VERSION"
 
     def test_duplicate_cve_same_component_is_deduped(self):
-        """Same CVE appearing twice (e.g. from the same scanner run) â†’ one CVE ID."""
+        """Same CVE appearing twice (e.g. from the same scanner run) → one CVE ID."""
         issues = [
             _grouper_sca(cve_id="CVE-2021-23337"),
             _grouper_sca(cve_id="CVE-2021-23337"),  # Exact duplicate
@@ -1377,7 +1377,7 @@ class TestSCAGrouping:
         assert groups[0].cve_ids == ["CVE-2021-23337"]
 
     def test_cross_tool_same_cve_component_file_merges(self):
-        """Semgrep SCA + ODC finding the same CVE on the same package/file â†’ merge."""
+        """Semgrep SCA + ODC finding the same CVE on the same package/file → merge."""
         semgrep_issue = _grouper_sca(source=IssueSource.SEMGREP, cve_id="CVE-2021-44228")
         odc_issue = _grouper_sca(source=IssueSource.ODC, cve_id="CVE-2021-44228")
         groups = group_with_fix_plans(
@@ -1530,7 +1530,7 @@ class TestSCAGrouping:
                 (_localized(issues[1]), _plan(status=FixPlanStatus.NO_FIX, strategy_used="none")),
             ],
         )
-        # Same component/file â†’ one group; no CVE IDs expected
+        # Same component/file → one group; no CVE IDs expected
         assert len(groups) == 1
         assert groups[0].cve_ids == []
 

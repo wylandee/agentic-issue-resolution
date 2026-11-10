@@ -21,13 +21,12 @@ class FindingModel(BaseModel):
     description: str | None = Field(
         default=None, description="Vulnerability description or finding message."
     )
-    status: Literal["flagged", "remediating", "remediated", "newly_detected", "unresolved"] = Field(
+    status: Literal["flagged", "remediated", "newly_detected", "unresolved"] = Field(
         default="flagged",
         description="Display status of the finding.",
     )
     is_new: bool = Field(default=False, description="True if detected during post-baseline scans.")
     group_id: str | None = Field(default=None, description="Associated triage group ID if mapped.")
-    task_id: str | None = Field(default=None, description="Currently active task ID if any.")
 
 
 class WorkspaceInfo(BaseModel):
@@ -63,7 +62,6 @@ class DashboardUpdate(BaseModel):
     type: Literal[
         "finding_removed",
         "finding_added",
-        "finding_status_change",
         "finding_updated",
         "full_refresh",
     ]
@@ -75,14 +73,22 @@ class DashboardUpdate(BaseModel):
     severity_counts: dict[str, int] = Field(default_factory=dict)
 
 
+RunStatus = Literal[
+    "pending",
+    "running",
+    "completed",
+    "completed_with_errors",
+    "failed",
+    "triage_completed_no_work",
+]
+
+
 class RunState(BaseModel):
     """Current state of an orchestration run."""
 
     run_id: str
     workspace_id: str
-    status: Literal["pending", "running", "completed", "completed_with_errors", "failed"] = (
-        "pending"
-    )
+    status: RunStatus = "pending"
     current_node: str | None = None
     active_findings: list[FindingModel] = Field(default_factory=list)
     remediated_count: int = 0
@@ -101,4 +107,4 @@ class ReportResponse(BaseModel):
     report_path: str | None = None
     diff: str = ""
     changed_files: list[str] = Field(default_factory=list)
-    status: str = "completed"
+    status: RunStatus = "completed"

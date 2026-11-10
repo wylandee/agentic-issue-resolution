@@ -25,28 +25,14 @@ class ReportContext:
     """Normalized, deterministic evidence supplied to report renderers."""
 
     run_id: str
-    repo_root: str
-    run_started_at: str | None
-    run_ended_at: str | None
     duration_seconds: float | None
     total_input_tokens: int | None
     total_output_tokens: int | None
     total_tokens: int | None
     status: str
     overall_label: str
-    targeted_qa_total: int
-    targeted_qa_passed: int
-    recorded_qa_total: int
     has_patch: bool
     canonical_finding_count: int
-    actionable_groups: int
-    groups_fixed: int
-    groups_unresolved: int
-    groups_inconclusive: int
-    groups_pending: int
-    groups_retriage_discovered: int | None
-    consistency_events: list[Any]
-    error_strings: list[str]
     error_records: list[ErrorRecord]
     initial_valid_groups: list[Any]
     initial_group_evidence_available: bool
@@ -55,32 +41,22 @@ class ReportContext:
     task_queue: dict[str, Any]
     action_summaries: list[Any]
     triage_reconciliation: dict[str, Any]
-    group_strategies: dict[str, Any]
-    retry_plans: dict[str, Any]
     qa_evaluations: dict[str, Any]
-    resolved_statuses_by_group: dict[str, Any]
     worker_results: dict[str, Any]
     qa_results: dict[str, Any]
     attempt_snapshots: dict[str, Any]
     retry_diagnostics: dict[str, Any]
-    final_full_scan_result: Any
     scan_coverage_scope: str
     scan_coverage_complete: bool | None
     scan_evidence_state: str
     triage_required: bool
     post_remediation_scan_issues: list[Any]
-    post_remediation_scan_identifiers: list[str]
     remaining_target_identifiers: list[str]
     new_vulnerability_identifiers: list[str]
-    new_vulnerability_status: str
     diff: str
     changed_files: list[str]
     trajectory_path: str | None
     langsmith_trace_url: str | None
-    new_groups_discovered: int | None = None
-    new_groups_unresolved: int | None = None
-    new_groups_inconclusive: int | None = None
-    new_groups_pending: int | None = None
     workaround_replay_plans: dict[str, Any] = field(default_factory=dict)
     group_reconciliation_incomplete: bool = False
 
@@ -270,9 +246,6 @@ def _group_status(task_queue: Mapping[str, Any], group_id: str) -> str:
 
 def _report_group_status(context: ReportContext, group_id: str) -> str:
     """Return a report group's effective status derived from task queue lineage."""
-    status = context.resolved_statuses_by_group.get(group_id)
-    if status is not None:
-        return _text(status)
     return _group_status(context.task_queue, group_id)
 
 
@@ -530,29 +503,6 @@ def _format_token_summary(context: ReportContext) -> str:
     )
 
 
-def _qa_record_summary(
-    qa_evaluations: Mapping[str, Any],
-    qa_results_by_attempt: Mapping[str, Any],
-) -> int:
-    """Count distinct task-keyed QA verdicts with committed provenance.
-
-    Attempt envelopes are authoritative because they retain the task and
-    attempt identity. The derived ``qa_evaluations`` projection contributes
-    only task IDs not already represented by an attempt envelope.
-    """
-    records: dict[str, Any] = {}
-    for result in qa_results_by_attempt.values():
-        evaluation = _value(result, "evaluation")
-        identifier = _text(_value(result, "task_id")) or _text(_value(evaluation, "task_id"))
-        if identifier and evaluation is not None:
-            records[identifier] = evaluation
-    for key, evaluation in qa_evaluations.items():
-        identifier = _text(_value(evaluation, "task_id"), str(key))
-        if identifier and evaluation is not None:
-            records.setdefault(identifier, evaluation)
-    return len(records)
-
-
 def _issue_identifiers(issue: Any) -> list[str]:
     """Return scanner-facing identifiers for one typed vulnerability issue."""
     identifiers: list[str] = []
@@ -579,47 +529,15 @@ def _issue_identifiers(issue: Any) -> list[str]:
 def _group_identifiers(group: Any) -> set[str]:
     """Return normalized scanner identifiers associated with a group."""
     identifiers: set[str] = set()
-    for identifier_field in ("cve_ids", "ghsa_ids", "finding_ids", "rule_ids", "identifiers"):
+    for field_name in ("cve_ids", "ghsa_ids", "finding_ids", "rule_ids", "identifiers"):
         identifiers.update(
             _text(value).strip().casefold()
-            for value in _items(_value(group, identifier_field))
+            for value in _items(_value(group, field_name))
             if _text(value).strip()
         )
     for issue in _items(_value(group, "issues")):
         identifiers.update(identifier.casefold() for identifier in _issue_identifiers(issue))
     return identifiers
-
-
-def _reconcile_authoritative_statuses(
-    statuses: Mapping[str, str],
-    groups: Sequence[Any],
-    final_scan: Any,
-    new_status: str,
-    remaining_identifiers: Sequence[str],
-) -> dict[str, str]:
-    """Reopen targeted successes contradicted by a repository-wide scan.
-
-    Incremental dependency scans are intentionally excluded: their evidence
-    cannot determine whether unrelated groups outside scanned closures remain
-    vulnerable.
-    """
-    result = dict(statuses)
-    if _scan_evidence_state(final_scan, new_status) != "complete":
-        return result
-    if _text(_value(final_scan, "coverage_scope"), "full_workspace") != "full_workspace":
-        return result
-    if _value(final_scan, "authoritative") is False:
-        return result
-    remaining = {identifier.casefold() for identifier in remaining_identifiers}
-    if not remaining:
-        return result
-    for group in groups:
-        group_id = _text(_value(group, "group_id"))
-        if result.get(group_id) != "qa_passed":
-            continue
-        if _group_identifiers(group).intersection(remaining):
-            result[group_id] = "needs_retry"
-    return result
 
 
 def _build_context(
@@ -659,19 +577,16 @@ def _build_context(
         group for group in final_groups if _text(_value(group, "group_id")) not in initial_group_ids
     ]
     all_groups.extend(_task_queue_fallback_groups(task_queue, represented_group_ids))
-    statuses = {
-        _text(_value(group, "group_id")): _group_status(
-            task_queue, _text(_value(group, "group_id"))
-        )
-        for group in all_groups
-    }
     reconciliation = _mapping(state.get("triage_reconciliation"))
     ended = _iso(run_ended_at)
     started = _iso(state.get("run_started_at"))
     tokens = dict(token_summary or {})
     status = _text(state.get("status"), "unknown")
     outcome_issues = terminal_outcome_issues(state)
-    if outcome_issues and status == "completed":
+    if (outcome_issues or state.get("errors")) and status in {
+        "completed",
+        "triage_completed_no_work",
+    }:
         status = "completed_with_errors"
     final_scan = state.get("final_full_scan_result")
     final_scan_issues = _value(final_scan, "found_issues")
@@ -680,16 +595,6 @@ def _build_context(
         if final_scan_issues is not None
         else _items(state.get("post_remediation_scan_issues"))
     )
-    final_scan_identifiers = _value(final_scan, "found_identifiers")
-    post_scan_identifiers = _unique_texts(
-        _items(final_scan_identifiers)
-        if final_scan_identifiers is not None
-        else _items(state.get("post_remediation_scan_identifiers"))
-    )
-    if not post_scan_identifiers:
-        post_scan_identifiers = _unique_texts(
-            identifier for issue in post_scan_issues for identifier in _issue_identifiers(issue)
-        )
     final_new_identifiers = _value(final_scan, "new_identifiers")
     new_identifiers = _unique_texts(
         _items(final_new_identifiers)
@@ -721,15 +626,8 @@ def _build_context(
         if triage_required_value is None
         else triage_required_value
     )
-    statuses = _reconcile_authoritative_statuses(
-        statuses,
-        all_groups,
-        final_scan,
-        new_status,
-        remaining_identifiers,
-    )
     status_counts = Counter(
-        statuses.get(_text(_value(group, "group_id")), "pending") for group in all_groups
+        _group_status(task_queue, _text(_value(group, "group_id"))) for group in all_groups
     )
     counts = {
         "fixed": status_counts.get("qa_passed", 0),
@@ -737,37 +635,6 @@ def _build_context(
         "inconclusive": status_counts.get("inconclusive", 0),
         "pending": status_counts.get("pending", 0) + status_counts.get("optimistically_fixed", 0),
     }
-    discovered_ids = _reconciliation_ids(
-        reconciliation,
-        "added",
-        "new_group_ids",
-        "reappeared",
-        "reappeared_group_ids",
-        "final_scan_reopened_group_ids",
-    )
-    scan_findings_usable = scan_evidence_state in {
-        "complete",
-        "incremental_complete",
-    } or (scan_evidence_state == "incremental_incomplete" and bool(new_identifiers))
-    if scan_findings_usable and (discovered_ids or (not triage_required and not new_identifiers)):
-        discovered_status_counts = Counter(
-            statuses.get(group_id, "pending") for group_id in discovered_ids
-        )
-        new_group_metrics: dict[str, int | None] = {
-            "discovered": len(discovered_ids),
-            "unresolved": discovered_status_counts.get("unfixable", 0)
-            + discovered_status_counts.get("needs_retry", 0),
-            "inconclusive": discovered_status_counts.get("inconclusive", 0),
-            "pending": discovered_status_counts.get("pending", 0)
-            + discovered_status_counts.get("optimistically_fixed", 0),
-        }
-    else:
-        new_group_metrics = {
-            "discovered": None,
-            "unresolved": None,
-            "inconclusive": None,
-            "pending": None,
-        }
     report_state = {
         **state,
         "errors": [
@@ -778,12 +645,8 @@ def _build_context(
     error_records = _error_records(report_state)
     qa_evaluations = _mapping(state.get("qa_evaluations"))
     qa_results = _mapping(state.get("qa_results_by_attempt"))
-    recorded_qa_total = _qa_record_summary(qa_evaluations, qa_results)
     return ReportContext(
         run_id=_text(state.get("run_id") or state.get("langsmith_run_id"), "local-run"),
-        repo_root=_text(state.get("repo_root")),
-        run_started_at=started,
-        run_ended_at=ended,
         duration_seconds=_duration_seconds(started, ended),
         total_input_tokens=tokens.get("input_tokens"),
         total_output_tokens=tokens.get("output_tokens"),
@@ -796,29 +659,13 @@ def _build_context(
             len(new_identifiers),
             len(remaining_identifiers),
         ),
-        targeted_qa_total=len(initial_groups),
-        targeted_qa_passed=sum(
-            statuses.get(_text(_value(group, "group_id")), "pending") == "qa_passed"
-            for group in initial_groups
-        ),
-        recorded_qa_total=recorded_qa_total,
         has_patch=bool(_text(state.get("diff"))),
         canonical_finding_count=len(canonical_issue_components(issues)),
-        actionable_groups=len(all_groups),
-        groups_fixed=counts["fixed"],
-        groups_unresolved=counts["unresolved"],
-        groups_inconclusive=counts["inconclusive"],
-        groups_pending=counts["pending"],
-        groups_retriage_discovered=new_group_metrics["discovered"],
         group_reconciliation_incomplete=(
             bool(issues)
             and not initial_groups
             and state.get("initial_triage_status") != "completed_no_work"
         ),
-        consistency_events=_items(state.get("consistency_events")),
-        error_strings=[
-            f"{record.source}/{record.code}: {record.message}" for record in error_records
-        ],
         error_records=error_records,
         initial_valid_groups=initial_groups,
         initial_group_evidence_available="initial_valid_groups" in state,
@@ -827,15 +674,11 @@ def _build_context(
         task_queue=task_queue,
         action_summaries=_items(state.get("action_summaries")),
         triage_reconciliation=reconciliation,
-        group_strategies=_mapping(state.get("group_strategies")),
-        retry_plans=_mapping(state.get("retry_plans_by_task")),
         qa_evaluations=qa_evaluations,
-        resolved_statuses_by_group=statuses,
         worker_results=_mapping(state.get("worker_results_by_attempt")),
         qa_results=qa_results,
         attempt_snapshots=_mapping(state.get("attempt_snapshots_by_id")),
         retry_diagnostics=_mapping(state.get("retry_diagnostics_by_task")),
-        final_full_scan_result=final_scan,
         scan_coverage_scope=_text(
             _value(final_scan, "coverage_scope"),
             "full_workspace" if final_scan is not None else "unknown",
@@ -844,18 +687,12 @@ def _build_context(
         scan_evidence_state=scan_evidence_state,
         triage_required=triage_required,
         post_remediation_scan_issues=post_scan_issues,
-        post_remediation_scan_identifiers=post_scan_identifiers,
-        new_vulnerability_identifiers=new_identifiers,
-        new_vulnerability_status=new_status,
         remaining_target_identifiers=remaining_identifiers,
+        new_vulnerability_identifiers=new_identifiers,
         diff=_text(state.get("diff")),
         changed_files=[_text(item) for item in _items(state.get("changed_files"))],
         trajectory_path=trajectory_path or _text(state.get("trajectory_path")) or None,
         langsmith_trace_url=trace_url or _text(state.get("langsmith_trace_url")) or None,
-        new_groups_discovered=new_group_metrics["discovered"],
-        new_groups_unresolved=new_group_metrics["unresolved"],
-        new_groups_inconclusive=new_group_metrics["inconclusive"],
-        new_groups_pending=new_group_metrics["pending"],
         workaround_replay_plans=_mapping(state.get("workaround_replay_plans_by_task")),
     )
 
@@ -1239,7 +1076,7 @@ def _line_indent(line: str) -> int:
 
 
 def _record_package_change(
-    records: dict[str, dict[str, str]],
+    records: dict[tuple[str, str], dict[str, str]],
     name: str,
     version: str,
     prefix: str,
@@ -1250,12 +1087,9 @@ def _record_package_change(
     if name in _NON_PACKAGE_KEYS:
         return
     record = records.setdefault(
-        name,
+        (file_path, name),
         {"old": "", "new": "", "file": file_path, "section": section},
     )
-    recorded_files = [item.strip() for item in record.get("file", "").split(";")]
-    if file_path and file_path not in recorded_files:
-        record["file"] = "; ".join([*recorded_files, file_path])
     if section and not record.get("section"):
         record["section"] = section
     if prefix == "+":
@@ -1272,8 +1106,8 @@ def _package_changes(diff: str) -> list[PackageChange]:
     package entries; metadata such as ``engines.node`` or ``deprecated`` is
     deliberately excluded.
     """
-    manifest_records: dict[str, dict[str, str]] = {}
-    lockfile_records: dict[str, dict[str, str]] = {}
+    manifest_records: dict[tuple[str, str], dict[str, str]] = {}
+    lockfile_records: dict[tuple[str, str], dict[str, str]] = {}
     current_file = ""
     manifest_section: tuple[str, int] | None = None
     lockfile_package: tuple[str, int] | None = None
@@ -1397,7 +1231,7 @@ def _package_changes(diff: str) -> list[PackageChange]:
                 )
                 if resolved_name and candidate is not None and candidate[3] != resolved_name:
                     _, _, _, previous_name, version = candidate
-                    previous_record = lockfile_records.get(previous_name)
+                    previous_record = lockfile_records.get((current_file, previous_name))
                     version_key = "new" if prefix == "+" else "old"
                     if previous_record is not None and previous_record.get(version_key) == version:
                         previous_record[version_key] = ""
@@ -1410,14 +1244,24 @@ def _package_changes(diff: str) -> list[PackageChange]:
                         "lockfile",
                     )
 
-    direct_names = set(manifest_records)
+    direct_keys = set(manifest_records)
     changes: list[PackageChange] = []
-    for name in sorted(manifest_records):
-        record = manifest_records[name]
+    for file_path, name in sorted(manifest_records):
+        record = manifest_records[(file_path, name)]
         if record["old"] or record["new"]:
             evidence_file = record["file"]
-            if name in lockfile_records:
-                evidence_file += f"; {lockfile_records[name]['file']}"
+            manifest_directory = _normalized_path(file_path).rpartition("/")[0]
+            matching_lockfiles = [
+                lockfile
+                for (lockfile_path, lockfile_name), lockfile in lockfile_records.items()
+                if lockfile_name == name
+                and _normalized_path(lockfile_path).rpartition("/")[0] == manifest_directory
+            ]
+            lockfile_paths = _unique_texts(
+                path for lockfile in matching_lockfiles for path in lockfile["file"].split(";")
+            )
+            if lockfile_paths:
+                evidence_file += f"; {'; '.join(lockfile_paths)}"
             changes.append(
                 PackageChange(
                     name,
@@ -1428,10 +1272,16 @@ def _package_changes(diff: str) -> list[PackageChange]:
                     record.get("section", ""),
                 )
             )
-    for name in sorted(lockfile_records):
-        if name in direct_names:
+    for file_path, name in sorted(lockfile_records):
+        record = lockfile_records[(file_path, name)]
+        lockfile_directory = _normalized_path(file_path).rpartition("/")[0]
+        has_local_direct_declaration = any(
+            direct_name == name
+            and _normalized_path(manifest_path).rpartition("/")[0] == lockfile_directory
+            for manifest_path, direct_name in direct_keys
+        )
+        if has_local_direct_declaration:
             continue
-        record = lockfile_records[name]
         if record["old"] or record["new"]:
             changes.append(
                 PackageChange(
@@ -1443,4 +1293,4 @@ def _package_changes(diff: str) -> list[PackageChange]:
                     record.get("section", "lockfile"),
                 )
             )
-    return sorted(changes, key=lambda change: (change.scope != "direct", change.name))
+    return sorted(changes, key=lambda change: (change.scope != "direct", change.file, change.name))

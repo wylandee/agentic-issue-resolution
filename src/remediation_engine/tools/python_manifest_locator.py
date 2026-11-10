@@ -115,17 +115,6 @@ def parse_requirements_txt(path: Path) -> list[RequirementEntry]:
     return entries
 
 
-def find_dependency_in_requirements(name: str, path: Path) -> RequirementEntry | None:
-    """Find one unambiguous PEP 503-equivalent requirement declaration."""
-    target = _normalized_name(name)
-    if not target:
-        return None
-    matches = [
-        entry for entry in parse_requirements_txt(path) if _normalized_name(entry.name) == target
-    ]
-    return matches[0] if len(matches) == 1 else None
-
-
 def update_requirements_dependency(path: Path, package_name: str, new_version: str) -> str:
     """Pin one simple requirements.txt declaration, preserving line formatting."""
     target = _normalized_name(package_name)

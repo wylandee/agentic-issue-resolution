@@ -13,15 +13,26 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 
-import remediation_engine.orchestration.graph as graph_module
+from pydantic import TypeAdapter
+
 from remediation_engine.api import RemediationRequest, RemediationResult, run_remediation
-from remediation_engine.contracts.schemas import SystemContext, VulnerabilityIssue
-from remediation_engine.runtime.telemetry import TrajectoryRecorder, to_jsonable
+from remediation_engine.contracts.schemas import (
+    SystemContext,
+    VulnerabilityIssue,
+    model_or_dict_value,
+)
+from remediation_engine.runtime.telemetry import (
+    TrajectoryRecorder,
+    get_active_trajectory_recorder,
+    to_jsonable,
+    use_trajectory_recorder,
+)
 
 from .findings_tracker import FindingsTracker
-from .models import ConsoleEvent, DashboardUpdate, RunState
+from .models import ConsoleEvent, DashboardUpdate, RunState, RunStatus
 
 logger = logging.getLogger(__name__)
+_RUN_STATUS_ADAPTER = TypeAdapter(RunStatus)
 
 # Active runs registry
 _RUN_SESSIONS: dict[str, RunSession] = {}
@@ -60,13 +71,6 @@ _TASK_ID_KEYS = frozenset(
     {"active_target_task_ids", "task_id", "task_ids", "target_task_id", "target_task_ids"}
 )
 _PACKAGE_NAME_KEYS = frozenset({"package", "package_name", "target_package_name"})
-
-
-def _record_value(record: Any, key: str, default: Any = None) -> Any:
-    """Read one field from either a mapping or a typed runtime record."""
-    if isinstance(record, Mapping):
-        return record.get(key, default)
-    return getattr(record, key, default)
 
 
 def _compact_trace_value(value: Any, omitted_keys: frozenset[str]) -> Any:
@@ -288,10 +292,10 @@ class RunSession:
             groups = state_patch.get("valid_groups")
             if isinstance(groups, (list, tuple)):
                 self._group_components = {
-                    str(_record_value(group, "group_id")): str(component).strip()
+                    str(model_or_dict_value(group, "group_id")): str(component).strip()
                     for group in groups
-                    if (component := _record_value(group, "vulnerable_component"))
-                    and str(_record_value(group, "group_id") or "").strip()
+                    if (component := model_or_dict_value(group, "vulnerable_component"))
+                    and str(model_or_dict_value(group, "group_id") or "").strip()
                     and str(component).strip()
                 }
 
@@ -308,9 +312,9 @@ class RunSession:
             labels_by_id: dict[str, str] = {}
             packages_by_id: dict[str, str | None] = {}
             for queue_id, task in self._task_queue.items():
-                task_id = str(_record_value(task, "task_id", queue_id) or queue_id).strip()
-                parent_group_id = str(_record_value(task, "parent_group_id", "") or "")
-                target_package = _record_value(task, "target_package_name")
+                task_id = str(model_or_dict_value(task, "task_id", queue_id) or queue_id).strip()
+                parent_group_id = str(model_or_dict_value(task, "parent_group_id", "") or "")
+                target_package = model_or_dict_value(task, "target_package_name")
                 package_name = str(target_package).strip() if target_package else ""
                 if not package_name:
                     package_name = self._group_components.get(parent_group_id, "")
@@ -365,7 +369,7 @@ class RunSession:
 
     def emit_run_status(self, status: str, current_node: str | None = None) -> None:
         """Update run status and notify frontend."""
-        self.state.status = status  # type: ignore[assignment]
+        self.state.status = _RUN_STATUS_ADAPTER.validate_python(status)
         if current_node:
             self.state.current_node = current_node
         self.event_queue.put(
@@ -650,6 +654,8 @@ class ScopedEngineLogHandler(logging.Handler):
             record: Logging record produced by the remediation engine.
         """
         try:
+            if getattr(get_active_trajectory_recorder(), "session", None) is not self.session:
+                return
             msg = self.format(record)
             if any(phrase in msg for phrase in self.KEY_PHRASES):
                 self.session.emit_console(
@@ -663,10 +669,9 @@ class ScopedEngineLogHandler(logging.Handler):
 
 def _execute_run_thread(session: RunSession) -> None:
     """Target function executed in background thread for run_remediation."""
-    original_recorder_cls = graph_module.TrajectoryRecorder
     scoped_handler = ScopedEngineLogHandler(session)
     root_logger = logging.getLogger("remediation_engine")
-    recorders: list[DemoTelemetryRecorder] = []
+    recorder = DemoTelemetryRecorder(session)
     try:
         session.emit_run_status("running", current_node="initial_triage")
         session.emit_console(
@@ -678,13 +683,6 @@ def _execute_run_thread(session: RunSession) -> None:
             ),
         )
 
-        # Non-intrusively bind DemoTelemetryRecorder to graph_module.TrajectoryRecorder
-        class BoundRecorder(DemoTelemetryRecorder):
-            def __init__(self) -> None:
-                super().__init__(session)
-                recorders.append(self)
-
-        graph_module.TrajectoryRecorder = BoundRecorder  # type: ignore[misc]
         root_logger.addHandler(scoped_handler)
 
         request = RemediationRequest(
@@ -701,7 +699,8 @@ def _execute_run_thread(session: RunSession) -> None:
             ),
         )
 
-        result = run_remediation(request)
+        with use_trajectory_recorder(recorder):
+            result = run_remediation(request)
         session.result = result
 
         # Reconcile final findings with raw state
@@ -741,13 +740,10 @@ def _execute_run_thread(session: RunSession) -> None:
         )
         session.emit_run_status("failed", current_node="error")
     finally:
-        for recorder in recorders:
-            try:
-                recorder.finish_incomplete_tool_spans()
-            except Exception:
-                logger.debug("Failed to close incomplete demo tool spans.", exc_info=True)
-        # Restore original recorder class
-        graph_module.TrajectoryRecorder = original_recorder_cls  # type: ignore[misc]
+        try:
+            recorder.finish_incomplete_tool_spans()
+        except Exception:
+            logger.debug("Failed to close incomplete demo tool spans.", exc_info=True)
         root_logger.removeHandler(scoped_handler)
         # Sentinel to signal end of stream to subscribers
         session.event_queue.put(None)
@@ -790,7 +786,7 @@ def start_remediation_run(
     if target_packages is None:
         requested_packages = list(available_packages.values())
     elif not target_packages:
-        raise ValueError("At least one detected package is required for targeted remediation.")
+        raise ValueError("Select at least one detected package.")
     else:
         requested_packages = target_packages
 

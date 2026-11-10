@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 from typing import Any
 
-from remediation_engine.contracts.schemas import VulnerabilityGroup, VulnerabilityIssue
+from remediation_engine.contracts.schemas import (
+    VulnerabilityGroup,
+    VulnerabilityIssue,
+    model_or_dict_value,
+)
 
 from .models import DashboardUpdate, FindingModel
 from .workspace_manager import calculate_severity_counts, finding_occurrence_key, normalize_findings
-
-logger = logging.getLogger(__name__)
 
 _SEVERITY_RANK = {"UNKNOWN": 0, "INFO": 1, "LOW": 2, "MEDIUM": 3, "HIGH": 4, "CRITICAL": 5}
 
@@ -25,18 +26,14 @@ class FindingsTracker:
         Args:
             initial_issues: Original vulnerability records for the workspace.
         """
-        self.initial_issues = list(initial_issues)
-        # Stable finding ID -> canonical FindingModel.
-        self.findings_by_id: dict[str, FindingModel] = {}
-        self.remediated_findings_by_id: dict[str, FindingModel] = {}
-        self.new_findings_by_id: dict[str, FindingModel] = {}
+        self._findings_by_id: dict[str, FindingModel] = {}
 
         # Mappings: group_id -> set of finding_ids; identifier -> finding_ids.
         self.group_to_finding_ids: dict[str, set[str]] = {}
         self.identifier_to_finding_ids: dict[str, set[str]] = {}
 
         for finding in normalize_findings(initial_issues, status="flagged"):
-            self.findings_by_id[finding.id] = finding
+            self._findings_by_id[finding.id] = finding
             self._index_finding(finding)
 
     @staticmethod
@@ -74,9 +71,7 @@ class FindingsTracker:
             candidate_ids.update(self.identifier_to_finding_ids.get(identifier, set()))
         matches: set[str] = set()
         for finding_id in candidate_ids:
-            existing = self.findings_by_id.get(finding_id)
-            if existing is None:
-                existing = self.remediated_findings_by_id.get(finding_id)
+            existing = self._findings_by_id.get(finding_id)
             if existing is not None and finding_occurrence_key(existing) == occurrence:
                 matches.add(finding_id)
         return matches
@@ -110,12 +105,7 @@ class FindingsTracker:
         if merged == existing:
             return existing, False
 
-        if existing.id in self.findings_by_id:
-            self.findings_by_id[existing.id] = merged
-        if existing.id in self.remediated_findings_by_id:
-            self.remediated_findings_by_id[existing.id] = merged
-        if existing.id in self.new_findings_by_id:
-            self.new_findings_by_id[existing.id] = merged
+        self._findings_by_id[existing.id] = merged
         self._index_finding(merged)
         return merged, True
 
@@ -123,7 +113,11 @@ class FindingsTracker:
     def active_findings(self) -> list[FindingModel]:
         """Return all currently active (unremediated baseline + unresolved new) findings."""
         return sorted(
-            self.findings_by_id.values(),
+            (
+                finding
+                for finding in self._findings_by_id.values()
+                if finding.status != "remediated"
+            ),
             key=lambda f: (
                 0
                 if f.severity == "CRITICAL"
@@ -142,20 +136,21 @@ class FindingsTracker:
     @property
     def remediated_count(self) -> int:
         """Return the number of canonical findings marked remediated."""
-        return len(self.remediated_findings_by_id)
+        return sum(finding.status == "remediated" for finding in self._findings_by_id.values())
 
     @property
     def new_count(self) -> int:
         """Return the number of canonical findings discovered after baseline."""
-        return len(self.new_findings_by_id)
+        return sum(finding.is_new for finding in self._findings_by_id.values())
 
     def get_dashboard_summary(self) -> dict[str, Any]:
         """Return current counters and active list for dashboard."""
+        active_findings = self.active_findings
         return {
-            "active_findings": self.active_findings,
+            "active_findings": active_findings,
             "remediated_count": self.remediated_count,
             "new_count": self.new_count,
-            "severity_counts": calculate_severity_counts(self.active_findings),
+            "severity_counts": calculate_severity_counts(active_findings),
         }
 
     def map_triaged_groups(self, groups: list[VulnerabilityGroup]) -> None:
@@ -169,7 +164,7 @@ class FindingsTracker:
                 for identifier in issue_identifiers:
                     candidate_ids = self.identifier_to_finding_ids.get(identifier, set())
                     for finding_id in candidate_ids:
-                        finding = self.findings_by_id.get(finding_id)
+                        finding = self._findings_by_id.get(finding_id)
                         if (
                             finding is not None
                             and issue_identifiers.intersection(self._finding_identifiers(finding))
@@ -178,48 +173,34 @@ class FindingsTracker:
                             finding.group_id = group_id
                             group_finding_ids.add(finding_id)
 
-            component = (group.vulnerable_component or "").strip().casefold()
-            group_identifiers = {
-                identifier.strip().upper()
-                for identifier in (group.cve_ids or []) + (group.ghsa_ids or [])
-                if identifier and identifier.strip()
-            }
-            for finding_id, finding in self.findings_by_id.items():
-                component_matches = bool(
-                    component and finding.package_name.strip().casefold() == component
-                )
-                identifier_matches = bool(
-                    group_identifiers.intersection(self._finding_identifiers(finding))
-                )
-                if component_matches or identifier_matches:
-                    finding.group_id = group_id
-                    group_finding_ids.add(finding_id)
-
     def mark_group_remediated(
-        self, group_id: str, remaining_target_identifiers: list[str] | None = None
+        self,
+        group_id: str,
+        *,
+        remaining_occurrences: set[tuple[str, str, str]],
+        unlocalized_remaining_identifiers: set[str],
     ) -> list[DashboardUpdate]:
-        """Remove remediated findings for a passed group."""
+        """Remove only occurrences cleared by complete task-scoped scan evidence."""
         updates: list[DashboardUpdate] = []
         target_fids = set(self.group_to_finding_ids.get(group_id, set()))
-        remaining_set = {rid.upper().strip() for rid in (remaining_target_identifiers or [])}
 
         for fid in target_fids:
-            if fid not in self.findings_by_id:
+            model = self._findings_by_id.get(fid)
+            if model is None or model.status == "remediated":
                 continue
-            model = self.findings_by_id[fid]
-            # Keep a row active if any of its linked identifiers remains.
-            if not self._finding_identifiers(model).intersection(remaining_set):
-                model.status = "remediated"
-                self.remediated_findings_by_id[fid] = model
-                del self.findings_by_id[fid]
-                updates.append(
-                    DashboardUpdate(
-                        type="finding_removed",
-                        finding_id=fid,
-                        finding=model,
-                        **self.get_dashboard_summary(),
-                    )
+            if finding_occurrence_key(model) in remaining_occurrences or self._finding_identifiers(
+                model
+            ).intersection(unlocalized_remaining_identifiers):
+                continue
+            model.status = "remediated"
+            updates.append(
+                DashboardUpdate(
+                    type="finding_removed",
+                    finding_id=fid,
+                    finding=model,
+                    **self.get_dashboard_summary(),
                 )
+            )
 
         return updates
 
@@ -235,15 +216,18 @@ class FindingsTracker:
                     (
                         candidate_id
                         for candidate_id in ordered_ids
-                        if candidate_id in self.findings_by_id
+                        if self._findings_by_id[candidate_id].status != "remediated"
                     ),
                     ordered_ids[0],
                 )
-                existing = self.findings_by_id.get(finding_id)
-                if existing is None:
-                    existing = self.remediated_findings_by_id[finding_id]
+                existing = self._findings_by_id[finding_id]
+                was_remediated = existing.status == "remediated"
                 merged, changed = self._merge_existing_finding(existing, finding)
-                if changed and finding_id in self.findings_by_id:
+                if was_remediated:
+                    merged.status = "unresolved"
+                    self._findings_by_id[finding_id] = merged
+                    changed = True
+                if changed:
                     updates.append(
                         DashboardUpdate(
                             type="finding_updated",
@@ -254,11 +238,10 @@ class FindingsTracker:
                     )
                 continue
 
-            if finding.id in self.findings_by_id or finding.id in self.remediated_findings_by_id:
+            if finding.id in self._findings_by_id:
                 continue
 
-            self.findings_by_id[finding.id] = finding
-            self.new_findings_by_id[finding.id] = finding
+            self._findings_by_id[finding.id] = finding
             self._index_finding(finding)
             updates.append(
                 DashboardUpdate(
@@ -288,15 +271,61 @@ class FindingsTracker:
 
         # 2. Supervisor task updates
         task_queue = state_patch.get("task_queue") or {}
+        qa_results_by_attempt = state_patch.get("qa_results_by_attempt") or {}
         if isinstance(task_queue, Mapping):
-            for _task_id, task in task_queue.items():
-                status = getattr(task, "status", None)
+            for task in task_queue.values():
+                status = model_or_dict_value(task, "status")
                 status_val = str(getattr(status, "value", status)).lower()
-                parent_group_id = getattr(task, "parent_group_id", "")
-
-                if status_val == "qa_passed" and parent_group_id:
-                    cleared_updates = self.mark_group_remediated(parent_group_id)
-                    updates.extend(cleared_updates)
+                group_id = str(model_or_dict_value(task, "parent_group_id") or "")
+                attempt_id = model_or_dict_value(task, "current_attempt_id")
+                if status_val != "qa_passed" or not group_id or not attempt_id:
+                    continue
+                qa_result = qa_results_by_attempt.get(attempt_id)
+                if (
+                    qa_result is None
+                    or model_or_dict_value(qa_result, "attempt_id") != attempt_id
+                    or model_or_dict_value(qa_result, "task_id")
+                    != model_or_dict_value(task, "task_id")
+                    or model_or_dict_value(qa_result, "task_revision")
+                    != model_or_dict_value(task, "task_revision")
+                ):
+                    continue
+                evaluation = model_or_dict_value(qa_result, "evaluation")
+                evidence = model_or_dict_value(evaluation, "scan_evidence")
+                if (
+                    evaluation is None
+                    or model_or_dict_value(evaluation, "passed") is not True
+                    or evidence is None
+                    or model_or_dict_value(evidence, "complete") is not True
+                ):
+                    continue
+                remaining_ids = {
+                    str(identifier).strip().upper()
+                    for identifier in (
+                        model_or_dict_value(evidence, "remaining_target_identifiers", []) or []
+                    )
+                    if str(identifier).strip()
+                }
+                remaining_occurrences: set[tuple[str, str, str]] = set()
+                observed_remaining_ids: set[str] = set()
+                for issue in model_or_dict_value(evidence, "found_issues", []) or []:
+                    issue_ids = self._issue_identifiers(issue)
+                    matched_ids = issue_ids.intersection(remaining_ids)
+                    if not matched_ids:
+                        continue
+                    occurrence = finding_occurrence_key(issue)
+                    if occurrence[0] == "unknown package" or not occurrence[2]:
+                        continue
+                    remaining_occurrences.add(occurrence)
+                    observed_remaining_ids.update(matched_ids)
+                unlocalized_ids = remaining_ids - observed_remaining_ids
+                updates.extend(
+                    self.mark_group_remediated(
+                        group_id,
+                        remaining_occurrences=remaining_occurrences,
+                        unlocalized_remaining_identifiers=unlocalized_ids,
+                    )
+                )
 
         # 3. QA Critic / Scan outputs (targeted scan results)
         scan_evidence = state_patch.get("scan_evidence")
@@ -338,56 +367,58 @@ class FindingsTracker:
     def reconcile_final_state(self, final_raw_state: dict[str, Any]) -> DashboardUpdate:
         """Authoritative final reconciliation against the final orchestrator state."""
         task_queue = final_raw_state.get("task_queue") or {}
-        remaining_target_ids = {
-            tid.upper().strip()
-            for tid in final_raw_state.get("remaining_target_identifiers", []) or []
-        }
+        self.process_node_state_update(
+            "final_reconciliation",
+            {
+                "task_queue": task_queue,
+                "qa_results_by_attempt": final_raw_state.get("qa_results_by_attempt") or {},
+            },
+        )
 
-        # 1. Identify all QA passed groups
-        qa_passed_group_ids: set[str] = set()
-        if isinstance(task_queue, Mapping):
-            for task in task_queue.values():
-                status = getattr(task, "status", None)
-                status_val = str(getattr(status, "value", status)).lower()
-                parent_group_id = getattr(task, "parent_group_id", None)
-                if status_val == "qa_passed" and parent_group_id:
-                    qa_passed_group_ids.add(parent_group_id)
+        final_scan = final_raw_state.get("final_full_scan_result")
+        if final_scan is not None and model_or_dict_value(final_scan, "completed") is True:
+            remaining_ids = {
+                str(identifier).strip().upper()
+                for identifier in (
+                    model_or_dict_value(final_scan, "remaining_target_identifiers", []) or []
+                )
+                if str(identifier).strip()
+            }
+            new_ids = {
+                str(identifier).strip().upper()
+                for identifier in (model_or_dict_value(final_scan, "new_identifiers", []) or [])
+                if str(identifier).strip()
+            }
+            found_issues = list(model_or_dict_value(final_scan, "found_issues", []) or [])
+            relevant_issues = [
+                issue
+                for issue in found_issues
+                if self._issue_identifiers(issue).intersection(remaining_ids | new_ids)
+            ]
+            self.add_new_scan_findings(relevant_issues)
 
-        # 2. Mark findings whose group passed QA and are not in remaining_target_identifiers
-        for group_id in qa_passed_group_ids:
-            target_fids = set(self.group_to_finding_ids.get(group_id, set()))
-            for fid in target_fids:
-                if fid in self.findings_by_id:
-                    model = self.findings_by_id[fid]
-                    if not self._finding_identifiers(model).intersection(remaining_target_ids):
-                        model.status = "remediated"
-                        self.remediated_findings_by_id[fid] = model
-                        del self.findings_by_id[fid]
+            observed_remaining_ids: set[str] = set()
+            for issue in relevant_issues:
+                issue_ids = self._issue_identifiers(issue).intersection(remaining_ids)
+                occurrence = finding_occurrence_key(issue)
+                if issue_ids and (occurrence[0] == "unknown package" or not occurrence[2]):
+                    for finding in self._findings_by_id.values():
+                        if finding.status == "remediated" and self._finding_identifiers(
+                            finding
+                        ).intersection(issue_ids):
+                            finding.status = "unresolved"
+                observed_remaining_ids.update(issue_ids)
+            unlocalized_remaining_ids = remaining_ids - observed_remaining_ids
+            for finding in self._findings_by_id.values():
+                if finding.status == "remediated" and self._finding_identifiers(
+                    finding
+                ).intersection(unlocalized_remaining_ids):
+                    finding.status = "unresolved"
 
-        # 3. Any remaining findings that failed QA are marked 'unresolved'
-        for model in self.findings_by_id.values():
+        # Any remaining baseline findings that failed QA stay visible as unresolved.
+        for model in self._findings_by_id.values():
             if not model.is_new and model.status != "remediated":
                 model.status = "unresolved"
-
-        # 4. Check for any final newly detected issues
-        final_scan = final_raw_state.get("final_full_scan_result")
-        if final_scan is not None:
-            found_issues = getattr(final_scan, "found_issues", None) or []
-            new_ids = getattr(final_scan, "new_identifiers", None) or []
-            if new_ids and found_issues:
-                new_issues = [
-                    iss
-                    for iss in found_issues
-                    if (
-                        getattr(iss, "cve_id", None)
-                        and iss.cve_id.upper() in [x.upper() for x in new_ids]
-                    )
-                    or (
-                        getattr(iss, "ghsa_id", None)
-                        and iss.ghsa_id.upper() in [x.upper() for x in new_ids]
-                    )
-                ]
-                self.add_new_scan_findings(new_issues)
 
         return DashboardUpdate(
             type="full_refresh",

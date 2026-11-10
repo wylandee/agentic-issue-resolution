@@ -704,12 +704,12 @@ def _group_sca(localized_issues: list[LocalizedIssue]) -> dict[str, Vulnerabilit
 
 
 def _group_sast(issues: list[VulnerabilityIssue]) -> dict[str, VulnerabilityGroup]:
-    """Return a dict of group_id â†’ VulnerabilityGroup for SAST issues."""
+    """Return a dict of group_id → VulnerabilityGroup for SAST issues."""
     groups: dict[str, VulnerabilityGroup] = {}
     for issue in issues:
         key = _sast_key(issue)
         if key in groups:
-            # Same SAST location seen twice (e.g. duplicate rule run) â€” merge sources
+            # Same SAST location seen twice (e.g. duplicate rule run) — merge sources
             existing = groups[key]
             if issue.source not in existing.sources:
                 existing.sources.append(issue.source)
@@ -992,7 +992,7 @@ def run_triage_pipeline(
     Returns
     -------
     List[Tuple[VulnerabilityGroup, TriageResult]]
-        One pair per group.  Includes *all* groups â€” valid and invalid.
+        One pair per group.  Includes *all* groups — valid and invalid.
         Use ``select_issues_for_remediation`` to filter to actionable ones.
     """
     if not issues:

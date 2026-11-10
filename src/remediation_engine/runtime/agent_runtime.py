@@ -52,21 +52,6 @@ _COMPACTION_TOOLS = frozenset(
         "query_qa_logs",
     }
 )
-_CRITICAL_SCRATCHPAD_TOOLS = frozenset(
-    {
-        "record_plan",
-        "remove_no_fix_dependency",
-        "remove_no_fix_python_dependency",
-        "modify_and_validate_python_dependency",
-        "deterministic_apply_edit_set",
-        "validate_workaround",
-        "validate_python_workaround",
-        "run_targeted_python_test",
-        "validate_python_syntax",
-        "emit_qa_evaluation",
-    }
-)
-
 PHASE_TOOL_REGISTRY: dict[WorkaroundExecutionPhase, frozenset[str]] = {
     WorkaroundExecutionPhase.INVESTIGATE: frozenset(
         {
@@ -1169,11 +1154,7 @@ def _infer_changed_files(tool_event: ToolEvent) -> list[str]:
         return [
             "pom.xml" if tool_event.name == _MAVEN_UPDATE_MANIFEST_TOOL_NAME else "package.json"
         ]
-    if tool_event.name in {
-        "deterministic_search_replace",
-        "deterministic_replace_ast_symbol",
-        "revert_workspace_file",
-    }:
+    if tool_event.name == "revert_workspace_file":
         file_path = tool_event.args.get("file_path")
         if isinstance(file_path, str) and file_path.strip():
             return [file_path.replace("\\", "/")]
@@ -1329,11 +1310,7 @@ def _stagnation_recovery_instruction(
             "Verify the test path is relative and the runner is supported, or proceed with AST "
             "inspection and syntax validation."
         )
-    elif tool_name in {
-        "deterministic_apply_edit_set",
-        "deterministic_search_replace",
-        "deterministic_replace_ast_symbol",
-    }:
+    elif tool_name == "deterministic_apply_edit_set":
         alternative = (
             "Inspect the target files using read_workspace_file or inspect_ast_symbol to verify "
             "exact anchor lines, expected_occurrences, and line_hints before recording a new complete replacement plan."
@@ -1505,7 +1482,6 @@ def run_bounded_subagent_loop(
     tools: Sequence[Any],
     initial_messages: Sequence[Any],
     touched_files: set[str],
-    planning_state: dict[str, bool] | None = None,
     execution_state: dict[str, Any] | None = None,
     structured_output_model: type[BaseModel] | None = None,
     structured_output_tool_name: str | None = None,
@@ -1519,7 +1495,6 @@ def run_bounded_subagent_loop(
         tools: Tools available to the bounded loop.
         initial_messages: Initial conversation messages.
         touched_files: Files already known to be changed by the worker.
-        planning_state: Optional mutable planning-phase state.
         execution_state: Optional mutable validation/execution state.
         structured_output_model: Optional Pydantic model for a terminal result.
         structured_output_tool_name: Tool name whose arguments are validated as
@@ -1616,11 +1591,6 @@ def run_bounded_subagent_loop(
             )
         conversation.append(response)
         final_text = _response_text_content(getattr(response, "content", ""))
-        if planning_state is not None:
-            lowered = final_text.lower()
-            if "planning answers" in lowered or "1. what version" in lowered:
-                planning_state["submitted"] = True
-
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
             if structured_output_model is None:
@@ -2031,8 +2001,6 @@ def run_bounded_subagent_loop(
                 and event.name
                 in {
                     "deterministic_apply_edit_set",
-                    "deterministic_search_replace",
-                    "deterministic_replace_ast_symbol",
                 }
                 and event.content.startswith("SUCCESS:")
             ):
@@ -2185,49 +2153,9 @@ def run_bounded_subagent_loop(
     )
 
 
-def has_all_modified_files_validated_after_last_edit(
-    tool_events: Sequence[ToolEvent],
-    edit_tool_names: Sequence[str] = (
-        "deterministic_search_replace",
-        "deterministic_replace_ast_symbol",
-    ),
-    validation_tool_name: str = "validate_code_syntax",
-) -> bool:
-    """Return whether every file modified by a successful edit had a successful syntax validation after its last edit."""
-    last_edit_by_file: dict[str, int] = {}
-    for index, event in enumerate(tool_events):
-        if event.name in edit_tool_names and event.content.startswith("SUCCESS:"):
-            file_path = event.args.get("file_path")
-            if isinstance(file_path, str) and file_path.strip():
-                norm_path = file_path.replace("\\", "/").strip()
-                last_edit_by_file[norm_path] = index
-
-    if not last_edit_by_file:
-        return False
-
-    for norm_path, last_edit_idx in last_edit_by_file.items():
-        validated = False
-        for event in tool_events[last_edit_idx + 1 :]:
-            if event.name == validation_tool_name and event.content.startswith("SUCCESS:"):
-                val_path = event.args.get("file_path")
-                if not val_path or val_path.replace("\\", "/").strip() == norm_path:
-                    validated = True
-                    break
-        if not validated:
-            return False
-
-    return True
-
-
 def has_successful_validation_gate(
     tool_events: Sequence[ToolEvent],
     validation_tool_name: str | None = None,
-    edit_tool_names: Sequence[str] = (
-        "deterministic_apply_edit_set",
-        "deterministic_search_replace",
-        "deterministic_replace_ast_symbol",
-        "revert_workspace_file",
-    ),
     has_prior_edits: bool = False,
 ) -> bool:
     """Return whether the combined gate passed after the final cumulative edit.
@@ -2241,7 +2169,8 @@ def has_successful_validation_gate(
         (
             index
             for index, event in enumerate(tool_events)
-            if event.name in edit_tool_names and event.content.startswith("SUCCESS:")
+            if event.name in {"deterministic_apply_edit_set", "revert_workspace_file"}
+            and event.content.startswith("SUCCESS:")
         ),
         default=-1,
     )
@@ -2264,17 +2193,11 @@ def has_successful_validation_gate(
 def has_tool_call_before_first_successful_edit(
     tool_events: Sequence[ToolEvent],
     lookup_tool_name: str,
-    edit_tool_names: Sequence[str] | str = (
-        "deterministic_apply_edit_set",
-        "deterministic_search_replace",
-        "deterministic_replace_ast_symbol",
-    ),
 ) -> bool:
     """Return whether a given tool was called before the first successful edit."""
-    names = (edit_tool_names,) if isinstance(edit_tool_names, str) else tuple(edit_tool_names)
     first_successful_edit_index = -1
     for index, event in enumerate(tool_events):
-        if event.name in names and event.content.startswith("SUCCESS:"):
+        if event.name == "deterministic_apply_edit_set" and event.content.startswith("SUCCESS:"):
             first_successful_edit_index = index
             break
 

@@ -127,7 +127,11 @@ def _capture_maven_subagent_state(dispatch, runner_name: str) -> dict:
         captured.update(subagent_state)
         return {}
 
-    runner_module = SimpleNamespace(**{runner_name: capture_runner_state})
+    runner_module = (
+        "remediation_engine.agents.update.run_update_subagent_node"
+        if runner_name == "run_update_subagent_node"
+        else "remediation_engine.agents.workaround.run_workaround_subagent_node"
+    )
     with (
         patch.object(graph_wrappers, "_dispatch_boundary_rejection", return_value=None),
         patch.object(graph_wrappers, "_prepare_workspace_for_dispatch", return_value=(state, [])),
@@ -137,7 +141,7 @@ def _capture_maven_subagent_state(dispatch, runner_name: str) -> dict:
             return_value=("attempt-snapshot", []),
         ),
         patch.object(graph_wrappers, "_finalize_worker_workspace_snapshot", return_value=[]),
-        patch.object(graph_wrappers, "_graph_module", return_value=runner_module),
+        patch(runner_module, capture_runner_state),
     ):
         dispatch(state)
     return captured
@@ -360,10 +364,11 @@ def test_unfixable_lockfile_candidate_is_absent_from_final_patch(tmp_path):
         }
     )
     sandbox = _execution_node_sandbox_mock()
-    sandbox.read_file.side_effect = {
+    files = {
         "package.json": json.dumps(manifest_after, indent=2) + "\n",
         "package-lock.json": json.dumps(lockfile_after, indent=2) + "\n",
-    }.get
+    }
+    sandbox.read_file.side_effect = lambda path, **_kwargs: files.get(path)
     client = MagicMock()
 
     with (
@@ -436,7 +441,7 @@ def test_python_teardown_restores_only_unfixable_requirements_declaration(tmp_pa
         }
     )
     sandbox = _execution_node_sandbox_mock()
-    sandbox.read_file.side_effect = {"requirements.txt": updated}.get
+    sandbox.read_file.side_effect = lambda path, **_kwargs: {"requirements.txt": updated}.get(path)
     client = MagicMock()
 
     with (
@@ -506,7 +511,6 @@ class TestStateDefaults:
         state = initial_orchestrator_state(str(tmp_path), [])
 
         assert state["constraints_ledger"] == []
-        assert state["retry_counts"] == {}
         assert state["group_strategies"] == {}
         assert state["qa_evaluations"] == {}
         assert state["action_summaries"] == []
@@ -814,7 +818,7 @@ class TestTeardownNode:
         ):
             result = run_teardown_node(state)
 
-        sandbox.read_file.assert_called_once_with("routes/login.ts")
+        sandbox.read_file.assert_called_once_with("routes/login.ts", strict=True)
         client.volumes.get.assert_called_once_with("agent_workspace_deadbeef")
         client.volumes.get.return_value.remove.assert_called_once_with(force=True)
         assert result["status"] == "completed"
@@ -951,7 +955,7 @@ class TestTeardownNode:
         state["changed_files"] = ["routes/login.ts", "lib/insecurity.ts"]
 
         sandbox = _execution_node_sandbox_mock()
-        sandbox.read_file.side_effect = lambda path: {
+        sandbox.read_file.side_effect = lambda path, **_kwargs: {
             "routes/login.ts": "const x = 2;\n",
             "lib/insecurity.ts": "const safe = true;\n",
         }.get(path)
@@ -1112,7 +1116,7 @@ class TestTeardownNodeStage2Parity:
         ):
             result = run_teardown_node(state)
 
-        sandbox.read_file.assert_called_once_with("routes/login.ts")
+        sandbox.read_file.assert_called_once_with("routes/login.ts", strict=True)
         sandbox_type.assert_called_once_with(
             repo_root=None,
             image=LANGUAGE_CONFIGS[ProjectLanguage.PYTHON].docker_image,
@@ -1633,7 +1637,6 @@ def _initial_state(tmp_path: Path, issues: list[VulnerabilityIssue], system_cont
         "issues": issues,
         "system_context": system_context,
         "constraints_ledger": [],
-        "retry_counts": {},
         "group_strategies": {},
         "qa_evaluations": {},
         "action_summaries": [],
@@ -1679,7 +1682,6 @@ class TestTriageNodeIntegration:
             "repo_root": str(tmp_path),
             "valid_groups": [],
             "constraints_ledger": [],
-            "retry_counts": {},
             "group_strategies": {},
             "qa_evaluations": {},
             "action_summaries": [],
@@ -1738,7 +1740,6 @@ class TestTriageNodeIntegration:
             mock_supervisor.return_value = {
                 "status": "supervisor_routed",
                 "next_routing_step": "teardown",
-                "feedback_by_group": {},
                 "supervisor_instructions": "done",
             }
             mock_teardown.return_value = {"status": "phase5_refactor_blocked"}

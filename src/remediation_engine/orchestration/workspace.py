@@ -1309,10 +1309,15 @@ def _run_teardown_node_impl(state: OrchestratorState) -> dict[str, Any]:
                                     rel_path,
                                     allow_workspace_prefix=False,
                                 )
-                                updated_text = sandbox.read_file(rel_path)
+                                updated_text = sandbox.read_file(rel_path, strict=True)
                             except WorkspacePathError as exc:
                                 errors.append(
                                     f"teardown_node: blocked workspace path '{rel_path}' - {exc}"
+                                )
+                                continue
+                            except Exception as exc:  # noqa: BLE001 - never turn unreadable into a deletion
+                                errors.append(
+                                    f"teardown_node: could not read workspace patch input '{rel_path}' - {exc}"
                                 )
                                 continue
                             host_path = resolve_repository_path(repo_root, rel_path)

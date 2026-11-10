@@ -16,7 +16,6 @@ from remediation_engine.agents.report import (
     generate_executive_summary,
     generate_report,
 )
-from remediation_engine.evals.judge import build_judge_score_metric
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import case_metadata_dict, set_pytest_item_identity
 
@@ -27,7 +26,7 @@ try:
         HallucinationMetric,
         SummarizationMetric,
     )
-    from deepeval.test_case import LLMTestCase, SingleTurnParams
+    from deepeval.test_case import LLMTestCase
 
     HAS_DEEPEVAL = True
 except ImportError:
@@ -36,7 +35,6 @@ except ImportError:
     HallucinationMetric = None  # type: ignore[assignment,misc]
     SummarizationMetric = None  # type: ignore[assignment,misc]
     LLMTestCase = None  # type: ignore[assignment,misc]
-    SingleTurnParams = None  # type: ignore[assignment,misc]
     assert_test = None  # type: ignore[assignment]
 
 
@@ -59,67 +57,6 @@ _REPORT_CODE_FILE_PATH_RE = re.compile(
     r"properties|cfg|ini|txt|ipynb))(?![\w])",
     re.IGNORECASE,
 )
-
-
-def _report_format_evidence() -> dict[str, Any]:
-    """Describe the canonical report shape supplied to live judges.
-
-    The report renderer is deterministic Markdown rather than a free-form
-    narrative. Keeping this description beside the eval adapter prevents the
-    judge prompt from silently reverting to the older narrative contract.
-    """
-    return {
-        "version": _REPORT_FORMAT_VERSION,
-        "sections": list(_REPORT_SECTIONS),
-        "finding_identity": (
-            "Use the scanner CVE/GHSA/finding identifier in the report. The group id is "
-            "internal state and is only a fallback when no scanner identifier exists."
-        ),
-        "evidence_policy": (
-            "Counts, statuses, attempts, package transitions, file paths, and references "
-            "must come from the typed report state."
-        ),
-        "executive_summary_style": (
-            "Use concise connected prose with no category labels followed by colons; "
-            "bold numeric finding and group counts."
-        ),
-    }
-
-
-_REPORT_JUDGE_CRITERIA = """
-Evaluate the Actual Output as a canonical remediation_report_v3 Markdown
-document against the deterministic evidence in the Context and Expected
-Output. The first section is an Executive Summary paragraph followed by the
-existing metrics table. The report must preserve the evidence-backed outcome
-and critical report rules:
-
-1. The Executive Summary must include original, QA-remediated, follow-up, and
-   newly detected finding and group counts. Counts must match the evidence,
-   remain separate when finding/group cardinalities differ, and describe
-   incomplete or unavailable evidence as partial or unknown rather than zero.
-   Write it as connected natural-language prose, without category labels followed
-   by colons, and bold the numeric counts.
-   Its remediated/follow-up group totals must also match the metrics table.
-   Every successful group must have one successful-remediation row, and every
-   outstanding group must have one follow-up action.
-2. Follow-up actions must retain the attempted-remediation evidence that is
-   present in the context, including package/version attempts and their
-   outcomes. Do not promote a worker claim or a diff into a successful fix
-   without QA-passed final task evidence.
-3. Version-only rows must report supported package transitions without inventing
-source-workaround claims. Code-workaround and package-removal rows must preserve
-the supported source explanation and accepted source-change evidence. A strategy
-pivot must retain both the version transition and later workaround evidence.
-File-path scope is validated deterministically and is not scored by this judge.
-4. A transitive finding must keep the vulnerable finding package as the report
-   identity while retaining the editable parent/target package as context when
-   the evidence distinguishes them.
-5. The four numbered report sections, scanner finding identifiers, statuses,
-   attempts, and References table must follow the current report format.
-6. Never invent CVE/GHSA IDs, package names, versions, statuses, metrics,
-   changed files, code changes, scan results, or recommendations. Do not turn
-   unavailable evidence into a definitive claim.
-""".strip()
 
 
 def _expected_count_label(value: Any) -> str:
@@ -769,44 +706,16 @@ def _build_report_source_evidence(case: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _build_report_policy_context() -> str:
-    """Render non-source constraints for the report judge.
-
-    File-path placement is enforced by ``validate_report_contract`` and is
-    deliberately excluded from all LLM metric contexts.
-
-    Returns:
-        General report-format and evidence-policy guidance for rubric scoring.
-    """
-    format_evidence = _report_format_evidence()
-    return "\n".join(
-        [
-            "Constraint-adherence rules follow; they are policies, not source facts.",
-            f"Required sections: {', '.join(format_evidence['sections'])}.",
-            format_evidence["finding_identity"],
-            format_evidence["evidence_policy"],
-            format_evidence["executive_summary_style"],
-            "Successful claims require final QA-passed outcomes; failed attempts alone "
-            "must not be presented as fixes.",
-            "Follow-up rows should preserve supported package/version attempts and outcomes.",
-            "File-path scope is checked deterministically and is not part of rubric scoring.",
-        ]
-    )
-
-
-def build_report_context(case: dict[str, Any]) -> list[str]:
-    """Build factual evidence and policy guidance for separate judge cases.
+def build_report_context(case: dict[str, Any]) -> str:
+    """Build factual source evidence for the report judges.
 
     Args:
         case: Curated report case containing deterministic state and provenance.
 
     Returns:
-        The source-evidence document followed by general report policy guidance.
+        The source-evidence document.
     """
-    return [
-        _build_report_source_evidence(case),
-        _build_report_policy_context(),
-    ]
+    return _build_report_source_evidence(case)
 
 
 def render_report(case: dict[str, Any], *, executive_summary: Any = None) -> str:
@@ -1063,21 +972,6 @@ def build_report_expected_output(case: dict[str, Any]) -> str:
     return json.dumps(expected, sort_keys=True)
 
 
-def _build_judge_expected_output(case: dict[str, Any]) -> str:
-    """Build expected report facts without path rules reserved for deterministic checks.
-
-    Args:
-        case: Curated report case containing the full golden contract.
-
-    Returns:
-        A compact contract for rubric scoring that excludes file-path constraints.
-    """
-    expected = json.loads(build_report_expected_output(case))
-    expected.pop("code_detail_diff_paths", None)
-    expected.pop("forbidden_code_detail_diff_paths", None)
-    return json.dumps(expected, sort_keys=True)
-
-
 def validate_report_contract(
     report: str,
     contract: dict[str, Any],
@@ -1088,8 +982,8 @@ def validate_report_contract(
     """Return fixture-contract violations without adding another eval metric.
 
     These checks validate that the curated evidence and production renderer are
-    wired together before an optional LLM judge runs. They are not persisted as
-    a fifth metric and do not replace the four DeepEval metrics.
+    wired together before the three optional DeepEval judges run. These checks
+    remain deterministic and are not persisted as a separate score.
 
     Args:
         report: Rendered production Markdown.
@@ -1243,7 +1137,7 @@ def validate_report_contract(
 
 
 def _build_metrics(eval_settings: EvalSettings, case: dict[str, Any]) -> list[Any]:
-    """Construct exactly the four DeepEval metrics for report evaluation."""
+    """Construct the three DeepEval metrics for report evaluation."""
     if not HAS_DEEPEVAL:
         raise RuntimeError("DeepEval is required for live report evaluation.")
     return [
@@ -1268,46 +1162,33 @@ def _build_metrics(eval_settings: EvalSettings, case: dict[str, Any]) -> list[An
             include_reason=True,
             verbose_mode=True,
         ),
-        build_judge_score_metric(
-            name="Report Constraint Adherence",
-            criteria=_REPORT_JUDGE_CRITERIA,
-            evaluation_params=[
-                SingleTurnParams.INPUT,
-                SingleTurnParams.ACTUAL_OUTPUT,
-                SingleTurnParams.EXPECTED_OUTPUT,
-                SingleTurnParams.CONTEXT,
-            ],
-            threshold=0.70,
-            model=eval_settings.judge_llm or eval_settings.judge_model,
-            verbose_mode=True,
-        ),
     ]
 
 
 def _record_live_report_metrics(
-    metric_groups: tuple[tuple[str, Any, list[Any]], ...],
+    metric_case: Any,
+    metrics: list[Any],
 ) -> list[str]:
     """Run report judges and return threshold failures as diagnostics."""
     if assert_test is None:
         raise RuntimeError("DeepEval is required for live report metrics.")
     failures: list[str] = []
-    for group_name, metric_case, selected_metrics in metric_groups:
-        set_pytest_item_identity(metric_case)
-        try:
-            assert_test(metric_case, selected_metrics)
-        except AssertionError as exc:
-            failures.append(f"{group_name}: {exc}")
+    set_pytest_item_identity(metric_case)
+    try:
+        assert_test(metric_case, metrics)
+    except AssertionError as exc:
+        failures.append(f"report metrics: {exc}")
     return failures
 
 
-def _build_report_metric_cases(
+def _build_report_metric_case(
     case: dict[str, Any],
     report: str,
-    context: list[str],
+    context: str,
     *,
     summary_generation: dict[str, Any] | None = None,
-) -> tuple[Any, Any]:
-    """Build factual-judge and policy-judge cases with separate contexts."""
+) -> Any:
+    """Build the shared fact-grounded case for the report judges."""
     metadata = {
         "case_id": case["case_id"],
         "provenance": case["provenance"],
@@ -1316,25 +1197,14 @@ def _build_report_metric_cases(
     }
     if summary_generation is not None:
         metadata["executive_summary_generation"] = summary_generation
-    evidence = context[0]
-    factual_case = LLMTestCase(
-        name=f"{case['case_id']} [Factual Report Metrics]",
-        input=evidence,
+    return LLMTestCase(
+        name=f"{case['case_id']} [Report Metrics]",
+        input=context,
         actual_output=report,
-        context=[evidence],
-        retrieval_context=[evidence],
+        context=[context],
+        retrieval_context=[context],
         additional_metadata=metadata,
     )
-    policy_case = LLMTestCase(
-        name=f"{case['case_id']} [Report Constraint Adherence]",
-        input=evidence,
-        actual_output=report,
-        expected_output=_build_judge_expected_output(case),
-        context=context,
-        retrieval_context=context,
-        additional_metadata=metadata,
-    )
-    return factual_case, policy_case
 
 
 @pytest.mark.eval
@@ -1342,13 +1212,13 @@ class TestReportNodeEval:
     """Evaluate the final report against historical, typed evidence."""
 
     @pytest.mark.parametrize("case", _load_golden_cases(), ids=_REPORT_CASE_IDS)
-    def test_report_uses_only_the_four_requested_metrics(
+    def test_report_uses_the_three_requested_metrics(
         self,
         case: dict[str, Any],
         eval_settings: EvalSettings,
         request: pytest.FixtureRequest | None = None,
     ) -> None:
-        """Persist four live judge metrics as diagnostics after deterministic checks."""
+        """Persist three live judge metrics after deterministic checks."""
         report = render_report(case)
         requirements_changes = [
             change
@@ -1401,18 +1271,14 @@ class TestReportNodeEval:
             )
 
         context = build_report_context(case)
-        factual_case, policy_case = _build_report_metric_cases(
+        metric_case = _build_report_metric_case(
             case,
             report,
             context,
             summary_generation=summary_result.metadata(),
         )
         metrics = _build_metrics(eval_settings, case)
-        metric_groups = (
-            ("factual metrics", factual_case, metrics[:3]),
-            ("constraint metric", policy_case, metrics[3:]),
-        )
-        failures = _record_live_report_metrics(metric_groups)
+        failures = _record_live_report_metrics(metric_case, metrics)
         if failures and request is not None:
             request.node.user_properties.append(("live_metric_diagnostics", "\n".join(failures)))
         if not summary_result.used_llm:
@@ -1482,7 +1348,7 @@ def test_report_summarization_questions_match_rendered_scan_fields() -> None:
         case for case in _REPORT_CASES if case["case_id"] == "python-report-pyjwt-follow-up"
     )
 
-    context = build_report_context(case)[0]
+    context = build_report_context(case)
     scan_question = next(
         question
         for question in _report_summarization_questions(case)
@@ -1538,17 +1404,16 @@ def test_live_metric_cases_carry_summary_generation_provenance() -> None:
         "source_fingerprint": "fixture-fingerprint",
     }
 
-    factual_case, policy_case = _build_report_metric_cases(
+    metric_case = _build_report_metric_case(
         case,
         render_report(case),
         build_report_context(case),
         summary_generation=generation,
     )
 
-    for metric_case in (factual_case, policy_case):
-        metadata = case_metadata_dict(metric_case)
-        assert metadata["executive_summary_generation"] == generation
-        assert metadata["case_id"] == case["case_id"]
+    metadata = case_metadata_dict(metric_case)
+    assert metadata["executive_summary_generation"] == generation
+    assert metadata["case_id"] == case["case_id"]
 
 
 def test_report_live_judge_failures_are_non_gating_diagnostics(
@@ -1564,7 +1429,7 @@ def test_report_live_judge_failures_are_non_gating_diagnostics(
     monkeypatch.setitem(globals(), "assert_test", fail_metric_assertion)
     metric_case = object()
     metric = object()
-    diagnostics = _record_live_report_metrics((("factual metrics", metric_case, [metric]),))
+    diagnostics = _record_live_report_metrics(metric_case, [metric])
 
-    assert diagnostics == ["factual metrics: judge threshold not met"]
+    assert diagnostics == ["report metrics: judge threshold not met"]
     assert recorded == [(metric_case, [metric])]

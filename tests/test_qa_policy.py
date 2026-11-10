@@ -365,10 +365,7 @@ def test_task_specific_scan_evidence_preserves_new_ids_and_closure_metadata() ->
 def _investigation() -> GroupInvestigation:
     return GroupInvestigation(
         group_id="g1",
-        task_id="task-1",
-        investigation_text="Reviewed the diff.\nStructured Review Verdict: PASS",
         tool_transcript="[TOOL: read_file_context]",
-        review_tools_used=["read_file_context"],
         source_review_evidence=True,
         structured_review_verdict=SecurityReviewVerdict.PASS,
     )
@@ -581,7 +578,10 @@ def test_target_absence_does_not_waive_install_or_required_tests(
 
 def test_target_absence_does_not_clear_remaining_target_identifiers() -> None:
     context = _task_context(_group("g1"))
-    results = _absence_results(remaining={"CVE-2025-0001"})
+    evidence = _absence_evidence().model_copy(
+        update={"remaining_target_identifiers": ["CVE-2025-0001"]}
+    )
+    results = _absence_results(evidence=evidence)
     policy = QAPolicy.VERSION_BUMP
     gates, _ = _evaluate_policy_gates([context], results, {context.task_id: policy})
 
@@ -595,6 +595,20 @@ def test_target_absence_does_not_clear_remaining_target_identifiers() -> None:
     assert gates[context.task_id].target_package_absent is True
     assert gates[context.task_id].target_scanner_cleared is False
     assert evaluations[context.task_id].passed is False
+
+
+def test_target_absence_ignores_global_identifier_without_task_occurrence_evidence() -> None:
+    context = _task_context(_group("g1"))
+    results = _absence_results(remaining={"CVE-2025-0001"})
+
+    gates, _ = _evaluate_policy_gates(
+        [context],
+        results,
+        {context.task_id: QAPolicy.VERSION_BUMP},
+    )
+
+    assert gates[context.task_id].target_package_absent is True
+    assert gates[context.task_id].target_scanner_cleared is True
 
 
 def test_version_bump_ignores_compacted_manifest_false_negative() -> None:
@@ -1464,7 +1478,7 @@ class TestGenerateWorkspaceDiff:
         rel_path = "src/remediation_engine/agents/qa.py"
 
         sandbox = MagicMock()
-        # read_file returns None â†’ file deleted in workspace
+        # read_file returns None → file deleted in workspace
         sandbox.read_file.return_value = None
         diff_text, changed = _generate_workspace_diff(str(tmp_path), sandbox, [rel_path])
 

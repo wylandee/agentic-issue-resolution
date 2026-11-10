@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-from base64 import b64decode
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -24,6 +23,7 @@ from remediation_engine.runtime.path_policy import (
 )
 from remediation_engine.runtime.sandbox import DockerSandbox
 from remediation_engine.settings import get_runtime_settings
+from remediation_engine.tools.advisories import _fetch_page_content
 from remediation_engine.tools.identity import normalize_python_package_name
 from remediation_engine.tools.maven_manifest_locator import (
     MavenManifestError,
@@ -74,7 +74,6 @@ _SERPER_MAX_RESULTS = 3
 _SEARCH_WEB_MAX_CALLS = 3
 
 _JINA_READER_URL_PREFIX = "https://r.jina.ai/"
-_GITHUB_API_URL_PREFIX = "https://api.github.com/"
 _READ_WEB_PAGE_TIMEOUT = 15
 _READ_WEB_PAGE_MAX_CHARS = 16_000
 
@@ -122,50 +121,68 @@ _RUNTIME_BOOTSTRAP_MARKERS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 def _is_authoritative_evidence_source(source: str) -> bool:
     """Return whether an evidence source URL or path is authoritative."""
-    candidate = (source or "").strip().lower()
+    candidate = str(source or "").strip().replace("\\", "/")
     if not candidate:
         return False
-    if any(
-        untrusted in candidate
-        for untrusted in ("stackoverflow.com", "stackexchange.com", "reddit.com", "snippet-only")
+    local_path = candidate.removeprefix("workspace:")
+    if "://" not in local_path:
+        try:
+            normalized = normalize_workspace_path(local_path, allow_workspace_prefix=False)
+        except ValueError:
+            return False
+        parts = normalized.split("/")
+        return (
+            len(parts) >= 3
+            and parts[0] == "node_modules"
+            and parts[-1].casefold() in {"readme", "readme.md", "index.d.ts", "package.json"}
+        )
+    try:
+        parsed = urlparse(candidate)
+        source_host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or not source_host
     ):
         return False
-    source_url = candidate if "://" in candidate else f"https://{candidate}"
-    try:
-        source_host = (urlparse(source_url).hostname or "").lower()
-    except ValueError:
-        source_host = ""
-    if source_host in {
-        "pypi.org",
-        "www.pypi.org",
-        "packaging.python.org",
-        "docs.python.org",
-    }:
+    path = parsed.path.rstrip("/").casefold()
+    if source_host in {"pypi.org", "www.pypi.org"}:
+        return path.startswith(("/project/", "/pypi/"))
+    if source_host in {"packaging.python.org", "docs.python.org", "expressjs.com", "jwt.io"}:
         return True
+    if source_host == "github.com":
+        parts = [part for part in path.split("/") if part]
+        return len(parts) >= 2
+    if source_host == "raw.githubusercontent.com":
+        return len([part for part in path.split("/") if part]) >= 4
+    if source_host == "nvd.nist.gov":
+        return path.startswith("/vuln/detail/")
+    if source_host in {"cve.org", "www.cve.org"}:
+        return path.startswith(("/cverecord", "/cve/")) or "/cve-" in path
+    if source_host == "osv.dev":
+        return path.startswith("/vulnerability/")
+    if source_host == "security.snyk.io":
+        return path.startswith("/vuln/")
+    if source_host in {"npmjs.com", "www.npmjs.com"}:
+        return path.startswith("/package/")
+    return source_host == "registry.npmjs.org" and bool(path.strip("/"))
 
-    authoritative_markers = (
-        "github.com/",
-        "github.com/advisories",
-        "raw.githubusercontent.com",
-        "nvd.nist.gov",
-        "cve.org",
-        "osv.dev",
-        "security.snyk.io",
-        "npmjs.com/package/",
-        "registry.npmjs.org",
-        "expressjs.com",
-        "jwt.io",
-        "node_modules/",
-        "readme",
-        "index.d.ts",
-        "package.json",
-        "official advisory",
-        "package repository",
-        "package docs",
-        "npm registry",
-        "installed package",
-    )
-    return any(marker in candidate for marker in authoritative_markers)
+
+def _record_inspected_authoritative_source(
+    plan_state: dict[str, Any] | None,
+    source: str,
+) -> None:
+    """Record an authoritative source only after its contents were read."""
+    if plan_state is None or not _is_authoritative_evidence_source(source):
+        return
+    ledger = plan_state.setdefault("evidence_ledger", [])
+    if source not in ledger:
+        ledger.append(source)
+    plan_state["has_authoritative_evidence"] = True
+    plan_state["evidence_source"] = source
 
 
 def _is_infrastructure_failure(error_text: str) -> bool:
@@ -899,88 +916,6 @@ def _make_search_web_tool(
     return search_web
 
 
-def _github_api_url(target_url: str) -> str | None:
-    """Translate a public GitHub URL into its corresponding GitHub API URL."""
-    parsed = urlparse(target_url)
-    hostname = (parsed.hostname or "").lower()
-    if hostname not in {"github.com", "www.github.com"}:
-        return None
-
-    parts = [part for part in parsed.path.split("/") if part]
-    if not parts:
-        return None
-
-    if parts[0].lower() == "advisories" and len(parts) >= 2:
-        return f"{_GITHUB_API_URL_PREFIX}advisories/{quote(parts[1], safe='')}"
-    if len(parts) < 2:
-        return None
-
-    owner, repository = parts[0], parts[1]
-    if repository.endswith(".git"):
-        repository = repository[:-4]
-    base = f"{_GITHUB_API_URL_PREFIX}repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
-    if len(parts) == 2:
-        return base
-
-    resource = parts[2].lower()
-    if resource in {"issues", "pulls", "commits"} and len(parts) >= 4:
-        return f"{base}/{resource}/{quote(parts[3], safe='')}"
-    if resource == "releases" and len(parts) >= 5 and parts[3].lower() == "tag":
-        return f"{base}/releases/tags/{quote('/'.join(parts[4:]), safe='')}"
-    if resource in {"blob", "raw", "tree"} and len(parts) >= 4:
-        ref = quote(parts[3], safe="")
-        content_path = quote("/".join(parts[4:]), safe="/")
-        endpoint = f"{base}/contents/{content_path}" if content_path else f"{base}/contents"
-        return f"{endpoint}?ref={ref}"
-    return base
-
-
-def _github_headers() -> dict[str, str]:
-    """Build GitHub API headers without exposing an optional token in logs."""
-    headers = {
-        "Accept": "application/vnd.github.raw+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    token = get_runtime_settings().github_token
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def _decode_github_response(resp: Any, target_url: str) -> str:
-    """Decode raw GitHub content or a JSON API response into readable text."""
-    text = getattr(resp, "text", "") or ""
-    if text.strip():
-        try:
-            payload = resp.json()
-        except Exception:  # noqa: BLE001
-            return text
-        if isinstance(payload, dict):
-            if payload.get("encoding") == "base64" and payload.get("content"):
-                try:
-                    return b64decode(str(payload["content"]).replace("\n", "")).decode("utf-8")
-                except Exception:  # noqa: BLE001
-                    return text
-            title = (
-                payload.get("title")
-                or payload.get("name")
-                or payload.get("login")
-                or "GitHub Content"
-            )
-            body = payload.get("body") or payload.get("description") or payload.get("content") or ""
-            if title or body:
-                return f"Title: {title}\nURL: {target_url}\n\n{body}".strip()
-            import json
-
-            return json.dumps(payload, indent=2, ensure_ascii=False)
-        if isinstance(payload, list):
-            import json
-
-            return json.dumps(payload, indent=2, ensure_ascii=False)
-        return text
-    return f"No readable content extracted from {target_url}."
-
-
 def _pypi_project_from_target(target: str) -> tuple[str, str] | None:
     """Resolve a bare Python distribution name or PyPI project URL."""
     parsed = urlparse(target)
@@ -1037,9 +972,7 @@ def _read_pypi_project(
         response.raise_for_status()
         text = _format_pypi_project(response.json(), package_name)
         if text and text.strip():
-            if plan_state is not None and _is_authoritative_evidence_source(evidence_source):
-                plan_state["has_authoritative_evidence"] = True
-                plan_state["evidence_source"] = evidence_source
+            _record_inspected_authoritative_source(plan_state, evidence_source)
             return text
     except Exception as exc:  # noqa: BLE001
         logger.debug("PyPI JSON fetch failed for %s: %s", package_name, exc)
@@ -1056,9 +989,7 @@ def _read_pypi_project(
             response.raise_for_status()
             text = response.text or ""
             if text and text.strip():
-                if plan_state is not None and _is_authoritative_evidence_source(evidence_source):
-                    plan_state["has_authoritative_evidence"] = True
-                    plan_state["evidence_source"] = evidence_source
+                _record_inspected_authoritative_source(plan_state, evidence_source)
                 return text
         except Exception as exc:  # noqa: BLE001
             logger.debug("PyPI page fetch failed for %s: %s", package_name, exc)
@@ -1122,95 +1053,11 @@ def _make_read_web_page_tool(
                         f"--- Markdown content of {target_url} ---\n\n{_truncate_page_text(text)}"
                     )
 
-        # 1. GitHub API & Raw GitHub fallback
-        if "github.com" in target_url and not target_url.startswith(
-            "https://raw.githubusercontent.com"
-        ):
-            github_api_url = _github_api_url(target_url)
-            if github_api_url:
-                try:
-                    resp = requests.get(
-                        github_api_url,
-                        headers=_github_headers(),
-                        timeout=_READ_WEB_PAGE_TIMEOUT,
-                    )
-                    resp.raise_for_status()
-                    text = _decode_github_response(resp, target_url)
-                    if text and text.strip():
-                        if len(text) > _READ_WEB_PAGE_MAX_CHARS:
-                            text = (
-                                text[:_READ_WEB_PAGE_MAX_CHARS]
-                                + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
-                            )
-                        if plan_state is not None and _is_authoritative_evidence_source(target_url):
-                            plan_state["has_authoritative_evidence"] = True
-                            plan_state["evidence_source"] = target_url
-                        return f"--- Markdown content of {target_url} ---\n\n{text}"
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("GitHub API fetch failed for %s: %s", target_url, exc)
-
-            raw_url = (
-                target_url.replace("github.com", "raw.githubusercontent.com")
-                .replace("/blob/", "/")
-                .replace("/tree/", "/")
-            )
-            try:
-                resp = requests.get(raw_url, timeout=_READ_WEB_PAGE_TIMEOUT)
-                resp.raise_for_status()
-                text = resp.text or ""
-                if text and text.strip():
-                    if len(text) > _READ_WEB_PAGE_MAX_CHARS:
-                        text = (
-                            text[:_READ_WEB_PAGE_MAX_CHARS]
-                            + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
-                        )
-                    if plan_state is not None and _is_authoritative_evidence_source(target_url):
-                        plan_state["has_authoritative_evidence"] = True
-                        plan_state["evidence_source"] = target_url
-                    return f"--- Markdown content of {target_url} ---\n\n{text}"
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Raw GitHub fetch failed for %s: %s", raw_url, exc)
-
-        # 2. Jina Reader fallback
-        jina_url = f"{_JINA_READER_URL_PREFIX}{target_url}"
-        try:
-            resp = requests.get(
-                jina_url,
-                headers={"Accept": "text/plain"},
-                timeout=_READ_WEB_PAGE_TIMEOUT,
-            )
-            resp.raise_for_status()
-            text = resp.text or ""
-            if text and text.strip():
-                if len(text) > _READ_WEB_PAGE_MAX_CHARS:
-                    text = (
-                        text[:_READ_WEB_PAGE_MAX_CHARS]
-                        + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
-                    )
-                if plan_state is not None and _is_authoritative_evidence_source(target_url):
-                    plan_state["has_authoritative_evidence"] = True
-                    plan_state["evidence_source"] = target_url
-                return f"--- Markdown content of {target_url} ---\n\n{text}"
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Jina Reader fetch failed for %s: %s", target_url, exc)
-
-        # 3. Direct page fetch fallback
-        try:
-            resp = requests.get(target_url, timeout=_READ_WEB_PAGE_TIMEOUT)
-            resp.raise_for_status()
-            text = resp.text or ""
-            if text and text.strip():
-                if len(text) > _READ_WEB_PAGE_MAX_CHARS:
-                    text = (
-                        text[:_READ_WEB_PAGE_MAX_CHARS]
-                        + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
-                    )
-                if plan_state is not None and _is_authoritative_evidence_source(target_url):
-                    plan_state["has_authoritative_evidence"] = True
-                    plan_state["evidence_source"] = target_url
-                return f"--- Markdown content of {target_url} ---\n\n{text}"
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Direct page fetch failed for %s: %s", target_url, exc)
+        # Shared transport handles GitHub, Jina, and direct page retrieval.
+        text = _fetch_page_content(target_url, truncation_marker=True)
+        if text:
+            _record_inspected_authoritative_source(plan_state, target_url)
+            return f"--- Markdown content of {target_url} ---\n\n{text}"
 
         # 4. npm registry fallback if URL relates to npm package
         if language is ProjectLanguage.NODEJS and (
@@ -1225,8 +1072,9 @@ def _make_read_web_page_tool(
             )
             if pkg_name:
                 try:
+                    registry_url = f"https://registry.npmjs.org/{pkg_name}"
                     resp = requests.get(
-                        f"https://registry.npmjs.org/{pkg_name}",
+                        registry_url,
                         timeout=_READ_WEB_PAGE_TIMEOUT,
                     )
                     resp.raise_for_status()
@@ -1237,9 +1085,7 @@ def _make_read_web_page_tool(
                                 text[:_READ_WEB_PAGE_MAX_CHARS]
                                 + f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
                             )
-                        if plan_state is not None and _is_authoritative_evidence_source(target_url):
-                            plan_state["has_authoritative_evidence"] = True
-                            plan_state["evidence_source"] = target_url
+                        _record_inspected_authoritative_source(plan_state, registry_url)
                         return f"--- Markdown content of {target_url} ---\n\n{text}"
                 except Exception:  # noqa: BLE001
                     pass
@@ -1350,12 +1196,6 @@ def _make_read_workspace_file_tool(
         except ValueError as exc:
             return f"ERROR: {exc}"
 
-        if plan_state is not None:
-            plan_state.setdefault("read_files", set()).add(rel_path)
-            plan_state.setdefault("inspected_files", set()).add(rel_path)
-            plan_state["local_investigation_complete"] = True
-            plan_state.setdefault("evidence_ledger", []).append(f"workspace:{rel_path}")
-
         content = sandbox.read_file(rel_path)
         if content is None:
             return (
@@ -1363,9 +1203,12 @@ def _make_read_workspace_file_tool(
                 "Use search_codebase_pattern or read_repository_map to verify the path."
             )
 
-        if plan_state is not None and rel_path.startswith("node_modules/"):
-            plan_state["has_authoritative_evidence"] = True
-            plan_state["evidence_source"] = rel_path
+        if plan_state is not None:
+            plan_state.setdefault("read_files", set()).add(rel_path)
+            plan_state.setdefault("inspected_files", set()).add(rel_path)
+            plan_state["local_investigation_complete"] = True
+            plan_state.setdefault("evidence_ledger", []).append(f"workspace:{rel_path}")
+            _record_inspected_authoritative_source(plan_state, rel_path)
 
         lines = content.splitlines()
         total_lines = len(lines)
@@ -1654,9 +1497,9 @@ def _make_inspect_ast_symbol_tool(
                 "AST symbols. Use search_codebase_pattern to find the relevant "
                 "call site, then inspect its enclosing declared symbol, or use "
                 "read_workspace_file and document the fallback in record_plan. "
-                "For an arrow-function binding, pass the variable name only after "
-                "confirming it is declared in this file; deterministic_replace_ast_symbol "
-                "accepts either the expression body or a complete enclosing declaration."
+                "For an arrow-function binding, use its variable name to inspect the "
+                "expression, then record and apply exact source replacements with "
+                "deterministic_apply_edit_set."
             )
 
         if plan_state is not None:

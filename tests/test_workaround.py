@@ -52,32 +52,32 @@ from remediation_engine.runtime.agent_runtime import (
     ToolEvent,
     _infer_changed_files,
     _stagnation_recovery_instruction,
-    has_all_modified_files_validated_after_last_edit,
     run_bounded_subagent_loop,
 )
+from remediation_engine.tools.npm_mutations import _is_prohibited_target
 from remediation_engine.tools.qa_scan import _QAExecutionResults
 from remediation_engine.tools.test_execution import (
     _detect_targeted_test_context,
+    _normalise_test_path,
     build_targeted_test_command,
-    detect_test_runner,
     extract_qa_failure_evidence,
 )
-from remediation_engine.tools.validation import _revert_current_iteration_edit
-from remediation_engine.tools.workers import (
-    _apply_replacements_to_content,
-    _is_prohibited_target,
-    _make_deterministic_apply_edit_set_tool,
-    _make_deterministic_search_replace_tool,
-    _make_read_web_page_tool,
+from remediation_engine.tools.validation import (
     _make_record_plan_tool,
     _make_record_targeted_test_substitution_tool,
-    _make_search_web_tool,
     _make_validate_workaround_tool,
+    _revert_current_iteration_edit,
+)
+from remediation_engine.tools.workers import (
+    _apply_replacements_to_content,
+    _make_deterministic_apply_edit_set_tool,
     build_workaround_toolbelt,
 )
 from remediation_engine.tools.workspace import (
     _is_authoritative_evidence_source,
     _is_infrastructure_failure,
+    _make_read_web_page_tool,
+    _make_search_web_tool,
 )
 from tests.helpers import qa_policy_for_task
 
@@ -339,7 +339,7 @@ def test_targeted_test_command_construction():
     mock_sandbox = MagicMock()
     mock_sandbox.read_file.return_value = '{"scripts": {"test": "mocha test/*.js"}}'
 
-    runner = detect_test_runner(mock_sandbox, "test/jwt.test.js")
+    runner = _detect_targeted_test_context(mock_sandbox, "test/jwt.test.js")[0]
     assert runner == "mocha"
 
     cmd = build_targeted_test_command("mocha", "test/jwt.test.js", "missing algorithms")
@@ -397,6 +397,15 @@ def test_targeted_test_context_selects_matching_npm_script():
         "frontend",
         "ng test",
     )
+
+
+def test_targeted_test_paths_keep_workspace_relative_and_reject_escapes():
+    assert (
+        _normalise_test_path("/workspace/build/test\\api\\auth.test.ts") == "test/api/auth.test.ts"
+    )
+    assert _normalise_test_path("") == ""
+    assert _normalise_test_path("/etc/passwd") == ""
+    assert _normalise_test_path("test/../../secret.test.ts") == ""
 
 
 def test_qa_evidence_is_reused_after_failed_attempt_is_closed():
@@ -799,47 +808,6 @@ def test_workaround_schemas_and_serialization() -> None:
     assert worker_result.replay_plan.task_id == "task-1"
 
 
-def test_has_all_modified_files_validated_after_last_edit() -> None:
-    """Verify per-file syntax validation check."""
-    events_valid = [
-        ToolEvent(
-            name="deterministic_search_replace",
-            args={"file_path": "a.js"},
-            content="SUCCESS: Modified",
-        ),
-        ToolEvent(
-            name="validate_code_syntax", args={"file_path": "a.js"}, content="SUCCESS: Validated"
-        ),
-        ToolEvent(
-            name="deterministic_search_replace",
-            args={"file_path": "b.js"},
-            content="SUCCESS: Modified",
-        ),
-        ToolEvent(
-            name="validate_code_syntax", args={"file_path": "b.js"}, content="SUCCESS: Validated"
-        ),
-    ]
-    assert has_all_modified_files_validated_after_last_edit(events_valid) is True
-
-    events_invalid = [
-        ToolEvent(
-            name="deterministic_search_replace",
-            args={"file_path": "a.js"},
-            content="SUCCESS: Modified",
-        ),
-        ToolEvent(
-            name="validate_code_syntax", args={"file_path": "a.js"}, content="SUCCESS: Validated"
-        ),
-        ToolEvent(
-            name="deterministic_search_replace",
-            args={"file_path": "b.js"},
-            content="SUCCESS: Modified",
-        ),
-        # Missing validation for b.js
-    ]
-    assert has_all_modified_files_validated_after_last_edit(events_invalid) is False
-
-
 def test_targeted_search_query_generation_in_prompt() -> None:
     """Verify that QA error context gives the worker evidence for query selection."""
     task = RemediationTask(
@@ -972,6 +940,10 @@ def test_is_authoritative_evidence_source() -> None:
     assert _is_authoritative_evidence_source("https://registry.npmjs.org/express-jwt") is True
     assert _is_authoritative_evidence_source("node_modules/express-jwt/README.md") is True
     assert _is_authoritative_evidence_source("https://stackoverflow.com/questions/12345") is False
+    assert (
+        _is_authoritative_evidence_source("https://github.com.evil.example/advisories/x") is False
+    )
+    assert _is_authoritative_evidence_source("official advisory from a package repository") is False
     assert _is_authoritative_evidence_source("search snippet only") is False
     assert _is_authoritative_evidence_source("") is False
 
@@ -1102,16 +1074,20 @@ def test_authoritative_evidence_enforcement_in_edit_tools() -> None:
         "inspected_files": {"lib/insecurity.ts"},
         "require_authoritative_evidence": True,
         "has_authoritative_evidence": False,
+        "evidence_ledger": ["https://github.com/expressjs/express-jwt"],
     }
 
-    edit_tool = _make_deterministic_search_replace_tool(mock_sandbox, touched, plan_state)
-    res = edit_tool.invoke(
+    replacements = [
         {
             "file_path": "lib/insecurity.ts",
             "old_text": "const x = 1;",
             "new_text": "const x = 2;",
+            "expected_occurrences": 1,
         }
-    )
+    ]
+    plan_state["planned_replacements"] = replacements
+    edit_tool = _make_deterministic_apply_edit_set_tool(mock_sandbox, touched, plan_state)
+    res = edit_tool.invoke({"replacements": replacements})
 
     assert res.startswith("ERROR:")
     assert "Authoritative evidence required" in res
@@ -1131,20 +1107,18 @@ def test_authoritative_evidence_enforcement_in_edit_tools() -> None:
                     "new_text": "const x = 2;",
                 }
             ],
-            "evidence_source": "https://github.com/expressjs/express-jwt",
+            "evidence_source": (
+                "Express JWT docs: https://github.com/expressjs/express-jwt; "
+                "related reference: https://github.com/expressjs/express-jwt/issues/72"
+            ),
         }
     )
 
     assert plan_state.get("has_authoritative_evidence") is True
+    assert plan_state.get("evidence_source") == "https://github.com/expressjs/express-jwt"
 
     # Now edit should succeed
-    res2 = edit_tool.invoke(
-        {
-            "file_path": "lib/insecurity.ts",
-            "old_text": "const x = 1;",
-            "new_text": "const x = 2;",
-        }
-    )
+    res2 = edit_tool.invoke({"replacements": replacements})
     assert res2.startswith("SUCCESS:")
 
 
@@ -1493,31 +1467,72 @@ def test_qa_repair_plan_rejects_non_authoritative_evidence_before_acceptance():
     assert plan_state.get("recorded", False) is False
 
 
+def test_qa_repair_plan_rejects_authority_claim_not_recorded_by_a_reader():
+    plan_state: dict[str, Any] = {
+        "require_authoritative_evidence": True,
+        "local_investigation_complete": True,
+        "inspected_files": {"src/index.js"},
+    }
+    record_plan = _make_record_plan_tool(plan_state)
+
+    result = record_plan.invoke(
+        {
+            "affected_files": ["src/index.js"],
+            "affected_symbols": ["handleAuth"],
+            "security_invariant": "Authorization remains enforced",
+            "causal_hypothesis": "The dependency changed its export shape",
+            "planned_replacements": [
+                {"file_path": "src/index.js", "old_text": "old", "new_text": "new"}
+            ],
+            "evidence_source": "https://github.com/advisories/GHSA-1234",
+        }
+    )
+
+    assert "ERROR: [MISSING_EVIDENCE]" in str(result)
+    assert plan_state.get("recorded", False) is False
+
+
 def test_edits_rejected_before_valid_plan():
     sandbox, _ = _lifecycle_mock_sandbox({"src/index.js": "const x = 1;"})
-    plan_state: dict[str, Any] = {"phase": WorkaroundExecutionPhase.INVESTIGATE.value}
+    replacements = [
+        {
+            "file_path": "src/index.js",
+            "old_text": "const x = 1;",
+            "new_text": "const x = 2;",
+            "expected_occurrences": 1,
+        }
+    ]
+    plan_state: dict[str, Any] = {
+        "phase": WorkaroundExecutionPhase.INVESTIGATE.value,
+        "planned_replacements": replacements,
+    }
     touched = set()
-    edit_tool = _make_deterministic_search_replace_tool(sandbox, touched, plan_state)
-    res = edit_tool.invoke(
-        {"file_path": "src/index.js", "old_text": "const x = 1;", "new_text": "const x = 2;"}
-    )
+    edit_tool = _make_deterministic_apply_edit_set_tool(sandbox, touched, plan_state)
+    res = edit_tool.invoke({"replacements": replacements})
     assert "ERROR: [PLAN_VIOLATION]" in str(res) or "ERROR: [PHASE_VIOLATION]" in str(res)
 
 
 def test_edits_rejected_after_one_edit_before_validation():
     sandbox, _ = _lifecycle_mock_sandbox({"src/index.js": "const x = 1;"})
+    replacements = [
+        {
+            "file_path": "src/index.js",
+            "old_text": "const x = 1;",
+            "new_text": "const x = 2;",
+            "expected_occurrences": 1,
+        }
+    ]
     plan_state: dict[str, Any] = {
         "recorded": True,
         "phase": WorkaroundExecutionPhase.EXECUTE.value,
         "planned_files": ["src/index.js"],
         "inspected_files": {"src/index.js"},
         "successful_edit_count_this_iteration": 1,
+        "planned_replacements": replacements,
     }
     touched = {"src/index.js"}
-    edit_tool = _make_deterministic_search_replace_tool(sandbox, touched, plan_state)
-    res = edit_tool.invoke(
-        {"file_path": "src/index.js", "old_text": "const x = 1;", "new_text": "const x = 2;"}
-    )
+    edit_tool = _make_deterministic_apply_edit_set_tool(sandbox, touched, plan_state)
+    res = edit_tool.invoke({"replacements": replacements})
     assert "ERROR: [ITERATION_LIMIT]" in str(res)
 
 

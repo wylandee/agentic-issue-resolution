@@ -700,7 +700,45 @@ def _package_change_matches_group(change: PackageChange, group: _ReportGroup) ->
     coordinate = _maven_group_coordinate(group)
     if _is_maven_group(group) or _is_maven_coordinate(change.name):
         return bool(coordinate and change.name == coordinate)
-    return change.name in names or change.name.casefold() in {name.casefold() for name in names}
+    if change.name not in names and change.name.casefold() not in {
+        name.casefold() for name in names
+    }:
+        return False
+
+    localized_paths = _group_package_manifest_paths(group)
+    if not localized_paths:
+        return True
+    change_paths = _package_change_files(change)
+    return any(
+        _path_matches_any(change_path, localized_paths)
+        or Path(_normalized_path(change_path)).parent
+        == Path(_normalized_path(localized_path)).parent
+        for change_path in change_paths
+        for localized_path in localized_paths
+    )
+
+
+def _group_package_manifest_paths(group: _ReportGroup | None) -> list[str]:
+    """Return manifest paths attached to a package finding occurrence."""
+    if group is None:
+        return []
+    candidates: list[Any] = [
+        *_items(_value(group, "file_paths")),
+        _value(group, "file_path"),
+    ]
+    for localized in _items(_value(group, "localized_issues")):
+        candidates.extend(
+            (
+                _value(localized, "manifest_file"),
+                _value(localized, "version_property_file"),
+            )
+        )
+        candidates.append(_value(_value(localized, "issue"), "file_path"))
+    return _unique_texts(
+        path
+        for value in candidates
+        if (path := _normalized_path(value)) and _PACKAGE_FILE_RE.search(path)
+    )
 
 
 def _package_change_pom_paths(change: PackageChange) -> list[str]:
@@ -1974,15 +2012,15 @@ def _attempt_qa_verdict(
 ) -> bool | None:
     """Return the authoritative QA verdict for one committed attempt.
 
-    Attempt envelopes are preferred; the task-keyed evaluation projection
-    supplies the same verdict when the envelope does not carry an evaluation.
-    ``None`` means neither projection contains a verdict, and remains distinct
-    from ``False`` so worker success cannot override an explicit QA failure.
+    Attempt envelopes are authoritative when an attempt ID is available. The
+    task-keyed projection is used only for legacy summaries without an attempt
+    ID. ``None`` means no verdict is recorded for this attempt and remains
+    distinct from ``False`` so worker success cannot override QA failure.
     """
     attempt_id = _text(_value(summary, "attempt_id")) or _text(_value(metadata, "attempt_id"))
     qa_result = context.qa_results.get(attempt_id) if attempt_id else None
     evaluation = _value(qa_result, "evaluation")
-    if evaluation is None:
+    if evaluation is None and not attempt_id:
         task_id = _text(_value(summary, "task_id")) or _text(_value(metadata, "task_id"))
         evaluation = context.qa_evaluations.get(task_id) if task_id else None
     if evaluation is None:
@@ -2262,6 +2300,46 @@ def _scan_coverage_label(context: ReportContext) -> str:
 def _summary_group_statuses(context: ReportContext) -> dict[str, str]:
     """Return the authoritative unique-group status projection for the summary."""
     return _unique_vulnerability_statuses_by_group(context)
+
+
+def _remaining_scan_follow_up_group_ids(context: ReportContext) -> set[str]:
+    """Map remaining target scan identifiers to report groups where possible."""
+    remaining = {identifier.casefold() for identifier in context.remaining_target_identifiers}
+    if not remaining:
+        return set()
+
+    groups = _follow_up_groups(context)
+    discovered_ids = set(_discovered_group_ids(context))
+    existing_follow_up_groups = {
+        _report_group_identity(context, group_id, discovered_ids)
+        for group_id, _group in groups
+        if _report_group_status(context, group_id) in _OUTSTANDING_GROUP_STATUSES
+    }
+    result: set[str] = set()
+    for identifier in remaining:
+        observations = [
+            issue
+            for issue in context.post_remediation_scan_issues
+            if identifier in {value.casefold() for value in _issue_identifiers(issue)}
+        ]
+        matching_groups = {
+            _report_group_identity(context, group_id, discovered_ids)
+            for group_id, group in groups
+            if (
+                any(
+                    _component_identity_matches([group_issue], [scan_issue])
+                    for group_issue in _summary_group_issues(group)
+                    for scan_issue in observations
+                )
+                if observations
+                else identifier in _group_identifiers(group)
+            )
+        }
+        if len(matching_groups) == 1:
+            result.update(matching_groups)
+        elif not existing_follow_up_groups:
+            result.add(f"remaining:{identifier}")
+    return result
 
 
 def _known_new_identifier_metric(context: ReportContext) -> str:
@@ -2713,6 +2791,7 @@ def _build_executive_summary_evidence(context: ReportContext) -> ExecutiveSummar
         for group_id, _group in _follow_up_groups(context)
         if _report_group_status(context, group_id) in _OUTSTANDING_GROUP_STATUSES
     }
+    follow_up_group_ids.update(_remaining_scan_follow_up_group_ids(context))
     if context.group_reconciliation_incomplete or not context.initial_group_evidence_available:
         original_group_count = None
     else:
@@ -2860,12 +2939,9 @@ def _render_summary(
     """
     group_statuses = _summary_group_statuses(context)
     fixed = sum(status == "qa_passed" for status in group_statuses.values())
-    follow_up = sum(
-        _report_group_status(context, group_id) in _OUTSTANDING_GROUP_STATUSES
-        for group_id, _ in _follow_up_groups(context)
-    )
-    total_vulnerability_groups = len(group_statuses)
     summary_evidence = _build_executive_summary_evidence(context)
+    follow_up = summary_evidence.follow_up_groups.value
+    total_vulnerability_groups = len(group_statuses)
     summary_result = executive_summary or fallback_executive_summary(summary_evidence)
     if (
         summary_result.source_fingerprint
@@ -2873,6 +2949,7 @@ def _render_summary(
     ):
         summary_result = fallback_executive_summary(summary_evidence)
     metrics = [
+        ("Run outcome", context.overall_label),
         ("Run ID", context.run_id),
         ("Total findings (CVEs and GHSAs)", context.canonical_finding_count),
         ("Total vulnerability groups", total_vulnerability_groups),
@@ -2886,6 +2963,16 @@ def _render_summary(
         ("Run duration", _format_duration(context.duration_seconds)),
         ("Total tokens", _format_token_summary(context)),
         ("Patch status", _format_patch_status(context)),
+        ("Operational errors", len(context.error_records)),
+        (
+            "Operational follow-up",
+            "Review the run errors before relying on this result."
+            if context.error_records
+            or context.status in {"failed", "error", "completed_with_errors"}
+            else "Review the terminal scan findings before treating target findings as cleared."
+            if context.remaining_target_identifiers
+            else "None required",
+        ),
     ]
     coverage_note = ""
     if (
@@ -3087,8 +3174,19 @@ def _render_follow_up_actions(context: ReportContext) -> str:
     )
 
     lines = ["## 2. Follow up Actions", ""]
+    if context.remaining_target_identifiers:
+        identifiers = ", ".join(context.remaining_target_identifiers)
+        lines.extend(
+            [
+                "The terminal dependency scan still reports these target identifiers: "
+                f"**{identifiers}**. Review the related dependency occurrences and resolve or "
+                "document the accepted workaround before treating them as clear.",
+                "",
+            ]
+        )
     if not groups:
-        lines.append("No follow-up actions are required.")
+        if not context.remaining_target_identifiers:
+            lines.append("No follow-up actions are required.")
         return "\n".join(lines)
 
     for index, (group_id, group) in enumerate(groups):

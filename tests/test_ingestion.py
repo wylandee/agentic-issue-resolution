@@ -154,7 +154,7 @@ def _minimal_dep(
 
 
 # ===========================================================================
-# odc_parser â€” PURL helpers
+# odc_parser — PURL helpers
 # ===========================================================================
 
 
@@ -170,7 +170,7 @@ class TestPURLHelpers:
             ("pkg:npm/base64url@0.0.6", "base64url"),
             ("pkg:javascript/underscore.js@1.7.0", "underscore.js"),
             ("pkg:pypi/Requests._Tool-Kit@2.31.0", "requests-tool-kit"),
-            # maven: namespace=commons-io, name=commons-io â†’ joined with ':'
+            # maven: namespace=commons-io, name=commons-io → joined with ':'
             ("pkg:maven/commons-io/commons-io@2.4", "commons-io:commons-io"),
         ],
     )
@@ -217,7 +217,7 @@ class TestPURLHelpers:
 
 
 # ===========================================================================
-# odc_parser â€” severity extraction
+# odc_parser — severity extraction
 # ===========================================================================
 
 
@@ -249,7 +249,7 @@ class TestSeverityExtraction:
 
 
 # ===========================================================================
-# odc_parser â€” CWE parsing
+# odc_parser — CWE parsing
 # ===========================================================================
 
 
@@ -261,7 +261,7 @@ class TestCWEParsing:
             (["77"], ["CWE-77"]),
             (["CWE79", "CWE-89"], ["CWE-79", "CWE-89"]),
             ([], []),
-            (["notacwe"], []),  # no digits â†’ skipped
+            (["notacwe"], []),  # no digits → skipped
         ],
     )
     def test_parse_cwes(self, raw, expected_ids):
@@ -274,7 +274,7 @@ class TestCWEParsing:
 
 
 # ===========================================================================
-# odc_parser â€” CVE-ID extraction
+# odc_parser — CVE-ID extraction
 # ===========================================================================
 
 
@@ -328,7 +328,7 @@ class TestGHSAIDExtraction:
 
 
 # ===========================================================================
-# odc_parser â€” parse_vulnerabilities
+# odc_parser — parse_vulnerabilities
 # ===========================================================================
 
 
@@ -504,7 +504,7 @@ class TestParseVulnerabilities:
 
 
 # ===========================================================================
-# odc_parser â€” export functions
+# odc_parser — export functions
 # ===========================================================================
 
 
@@ -549,7 +549,7 @@ class TestExportFunctions:
 
 
 # ===========================================================================
-# manifest_locator â€” normalize_package_name
+# manifest_locator — normalize_package_name
 # ===========================================================================
 
 
@@ -576,7 +576,7 @@ class TestNormalizePackageName:
 
 
 # ===========================================================================
-# manifest_locator â€” parse_lockfile_path
+# manifest_locator — parse_lockfile_path
 # ===========================================================================
 
 
@@ -647,7 +647,7 @@ class TestParseLockfilePath:
 
 
 # ===========================================================================
-# manifest_locator â€” detect_package_manager
+# manifest_locator — detect_package_manager
 # ===========================================================================
 
 
@@ -670,7 +670,7 @@ class TestDetectPackageManager:
 
 
 # ===========================================================================
-# manifest_locator â€” _locate_in_manifest
+# manifest_locator — _locate_in_manifest
 # ===========================================================================
 
 
@@ -693,7 +693,7 @@ class TestLocateInManifest:
         assert result["is_direct"] is True
 
     def test_transitive_dep_no_line(self, tmp_repo):
-        """Transitive deps are not in direct deps â€” no line number returned."""
+        """Transitive deps are not in direct deps — no line number returned."""
         result = _locate_in_manifest(tmp_repo / "package.json", "cookie", "npm")
         assert result["is_direct"] is False
         assert result["line_number"] is None
@@ -714,7 +714,7 @@ class TestLocateInManifest:
         assert result["package_manager"] == "pnpm"
 
     def test_keys_returned(self, tmp_repo):
-        """Exactly the right keys â€” no OSV/fix artefacts."""
+        """Exactly the right keys — no OSV/fix artefacts."""
         result = _locate_in_manifest(tmp_repo / "package.json", "lodash", "npm")
         expected_keys = {
             "manifest_file",
@@ -730,7 +730,7 @@ class TestLocateInManifest:
 
 
 # ===========================================================================
-# manifest_locator â€” _find_nearest_manifest
+# manifest_locator — _find_nearest_manifest
 # ===========================================================================
 
 
@@ -772,7 +772,7 @@ class TestFindNearestManifest:
 
     def test_empty_path_returns_none(self, tmp_repo):
         result = _find_nearest_manifest(tmp_repo, "")
-        # Empty path â€” falls back gracefully
+        # Empty path — falls back gracefully
         assert result is None or result.name == "package.json"
 
     def test_external_symlinked_manifest_is_not_returned_or_read(self, tmp_path):
@@ -789,7 +789,7 @@ class TestFindNearestManifest:
 
 
 # ===========================================================================
-# manifest_locator â€” locate_dependency (end-to-end, no OSV)
+# manifest_locator — locate_dependency (end-to-end, no OSV)
 # ===========================================================================
 
 
@@ -821,7 +821,7 @@ class TestLocateDependency:
         assert "fix_instruction" not in result
 
     def test_lockfile_ancestry_propagated(self, tmp_repo):
-        """jws â†’ base64url transitive chain ancestry is preserved."""
+        """jws → base64url transitive chain ancestry is preserved."""
         result = locate_dependency(
             repo_path=tmp_repo,
             raw_dependency_name="base64url:0.0.6",
@@ -995,7 +995,7 @@ class TestLocateDependency:
         )
         assert result["status"] == "success"
         assert result["package_name"] == "@tootallnate/once"
-        assert result["is_direct"] is False  # not in deps â†’ transitive
+        assert result["is_direct"] is False  # not in deps → transitive
 
     def test_no_extra_parameters_accepted(self):
         """Verify that old OSV parameters are gone from the signature."""
@@ -1015,7 +1015,7 @@ class TestLocateDependency:
 
 
 # ===========================================================================
-# manifest_locator â€” locate_from_issue
+# manifest_locator — locate_from_issue
 # ===========================================================================
 
 
@@ -1096,7 +1096,7 @@ class TestLocateFromIssue:
         issue = self._make_issue()
         assert issue.fixed_version is None
         locate_from_issue(issue, tmp_repo)
-        # fixed_version should remain None â€” no OSV enrichment happens
+        # fixed_version should remain None — no OSV enrichment happens
         assert issue.fixed_version is None
 
     def test_package_manager_in_localized_issue(self, tmp_repo):

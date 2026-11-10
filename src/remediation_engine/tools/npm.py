@@ -27,12 +27,7 @@ from remediation_engine.tools.manifest_locator import (
     _lockfile_package_candidate_keys,
     _lockfile_package_candidates,
     _normalize_npm_operator_whitespace,
-    _parse_npm_alias_requirement,
 )
-
-
-class ClosureResolutionError(ValueError):
-    """Raised when a package-lock closure cannot be represented safely."""
 
 
 @dataclass(frozen=True)
@@ -171,63 +166,6 @@ def _closure_failure(
         lockfile_version=lockfile_version,
         failure_detail=failure_detail,
     )
-
-
-def resolve_target_package(
-    packages: Mapping[str, Any],
-    *,
-    source_lockfile: str = "package-lock.json",
-    target_package: str,
-    target_version: str | None = None,
-    dependency_ancestry: Sequence[str] = (),
-    lockfile_version: int = 3,
-) -> TargetPackageResolution:
-    """Select one exact package-lock entry without traversing its dependencies.
-
-    Args:
-        packages: The npm lockfile ``packages`` object.
-        source_lockfile: Workspace-relative source path for evidence.
-        target_package: Package controlled by the current remediation task.
-        target_version: Expected installed version after the worker edit.
-        dependency_ancestry: Scanner/group ancestry used to disambiguate nested
-            copies of the same package.
-        lockfile_version: Original package-lock format version.
-
-    Returns:
-        A resolution containing the selected package node, or a stable fallback
-        reason when the lockfile is invalid, the target is absent, or multiple
-        entries remain ambiguous.
-    """
-    resolutions, reason = resolve_target_packages(
-        packages,
-        source_lockfile=source_lockfile,
-        target_package=target_package,
-        target_version=target_version,
-        dependency_ancestry=dependency_ancestry,
-        lockfile_version=lockfile_version,
-    )
-    if reason:
-        return TargetPackageResolution(
-            source_lockfile=source_lockfile,
-            target_node=None,
-            lockfile_version=lockfile_version,
-            fallback_reason=reason,
-        )
-    if len(resolutions) != 1:
-        return TargetPackageResolution(
-            source_lockfile=source_lockfile,
-            target_node=None,
-            lockfile_version=lockfile_version,
-            candidate_keys=tuple(
-                sorted(
-                    resolution.target_node.lockfile_key
-                    for resolution in resolutions
-                    if resolution.target_node is not None
-                )
-            ),
-            fallback_reason="multiple_targets",
-        )
-    return resolutions[0]
 
 
 def resolve_target_packages(
@@ -472,416 +410,6 @@ def resolve_dependency_closure_for_target(
     )
 
 
-def resolve_dependency_closure(
-    packages: Mapping[str, Any],
-    *,
-    source_lockfile: str = "package-lock.json",
-    target_package: str,
-    target_version: str | None = None,
-    dependency_ancestry: Sequence[str] = (),
-    include_optional: bool = True,
-    include_peer: bool = True,
-    lockfile_version: int = 3,
-    npm_overrides: Mapping[str, Any] | None = None,
-) -> DependencyClosure:
-    """Resolve a transitive npm dependency closure from a decoded lockfile.
-
-    Args:
-        packages: The npm lockfile ``packages`` object.
-        source_lockfile: Workspace-relative source path for diagnostics.
-        target_package: Package controlled by the current remediation task.
-        target_version: Expected installed version after the worker edit.
-        dependency_ancestry: Scanner/group ancestry used to disambiguate nodes.
-        include_optional: Traverse optional dependency edges.
-        include_peer: Traverse peer dependency edges.
-        lockfile_version: Original package-lock format version.
-        npm_overrides: Root package npm overrides for this lockfile.
-
-    Returns:
-        A complete closure or a result with ``complete=False`` and a stable
-        fallback reason. Circular references are handled by the visited set
-        and are not failures.
-    """
-    resolution = resolve_target_package(
-        packages,
-        source_lockfile=source_lockfile,
-        target_package=target_package,
-        target_version=target_version,
-        dependency_ancestry=dependency_ancestry,
-        lockfile_version=lockfile_version,
-    )
-    return resolve_dependency_closure_for_target(
-        packages,
-        resolution,
-        include_optional=include_optional,
-        include_peer=include_peer,
-        npm_overrides=npm_overrides,
-    )
-
-
-def _synthetic_package_key(package_name: str) -> str:
-    """Return a safe npm physical key for one synthetic package name."""
-    parts = package_name.split("/")
-    is_scoped = package_name.startswith("@")
-    if (
-        not package_name
-        or (is_scoped and len(parts) != 2)
-        or (not is_scoped and len(parts) != 1)
-        or any(not part or part in {".", ".."} or "\\" in part for part in parts)
-        or (is_scoped and not parts[0].startswith("@"))
-    ):
-        raise ClosureResolutionError("incomplete_closure")
-    return f"node_modules/{package_name}"
-
-
-def build_sliced_lockfile_artifacts(
-    closure: DependencyClosure,
-) -> dict[str, str]:
-    """Build a synthetic npm project containing one complete package closure.
-
-    The selected root is rebased to ``node_modules/<name>``. Dependencies are
-    hoisted when the nearest-package lookup still selects their exact original
-    occurrence; conflicting versions remain nested beneath the declaring
-    package. Every emitted physical package has a matching minimal manifest.
-
-    Args:
-        closure: Complete dependency closure rooted at exact package-lock nodes.
-
-    Returns:
-        The root manifest, sliced package lock, and package manifests suitable
-        for writing into a targeted ODC project.
-
-    Raises:
-        ClosureResolutionError: If a required edge or physical occurrence
-            cannot be represented without changing npm's nearest resolution.
-    """
-    if not closure.complete:
-        reason = closure.fallback_reason or "incomplete_closure"
-        if closure.failure_detail:
-            raise ClosureResolutionError(f"{reason}: {closure.failure_detail}")
-        raise ClosureResolutionError(reason)
-    if not closure.nodes or not closure.root_keys:
-        raise ClosureResolutionError("empty_closure")
-
-    nodes_by_key = {node.lockfile_key: node for node in closure.nodes}
-    if len(nodes_by_key) != len(closure.nodes):
-        raise ClosureResolutionError("incomplete_closure")
-    if any(not isinstance(node.metadata, Mapping) for node in closure.nodes):
-        raise ClosureResolutionError("incomplete_closure")
-    original_packages = {node.lockfile_key: dict(node.metadata) for node in closure.nodes}
-    npm_overrides = closure.npm_overrides or {}
-    edge_categories = (
-        "dependencies",
-        "optionalDependencies",
-        "peerDependencies",
-        "devDependencies",
-    )
-    retained_edges: dict[tuple[str, str], dict[str, str]] = {}
-    edges_by_parent: dict[str, list[tuple[str, str, str, str]]] = {key: [] for key in nodes_by_key}
-
-    for node in closure.nodes:
-        peer_meta = node.metadata.get("peerDependenciesMeta", {})
-        if "peerDependenciesMeta" in node.metadata and not isinstance(peer_meta, Mapping):
-            raise ClosureResolutionError("incomplete_closure")
-        for category in edge_categories:
-            if category == "devDependencies" and node.lockfile_key != "":
-                # Only a project-root lockfile entry contributes installed
-                # dev dependencies to the project closure.
-                retained_edges[(node.lockfile_key, category)] = {}
-                continue
-
-            if category not in node.metadata:
-                continue
-            declared_edges = node.metadata[category]
-            if not isinstance(declared_edges, Mapping):
-                raise ClosureResolutionError("incomplete_closure")
-            retained: dict[str, str] = {}
-            for package_name, requirement in sorted(declared_edges.items()):
-                if not isinstance(package_name, str) or not isinstance(requirement, str):
-                    raise ClosureResolutionError("incomplete_closure")
-                _synthetic_package_key(package_name)
-                if category == "optionalDependencies" and not closure.includes_optional:
-                    continue
-                if category == "peerDependencies" and not closure.includes_peer:
-                    continue
-
-                candidates = _lockfile_package_candidates(
-                    original_packages,
-                    node.lockfile_key,
-                    package_name,
-                    requirement,
-                    overrides=npm_overrides,
-                )
-                if not candidates:
-                    peer_optional = (
-                        category == "peerDependencies"
-                        and isinstance(peer_meta, Mapping)
-                        and isinstance(peer_meta.get(package_name), Mapping)
-                        and bool(peer_meta[package_name].get("optional"))
-                    )
-                    if category == "optionalDependencies" or peer_optional:
-                        continue
-                    raise ClosureResolutionError("incomplete_closure")
-
-                child_key = candidates[0][0]
-                if child_key not in nodes_by_key:
-                    raise ClosureResolutionError("incomplete_closure")
-                retained[package_name] = requirement
-                edges_by_parent[node.lockfile_key].append(
-                    (category, package_name, requirement, child_key)
-                )
-            retained_edges[(node.lockfile_key, category)] = retained
-
-    alias_targets_by_child: dict[str, set[str]] = {}
-    for parent_edges in edges_by_parent.values():
-        for _category, package_name, requirement, child_key in parent_edges:
-            alias = _parse_npm_alias_requirement(requirement)
-            if alias is None:
-                continue
-            alias_name, _alias_range = alias
-            child_node = nodes_by_key.get(child_key)
-            if (
-                child_node is None
-                or child_node.package_name != package_name
-                or str(child_node.metadata.get("name") or "").strip() != alias_name
-            ):
-                raise ClosureResolutionError("incomplete_closure")
-            alias_targets_by_child.setdefault(child_key, set()).add(alias_name)
-
-    root_dependencies: dict[str, str] = {}
-    original_to_synthetic: dict[str, str] = {}
-    synthetic_to_original: dict[str, str] = {}
-    synthetic_packages: dict[str, dict[str, Any]] = {}
-    for root_key in closure.root_keys:
-        node = nodes_by_key.get(root_key)
-        if node is None or not node.version:
-            raise ClosureResolutionError("incomplete_closure")
-        if node.package_name in root_dependencies:
-            raise ClosureResolutionError("incomplete_closure")
-        root_key_synthetic = _synthetic_package_key(node.package_name)
-        if root_key_synthetic in synthetic_to_original:
-            raise ClosureResolutionError("incomplete_closure")
-        root_manifest_name = str(node.metadata.get("name") or node.package_name).strip()
-        if not root_manifest_name:
-            raise ClosureResolutionError("incomplete_closure")
-        root_dependencies[node.package_name] = (
-            f"npm:{root_manifest_name}@{node.version}"
-            if root_manifest_name != node.package_name
-            else node.version
-        )
-        original_to_synthetic[root_key] = root_key_synthetic
-        synthetic_to_original[root_key_synthetic] = root_key
-        synthetic_packages[root_key_synthetic] = {
-            "name": root_manifest_name,
-            "version": node.version,
-        }
-
-    # Reserve original package locations before traversal can hoist a nested
-    # copy of the same package name into an occupied physical slot. For a
-    # project-root closure, keep the complete source package-lock layout;
-    # for a single dependency closure, reserve its original root-level nodes.
-    project_root_closure = "" in closure.root_keys
-    for node in closure.nodes:
-        if node.lockfile_key in original_to_synthetic:
-            continue
-        if project_root_closure:
-            synthetic_key = node.lockfile_key
-        else:
-            if (
-                not node.lockfile_key.startswith("node_modules/")
-                or "/node_modules/" in node.lockfile_key
-            ):
-                continue
-            synthetic_key = _synthetic_package_key(node.package_name)
-            if synthetic_key != node.lockfile_key:
-                raise ClosureResolutionError("incomplete_closure")
-        if not node.version:
-            raise ClosureResolutionError("incomplete_closure")
-        if synthetic_key in synthetic_to_original:
-            if synthetic_to_original[synthetic_key] != node.lockfile_key:
-                raise ClosureResolutionError("incomplete_closure")
-            continue
-        manifest_name = str(node.metadata.get("name") or node.package_name).strip()
-        if not manifest_name or (
-            manifest_name != node.package_name
-            and manifest_name not in alias_targets_by_child.get(node.lockfile_key, set())
-        ):
-            raise ClosureResolutionError("incomplete_closure")
-        original_to_synthetic[node.lockfile_key] = synthetic_key
-        synthetic_to_original[synthetic_key] = node.lockfile_key
-        synthetic_packages[synthetic_key] = {
-            "name": manifest_name,
-            "version": node.version,
-        }
-
-    queue = list(closure.root_keys)
-    visited: set[str] = set()
-    queue_index = 0
-    while queue_index < len(queue):
-        parent_original_key = queue[queue_index]
-        queue_index += 1
-        if parent_original_key in visited:
-            continue
-        visited.add(parent_original_key)
-        parent_synthetic_key = original_to_synthetic.get(parent_original_key)
-        if parent_synthetic_key is None:
-            raise ClosureResolutionError("incomplete_closure")
-
-        for _category, package_name, requirement, child_original_key in sorted(
-            edges_by_parent[parent_original_key],
-            key=lambda edge: (edge[0], edge[1], edge[2], edge[3]),
-        ):
-            child_node = nodes_by_key[child_original_key]
-            child_synthetic_key = original_to_synthetic.get(child_original_key)
-            if child_synthetic_key is not None:
-                resolved = _lockfile_package_candidates(
-                    synthetic_packages,
-                    parent_synthetic_key,
-                    package_name,
-                    requirement,
-                    overrides=npm_overrides,
-                )
-                if not resolved or resolved[0][0] != child_synthetic_key:
-                    raise ClosureResolutionError("incomplete_closure")
-            else:
-                child_synthetic_key = None
-                candidate_keys = _lockfile_package_candidate_keys(
-                    parent_synthetic_key,
-                    package_name,
-                )
-                for candidate_key in reversed(candidate_keys):
-                    if candidate_key in synthetic_to_original:
-                        continue
-                    child_manifest_name = str(
-                        child_node.metadata.get("name") or child_node.package_name
-                    ).strip()
-                    if not child_manifest_name:
-                        raise ClosureResolutionError("incomplete_closure")
-                    synthetic_packages[candidate_key] = {
-                        "name": child_manifest_name,
-                        "version": child_node.version,
-                    }
-                    synthetic_to_original[candidate_key] = child_original_key
-                    resolved = _lockfile_package_candidates(
-                        synthetic_packages,
-                        parent_synthetic_key,
-                        package_name,
-                        requirement,
-                        overrides=npm_overrides,
-                    )
-                    if resolved and resolved[0][0] == candidate_key:
-                        child_synthetic_key = candidate_key
-                        original_to_synthetic[child_original_key] = candidate_key
-                        break
-                    del synthetic_packages[candidate_key]
-                    del synthetic_to_original[candidate_key]
-                if child_synthetic_key is None:
-                    raise ClosureResolutionError("incomplete_closure")
-            queue.append(child_original_key)
-
-    if visited != set(nodes_by_key):
-        raise ClosureResolutionError("incomplete_closure")
-
-    root_name = "remediation-engine-targeted-scan"
-    root_version = "0.0.0"
-    root_metadata = {
-        "name": root_name,
-        "version": root_version,
-        "dependencies": dict(root_dependencies),
-    }
-    package_lock_packages: dict[str, dict[str, Any]] = {"": root_metadata}
-    artifacts = {
-        "package.json": json.dumps(
-            {
-                "name": root_name,
-                "version": root_version,
-                "private": True,
-                "dependencies": dict(root_dependencies),
-                "overrides": dict(npm_overrides),
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
-    }
-
-    for original_key in sorted(nodes_by_key):
-        node = nodes_by_key[original_key]
-        synthetic_key = original_to_synthetic.get(original_key)
-        if synthetic_key is None or not node.version:
-            raise ClosureResolutionError("incomplete_closure")
-        metadata = deepcopy(dict(node.metadata))
-        raw_name = metadata.get("name")
-        if raw_name is not None and not isinstance(raw_name, str):
-            raise ClosureResolutionError("incomplete_closure")
-        manifest_name = str(raw_name or node.package_name).strip()
-        if not manifest_name:
-            raise ClosureResolutionError("incomplete_closure")
-        if (
-            manifest_name != node.package_name
-            and manifest_name not in alias_targets_by_child.get(original_key, set())
-            and original_key not in closure.root_keys
-        ):
-            raise ClosureResolutionError("incomplete_closure")
-        raw_version = metadata.get("version")
-        if raw_version is not None and str(raw_version) != node.version:
-            raise ClosureResolutionError("incomplete_closure")
-        metadata["name"] = manifest_name
-        metadata["version"] = node.version
-        for category in edge_categories:
-            if category in metadata:
-                metadata[category] = retained_edges.get((original_key, category), {})
-        if "peerDependenciesMeta" in metadata:
-            peer_meta = metadata["peerDependenciesMeta"]
-            if not isinstance(peer_meta, Mapping):
-                raise ClosureResolutionError("incomplete_closure")
-            retained_peer_names = set(retained_edges.get((original_key, "peerDependencies"), {}))
-            retained_peer_meta = {
-                name: deepcopy(value)
-                for name, value in peer_meta.items()
-                if name in retained_peer_names
-            }
-            if retained_peer_meta:
-                metadata["peerDependenciesMeta"] = retained_peer_meta
-            else:
-                metadata.pop("peerDependenciesMeta")
-        package_lock_packages[synthetic_key] = metadata
-        artifacts[f"{synthetic_key}/package.json"] = (
-            json.dumps(
-                {
-                    "name": manifest_name,
-                    "version": node.version,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
-        )
-
-    for parent_original_key, parent_edges in edges_by_parent.items():
-        parent_synthetic_key = original_to_synthetic[parent_original_key]
-        for _category, package_name, requirement, child_original_key in parent_edges:
-            resolved = _lockfile_package_candidates(
-                package_lock_packages,
-                parent_synthetic_key,
-                package_name,
-                requirement,
-                overrides=npm_overrides,
-            )
-            if not resolved or resolved[0][0] != original_to_synthetic[child_original_key]:
-                raise ClosureResolutionError("incomplete_closure")
-
-    lockfile = {
-        "name": root_name,
-        "version": root_version,
-        "lockfileVersion": closure.lockfile_version,
-        "requires": True,
-        "packages": package_lock_packages,
-    }
-    artifacts["package-lock.json"] = json.dumps(lockfile, indent=2, sort_keys=True) + "\n"
-    return artifacts
-
-
 logger = logging.getLogger(__name__)
 
 _MANIFEST_NAME = "package.json"
@@ -889,11 +417,6 @@ _LOCKFILE_NAMES = frozenset({"package-lock.json", "npm-shrinkwrap.json"})
 _MANIFEST_SECTIONS = (
     "dependencies",
     "devDependencies",
-    "optionalDependencies",
-    "peerDependencies",
-)
-_LOCKFILE_DEPENDENCY_SECTIONS = (
-    "dependencies",
     "optionalDependencies",
     "peerDependencies",
 )
@@ -982,9 +505,6 @@ def _package_name_from_lockfile_key(package_key: str) -> str | None:
     return parts[0]
 
 
-lockfile_package_name = _package_name_from_lockfile_key
-
-
 def lockfile_key_matches_package(package_key: str, package_name: str) -> bool:
     """Return whether a physical lockfile key identifies the named package."""
     normalized = str(package_key or "").replace("\\", "/").strip("/")
@@ -1041,10 +561,6 @@ def check_npm_range(version_range: str | None, version: str | None) -> NpmRangeC
 def npm_range_contains(version_range: str | None, version: str | None) -> bool | None:
     """Return whether ``version`` satisfies an npm range, or ``None`` if invalid."""
     return check_npm_range(version_range, version).matches
-
-
-# Kept as a local compatibility spelling for graph consumers, not orchestration.
-_npm_range_contains = npm_range_contains
 
 
 def normalize_dependency_ancestry(ancestry: str | Iterable[str] | None) -> tuple[str, ...]:
@@ -1180,8 +696,6 @@ class NpmDependencyRecord:
 
 
 # Private spelling used by the old helper during migration.
-_DependencyRecord = NpmDependencyRecord
-DependencyRecord = NpmDependencyRecord
 
 
 @dataclass(frozen=True)
@@ -1369,21 +883,6 @@ def _discover_files(root: Path, names: set[str], diagnostics: list[str]) -> list
         except (OSError, ValueError):
             diagnostics.append(f"unsafe metadata path skipped: {path}")
     return sorted(found, key=lambda item: item[0])
-
-
-def _read_json(path: Path, relative: str, diagnostics: list[str]) -> tuple[Any, str] | None:
-    """Read JSON and return payload plus raw fingerprint material."""
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        diagnostics.append(f"could not read {relative}: {exc}")
-        return None
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        diagnostics.append(f"invalid JSON in {relative}: {exc.msg}")
-        return None
-    return payload, raw
 
 
 def _parse_v1_packages(
@@ -1628,26 +1127,6 @@ def _build_occurrences(
     return tuple(sorted(by_id.values(), key=lambda item: item.occurrence_id))
 
 
-def repository_fingerprint_inputs(repo_root: str | Path) -> tuple[tuple[str, str], ...]:
-    """Return canonical metadata inputs used for repository fingerprinting."""
-    diagnostics: list[str] = []
-    inputs: list[tuple[str, str]] = []
-    for relative, path in _discover_files(
-        Path(repo_root).resolve(), {_MANIFEST_NAME, *_LOCKFILE_NAMES}, diagnostics
-    ):
-        loaded = _read_json(path, relative, diagnostics)
-        if loaded is None:
-            try:
-                raw = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            inputs.append((relative, raw))
-            continue
-        payload, _raw = loaded
-        inputs.append((relative, _canonical_json(payload)))
-    return tuple(sorted(inputs))
-
-
 def _load_npm_graph_snapshot_from_documents(
     documents: Mapping[str, str],
     initial_diagnostics: Sequence[str] = (),
@@ -1801,31 +1280,12 @@ def resolve_lockfile_dependency_package(
     return None
 
 
-# Practical aliases for callers migrating from private portfolio helpers.
-load_graph_snapshot = load_npm_graph_snapshot
-
-
-def load_npm_manifests(repo_root: str | Path) -> tuple[NpmManifest, ...]:
-    """Return the deterministic npm manifest projection for a repository."""
-    return load_npm_graph_snapshot(repo_root).manifests
-
-
-def load_lockfile_packages(repo_root: str | Path) -> tuple[NpmLockfilePackage, ...]:
-    """Return the deterministic lockfile package projection for a repository."""
-    return load_npm_graph_snapshot(repo_root).lockfile_packages
-
-
 __all__ = [
-    "ClosureResolutionError",
     "DependencyClosure",
     "LockfilePackageNode",
     "TargetPackageResolution",
-    "build_sliced_lockfile_artifacts",
-    "resolve_dependency_closure",
     "resolve_dependency_closure_for_target",
-    "resolve_target_package",
     "resolve_target_packages",
-    "DependencyRecord",
     "NpmDependencyRecord",
     "NpmGraphSnapshot",
     "NpmLockfile",
@@ -1835,16 +1295,11 @@ __all__ = [
     "NpmRangeCheck",
     "NpmWorkspaceMembership",
     "check_npm_range",
-    "load_graph_snapshot",
-    "load_lockfile_packages",
     "load_npm_graph_snapshot",
     "load_npm_graph_snapshot_from_documents",
-    "load_npm_manifests",
     "resolve_lockfile_dependency_package",
-    "lockfile_package_name",
     "make_occurrence_id",
     "normalize_dependency_ancestry",
     "npm_range_contains",
-    "repository_fingerprint_inputs",
     "safe_repository_path",
 ]

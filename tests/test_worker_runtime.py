@@ -711,31 +711,6 @@ def test_response_content_extracts_text_without_serializing_reasoning_blocks():
     assert "OPAQUE ENCRYPTED PAYLOAD" not in extracted
 
 
-def test_list_response_text_still_marks_planning_answers_as_submitted():
-    """Text extraction keeps planning-state detection working for Responses blocks."""
-    bound_llm = MagicMock()
-    bound_llm.invoke.return_value = AIMessage(
-        content=[
-            {"type": "reasoning", "reasoning": "PRIVATE REASONING PAYLOAD"},
-            {"type": "text", "text": "Planning answers: update lodash to 4.17.21."},
-        ]
-    )
-    llm = MagicMock()
-    llm.bind_tools.return_value = bound_llm
-    planning_state = {"submitted": False}
-
-    result = run_bounded_subagent_loop(
-        llm,
-        [],
-        [HumanMessage(content="Plan the update.")],
-        set(),
-        planning_state=planning_state,
-    )
-
-    assert result.final_text == "Planning answers: update lodash to 4.17.21."
-    assert planning_state["submitted"] is True
-
-
 def test_structured_terminal_output_is_returned_without_free_text() -> None:
     """The QA evaluator returns only validated structured data."""
     terminal_tool = MagicMock()
@@ -991,7 +966,7 @@ def test_validation_gate_must_follow_the_final_edit() -> None:
     """A gate passed before a later edit must not establish success."""
     events = [
         ToolEvent(
-            name="deterministic_search_replace",
+            name="deterministic_apply_edit_set",
             args={"file_path": "src/a.ts"},
             content="SUCCESS: Modified",
         ),
@@ -1001,7 +976,7 @@ def test_validation_gate_must_follow_the_final_edit() -> None:
             content="SUCCESS: Workaround validation gate passed",
         ),
         ToolEvent(
-            name="deterministic_search_replace",
+            name="deterministic_apply_edit_set",
             args={"file_path": "src/a.ts"},
             content="SUCCESS: Modified again",
         ),
@@ -1033,7 +1008,7 @@ def test_validation_gate_can_validate_replayed_edits() -> None:
 def test_validation_pass_terminates_without_a_max_round_error() -> None:
     """A valid workaround PASS closes the bounded worker loop immediately."""
     edit_tool = MagicMock()
-    edit_tool.name = "deterministic_search_replace"
+    edit_tool.name = "deterministic_apply_edit_set"
     edit_tool.invoke.return_value = "SUCCESS: File modified: src/auth.ts"
     validate_tool = MagicMock()
     validate_tool.name = "validate_workaround"
@@ -1088,7 +1063,7 @@ def test_validation_pass_terminates_without_a_max_round_error() -> None:
 
 def test_python_validation_pass_is_terminal_and_counts_the_executed_gate() -> None:
     edit_tool = MagicMock()
-    edit_tool.name = "deterministic_search_replace"
+    edit_tool.name = "deterministic_apply_edit_set"
     edit_tool.invoke.return_value = "SUCCESS: File modified: src/auth.py"
     validate_tool = MagicMock()
     validate_tool.name = "validate_python_workaround"
@@ -1395,7 +1370,7 @@ def test_repeated_invalid_validation_target_stops_before_third_retry() -> None:
 
 def test_successful_workaround_edit_injects_immediate_validation_instruction() -> None:
     edit_tool = MagicMock()
-    edit_tool.name = "deterministic_search_replace"
+    edit_tool.name = "deterministic_apply_edit_set"
     edit_tool.invoke.return_value = "SUCCESS: File modified: src/auth.ts"
 
     bound_llm = MagicMock()

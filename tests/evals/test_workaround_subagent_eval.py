@@ -120,25 +120,6 @@ def build_workaround_test_case(
     )
 
 
-def _measure_expected(
-    metric: Any,
-    test_case: Any,
-    *,
-    expected_pass: bool,
-    case_id: str,
-    label: str,
-) -> None:
-    """Measure and register an expected-positive or expected-negative metric."""
-    measure_expected(
-        metric,
-        test_case,
-        expected_pass=expected_pass,
-        case_id=case_id,
-        label=label,
-        register=assert_test,
-    )
-
-
 def test_expected_negative_metric_is_registered_with_deepeval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -170,12 +151,13 @@ def test_expected_negative_metric_is_registered_with_deepeval(
         "tests.evals.test_workaround_subagent_eval.assert_test",
         fake_assert_test,
     )
-    _measure_expected(
+    measure_expected(
         metric,
         test_case,
         expected_pass=False,
         case_id="negative-case",
         label="task completion",
+        register=assert_test,
     )
 
     assert registered == [(test_case, [metric], False)]
@@ -263,12 +245,13 @@ class TestWorkaroundSubagentEval:
                 if historical_negative_trace:
                     measure_diagnostic(tool_metric, test_case, register=assert_test)
                 else:
-                    _measure_expected(
+                    measure_expected(
                         tool_metric,
                         test_case,
                         expected_pass=True,
                         case_id=str(case["case_id"]),
                         label="workaround tool correctness",
+                        register=assert_test,
                     )
             if DeepEvalTaskCompletionMetric is not None and bool(
                 case.get("task_completion_applicable", True)
@@ -278,12 +261,13 @@ class TestWorkaroundSubagentEval:
                     model=eval_settings.judge_llm or eval_settings.judge_model,
                     async_mode=False,
                 )
-                _measure_expected(
+                measure_expected(
                     task_metric,
                     test_case,
                     expected_pass=bool(case.get("expected_completion_pass", True)),
                     case_id=str(case["case_id"]),
                     label="workaround task completion",
+                    register=assert_test,
                 )
 
 

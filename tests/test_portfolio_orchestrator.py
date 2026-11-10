@@ -37,9 +37,7 @@ from remediation_engine.contracts import (
     VulnerabilityIssue,
 )
 from remediation_engine.contracts.solver_models import (
-    PackageResolutionCertificate,
     PackageResolutionStatus,
-    SolverRuntimeFingerprint,
     SolverStatus,
     SolverTaskDecision,
 )
@@ -69,7 +67,11 @@ from remediation_engine.solver.graph import cluster_packages, extract_solver_sub
 from remediation_engine.tools.npm import load_npm_graph_snapshot, make_occurrence_id
 from remediation_engine.tools.registry import RegistryPackumentCache
 from remediation_engine.tools.test_execution import parse_peer_conflict_evidence
-from tests.helpers import group_with_fix_plans, selected_group_plan
+from tests.helpers import (
+    attach_test_resolution_certificate,
+    group_with_fix_plans,
+    selected_group_plan,
+)
 
 
 def _group(
@@ -136,54 +138,6 @@ def _test_packument_fetcher(package_name: str) -> dict[str, object]:
         "name": package_name,
         "versions": {version: {"name": package_name, "version": version} for version in versions},
     }
-
-
-def _attach_test_resolution_certificate(plan):
-    """Attach matching offline evidence for Supervisor contract tests."""
-    solver_plan = plan.solver_plan.model_copy(update={"candidate_catalog_complete": True})
-    selected = solver_plan.selected_plan
-    assert selected is not None
-    assignment_digest = hashlib.sha256(
-        json.dumps(
-            dict(sorted(selected.selected_candidate_versions.items())),
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
-    covered = sorted(
-        coverage_id for batch in selected.batches for coverage_id in batch.resolved_coverage_ids
-    )
-    workaround = sorted(
-        coverage_id for batch in selected.batches for coverage_id in batch.workaround_coverage_ids
-    )
-    assert not any(batch.unresolved_coverage_ids for batch in selected.batches)
-    certificate = PackageResolutionCertificate(
-        status=PackageResolutionStatus.CERTIFIED,
-        portfolio_plan_id=plan.portfolio_plan_id,
-        candidate_plan_id=selected.candidate_plan_id,
-        solver_input_digest=plan.solver_input_digest,
-        repository_fingerprint=plan.repository_fingerprint,
-        task_revisions=plan.task_revisions,
-        workspace_graph_digest=plan.workspace_graph_digest,
-        candidate_catalog_digest=solver_plan.candidate_catalog_digest,
-        candidate_assignment_digest=assignment_digest,
-        resolved_graph_digest="test-resolved-graph-digest",
-        runtime_fingerprint=SolverRuntimeFingerprint(
-            node_version="v22.0.0",
-            npm_version="10.0.0",
-            platform="linux",
-            architecture="x64",
-        ),
-        covered_coverage_ids=covered,
-        workaround_coverage_ids=workaround,
-    )
-    return plan.model_copy(
-        update={
-            "solver_plan": solver_plan,
-            "resolution_certificate": certificate,
-        }
-    )
 
 
 def _apply_single_solver_decision(group, task, decision):
@@ -1251,7 +1205,7 @@ def test_scoped_angular_mutation_closure_stays_at_nine_packages(tmp_path: Path):
     from unittest.mock import patch
 
     with patch(
-        "remediation_engine.orchestration.graph.run_update_subagent_node",
+        "remediation_engine.agents.update.run_update_subagent_node",
         return_value={"worker_results_by_attempt": worker_results, "errors": []},
     ):
         worker_projection = run_update_subagent_from_orchestrator(state)
@@ -1265,7 +1219,7 @@ def test_scoped_angular_mutation_closure_stays_at_nine_packages(tmp_path: Path):
         for task in committed_queue.values()
     }
     with patch(
-        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        "remediation_engine.agents.qa.run_qa_critic_node",
         return_value={
             "qa_evaluations": pass_evaluations,
             "eval_status": "all_passed",
@@ -1905,7 +1859,7 @@ def test_supervisor_commits_shared_atomic_provenance_for_cluster(tmp_path: Path)
         prepared_queue,
         registry_fetcher=_test_packument_fetcher,
     )
-    plan = _attach_test_resolution_certificate(plan)
+    plan = attach_test_resolution_certificate(plan)
     committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
         plan,
         prepared_groups,
@@ -1986,7 +1940,7 @@ def test_invalid_atomic_action_requests_portfolio_replan(tmp_path: Path, monkeyp
         prepared_queue,
         registry_fetcher=_test_packument_fetcher,
     )
-    plan = _attach_test_resolution_certificate(plan)
+    plan = attach_test_resolution_certificate(plan)
     committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
         plan,
         prepared_groups,
@@ -2061,7 +2015,7 @@ def test_supervisor_preserves_all_cluster_targets_through_commit(tmp_path: Path)
     )
     assert prepare_diagnostics == []
     plan = build_portfolio_plan(tmp_path, prepared_groups, prepared_queue)
-    plan = _attach_test_resolution_certificate(plan)
+    plan = attach_test_resolution_certificate(plan)
     committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
         plan,
         prepared_groups,

@@ -1171,7 +1171,7 @@ def replay_qa_case(
             stack.enter_context(use_trajectory_recorder(recorder))
             stack.enter_context(patch.object(qa, "DockerSandbox", return_value=sandbox))
             stack.enter_context(
-                patch("remediation_engine.orchestration.graph.DockerSandbox", return_value=sandbox)
+                patch("remediation_engine.runtime.sandbox.DockerSandbox", return_value=sandbox)
             )
             if llm is not None:
                 stack.enter_context(
@@ -1743,6 +1743,9 @@ def replay_supervisor_case(
     import remediation_engine.agents.supervisor_reasoning as tactical_supervisor
 
     replay_input = _replay_input(case)
+    planning_input = replay_input.get("planning")
+    if planning_input is not None and not isinstance(planning_input, Mapping):
+        raise TypeError("replay.input.planning must be an object")
     raw_task = replay_input.get("task")
     raw_group = replay_input.get("group")
     if not isinstance(raw_task, Mapping):
@@ -1754,17 +1757,111 @@ def replay_supervisor_case(
     # Golden replay inputs intentionally retain their historical serialization.
     # Normalize that fixture boundary into the current candidate-only contract.
     legacy_plan = group_payload.pop("fix_plan", None)
-    if legacy_plan is not None and not group_payload.get("fix_plan_candidates"):
+    if (
+        planning_input is None
+        and legacy_plan is not None
+        and not group_payload.get("fix_plan_candidates")
+    ):
         group_payload["fix_plan_candidates"] = [
             {
                 "issue_id": group_payload["representative_issue_id"],
                 "plan": legacy_plan,
             }
         ]
+    if planning_input is not None:
+        group_payload["fix_plan_candidates"] = []
+        group_payload.pop("fix_plan", None)
     group = VulnerabilityGroup.model_validate(group_payload)
+    settings_api_key = (
+        "scripted-replay" if llm is not None else getattr(eval_settings, "openai_api_key", "") or ""
+    )
+    settings = dataclasses.replace(
+        AppSettings.from_env(),
+        openai_api_key=settings_api_key,
+    )
+    recorder = TrajectoryRecorder()
+    planning_result: dict[str, Any] | None = None
+    if isinstance(planning_input, Mapping):
+        import remediation_engine.agents.supervisor_reasoning as planning
+        import remediation_engine.tools.advisories as advisories
+
+        page_contents = planning_input.get("page_contents", {})
+        search_results = planning_input.get("search_results", [])
+        if not isinstance(page_contents, Mapping) or not isinstance(search_results, list):
+            raise TypeError("replay.input.planning page_contents/search_results have invalid types")
+
+        def _extract_osv(_issue: Any, *, maven_mode: bool | None = None) -> tuple[Any, Any]:
+            del maven_mode
+            return (
+                planning_input.get("osv_fixed_version"),
+                planning_input.get("osv_workaround_snippets"),
+            )
+
+        class _ScriptedPlannerModel:
+            def with_structured_output(self, schema: Any) -> _ScriptedPlannerModel:
+                self.schema = schema
+                return self
+
+            def invoke(self, prompt: str) -> Any:
+                if case.get("expected_output") and str(case["expected_output"]) in prompt:
+                    raise AssertionError(
+                        "Supervisor acceptance criteria leaked into planning input"
+                    )
+                result = planning_input.get("offline_extraction")
+                if not isinstance(result, Mapping):
+                    raise TypeError("Offline planning replay requires offline_extraction")
+                return self.schema.model_validate(dict(result))
+
+        plan_stack = ExitStack()
+        plan_stack.enter_context(use_trajectory_recorder(recorder))
+        plan_stack.enter_context(
+            patch.object(advisories, "get_runtime_settings", return_value=settings)
+        )
+        plan_stack.enter_context(
+            patch.object(advisories, "_query_osv_fixed_version", side_effect=_extract_osv)
+        )
+        plan_stack.enter_context(
+            patch.object(
+                advisories,
+                "_query_serper",
+                return_value=[dict(item) for item in search_results],
+            )
+        )
+        plan_stack.enter_context(
+            patch.object(advisories, "_fetch_page_content", side_effect=page_contents.get)
+        )
+        if llm is not None:
+            plan_stack.enter_context(
+                patch.object(
+                    advisories,
+                    "create_chat_model",
+                    return_value=_ScriptedPlannerModel(),
+                )
+            )
+        with plan_stack:
+            planned_groups, refreshed_queue, pending_refresh_ids = (
+                planning.prepare_supervisor_fix_plan_state(
+                    [group],
+                    {task.task_id: task},
+                    [task.task_id],
+                    _project_language(case),
+                )
+            )
+        if len(planned_groups) != 1:
+            raise ValueError("Supervisor planning replay must retain exactly one group")
+        group = planned_groups[0]
+        task = refreshed_queue[task.task_id]
+        selected_plan = select_package_fix_plan(group).plan
+        if selected_plan is None:
+            raise ValueError("Supervisor planning replay did not produce a typed fix plan")
+        planning_result = {
+            "plan": selected_plan.model_dump(mode="json"),
+            "refreshed_task": task.model_dump(mode="json"),
+            "pending_refresh_ids": pending_refresh_ids,
+        }
     selected_plan = select_package_fix_plan(group).plan
-    if selected_plan is None or not selected_plan.fixed_version:
-        raise ValueError("Supervisor replay group requires a committed fixed-version floor.")
+    if selected_plan is None:
+        raise ValueError("Supervisor replay group requires a committed fix plan.")
 
     raw_candidate_sets = replay_input.get("candidate_sets")
     if not isinstance(raw_candidate_sets, list):
@@ -1812,6 +1909,8 @@ def replay_supervisor_case(
                 f"replay.input.candidate_sets[{index}].approved_version_pool "
                 "must be a list of strings"
             )
+        if selected_plan.fixed_version is None:
+            raise ValueError("Supervisor candidate sets require a committed version floor.")
         if security_floor != selected_plan.fixed_version:
             raise ValueError(
                 f"Candidate set {index} security floor does not match the group fix-plan floor."
@@ -1853,13 +1952,6 @@ def replay_supervisor_case(
     ]
 
     typed_candidate_sets = tuple(candidate_sets)
-    settings_api_key = (
-        "scripted-replay" if llm is not None else getattr(eval_settings, "openai_api_key", "") or ""
-    )
-    settings = dataclasses.replace(
-        AppSettings.from_env(),
-        openai_api_key=settings_api_key,
-    )
     task_queue = {task.task_id: task}
     group_by_id = {group.group_id: group}
     qa_evaluations = {task.task_id: evaluation} if evaluation is not None else {}
@@ -1880,7 +1972,6 @@ def replay_supervisor_case(
         "model_factory_calls": 0,
         "registry_resolution_calls": 0,
     }
-    recorder = TrajectoryRecorder()
     original_proposer = supervisor_node.propose_and_verify_tactical_action
     original_invoker = tactical_supervisor.invoke_with_trajectory
 
@@ -2091,6 +2182,7 @@ def replay_supervisor_case(
             "rationale": getattr(action, "rationale", None),
             "reason": reason,
             "instruction": (verification.instruction if verification is not None else None),
+            "planning": planning_result,
             "action": action_payload,
             "verification": verification_payload,
             "decision": decision_payload,
@@ -2114,6 +2206,7 @@ def replay_supervisor_case(
         "model_factory_calls": counters["model_factory_calls"],
         "registry_resolution_calls": counters["registry_resolution_calls"],
         "model_invocation_messages": list(getattr(llm, "invocation_messages", []) or []),
+        "planning_result": planning_result,
         "task_queue": task_queue,
         "retry_diagnostics_by_task": retry_diagnostics_by_task,
         "worker_results_by_attempt": worker_results_by_attempt,

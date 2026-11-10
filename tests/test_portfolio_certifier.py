@@ -27,6 +27,7 @@ from remediation_engine.contracts.schemas import (
     QAEvaluation,
     QAPolicy,
     RemediationTask,
+    RoutingStrategy,
     Severity,
     TaskStatus,
     VulnerabilityGroup,
@@ -63,7 +64,6 @@ from remediation_engine.planning.certification import (
     _authorized_workaround,
     _candidate_conflict,
     _CertificationUnknown,
-    _last_qa_passed_prefix_digest,
     _last_qa_passed_prefix_provenance,
     _peer_conflict_literal_ids,
     _peer_conflict_rejection,
@@ -134,7 +134,7 @@ class _FakeSandbox:
             raise RuntimeError(f"unknown workspace snapshot {snapshot_id!r}")
         self.state.files = dict(snapshot)
 
-    def read_file(self, file_path: str) -> str | None:
+    def read_file(self, file_path: str, **_kwargs: Any) -> str | None:
         path = str(file_path).replace("\\", "/").strip("/")
         if path.startswith("workspace/"):
             path = path[len("workspace/") :]
@@ -658,19 +658,23 @@ def test_last_qa_passed_prefix_obeys_phase_order_and_terminal_skips():
     )
 
     assert (
-        _last_qa_passed_prefix_digest(prior_plan, task_queue, request, "host-fingerprint")
+        _last_qa_passed_prefix_provenance(
+            prior_plan, task_queue, request, "host-fingerprint"
+        ).graph_digest
         == "prefix-d"
     )
     task_queue["task-c"] = task_queue["task-c"].model_copy(update={"status": TaskStatus.PENDING})
     assert (
-        _last_qa_passed_prefix_digest(prior_plan, task_queue, request, "host-fingerprint")
+        _last_qa_passed_prefix_provenance(
+            prior_plan, task_queue, request, "host-fingerprint"
+        ).graph_digest
         == "prefix-a"
     )
     task_queue["task-c"] = task_queue["task-c"].model_copy(update={"status": TaskStatus.QA_PASSED})
     task_queue["task-b"] = task_queue["task-b"].model_copy(update={"status": TaskStatus.PENDING})
     prefix_diagnostics: list[str] = []
     assert (
-        _last_qa_passed_prefix_digest(
+        _last_qa_passed_prefix_provenance(
             prior_plan,
             task_queue,
             request,
@@ -681,7 +685,7 @@ def test_last_qa_passed_prefix_obeys_phase_order_and_terminal_skips():
     )
     assert any("batch-terminal" in item for item in prefix_diagnostics)
     assert (
-        _last_qa_passed_prefix_digest(
+        _last_qa_passed_prefix_provenance(
             prior_plan,
             task_queue,
             request.model_copy(update={"source_portfolio_plan_id": "wrong-plan"}),
@@ -690,7 +694,9 @@ def test_last_qa_passed_prefix_obeys_phase_order_and_terminal_skips():
         is None
     )
     assert (
-        _last_qa_passed_prefix_digest(prior_plan, task_queue, request, "different-host-fingerprint")
+        _last_qa_passed_prefix_provenance(
+            prior_plan, task_queue, request, "different-host-fingerprint"
+        )
         is None
     )
 
@@ -1266,7 +1272,7 @@ def test_maven_assignment_uses_exact_tool_and_native_resolution_evidence(
             self.files = {f"{scratch}/pom.xml": original_pom}
             self.commands: list[str] = []
 
-        def read_file(self, path: str) -> str | None:
+        def read_file(self, path: str, **_kwargs: Any) -> str | None:
             return self.files.get(path)
 
         def write_file(self, path: str, content: str) -> None:
@@ -1416,7 +1422,7 @@ def test_maven_portfolio_dispatch_uses_shared_solver_and_native_certifier(
         def __exit__(self, *_args):
             return None
 
-        def read_file(self, path: str) -> str | None:
+        def read_file(self, path: str, **_kwargs: Any) -> str | None:
             return self.files.get(path)
 
         def write_file(self, path: str, content: str) -> None:
@@ -1762,9 +1768,8 @@ def test_maven_qa_passed_snapshot_uses_pom_fingerprint(monkeypatch: pytest.Monke
         lambda *_args: documents,
     )
     monkeypatch.setattr(
-        graph_wrappers,
-        "_graph_module",
-        lambda: SimpleNamespace(DockerSandbox=lambda **_kwargs: sandbox),
+        "remediation_engine.runtime.sandbox.DockerSandbox",
+        lambda **_kwargs: sandbox,
     )
     state = {
         "workspace_volume": "maven-workspace",
@@ -1864,7 +1869,7 @@ def test_maven_no_fix_package_removal_does_not_require_release_catalog(
         def __exit__(self, *_args):
             return None
 
-        def read_file(self, path: str) -> str | None:
+        def read_file(self, path: str, **_kwargs: Any) -> str | None:
             return self.files.get(path)
 
         def write_file(self, path: str, content: str) -> None:
@@ -2292,10 +2297,20 @@ def test_active_workaround_is_not_certified_before_qa_pass():
     assert _authorized_workaround(finding, prepared, selected_plan) is False
 
 
-def test_terminal_failed_batch_is_skipped_and_kept_unresolved(tmp_path: Path):
+@pytest.mark.parametrize(
+    "task_updates",
+    [
+        {"status": TaskStatus.UNFIXABLE},
+        {"strategy": RoutingStrategy.CODE_WORKAROUND},
+    ],
+)
+def test_non_dispatchable_non_mutation_batch_is_skipped_and_kept_unresolved(
+    tmp_path: Path,
+    task_updates: dict[str, Any],
+):
     root, _files, groups, task_queue = _certifier_fixture(tmp_path)
     task_queue["task-jsonwebtoken"] = task_queue["task-jsonwebtoken"].model_copy(
-        update={"status": TaskStatus.UNFIXABLE}
+        update=task_updates
     )
 
     plan, state, _factory = _run_fake_certifier(root, _files, groups, task_queue)
@@ -2337,6 +2352,24 @@ def test_terminal_only_replan_remains_unknown_without_executable_batches(tmp_pat
     assert any(
         "no executable package batch" in item for item in plan.resolution_certificate.diagnostics
     )
+    assert state.install_assignments == []
+
+
+def test_active_workaround_only_plan_certifies_unchanged_workspace(tmp_path: Path):
+    root, files, groups, task_queue = _certifier_fixture(tmp_path)
+    task_queue = {
+        task_id: task.model_copy(update={"strategy": RoutingStrategy.CODE_WORKAROUND})
+        for task_id, task in task_queue.items()
+    }
+
+    plan, state, _factory = _run_fake_certifier(root, files, groups, task_queue)
+
+    assert plan.solver_plan is not None
+    assert plan.solver_plan.status in {SolverStatus.OPTIMAL, SolverStatus.FEASIBLE}
+    assert plan.resolution_certificate is not None
+    assert plan.resolution_certificate.status == PackageResolutionStatus.CERTIFIED
+    assert plan.resolution_certificate.unresolved_coverage_ids
+    assert plan.resolution_certificate.batch_prefix_graph_digests == {}
     assert state.install_assignments == []
 
 
@@ -2497,6 +2530,87 @@ def test_exact_rejection_uses_next_optimal_candidate_without_resolving(
     assert state.archive_create_count == 1
     assert len(state.extraction_paths) == 2
     assert len(set(state.extraction_paths)) == 2
+
+
+def test_non_dispatchable_candidate_does_not_block_later_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from remediation_engine.planning import certification as portfolio_certifier
+
+    root, files, groups, task_queue = _certifier_fixture(tmp_path)
+    solver_results: list[Any] = []
+    attempts: list[str] = []
+    real_solve = portfolio_certifier.solve_portfolio
+    real_certify = portfolio_certifier._certify_assignment
+
+    def count_solves(*args: Any, **kwargs: Any) -> Any:
+        result = real_solve(*args, **kwargs)
+        solver_results.append(result)
+        return result
+
+    def certify_after_non_dispatchable_candidate(
+        sandbox: Any,
+        workspace_volume: str,
+        sandbox_factory: Any,
+        prepared: Any,
+        selected_plan: Any,
+        assignment: dict[str, str],
+        runtime: SolverRuntimeFingerprint,
+        archive_path: str,
+        scratch_root: str,
+        metrics: dict[str, Any],
+        deadline: float,
+    ) -> _AssignmentResult:
+        attempts.append(selected_plan.candidate_plan_id)
+        if len(attempts) == 1:
+            return _AssignmentResult(
+                status=PackageResolutionStatus.UNKNOWN,
+                snapshot=None,
+                covered_coverage_ids=(),
+                workaround_coverage_ids=(),
+                unresolved_coverage_ids=(),
+                resolved_lockfile_digests={},
+                batch_prefix_graph_digests={},
+                diagnostics=(
+                    "selected plan contains a non-dispatchable batch that is not terminal-only",
+                ),
+            )
+        return real_certify(
+            sandbox,
+            workspace_volume,
+            sandbox_factory,
+            prepared,
+            selected_plan,
+            assignment,
+            runtime,
+            archive_path,
+            scratch_root,
+            metrics,
+            deadline,
+        )
+
+    monkeypatch.setattr(portfolio_certifier, "solve_portfolio", count_solves)
+    monkeypatch.setattr(
+        portfolio_certifier, "_certify_assignment", certify_after_non_dispatchable_candidate
+    )
+    plan, _state, _factory = _run_fake_certifier(
+        root,
+        files,
+        groups,
+        task_queue,
+        solver_top_k=2,
+    )
+
+    assert len(solver_results) == 1
+    assert len(solver_results[0].candidate_plans) >= 2
+    assert len(attempts) == 2
+    assert attempts[1] == solver_results[0].candidate_plans[1].candidate_plan_id
+    assert plan.resolution_certificate is not None
+    assert plan.resolution_certificate.status == PackageResolutionStatus.CERTIFIED, (
+        plan.resolution_certificate.diagnostics
+    )
+    assert plan.resolution_certificate.candidate_plan_id == attempts[1]
 
 
 @pytest.mark.parametrize("failure_mode", ["timeout", "exception"])

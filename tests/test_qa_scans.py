@@ -55,8 +55,8 @@ from remediation_engine.tools.qa_workspace import (
     _build_qa_scan_targets,
     _collect_baseline_identifiers,
     _collect_target_identifiers,
+    _generate_workspace_diff,
     _scan_state_projection,
-    _workspace_remediation_fingerprint,
 )
 from remediation_engine.tools.test_execution import (
     _NPM_INSTALL_TIMEOUT_SECONDS,
@@ -480,6 +480,10 @@ class TestParseReportIdentifiers:
     def test_returns_none_on_invalid_json(self):
         result = _parse_report_identifiers("not json")
         assert result is None
+
+    @pytest.mark.parametrize("report", ["{}", '{"dependencies": null}', '{"dependencies": {}}'])
+    def test_returns_none_when_inventory_is_missing_or_malformed(self, report):
+        assert _parse_report_identifiers(report) is None
 
     @patch("remediation_engine.tools.qa_scan._parse_report_identifiers")
     def test_integration_returns_identifier_set(self, mock_parse):
@@ -939,7 +943,7 @@ class TestRunSecurityScan:
         assert "parseable" in result.summary.lower() or "no parseable" in result.summary.lower()
 
     def test_nonzero_exit_but_parseable_report_continues(self):
-        """ODC exits non-zero but produces a valid report â†’ treat as soft exit."""
+        """ODC exits non-zero but produces a valid report → treat as soft exit."""
         proc = MagicMock()
         proc.returncode = 2  # Dependency-Check warning exit
         sandbox = MagicMock()
@@ -1488,18 +1492,20 @@ class TestRunOdcStage2Parity:
         assert outcome.log_records[0].label == "manage.py test"
 
 
-def test_workspace_remediation_fingerprint_changes_with_material_file_change(tmp_path) -> None:
-    """The fingerprint reflects content changes, not only candidate file names."""
+def test_workspace_diff_reports_material_file_content_changes(tmp_path) -> None:
+    """The active diff builder detects content changes for candidate files."""
     (tmp_path / "package.json").write_text('{"version":"1.0.0"}', encoding="utf-8")
     sandbox = MagicMock()
     sandbox.read_file.return_value = '{"version":"1.0.0"}'
 
-    unchanged = _workspace_remediation_fingerprint(str(tmp_path), sandbox, ["package.json"])
+    unchanged, unchanged_files = _generate_workspace_diff(str(tmp_path), sandbox, ["package.json"])
 
     sandbox.read_file.return_value = '{"version":"2.0.0"}'
-    changed = _workspace_remediation_fingerprint(str(tmp_path), sandbox, ["package.json"])
+    changed, changed_files = _generate_workspace_diff(str(tmp_path), sandbox, ["package.json"])
 
     assert changed != unchanged
+    assert unchanged_files == []
+    assert changed_files == ["package.json"]
 
 
 def test_python_package_inventory_includes_nonvulnerable_dependencies():

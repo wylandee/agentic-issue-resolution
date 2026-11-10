@@ -25,7 +25,14 @@ from remediation_engine.agents.report import (
     run_report_node,
 )
 from remediation_engine.agents.report_evidence import PackageChange, _package_changes
+from remediation_engine.contracts.schemas import (
+    QAPolicy,
+    RemediationTask,
+    RoutingStrategy,
+    TaskStatus,
+)
 from remediation_engine.orchestration.graph import build_orchestrator_graph
+from remediation_engine.orchestration.state import reconcile_phase5_state_before_teardown
 from remediation_engine.runtime.telemetry import write_report_atomic
 from remediation_engine.settings import AppSettings
 
@@ -117,6 +124,40 @@ def test_generate_report_contains_four_sections_and_final_change_evidence():
     assert "Targeted remediation" not in report
     assert "Post-remediation security status" not in report
     assert "Re-triage groups discovered" not in report
+
+
+def test_package_diffs_preserve_same_package_across_manifests_and_localize_groups():
+    diff = (
+        "--- a/apps/one/package.json\n"
+        "+++ b/apps/one/package.json\n"
+        "@@ -1 +1 @@\n"
+        '-  "shared-package": "1.0.0"\n'
+        '+  "shared-package": "1.1.0"\n'
+        "--- a/tools/two/package.json\n"
+        "+++ b/tools/two/package.json\n"
+        "@@ -1 +1 @@\n"
+        '-  "shared-package": "2.0.0"\n'
+        '+  "shared-package": "2.1.0"\n'
+    )
+
+    changes = _package_changes(diff)
+    first_group = {
+        "vulnerable_component": "shared-package",
+        "file_path": "apps/one/package-lock.json",
+    }
+    second_group = {
+        "vulnerable_component": "shared-package",
+        "file_path": "tools/two/package-lock.json",
+    }
+
+    assert [(change.file, change.old, change.new) for change in changes] == [
+        ("apps/one/package.json", "1.0.0", "1.1.0"),
+        ("tools/two/package.json", "2.0.0", "2.1.0"),
+    ]
+    assert report_node._package_change_matches_group(changes[0], first_group)
+    assert not report_node._package_change_matches_group(changes[0], second_group)
+    assert not report_node._package_change_matches_group(changes[1], first_group)
+    assert report_node._package_change_matches_group(changes[1], second_group)
 
 
 def test_sections_two_through_four_use_the_existing_section_renderers():
@@ -561,6 +602,21 @@ def test_terminal_success_does_not_accept_an_older_attempt_if_a_newer_commit_exi
     )
 
 
+def test_historical_attempt_without_qa_envelope_does_not_inherit_latest_task_verdict():
+    state = _state()
+    context = report_node._build_context(state)
+
+    assert (
+        report_node._attempt_qa_verdict(
+            context,
+            {"task_id": "task-1", "attempt_id": "attempt-old"},
+            None,
+        )
+        is None
+    )
+    assert report_node._attempt_qa_verdict(context, {"task_id": "task-1"}, None) is True
+
+
 def test_incremental_incomplete_report_keeps_known_new_identifiers_visible():
     state = _state()
     identifier = "CVE-2026-0042"
@@ -766,7 +822,6 @@ def test_graph_executes_report_after_mocked_teardown(tmp_path: Path):
         "qa_evaluations": {},
         "action_summaries": [],
         "constraints_ledger": [],
-        "retry_counts": {},
         "workspace_volume": None,
     }
     with (
@@ -791,6 +846,8 @@ def test_graph_executes_report_after_mocked_teardown(tmp_path: Path):
     assert "report" in build_orchestrator_graph().get_graph().nodes
     assert "workspace volume cleanup failed" not in result["report_markdown"]
     assert result["report_markdown"].startswith("# Remediation Run Report")
+    assert "| Run outcome | Completed with errors |" in result["report_markdown"]
+    assert "Review the run errors before relying on this result." in result["report_markdown"]
     assert result["report_status"] == "rendered"
     assert result["report_path"] is None
     assert result["report_error"] is None
@@ -1348,6 +1405,14 @@ def test_workaround_final_change_includes_replacement_evidence():
             },
         }
     }
+    state["qa_results_by_attempt"] = {
+        "attempt-1": {
+            "attempt_id": "attempt-1",
+            "task_id": "task-1",
+            "task_revision": 1,
+            "evaluation": {"passed": True},
+        }
+    }
 
     report = generate_report(state)
 
@@ -1386,6 +1451,14 @@ def test_workaround_replay_projection_supplies_attempt_diff_when_worker_result_i
                     ],
                 }
             ]
+        }
+    }
+    state["qa_results_by_attempt"] = {
+        "attempt-1": {
+            "attempt_id": "attempt-1",
+            "task_id": "task-1",
+            "task_revision": 1,
+            "evaluation": {"passed": True},
         }
     }
 
@@ -1670,18 +1743,43 @@ def test_final_scan_reopened_groups_are_follow_up_actions():
 
 
 def test_authoritative_remaining_finding_reopens_targeted_success():
-    """A repository-wide finding overrides a narrower targeted QA success."""
+    """The teardown state barrier reopens a QA success by matching occurrence evidence."""
     state = _state()
     state["initial_valid_groups"][0]["cve_ids"] = ["CVE-2024-0001"]
-    state["initial_valid_groups"][0]["issues"][0]["cve_id"] = "CVE-2024-0001"
+    state["initial_valid_groups"][0]["issues"][0].update(
+        {
+            "cve_id": "CVE-2024-0001",
+            "package_name": "lodash|legacy",
+            "package_version": "4.17.15",
+            "file_path": "package-lock.json",
+        }
+    )
+    state["task_queue"]["task-1"] = RemediationTask(
+        task_id="task-1",
+        parent_group_id="group-1",
+        qa_policy=QAPolicy.VERSION_BUMP,
+        strategy=RoutingStrategy.VERSION_BUMP,
+        status=TaskStatus.QA_PASSED,
+    )
     state["final_full_scan_result"] = {
         "completed": True,
         "authoritative": True,
+        "coverage_scope": "full_workspace",
         "status": "detected",
         "remaining_target_identifiers": ["CVE-2024-0001"],
+        "found_issues": [
+            {
+                "cve_id": "CVE-2024-0001",
+                "package_name": "lodash|legacy",
+                "package_version": "4.17.15",
+                "file_path": "package-lock.json",
+            }
+        ],
     }
     state["new_vulnerability_status"] = "detected"
     state["triage_reconciliation"] = {}
+    state.update(reconcile_phase5_state_before_teardown(state))
+    state["status"] = "completed_with_errors"
 
     report = generate_report(state)
     follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
@@ -1693,6 +1791,146 @@ def test_authoritative_remaining_finding_reopens_targeted_success():
     assert "CVE-2024-0001" in follow_up
     assert "**Status:** Retry needed" in follow_up
     assert "No successful remediations were produced during this run." in report
+
+
+def test_complete_incremental_scan_reopens_the_matching_qa_success():
+    """A complete targeted scan reopens its matching occurrence after QA passed."""
+    state = _state()
+    state["task_queue"]["task-1"] = RemediationTask(
+        task_id="task-1",
+        parent_group_id="group-1",
+        qa_policy=QAPolicy.VERSION_BUMP,
+        strategy=RoutingStrategy.VERSION_BUMP,
+        status=TaskStatus.QA_PASSED,
+    )
+    state["triage_reconciliation"] = {}
+    state["initial_valid_groups"][0]["cve_ids"] = ["CVE-2024-0001"]
+    state["initial_valid_groups"][0]["ghsa_ids"] = ["GHSA-ABCD-EFGH-IJKL"]
+    state["initial_valid_groups"][0]["issues"][0].update(
+        {
+            "cve_id": "CVE-2024-0001",
+            "ghsa_id": "GHSA-ABCD-EFGH-IJKL",
+            "package_name": "lodash|legacy",
+            "package_version": "4.17.15",
+            "file_path": "scan/package-lock.json?/lodash|legacy:4.17.15",
+        }
+    )
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": False,
+        "coverage_scope": "incremental_dependency_inputs",
+        "coverage_complete": True,
+        "status": "detected",
+        "remaining_target_identifiers": ["CVE-2024-0001", "GHSA-ABCD-EFGH-IJKL"],
+        "found_issues": [
+            {
+                "cve_id": "CVE-2024-0001",
+                "ghsa_id": "GHSA-ABCD-EFGH-IJKL",
+                "package_name": "lodash|legacy",
+                "package_version": "4.17.15",
+                "file_path": "scan/.odc-targeted/000/package-lock.json?/lodash|legacy:4.17.15",
+            }
+        ],
+    }
+    state.update(reconcile_phase5_state_before_teardown(state))
+    state["status"] = "completed_with_errors"
+    state["errors"] = ["teardown_node: incremental scan still contains CVE-2024-0001"]
+
+    report = generate_report(state)
+    follow_up = report.split("## 2. Follow up Actions", 1)[1].split(
+        "## 3. Successful Remediations", 1
+    )[0]
+
+    assert state["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
+    assert "| Successfully remediated vulnerability groups | 0 |" in report
+    assert "| Vulnerability groups requiring follow-up | 1 |" in report
+    assert "CVE-2024-0001" in follow_up
+    assert "No follow-up actions are required." not in follow_up
+    assert "Review the run errors" in report
+
+
+def test_incremental_scan_reopens_only_the_matching_same_cve_occurrence():
+    state = _state()
+    first_group = state["initial_valid_groups"][0]
+    first_group.update(
+        {
+            "vulnerable_component": "shared-package",
+            "cve_ids": ["CVE-2024-0001"],
+            "issues": [
+                {
+                    "cve_id": "CVE-2024-0001",
+                    "issue_type": "sca",
+                    "package_name": "shared-package",
+                    "package_version": "1.0.0",
+                    "file_path": "scan/app/package-lock.json?/shared-package:1.0.0",
+                    "source": "odc",
+                }
+            ],
+        }
+    )
+    second_group = {
+        **first_group,
+        "group_id": "group-2",
+        "file_path": "tools/package-lock.json",
+        "file_paths": ["tools/package-lock.json"],
+        "issues": [
+            {
+                "cve_id": "CVE-2024-0001",
+                "issue_type": "sca",
+                "package_name": "shared-package",
+                "package_version": "1.0.0",
+                "file_path": "scan/tools/package-lock.json?/shared-package:1.0.0",
+                "source": "odc",
+            }
+        ],
+    }
+    state["initial_valid_groups"].append(second_group)
+    state["task_queue"] = {
+        "task-1": RemediationTask(
+            task_id="task-1",
+            parent_group_id="group-1",
+            qa_policy=QAPolicy.VERSION_BUMP,
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.QA_PASSED,
+        ),
+        "task-2": RemediationTask(
+            task_id="task-2",
+            parent_group_id="group-2",
+            qa_policy=QAPolicy.VERSION_BUMP,
+            strategy=RoutingStrategy.VERSION_BUMP,
+            status=TaskStatus.QA_PASSED,
+        ),
+    }
+    state["final_full_scan_result"] = {
+        "completed": True,
+        "authoritative": False,
+        "coverage_scope": "incremental_dependency_inputs",
+        "coverage_complete": True,
+        "status": "detected",
+        "remaining_target_identifiers": ["CVE-2024-0001"],
+        "found_issues": [
+            {
+                "cve_id": "CVE-2024-0001",
+                "issue_type": "sca",
+                "package_name": "shared-package",
+                "package_version": "1.0.0",
+                "file_path": "scan/.odc-targeted/000/package-lock.json?/shared-package:1.0.0",
+                "source": "odc",
+            }
+        ],
+    }
+    state["latest_incremental_scan_by_input"] = {
+        "tools/package-lock.json": {
+            "source_input_path": "tools/package-lock.json",
+            "complete": True,
+            "found_issues": state["final_full_scan_result"]["found_issues"],
+        }
+    }
+
+    barrier = reconcile_phase5_state_before_teardown(state)
+
+    assert barrier["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
+    assert barrier["task_queue"]["task-2"].status == TaskStatus.NEEDS_RETRY
 
 
 def test_follow_up_actions_collapse_undiscovered_pivot_child_into_parent():

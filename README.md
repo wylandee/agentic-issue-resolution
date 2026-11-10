@@ -47,7 +47,8 @@ environment interfaces when integrating the package:
   `REMEDY_SOLVER_RANDOM_SEED`, `REMEDY_SOLVER_NUM_SEARCH_WORKERS`,
   `REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET`,
   `REMEDY_SOLVER_MAX_MODEL_VARIABLES`, `REMEDY_SOLVER_LLM_ENABLED`, and
-  `SOLVER_LLM_MODEL`.
+  `SOLVER_LLM_MODEL` (the last two are parsed for compatibility but are not
+  currently used by the production solver).
 
 Do not commit `.env`, credentials, clones, reports, or trajectories. The final
 full-repository Dependency-Check scan is opt-in with
@@ -159,9 +160,9 @@ python scripts/run_batch.py --help
 python scripts/eval_compare.py --help
 ```
 
-The eight maintained evaluation datasets contain 14 report, 20 triage, 18
-fix-planner, 22 update-worker, 19 workaround-worker, 31 QA, 17 Supervisor,
-and 10 end-to-end cases. Offline replay invokes production node boundaries
+The seven maintained evaluation datasets contain 14 report, 20 triage, 22
+update-worker, 19 workaround-worker, 31 QA, 20 Supervisor, and 10 end-to-end
+cases. The Supervisor cases include eight fix-planning scenarios. Offline replay invokes production node boundaries
 with scripted model, scanner, registry, and workspace doubles. Observed
 historical traces are kept separate from independently authored expectations.
 Offline evaluation makes no judge calls. Model-judged suites require
@@ -170,14 +171,16 @@ goldens additionally run the real engine with Docker and its configured
 scanner/model services; replay or rescoring a saved trajectory is not a fresh
 remediation run.
 
-The end-to-end evaluator has two metrics—Task Completion and System Safety and
-Contract Adherence—at threshold `0.70`. Deterministic checks enforce attempt
-lineage, authorized versions, QA evidence, patch support, rollback and cleanup.
-Judge scores are diagnostic unless `--e2e-strict` is selected. The live report
-suite separately requires a generated Executive Summary and records four
-diagnostic metrics: Hallucination (`0.70`), Faithfulness (`0.85`),
-Summarization (`0.80`), and Report Constraint Adherence (`0.70`). A fallback
-summary does not count as generated in live mode.
+The end-to-end evaluator uses one Task Completion metric at threshold `0.70`.
+Deterministic checks enforce attempt lineage, authorized versions, QA evidence,
+patch support, rollback, host preservation, and cleanup. Judge scores are
+diagnostic unless `--e2e-strict` is selected. The Supervisor suite also uses
+one Task Completion metric per case for its combined planning and disposition.
+The live report suite requires a generated Executive Summary and records three
+diagnostic metrics: Hallucination (`0.70`), Faithfulness (`0.85`), and
+Summarization (`0.80`). Operational token, latency, and tool-call limits remain
+runtime controls and telemetry, not evaluation scores. A fallback summary does
+not count as generated in live mode.
 
 Evaluation runs and metric results are persisted to SQLite at
 `data/evals/eval_results.db` by default. Set `EVAL_DB_PATH` to use another

@@ -23,6 +23,7 @@ from remediation_engine.tools.identity import normalize_python_package_name
 from remediation_engine.tools.npm_mutations import (
     _bounded_command_output,
     _capture_package_checkpoint,
+    _execute_committed_multi_package_action,
     _normalize_python_manifest_targets,
     _PackageCheckpoint,
     _restore_package_checkpoint,
@@ -1102,32 +1103,14 @@ def _make_modify_batch_python_dependencies_tool(
     @tool
     def modify_batch_python_dependencies() -> str:
         """Apply and validate the complete Supervisor-committed Python batch."""
-        if state.get("multi_package_action_executed"):
-            return _tool_error(
-                "MULTI_PACKAGE_ACTION_ALREADY_EXECUTED",
-                "The committed cluster action has already been executed; return control to the Supervisor.",
-            )
-        state["multi_package_action_executed"] = True
-        try:
-            succeeded, error = apply_multi_package_python_action(
-                sandbox,
-                action,
-                touched_files,
-                checkpoint_store=package_checkpoints,
-            )
-        except Exception as exc:  # noqa: BLE001 - tool boundary returns typed failure
-            succeeded, error = False, f"Python batch action raised an unexpected error: {exc}"
-        state["multi_package_action_succeeded"] = succeeded
-        state["multi_package_action_error"] = error or None
-        if succeeded:
-            label = getattr(action, "cluster_id", None) or "unclustered"
-            return (
-                "SUCCESS: Applied the Supervisor-committed Python multi-package action "
-                f"for cluster {label}; every declaration and resolver check passed."
-            )
-        return _tool_error(
-            "MULTI_PACKAGE_ACTION_FAILED",
-            error or "The committed Python batch failed and was rolled back.",
+        return _execute_committed_multi_package_action(
+            sandbox,
+            action,
+            touched_files,
+            state,
+            package_checkpoints,
+            executor=apply_multi_package_python_action,
+            success_detail="every declaration and resolver check passed",
         )
 
     return modify_batch_python_dependencies
@@ -1158,6 +1141,12 @@ def _make_modify_and_validate_python_dependency_tool(
         manifest_path: str,
     ) -> str:
         """Atomically update one Supervisor-authorized Python dependency."""
+        if state.get("restoration_failed"):
+            paths = ", ".join(state.get("restoration_failure_paths", []) or [])
+            return (
+                "ERROR_CODE: RESTORATION_INCOMPLETE: A previous rollback did not restore "
+                f"the workspace files ({paths}); further dependency edits are blocked."
+            )
         package = _canonical_package(package_name)
         if package is None:
             return _tool_error("INVALID_ARGUMENT", "package_name must be a canonical PEP 503 name.")
@@ -1306,8 +1295,13 @@ def _make_modify_and_validate_python_dependency_tool(
                         if error
                     ]
                 )
-            checkpoints.pop(package, None)
-            state["pending_validation_package"] = None
+            if rollback_errors:
+                state["restoration_failed"] = True
+                state["restoration_failure_paths"] = sorted(checkpoint.files) if checkpoint else []
+                state["pending_validation_package"] = package
+            else:
+                checkpoints.pop(package, None)
+                state["pending_validation_package"] = None
             failure = _tool_error("PYTHON_TRANSACTION_FAILED", str(exc))
             rollback_note = (
                 " Rollback failed: " + " | ".join(rollback_errors)

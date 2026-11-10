@@ -83,6 +83,7 @@ from remediation_engine.runtime.path_policy import (
     normalize_workspace_path,
     repository_relative_path,
 )
+from remediation_engine.tools.identity import finding_occurrence_key, stable_issue_fingerprint
 from remediation_engine.tools.manifest_locator import expand_dependency_ancestry_from_repository
 
 _logger = logging.getLogger(__name__)
@@ -436,27 +437,6 @@ def normalize_group_paths(
     return normalized
 
 
-def _derive_feedback_by_group(
-    target_tasks: list[RemediationTask],
-    target_groups: list[VulnerabilityGroup],
-    feedback_by_task: Mapping[str, str] | None,
-) -> dict[str, str]:
-    """Translate task-keyed feedback into group-keyed feedback when possible."""
-    feedback_by_group: dict[str, str] = {}
-    task_map = {task.task_id: task for task in target_tasks}
-    group_map = {group.group_id: group for group in target_groups}
-
-    for task_id, feedback in dict(feedback_by_task or {}).items():
-        task = task_map.get(task_id)
-        if task is not None:
-            feedback_by_group[task.parent_group_id] = feedback
-            continue
-        if task_id in group_map:
-            feedback_by_group[task_id] = feedback
-
-    return feedback_by_group
-
-
 class OrchestratorState(TypedDict, total=False):
     """
     Full state schema for the Phase 5 supervisor master state.
@@ -486,6 +466,8 @@ class OrchestratorState(TypedDict, total=False):
 
     repo_root: str
     run_id: str
+    state_revision: int
+    consistency_events: Annotated[list[StateConsistencyEvent], operator.add]
     valid_groups: list[VulnerabilityGroup]
     initial_valid_groups: list[VulnerabilityGroup]
     run_started_at: str
@@ -499,7 +481,6 @@ class OrchestratorState(TypedDict, total=False):
     system_context: SystemContext
 
     constraints_ledger: Annotated[list[str], operator.add]
-    retry_counts: Annotated[dict[str, int], merge_dict_reducer]
     group_strategies: Annotated[dict[str, RoutingStrategy], merge_dict_reducer]
     qa_evaluations: Annotated[dict[str, QAEvaluation], replace_dict_reducer]
     action_summaries: Annotated[list[AgentActionSummary], operator.add]
@@ -564,7 +545,6 @@ class OrchestratorState(TypedDict, total=False):
     next_routing_step: str
     decision_code: DecisionCode | None
     supervisor_audit: AuditRecord | None
-    feedback_by_group: Annotated[dict[str, str], replace_dict_reducer]
     feedback_by_task: Annotated[dict[str, str], replace_dict_reducer]
     supervisor_instructions: str
     eval_status: str
@@ -620,7 +600,6 @@ class SubagentState(TypedDict, total=False):
     dispatch_batch_id: str | None
     multi_package_action: MultiPackageAction | None
     target_groups: list[VulnerabilityGroup]
-    feedback_by_group: dict[str, str]
     feedback_by_task: dict[str, str]
     previous_action_summaries_by_task: dict[str, str]
     retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics]
@@ -687,7 +666,6 @@ def initial_orchestrator_state(
         "target_packages": normalized_target_packages,
         "project_language": resolved_project_language,
         "constraints_ledger": [],
-        "retry_counts": {},
         "group_strategies": {},
         "qa_evaluations": {},
         "action_summaries": [],
@@ -721,7 +699,6 @@ def initial_orchestrator_state(
         "maven_cache_volume": None,
         "status": "pending",
         "next_routing_step": "",
-        "feedback_by_group": {},
         "feedback_by_task": {},
         "supervisor_instructions": "",
         "eval_status": "",
@@ -773,7 +750,6 @@ def initial_update_subagent_state(
     target_groups: Sequence[VulnerabilityGroup],
     constraints_ledger: Sequence[str] = (),
     feedback_by_task: Mapping[str, str] | None = None,
-    feedback_by_group: Mapping[str, str] | None = None,
     previous_action_summaries_by_task: Mapping[str, str] | None = None,
     retry_diagnostics_by_task: Mapping[str, UpdateRetryDiagnostics] | None = None,
     target_attempt_snapshots: Mapping[str, TaskAttemptSnapshot] | None = None,
@@ -792,22 +768,12 @@ def initial_update_subagent_state(
     previous_summaries_dict = dict(previous_action_summaries_by_task or {})
     retry_diagnostics_dict = dict(retry_diagnostics_by_task or {})
     target_attempt_snapshots_dict = dict(target_attempt_snapshots or {})
-    feedback_by_group_dict = dict(
-        feedback_by_group
-        or _derive_feedback_by_group(
-            target_tasks_list,
-            target_groups_list,
-            feedback_by_task_dict,
-        )
-    )
-
     return {
         "repo_root": repo_root,
         "workspace_volume": workspace_volume,
         "project_language": project_language,
         "target_tasks": target_tasks_list,
         "target_groups": target_groups_list,
-        "feedback_by_group": feedback_by_group_dict,
         "feedback_by_task": feedback_by_task_dict,
         "previous_action_summaries_by_task": previous_summaries_dict,
         "retry_diagnostics_by_task": retry_diagnostics_dict,
@@ -1445,8 +1411,8 @@ def derive_initial_strategy(group: VulnerabilityGroup) -> RoutingStrategy:
     Derive the initial routing strategy from a group's fix plan.
 
     Returns ``VERSION_BUMP`` only when the fix plan has ``status=VERSION_FOUND``
-    (i.e. a safe pinned version is available).  All other plans â€” workaround,
-    no-fix, or absent â€” map to ``CODE_WORKAROUND``.
+    (i.e. a safe pinned version is available).  All other plans — workaround,
+    no-fix, or absent — map to ``CODE_WORKAROUND``.
     """
     fix_plan = select_package_fix_plan(group).plan
     if fix_plan is not None and fix_plan.status == FixPlanStatus.VERSION_FOUND:
@@ -1748,12 +1714,6 @@ def _build_consistency_event(
     action: str,
     details: str,
 ) -> StateConsistencyEvent:
-    # ``deferred`` was used by the registry-pending branch before it was
-    # added to the typed event contract.  Keep this compatibility boundary
-    # fail-closed: a deferred proposal is a rejected dispatch, and must never
-    # crash the Supervisor while constructing its diagnostic event.
-    if action == "deferred":
-        action = "rejected"
     return StateConsistencyEvent(
         error_code=error_code,
         task_id=task_id,
@@ -2293,6 +2253,179 @@ def reconcile_phase5_state_before_teardown(
                 ),
             )
         )
+
+    final_scan = state.get("final_full_scan_result")
+    remaining_identifiers = {
+        str(identifier).strip().casefold()
+        for identifier in (_task_value(final_scan, "remaining_target_identifiers", []) or [])
+        if str(identifier).strip()
+    }
+    final_scan_issues = _task_value(final_scan, "found_issues", []) or []
+    final_occurrences: set[tuple[tuple[str, str, str], str]] = set()
+    staged_occurrences: set[tuple[str, str, str]] = set()
+
+    def occurrence_key(issue: Any) -> tuple[str, str, str]:
+        package, version, file_path = finding_occurrence_key(issue)
+        source = _task_value(issue, "source", "")
+        source = str(getattr(source, "value", source)).casefold()
+        marker = ".odc-targeted/"
+        marker_at = file_path.find(marker)
+        if marker_at >= 0:
+            staged_index, separator, staged_path = file_path[marker_at + len(marker) :].partition(
+                "/"
+            )
+            if separator and staged_index.isdigit():
+                try:
+                    fingerprint = stable_issue_fingerprint(
+                        issue
+                        if isinstance(issue, VulnerabilityIssue)
+                        else VulnerabilityIssue.model_validate(issue)
+                    )
+                except (TypeError, ValueError):
+                    fingerprint = ""
+                source_paths = source_paths_by_fingerprint.get(fingerprint, set())
+                if len(source_paths) == 1:
+                    source_path = next(iter(source_paths))
+                    staged_file = staged_path.split("?", 1)[0].split("#", 1)[0]
+                    source_name = Path(source_path).name
+                    if staged_file == source_name:
+                        suffix = staged_path[len(staged_file) :]
+                        file_path = f"{file_path[:marker_at]}{source_path}{suffix}"
+        if source in {"odc", "dependency-check"}:
+            file_path = file_path.removeprefix("/scan/").removeprefix("scan/")
+        return package, version, file_path
+
+    source_paths_by_fingerprint: dict[str, set[str]] = {}
+    for input_path, record in (state.get("latest_incremental_scan_by_input", {}) or {}).items():
+        source_path = str(_task_value(record, "source_input_path", "") or "").replace("\\", "/")
+        normalized_input_path = str(input_path).replace("\\", "/").strip()
+        path = Path(source_path)
+        if (
+            _task_value(record, "complete") is not True
+            or not source_path
+            or source_path != normalized_input_path
+            or path.is_absolute()
+            or ".." in path.parts
+        ):
+            continue
+        for issue in _task_value(record, "found_issues", []) or []:
+            try:
+                fingerprint = stable_issue_fingerprint(
+                    issue
+                    if isinstance(issue, VulnerabilityIssue)
+                    else VulnerabilityIssue.model_validate(issue)
+                )
+            except (TypeError, ValueError):
+                continue
+            source_paths_by_fingerprint.setdefault(fingerprint, set()).add(source_path)
+
+    for issue in final_scan_issues:
+        occurrence = occurrence_key(issue)
+        issue_path = str(_task_value(issue, "file_path", "") or "").replace("\\", "/")
+        is_staged_scan_path = ".odc-targeted" in Path(issue_path).parts
+        for field in ("cve_id", "ghsa_id"):
+            identifier = str(_task_value(issue, field, "") or "").strip().casefold()
+            if identifier and identifier in remaining_identifiers:
+                final_occurrences.add((occurrence, identifier))
+                if is_staged_scan_path:
+                    staged_occurrences.add((occurrence[0], occurrence[1], identifier))
+
+    groups = list(state.get("valid_groups", []) or [])
+    if not groups:
+        groups = list(state.get("initial_valid_groups", []) or [])
+    group_ids: dict[str, set[str]] = {}
+    for group in groups:
+        group_id = str(_task_value(group, "group_id", "") or "")
+        identifiers = {
+            str(identifier).strip().casefold()
+            for field in ("cve_ids", "ghsa_ids")
+            for identifier in (_task_value(group, field, []) or [])
+            if str(identifier).strip()
+        }
+        for issue in _task_value(group, "issues", []) or []:
+            identifiers.update(
+                str(_task_value(issue, field, "") or "").strip().casefold()
+                for field in ("cve_id", "ghsa_id")
+                if str(_task_value(issue, field, "") or "").strip()
+            )
+        group_ids[group_id] = identifiers
+    groups_by_identifier: dict[str, set[str]] = {}
+    for group_id, identifiers in group_ids.items():
+        for identifier in identifiers:
+            groups_by_identifier.setdefault(identifier, set()).add(group_id)
+
+    coverage_scope = _task_value(final_scan, "coverage_scope", "full_workspace")
+    full_scan_is_authoritative = (
+        coverage_scope == "full_workspace"
+        and _task_value(final_scan, "completed") is True
+        and _task_value(final_scan, "authoritative") is True
+    )
+    incremental_scan_is_complete = (
+        coverage_scope == "incremental_dependency_inputs"
+        and _task_value(final_scan, "completed") is True
+        and _task_value(final_scan, "coverage_complete") is True
+    )
+    if (full_scan_is_authoritative or incremental_scan_is_complete) and remaining_identifiers:
+        for group in groups:
+            group_id = str(_task_value(group, "group_id", "") or "")
+            if (
+                not group_id
+                or effective_group_status(task_queue, group_id) != TaskStatus.QA_PASSED.value
+            ):
+                continue
+            group_issues = list(_task_value(group, "issues", []) or [])
+            contradicted = any(
+                (occurrence_key(issue), identifier) in final_occurrences
+                for issue in group_issues
+                for field in ("cve_id", "ghsa_id")
+                for identifier in [str(_task_value(issue, field, "") or "").strip().casefold()]
+                if identifier
+            )
+            if not contradicted and incremental_scan_is_complete:
+                group_package_versions = {occurrence_key(issue)[:2] for issue in group_issues}
+                contradicted = any(
+                    (package, version) in group_package_versions
+                    and groups_by_identifier.get(identifier) == {group_id}
+                    for package, version, identifier in staged_occurrences
+                )
+            # Older or reduced scan projections can omit occurrence records.
+            # Attribute those identifiers only when they belong to one group.
+            if not final_scan_issues:
+                contradicted = any(
+                    identifier in remaining_identifiers
+                    and groups_by_identifier.get(identifier) == {group_id}
+                    for identifier in group_ids.get(group_id, set())
+                )
+            if not contradicted:
+                continue
+            for task in task_group_lineage(task_queue, group_id):
+                if _task_status_name(task) != TaskStatus.QA_PASSED.value:
+                    continue
+                task_id = str(_task_value(task, "task_id", ""))
+                received_attempt_id = _task_value(task, "current_attempt_id")
+                updates = {
+                    "status": TaskStatus.NEEDS_RETRY,
+                    "current_attempt_id": None,
+                    "selected_version": None,
+                    "task_revision": int(_task_value(task, "task_revision", 0)) + 1,
+                }
+                task_queue[task_id] = (
+                    task.model_copy(update=updates)
+                    if hasattr(task, "model_copy")
+                    else {**task, **updates}
+                )
+                pivot_repair_events.append(
+                    _build_consistency_event(
+                        error_code="FINAL_SCAN_REOPENED_TASK",
+                        task_id=task_id,
+                        expected_attempt_id=received_attempt_id,
+                        received_attempt_id=None,
+                        action="replanned",
+                        details=(
+                            "Authoritative final scan found the same finding occurrence after QA passed."
+                        ),
+                    )
+                )
 
     events, errors = _validate_committed_state(
         task_queue,

@@ -43,7 +43,6 @@ SUITE_PATHS: dict[str, list[str]] = {
     "qa_critic": ["tests/evals/test_qa_critic_eval.py"],
     "report": ["tests/evals/test_report_eval.py"],
     "triage": ["tests/evals/test_triage_eval.py"],
-    "fix_planner": ["tests/evals/test_fix_planner_eval.py"],
     "adapters": ["tests/evals/test_adapters.py"],
 }
 
@@ -59,7 +58,7 @@ def run_eval_subprocess(
     """Execute pytest evaluation suite as a subprocess, yielding stdout lines in real-time.
 
     Args:
-        suite_key: Target evaluation suite name (e.g. 'all', 'report', 'triage', 'fix_planner', 'end_to_end').
+        suite_key: Maintained evaluation suite name.
         is_live: Whether to pass --run-eval-live for live LLM judge evaluations.
         judge_model: Judge model identifier to export in EVAL_JUDGE_MODEL.
         reasoning_effort: OpenAI reasoning effort to export in EVAL_JUDGE_REASONING_EFFORT.
@@ -72,7 +71,9 @@ def run_eval_subprocess(
     Returns:
         The process exit code.
     """
-    targets = SUITE_PATHS.get(suite_key, ["tests/evals"])
+    if suite_key not in SUITE_PATHS:
+        raise ValueError(f"Unknown evaluation suite {suite_key!r}.")
+    targets = SUITE_PATHS[suite_key]
     python_exe = sys.executable
 
     cmd = [python_exe, "-m", "pytest", "-v", "--strict-markers"]
@@ -151,7 +152,7 @@ def create_sample_run(
             input_text=(
                 "Render the final deterministic Markdown remediation report for a human reader.\n"
                 "Deterministic evidence:\n"
-                '{"status": "completed", "overall_label": "success", "metrics": {"actionable_groups": 3, "groups_fixed": 3}}'
+                '{"status": "completed", "overall_label": "Successful", "metrics": {"actionable_groups": 3, "groups_fixed": 3}}'
             ),
             actual_output=(
                 "The remediation workflow completed successfully. All 3 actionable vulnerability groups "
@@ -160,14 +161,14 @@ def create_sample_run(
             expected_output=(
                 "All 3 actionable vulnerability groups were resolved successfully with passing QA gates."
             ),
-            context_text="Remediation status: completed. Overall label: success. Actionable groups: 3, Fixed: 3.",
+            context_text="Remediation status: completed. Overall label: Successful. Actionable groups: 3, Fixed: 3.",
             latency_seconds=1.84,
             cost=0.0032,
             metrics=[
                 MetricRecord(
                     metric_name="HallucinationMetric",
-                    score=0.02,
-                    threshold=0.30,
+                    score=0.98,
+                    threshold=0.70,
                     success=True,
                     reason="The report contains no unsupported package, status, or count claims.",
                     evaluation_model=judge_model,
@@ -188,39 +189,31 @@ def create_sample_run(
                     reason="The report preserves the complete remediation outcome and package changes.",
                     evaluation_model=judge_model,
                 ),
-                MetricRecord(
-                    metric_name="Report Constraint Adherence",
-                    score=0.98,
-                    threshold=0.70,
-                    success=True,
-                    reason="Counts, statuses, package changes, and no-workaround constraints are preserved.",
-                    evaluation_model=judge_model,
-                ),
             ],
         ),
         EvalTestCaseRecord(
             case_id="case_02",
-            test_name="test_report_negative_constraints [case_02]",
+            test_name="test_report_partial_outcome_factuality [case_02]",
             suite="report",
             status="PASSED",
             input_text=(
                 "Render the final deterministic Markdown remediation report for a human reader.\n"
                 "Deterministic evidence:\n"
-                '{"status": "partial", "overall_label": "partial_success", "metrics": {"actionable_groups": 4, "groups_fixed": 2, "groups_unresolved": 2}}'
+                '{"status": "partial", "overall_label": "Partial", "metrics": {"actionable_groups": 4, "groups_fixed": 2, "groups_unresolved": 2}}'
             ),
             actual_output=(
                 "The remediation process achieved partial success, successfully fixing 2 actionable vulnerability "
                 "groups while 2 groups remain unresolved due to peer dependency conflicts."
             ),
             expected_output=("2 groups fixed and 2 unresolved due to peer dependency conflicts."),
-            context_text="Remediation status: partial. Fixed: 2, Unresolved: 2.",
+            context_text="Remediation status: partial. Overall label: Partial. Fixed: 2, Unresolved: 2.",
             latency_seconds=2.15,
             cost=0.0041,
             metrics=[
                 MetricRecord(
                     metric_name="HallucinationMetric",
-                    score=0.04,
-                    threshold=0.30,
+                    score=0.96,
+                    threshold=0.70,
                     success=True,
                     reason="The report does not invent unresolved-package outcomes or remediation counts.",
                     evaluation_model=judge_model,
@@ -238,15 +231,7 @@ def create_sample_run(
                     score=0.89,
                     threshold=0.80,
                     success=True,
-                    reason="The report retains the one-success/two-follow-up outcome.",
-                    evaluation_model=judge_model,
-                ),
-                MetricRecord(
-                    metric_name="Report Constraint Adherence",
-                    score=0.93,
-                    threshold=0.70,
-                    success=True,
-                    reason="The report preserves final statuses and does not add unsupported recommendations.",
+                    reason="The report retains the two-fixed/two-unresolved outcome.",
                     evaluation_model=judge_model,
                 ),
             ],
@@ -273,28 +258,6 @@ def create_sample_run(
                 )
             ],
         ),
-        EvalTestCaseRecord(
-            case_id="case_04",
-            test_name="test_fix_planner_strategy_selection [fix_002]",
-            suite="fix_planner",
-            status="PASSED",
-            input_text='{"target": "lodash", "installed": "4.17.20", "advisory": "Prototype pollution in lodash"}',
-            actual_output='{"strategy": "UPGRADE_DIRECT", "recommended_version": "4.17.21"}',
-            expected_output='{"strategy": "UPGRADE_DIRECT", "recommended_version": "4.17.21"}',
-            context_text="Lodash 4.17.21 contains the official patch.",
-            latency_seconds=1.12,
-            cost=0.0022,
-            metrics=[
-                MetricRecord(
-                    metric_name="Fix Planner Recommendation Accuracy",
-                    score=1.00,
-                    threshold=0.70,
-                    success=True,
-                    reason="Selected correct target version 4.17.21.",
-                    evaluation_model=judge_model,
-                )
-            ],
-        ),
     ]
 
     total = len(test_cases)
@@ -315,7 +278,7 @@ def create_sample_run(
         skipped_tests=0,
         duration_seconds=round(duration, 2),
         total_cost=round(cost, 4),
-        metadata={"git_branch": "feat/add-eval-ui", "triggered_by": "sample_generator"},
+        metadata={"triggered_by": "sample_generator"},
         test_cases=test_cases,
     )
 

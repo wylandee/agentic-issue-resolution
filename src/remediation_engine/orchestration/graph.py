@@ -45,18 +45,14 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph
 
 from remediation_engine.agents.qa import (
-    run_qa_critic_node,
     run_workspace_setup_scan_node,
 )
 from remediation_engine.agents.report import finalize_report, run_report_node
 from remediation_engine.agents.supervisor import (
-    instruction_digest,
     run_supervisor_node,
     supervisor_router,
 )
 from remediation_engine.agents.triage import run_triage_pipeline
-from remediation_engine.agents.update import run_update_subagent_node
-from remediation_engine.agents.workaround import run_workaround_subagent_node
 from remediation_engine.contracts.schemas import (
     IncrementalScanRecord,
     IssueSource,
@@ -73,23 +69,6 @@ from remediation_engine.contracts.solver_models import (
 )
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.execution import (
-    _create_workspace_attempt_snapshot,
-    _dispatch_boundary_rejection,
-    _finalize_qa_workspace_snapshot,
-    _finalize_worker_workspace_snapshot,
-    _finish_all_workspace_rollback_anchors,
-    _finish_parent_workspace_rollback_anchors,
-    _finish_workspace_attempt_snapshot,
-    _finish_workspace_rollback_anchors,
-    _has_partial_update_success,
-    _parent_workspace_rollback_anchors,
-    _qa_workspace_rollback_anchor_updates,
-    _restore_retained_workspace_anchors,
-    _restore_unrelated_workspace_anchors,
-    _restore_workspace_snapshot,
-    _worker_attempts_succeeded,
-    _workspace_rollback_anchor_ids,
-    _workspace_snapshot_id,
     run_qa_critic_from_orchestrator,
     run_update_subagent_from_orchestrator,
     run_workaround_subagent_from_orchestrator,
@@ -109,12 +88,12 @@ from remediation_engine.orchestration.workspace import (
     run_teardown_node,
     run_workspace_builder_node,
 )
-from remediation_engine.runtime.sandbox import DockerSandbox
 from remediation_engine.runtime.telemetry import (
     TrajectoryRecorder,
     build_phase5_runnable_config,
     build_phase5_trajectory_path,
     export_phase5_trajectory,
+    get_active_trajectory_recorder,
     invoke_with_trajectory,
     mark_phase5_trace_failed,
     resolve_phase5_trace_url,
@@ -148,32 +127,6 @@ __all__ = [
     "route_after_workspace_builder",
     "run_orchestrator",
     "triage_node",
-    # Compatibility exports for the extracted wrapper implementation.
-    "_create_workspace_attempt_snapshot",
-    "_dispatch_boundary_rejection",
-    "_finalize_qa_workspace_snapshot",
-    "_finalize_worker_workspace_snapshot",
-    "_finish_all_workspace_rollback_anchors",
-    "_finish_parent_workspace_rollback_anchors",
-    "_finish_workspace_attempt_snapshot",
-    "_finish_workspace_rollback_anchors",
-    "_has_partial_update_success",
-    "_parent_workspace_rollback_anchors",
-    "_qa_workspace_rollback_anchor_updates",
-    "_restore_retained_workspace_anchors",
-    "_restore_unrelated_workspace_anchors",
-    "_restore_workspace_snapshot",
-    "_worker_attempts_succeeded",
-    "_workspace_rollback_anchor_ids",
-    "_workspace_snapshot_id",
-    "run_qa_critic_from_orchestrator",
-    "run_update_subagent_from_orchestrator",
-    "run_workaround_subagent_from_orchestrator",
-    "DockerSandbox",
-    "instruction_digest",
-    "run_qa_critic_node",
-    "run_update_subagent_node",
-    "run_workaround_subagent_node",
 ]
 
 
@@ -510,9 +463,6 @@ def _restore_incremental_scan_input_paths(
     return restored
 
 
-_worker_result_value = model_or_dict_value
-
-
 def _accepted_remediation_task_ids(
     state: OrchestratorState,
     task_ids: set[str] | None = None,
@@ -520,13 +470,12 @@ def _accepted_remediation_task_ids(
     """Return tasks whose changed workspace was accepted by QA.
 
     Worker status is provisional. Only the latest worker result paired with
-    a passing task-keyed QA evaluation and matching attempt provenance proves
+    a passing attempt-keyed QA evaluation and matching attempt provenance proves
     accepted remediation. Stale changed-file projections and failed attempts
     cannot authorize task reopening.
     """
     worker_results = state.get("worker_results_by_attempt", {}) or {}
     qa_results = state.get("qa_results_by_attempt", {}) or {}
-    qa_evaluations = state.get("qa_evaluations", {}) or {}
     attempt_snapshots = state.get("attempt_snapshots_by_id", {}) or {}
     accepted: set[str] = set()
 
@@ -534,15 +483,15 @@ def _accepted_remediation_task_ids(
     # attempt make a later no-op retry look like fresh material work. Select
     # only the latest worker result for each task; attempt number and revision
     # are committed Supervisor fields and provide a deterministic ordering.
-    latest_by_task: dict[str, tuple[tuple[int, int, int, str], str, Any]] = {}
+    latest_by_task: dict[str, tuple[tuple[int, int, int, str], str, str, Any]] = {}
     for attempt_key, result in worker_results.items():
-        raw_task_id = _worker_result_value(result, "task_id", "")
+        raw_task_id = model_or_dict_value(result, "task_id", "")
         result_task_id = str(raw_task_id) if raw_task_id else ""
         if task_ids is not None and result_task_id not in task_ids:
             continue
         if not result_task_id:
             continue
-        attempt_id = str(_worker_result_value(result, "attempt_id", "") or attempt_key)
+        attempt_id = str(model_or_dict_value(result, "attempt_id", "") or attempt_key)
         snapshot = attempt_snapshots.get(attempt_id)
 
         def _as_int(value: Any) -> int:
@@ -552,40 +501,66 @@ def _accepted_remediation_task_ids(
                 return 0
 
         order = (
-            _as_int(_worker_result_value(result, "task_revision")),
-            _as_int(_worker_result_value(snapshot, "attempt_number")),
-            _as_int(_worker_result_value(snapshot, "state_revision")),
+            _as_int(model_or_dict_value(result, "task_revision")),
+            _as_int(model_or_dict_value(snapshot, "attempt_number")),
+            _as_int(model_or_dict_value(snapshot, "state_revision")),
             attempt_id,
         )
         previous = latest_by_task.get(result_task_id)
         if previous is None or order >= previous[0]:
-            latest_by_task[result_task_id] = (order, attempt_id, result)
+            latest_by_task[result_task_id] = (order, attempt_id, str(attempt_key), result)
 
-    for _order, attempt_id, result in latest_by_task.values():
-        raw_task_id = _worker_result_value(result, "task_id", "")
+    for _order, attempt_id, attempt_key, result in latest_by_task.values():
+        raw_task_id = model_or_dict_value(result, "task_id", "")
         result_task_id = str(raw_task_id) if raw_task_id else ""
-        changed_files = _worker_result_value(result, "changed_files", []) or []
+        snapshot = attempt_snapshots.get(attempt_id)
+        if (
+            snapshot is None
+            or attempt_key != attempt_id
+            or model_or_dict_value(result, "attempt_id") != attempt_id
+            or model_or_dict_value(snapshot, "attempt_id") != attempt_id
+            or model_or_dict_value(snapshot, "task_id") != result_task_id
+            or model_or_dict_value(snapshot, "task_revision")
+            != model_or_dict_value(result, "task_revision")
+            or model_or_dict_value(snapshot, "instruction_digest")
+            != model_or_dict_value(result, "instruction_digest")
+            or model_or_dict_value(snapshot, "cluster_id")
+            != model_or_dict_value(result, "cluster_id")
+            or model_or_dict_value(snapshot, "dispatch_batch_id")
+            != model_or_dict_value(result, "dispatch_batch_id")
+            or model_or_dict_value(snapshot, "action_digest")
+            != model_or_dict_value(result, "action_digest")
+        ):
+            continue
+
+        status = model_or_dict_value(result, "status")
+        status_value = str(getattr(status, "value", status)).casefold()
+        diagnostics = model_or_dict_value(result, "execution_diagnostics")
+        if status_value not in {"success", "qa_passed"} or not bool(
+            model_or_dict_value(diagnostics, "validation_passed", False)
+        ):
+            continue
+        changed_files = model_or_dict_value(result, "changed_files", []) or []
         if not any(isinstance(path, str) and path.strip() for path in changed_files):
             continue
 
         qa_result = qa_results.get(attempt_id) if attempt_id else None
-        evaluation = _worker_result_value(qa_result, "evaluation")
-        if evaluation is None and result_task_id:
-            evaluation = qa_evaluations.get(result_task_id)
-        if evaluation is not None:
-            if bool(_worker_result_value(evaluation, "passed", False)):
-                accepted.add(result_task_id)
-            continue
-
-        # Compatibility callers may omit a QA envelope. Only accept the
-        # worker's own validated result in that legacy case; a non-success
-        # result can never authorize task reopening.
-        status = _worker_result_value(result, "status")
-        status_value = str(getattr(status, "value", status)).casefold()
-        diagnostics = _worker_result_value(result, "execution_diagnostics")
-        if status_value in {"success", "qa_passed"} and bool(
-            _worker_result_value(diagnostics, "validation_passed", False)
+        if (
+            qa_result is None
+            or model_or_dict_value(qa_result, "attempt_id") != attempt_id
+            or model_or_dict_value(qa_result, "task_id") != result_task_id
+            or model_or_dict_value(qa_result, "task_revision")
+            != model_or_dict_value(snapshot, "task_revision")
+            or model_or_dict_value(qa_result, "cluster_id")
+            != model_or_dict_value(snapshot, "cluster_id")
+            or model_or_dict_value(qa_result, "dispatch_batch_id")
+            != model_or_dict_value(snapshot, "dispatch_batch_id")
+            or model_or_dict_value(qa_result, "action_digest")
+            != model_or_dict_value(snapshot, "action_digest")
         ):
+            continue
+        evaluation = model_or_dict_value(qa_result, "evaluation")
+        if evaluation is not None and bool(model_or_dict_value(evaluation, "passed", False)):
             accepted.add(result_task_id)
 
     return accepted
@@ -1052,7 +1027,7 @@ def run_orchestrator(
         target_packages=normalized_target_packages,
         settings=settings,
     )
-    recorder = TrajectoryRecorder()
+    recorder = get_active_trajectory_recorder() or TrajectoryRecorder()
     langsmith_enabled = config is not None and run_id is not None
     trace_id = run_id if run_id is not None else uuid.uuid4()
     initial_state["run_id"] = str(trace_id)

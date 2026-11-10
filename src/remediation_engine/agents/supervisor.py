@@ -3130,7 +3130,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
     3. Ingest QA results for active task IDs only (when status == "qa_completed").
     4. Resolve no-fix terminal states; defer the retry-cap terminalization
        until tactical and deterministic replanning has had a chance to pivot.
-    5. Short-circuit: if an active task is optimistically_fixed â†’ qa_critic.
+    5. Short-circuit: if an active task is optimistically_fixed → qa_critic.
     6. Project accepted incremental scan results before terminal routing.
     7. Plan retry inputs from deterministic registry facts and committed state.
     8. Route through the deterministic state machine and validate its
@@ -3255,7 +3255,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 ),
                 **_scan_ledger_state_snapshot(state),
             }
-        logger.info("supervisor: no valid groups â€” routing to teardown.")
+        logger.info("supervisor: no valid groups — routing to teardown.")
         decision = SupervisorDecision(
             decision_code=DecisionCode.NO_VALID_GROUPS,
             next_node="teardown",
@@ -5073,7 +5073,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 task_queue, delta_isolation_by_cluster, attempt_snapshots_by_id
             ),
         )
-        logger.info("supervisor: deterministic fallback â†’ next_node=%s", decision.next_node)
+        logger.info("supervisor: deterministic fallback → next_node=%s", decision.next_node)
         fallback_pivot_strategy_by_parent = {
             req.parent_task_id: req.strategy
             for req in decision.spawn_requests
@@ -5103,16 +5103,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             and task_queue[req.parent_task_id].strategy != req.strategy
             and decision.next_node == _worker_node_for_strategy(req.strategy)
         }
-        raw_pivot_parent_ids.update(
-            task_id
-            for task_id, new_strategy in decision.updated_task_strategies.items()
-            if task_id in known_task_ids
-            and task_queue[task_id].status not in _TERMINAL_STATUSES
-            and task_queue[task_id].status in _WORKABLE_STATUSES
-            and task_queue[task_id].strategy != new_strategy
-            and decision.next_node == _worker_node_for_strategy(new_strategy)
-        )
-
         if decision.next_node == "qa_critic":
             valid_target_ids = _qa_ready_task_ids(
                 task_queue,
@@ -5165,12 +5155,12 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         requested_target_count = len(decision.target_task_ids)
         if decision.next_node == "workaround_subagent" and len(valid_target_ids) != 1:
             logger.warning(
-                "supervisor: workaround_subagent needs 1 target, got %d â€” falling back.",
+                "supervisor: workaround_subagent needs 1 target, got %d — falling back.",
                 len(valid_target_ids),
             )
             needs_fallback = True
         elif decision.next_node == "update_subagent" and not valid_target_ids:
-            logger.warning("supervisor: update_subagent needs â‰¥1 target, got 0 â€” falling back.")
+            logger.warning("supervisor: update_subagent needs ≥1 target, got 0 — falling back.")
             needs_fallback = True
 
         if (
@@ -5180,7 +5170,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             and requested_target_count > UPDATE_DISPATCH_LIMIT
         ):
             logger.warning(
-                "supervisor: update_subagent current policy allows exactly 1 target, got %d â€” falling back.",
+                "supervisor: update_subagent current policy allows exactly 1 target, got %d — falling back.",
                 requested_target_count,
             )
             needs_fallback = True
@@ -5214,11 +5204,11 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             )
             if has_retry_targets and has_first_pass_targets:
                 logger.warning(
-                    "supervisor: update_subagent request mixed first-pass and retry tasks â€” falling back."
+                    "supervisor: update_subagent request mixed first-pass and retry tasks — falling back."
                 )
                 needs_fallback = True
         if not needs_fallback and decision.next_node == "qa_critic" and not valid_target_ids:
-            logger.warning("supervisor: qa_critic needs at least 1 target, got 0 â€” falling back.")
+            logger.warning("supervisor: qa_critic needs at least 1 target, got 0 — falling back.")
             needs_fallback = True
 
         if needs_fallback:
@@ -5293,11 +5283,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
             clean_feedback = {
                 k: v for k, v in decision.feedback_by_task.items() if k in known_task_ids
             }
-            clean_updated_task_strategies = {
-                k: v
-                for k, v in decision.updated_task_strategies.items()
-                if k in known_task_ids and task_queue[k].status not in _TERMINAL_STATUSES
-            }
             missing_retry_revisions = _missing_retry_revised_instructions(
                 decision.next_node,
                 valid_target_ids,
@@ -5357,7 +5342,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 valid_unfixable_ids = list(decision.unfixable_task_ids)
                 clean_revised_instructions = dict(decision.revised_instructions)
                 clean_feedback = dict(decision.feedback_by_task)
-                clean_updated_task_strategies = dict(decision.updated_task_strategies)
 
             # Validate task_status_updates — only known tasks and fail-closed statuses
             clean_status_updates: dict[str, TaskStatus] = {}
@@ -5392,32 +5376,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 for req in clean_spawn_requests
                 if task_queue[req.parent_task_id].strategy != req.strategy
             }
-            legacy_pivot_strategy_updates = {
-                task_id: new_strategy
-                for task_id, new_strategy in clean_updated_task_strategies.items()
-                if task_queue[task_id].strategy != new_strategy
-                and task_id not in pivot_strategy_by_parent
-            }
-            malformed_pivot_parent_ids: list[str] = []
-            for task_id, new_strategy in legacy_pivot_strategy_updates.items():
-                child_instruction = clean_revised_instructions.pop(task_id, "").strip()
-                if not child_instruction:
-                    malformed_pivot_parent_ids.append(task_id)
-                    continue
-                clean_spawn_requests.append(
-                    TaskSpawnRequest(
-                        parent_task_id=task_id,
-                        strategy=new_strategy,
-                        instruction=child_instruction,
-                        reason=(
-                            "Auto-converted legacy strategy pivot from "
-                            f"{task_queue[task_id].strategy.value} to {new_strategy.value}. "
-                            f"{decision.decision_reason}"
-                        ),
-                    )
-                )
-                pivot_strategy_by_parent[task_id] = new_strategy
-
             targeted_pivot_ids = [
                 task_id for task_id in valid_target_ids if task_id in pivot_strategy_by_parent
             ]
@@ -5427,30 +5385,15 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 if decision.next_node
                 != _worker_node_for_strategy(pivot_strategy_by_parent[task_id])
             ]
-            pivot_validation_failed = bool(
-                malformed_pivot_parent_ids or incompatible_targeted_pivots
-            )
-            if pivot_validation_failed:
-                if malformed_pivot_parent_ids:
-                    errors.append(
-                        "supervisor: rejected strategy pivot without task-specific child "
-                        f"instructions for {malformed_pivot_parent_ids}."
-                    )
-                if incompatible_targeted_pivots:
-                    errors.append(
-                        "supervisor: rejected strategy pivot because next_node does not match "
-                        f"the child strategy for {incompatible_targeted_pivots}."
-                    )
-                failed_parent_ids = list(
-                    {
-                        *malformed_pivot_parent_ids,
-                        *incompatible_targeted_pivots,
-                    }
+            if incompatible_targeted_pivots:
+                errors.append(
+                    "supervisor: rejected strategy pivot because next_node does not match "
+                    f"the child strategy for {incompatible_targeted_pivots}."
                 )
                 _terminalize_pivot_parents(
                     task_queue,
-                    failed_parent_ids,
-                    pivot_strategy_by_parent | legacy_pivot_strategy_updates,
+                    incompatible_targeted_pivots,
+                    pivot_strategy_by_parent,
                     qa_evaluations,
                     retry_diagnostics_by_task=retry_diagnostics_by_task,
                     retry_plans_by_task=retry_plans_by_task,
@@ -5474,7 +5417,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 valid_unfixable_ids = list(decision.unfixable_task_ids)
                 clean_revised_instructions = dict(decision.revised_instructions)
                 clean_feedback = dict(decision.feedback_by_task)
-                clean_updated_task_strategies = dict(decision.updated_task_strategies)
                 clean_status_updates = dict(decision.task_status_updates)
                 clean_spawn_requests = list(decision.spawn_requests)
                 pivot_strategy_by_parent = {
@@ -5499,7 +5441,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 decision = SupervisorDecision(
                     decision_code=decision.decision_code,
                     next_node=decision.next_node,
-                    updated_task_strategies={},
                     target_task_ids=valid_target_ids,
                     unfixable_task_ids=valid_unfixable_ids,
                     new_constraints=decision.new_constraints,
@@ -5513,7 +5454,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                     decision_reason=decision.decision_reason,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("supervisor: decision rebuild failed (%s) â€” falling back.", exc)
+                logger.warning("supervisor: decision rebuild failed (%s) — falling back.", exc)
                 decision = _deterministic_routing(
                     task_queue,
                     group_by_id,
@@ -5560,17 +5501,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
                 updates={"instruction": new_instr},
             )
 
-    # 8b. Apply direct strategy pivots (currently reserved for no-op / legacy cases)
-    for t_id, new_strategy in decision.updated_task_strategies.items():
-        if t_id in task_queue:
-            _commit_task_transition(
-                task_queue,
-                t_id,
-                updates={"strategy": new_strategy},
-                close_attempt=task_queue[t_id].current_attempt_id is not None,
-            )
-
-    # 8c. Apply guarded task status overrides.
+    # 8b. Apply guarded task status overrides.
     _allowed_statuses = {
         TaskStatus.QA_PASSED,
         TaskStatus.UNFIXABLE,
@@ -6564,13 +6495,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         ):
             returned_constraints.append(constraint)
 
-    # Build feedback_by_group for bridge node backward compat
     feedback_by_task = remapped_feedback_by_task
-    feedback_by_group: dict[str, str] = {}
-    for t_id, fb in feedback_by_task.items():
-        if t_id in task_queue:
-            gid = task_queue[t_id].parent_group_id
-            feedback_by_group[gid] = fb
 
     consistency_new_events, consistency_errors = _validate_committed_state(
         task_queue,
@@ -6693,7 +6618,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         "portfolio_dirty": portfolio_dirty,
         "portfolio_replan_request": portfolio_replan_request,
         "feedback_by_task": feedback_by_task,
-        "feedback_by_group": feedback_by_group,
         "supervisor_instructions": decision.instructions,
         # Compatibility projection: the attempt-tagged QA envelope remains
         # authoritative, while this task-keyed view is retained for existing
@@ -6727,7 +6651,7 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         "setup_scan_committed": setup_scan_committed,
         "consistency_events": consistency_events,
         "state_revision": state_revision,
-        # constraints_ledger uses operator.add â€” return only NEW entries
+        # constraints_ledger uses operator.add — return only NEW entries
         "constraints_ledger": returned_constraints,
         "errors": errors,
         "task_ids_requiring_fix_plan_refresh": pending_refresh_ids,

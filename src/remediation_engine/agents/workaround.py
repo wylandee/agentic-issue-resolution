@@ -58,8 +58,6 @@ from remediation_engine.tools.workspace import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "gpt-4o-mini"
-
 try:
     from langchain_openai import ChatOpenAI  # type: ignore[import]
 except ImportError:  # pragma: no cover
@@ -103,12 +101,6 @@ def _default_no_fix_package_manager(
         }:
             managers.add("pip")
     return next(iter(managers)) if len(managers) == 1 else ""
-
-
-_QA_ERROR_MARKER = re.compile(
-    r"(?:error|exception|failed|failure|not\s+a\s+function|undefined|cannot|invalid|missing|required\s+option|not\s+exported|cannot\s+find)",
-    re.IGNORECASE,
-)
 
 
 def _clean_prompt_snippet(value: str, max_chars: int | None = 240) -> str:
@@ -1303,16 +1295,6 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
             "changed_files": [],
             "errors": ["Workaround Subagent: target_task or target_group is missing from state."],
         }
-    language_value = state.get("project_language", ProjectLanguage.NODEJS)
-    try:
-        project_language = (
-            language_value
-            if isinstance(language_value, ProjectLanguage)
-            else ProjectLanguage(str(language_value))
-        )
-    except ValueError:
-        project_language = ProjectLanguage.NODEJS
-
     if ChatOpenAI is None:
         summaries = _build_surrender_summaries(
             t_id, "Stopped before execution because the LLM client is unavailable."
@@ -1649,12 +1631,6 @@ def run_workaround_subagent_node(state: SubagentState) -> dict[str, Any]:
                 or has_tool_call_before_first_successful_edit(
                     runtime.tool_events,
                     lookup_tool_name="record_plan",
-                    edit_tool_names="deterministic_search_replace",
-                )
-                or has_tool_call_before_first_successful_edit(
-                    runtime.tool_events,
-                    lookup_tool_name="record_plan",
-                    edit_tool_names="deterministic_replace_ast_symbol",
                 )
             )
 

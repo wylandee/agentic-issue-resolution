@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import type {
   ConsoleEvent,
   FindingModel,
@@ -32,6 +32,8 @@ function getTargetPackageOptions(findings: FindingModel[]): { name: string; find
 }
 
 export const App: React.FC = () => {
+  const streamCleanupRef = useRef<(() => void) | null>(null);
+  const streamRunIdRef = useRef<string | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
   const [runStatus, setRunStatus] = useState<RunStatus>("pending");
@@ -57,7 +59,16 @@ export const App: React.FC = () => {
     option.name.toLowerCase().includes(packageFilter.trim().toLowerCase()),
   );
 
+  const closeRunStream = () => {
+    streamCleanupRef.current?.();
+    streamCleanupRef.current = null;
+    streamRunIdRef.current = null;
+  };
+
+  useEffect(() => () => closeRunStream(), []);
+
   const handleWorkspaceAttached = (ws: WorkspaceInfo) => {
+    closeRunStream();
     setWorkspace(ws);
     setActiveFindings(ws.findings);
     setSelectedTargetPackages(getTargetPackageOptions(ws.findings).map((option) => option.name));
@@ -77,14 +88,17 @@ export const App: React.FC = () => {
     if (!workspace) return;
 
     try {
+      closeRunStream();
       setErrorMessage(null);
       setRunStatus("running");
       const { run_id } = await startRun(workspace.workspace_id, selectedTargetPackages);
       setRunId(run_id);
+      streamRunIdRef.current = run_id;
 
       // Subscribe to real-time events
-      subscribeRunStream(run_id, {
+      streamCleanupRef.current = subscribeRunStream(run_id, {
         onInitialSync: (state) => {
+          if (streamRunIdRef.current !== run_id) return;
           setActiveFindings(state.active_findings);
           setRemediatedCount(state.remediated_count);
           setNewCount(state.new_count);
@@ -94,6 +108,7 @@ export const App: React.FC = () => {
           setReportAvailable(state.report_available);
         },
         onConsoleEvent: (event) => {
+          if (streamRunIdRef.current !== run_id) return;
           setLogs((previous) => {
             const existingIndex = previous.findIndex((entry) => entry.id === event.id);
             if (existingIndex < 0) return [...previous, event];
@@ -103,20 +118,31 @@ export const App: React.FC = () => {
           });
         },
         onDashboardUpdate: (update) => {
+          if (streamRunIdRef.current !== run_id) return;
           setActiveFindings(update.active_findings);
           setRemediatedCount(update.remediated_count);
           setNewCount(update.new_count);
         },
         onRunStatus: (statusData) => {
-          setRunStatus(statusData.status as RunStatus);
+          if (streamRunIdRef.current !== run_id) return;
+          setRunStatus(statusData.status);
           if (statusData.current_node) {
             setCurrentNode(statusData.current_node);
           }
           if (statusData.report_available) {
             setReportAvailable(true);
           }
+          if ([
+            "completed",
+            "completed_with_errors",
+            "failed",
+            "triage_completed_no_work",
+          ].includes(statusData.status)) {
+            closeRunStream();
+          }
         },
         onError: () => {
+          if (streamRunIdRef.current !== run_id) return;
           console.warn("SSE connection error or completed");
         },
       });
@@ -143,7 +169,6 @@ export const App: React.FC = () => {
 
   return (
     <div className="flex flex-col h-screen w-screen bg-slate-950 text-slate-100 overflow-hidden font-sans">
-      {/* Top Header / Action Bar */}
       <header className="flex flex-wrap items-center justify-between px-6 py-3.5 bg-slate-900 border-b border-slate-800 gap-4 flex-shrink-0">
         <div className="flex items-center gap-3">
           <div className="p-2 bg-gradient-to-br from-blue-600 to-indigo-700 text-white rounded-xl shadow-md">
@@ -162,7 +187,6 @@ export const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Action Controls */}
         <div className="flex items-center gap-3">
           <FolderAttachButton
             onWorkspaceAttached={handleWorkspaceAttached}
@@ -307,7 +331,6 @@ export const App: React.FC = () => {
         )}
       </header>
 
-      {/* Error Banner if any */}
       {errorMessage && (
         <div className="flex items-center justify-between px-6 py-2 bg-red-950/90 border-b border-red-700 text-xs text-red-200">
           <div className="flex items-center gap-2">
@@ -320,9 +343,7 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      {/* Main 2-Column Content Layout */}
       <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-4 p-4 min-h-0 overflow-hidden bg-slate-950">
-        {/* Left / Main Column: Findings Dashboard (7 cols on lg) */}
         <section className="lg:col-span-7 flex flex-col min-h-0 h-full">
           <FindingsDashboard
             findings={activeFindings}
@@ -333,7 +354,6 @@ export const App: React.FC = () => {
           />
         </section>
 
-        {/* Right Column: Filtered Console Log View (5 cols on lg) */}
         <section className="lg:col-span-5 flex flex-col min-h-0 h-full">
           <ConsoleLogView
             logs={logs}
@@ -343,7 +363,6 @@ export const App: React.FC = () => {
         </section>
       </main>
 
-      {/* Final Markdown Report Modal */}
       {reportModalData && (
         <ReportModal
           report={reportModalData}

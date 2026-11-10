@@ -236,6 +236,12 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             state.get("task_ids_requiring_fix_plan_refresh", []) or []
         ),
     }
+    dispatch_reset = {
+        "active_target_task_ids": [],
+        "active_cluster_id": None,
+        "active_dispatch_batch_id": None,
+        "active_multi_package_action": None,
+    }
     replan_history, replan_guard_error = _record_portfolio_replan_attempt(state, request)
     if replan_guard_error:
         log.warning("run_portfolio_plan_tool: %s", replan_guard_error)
@@ -307,11 +313,9 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
                 "portfolio_dirty": False,
                 "valid_groups": prepared_groups,
                 "task_queue": prepared_queue,
-                "active_target_task_ids": [],
-                "active_cluster_id": None,
-                "active_dispatch_batch_id": None,
+                **dispatch_reset,
                 "task_ids_requiring_fix_plan_refresh": pending_refresh_ids,
-                "errors": sorted(set(prepare_diagnostics)),
+                "errors": [],
             }
         plan = build_certified_portfolio_plan(
             state["repo_root"],
@@ -339,7 +343,7 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "status": "portfolio_failed",
             "next_routing_step": "teardown",
             "portfolio_dirty": False,
-            "active_target_task_ids": [],
+            **dispatch_reset,
             "portfolio_iteration": iteration,
             "portfolio_replan_request": request,
             "portfolio_replan_history": replan_history,
@@ -354,6 +358,15 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
         set(prepare_diagnostics) | set(plan_diagnostics) | set(solver_plan_diagnostics)
     )
     diagnostics_text = "\n".join(diagnostics).lower()
+    invalid_dag_markers = (
+        "invalid dag",
+        "invalid-dag",
+        "invalid dependency dag",
+        "dag validation failed",
+        "unknown endpoint",
+        "unresolved cycle",
+        "partial result",
+    )
     solver_status = getattr(solver_plan, "status", None)
     solver_status = getattr(solver_status, "value", solver_status)
     solver_status = str(solver_status or "").upper()
@@ -362,18 +375,7 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
         plan, portfolio_queue, accept_feasible=accept_feasible
     )
     diagnostics = sorted(set(diagnostics) | set(certificate_violations))
-    invalid_dag = any(
-        marker in diagnostics_text
-        for marker in (
-            "invalid dag",
-            "invalid-dag",
-            "invalid dependency dag",
-            "dag validation failed",
-            "unknown endpoint",
-            "unresolved cycle",
-            "partial result",
-        )
-    )
+    invalid_dag = any(marker in diagnostics_text for marker in invalid_dag_markers)
     all_non_dispatchable_clusters = [
         cluster
         for cluster in getattr(plan, "clusters", [])
@@ -398,7 +400,12 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
         accept_feasible and solver_status == "FEASIBLE"
     )
     if blocked or invalid_dag or failed_status:
-        errors = list(diagnostics)
+        errors = list(certificate_violations)
+        errors.extend(
+            diagnostic
+            for diagnostic in diagnostics
+            if any(marker in diagnostic.lower() for marker in invalid_dag_markers)
+        )
         if multiple_active_tasks:
             errors.append(
                 "portfolio node blocked dispatch because a package group has multiple "
@@ -436,10 +443,7 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "portfolio_dirty": False,
             "valid_groups": prepared_groups,
             "task_queue": portfolio_queue,
-            "active_target_task_ids": [],
-            "active_cluster_id": None,
-            "active_dispatch_batch_id": None,
-            "active_multi_package_action": None,
+            **dispatch_reset,
             "errors": errors,
             "task_ids_requiring_fix_plan_refresh": fix_plan_state[
                 "task_ids_requiring_fix_plan_refresh"
@@ -463,7 +467,7 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "portfolio_dirty": False,
             "valid_groups": prepared_groups,
             "task_queue": portfolio_queue,
-            "active_target_task_ids": [],
+            **dispatch_reset,
             "task_ids_requiring_fix_plan_refresh": fix_plan_state[
                 "task_ids_requiring_fix_plan_refresh"
             ],
@@ -515,7 +519,7 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
             "active_cluster_id": None,
             "active_dispatch_batch_id": None,
             "active_multi_package_action": None,
-            "errors": [*diagnostics, reconcile_reason],
+            "errors": [],
             "task_ids_requiring_fix_plan_refresh": fix_plan_state[
                 "task_ids_requiring_fix_plan_refresh"
             ],
@@ -531,11 +535,8 @@ def run_portfolio_plan_tool(state: OrchestratorState) -> dict[str, Any]:
         "portfolio_dirty": False,
         "valid_groups": committed_groups,
         "task_queue": committed_queue,
-        "active_target_task_ids": [],
-        "active_cluster_id": None,
-        "active_dispatch_batch_id": None,
-        "active_multi_package_action": None,
-        "errors": diagnostics,
+        **dispatch_reset,
+        "errors": [],
         "task_ids_requiring_fix_plan_refresh": fix_plan_state[
             "task_ids_requiring_fix_plan_refresh"
         ],

@@ -1,7 +1,7 @@
 """Dispatch, worker, QA and rollback transitions for the orchestration graph.
 
-Worker dependencies are resolved from the graph module at the execution
-boundary so graph-level integrations can supply their configured collaborators.
+Worker dependencies are imported from the modules that own them, so execution
+does not depend on graph-module reexports.
 """
 
 from __future__ import annotations
@@ -13,6 +13,11 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal
 
+import remediation_engine.agents.qa as qa_agent
+import remediation_engine.agents.update as update_agent
+import remediation_engine.agents.workaround as workaround_agent
+import remediation_engine.runtime.sandbox as sandbox_runtime
+import remediation_engine.settings as settings_module
 import remediation_engine.tools.test_execution as _qa_test_parsing
 from remediation_engine.contracts.schemas import (
     AgentActionStatus,
@@ -34,6 +39,7 @@ from remediation_engine.orchestration.state import (
     OrchestratorState,
     initial_update_subagent_state,
     initial_workaround_subagent_state,
+    instruction_digest,
 )
 from remediation_engine.planning.portfolio import (
     isolate_delta_failure,
@@ -42,18 +48,6 @@ from remediation_engine.planning.portfolio import (
 from remediation_engine.tools.npm_mutations import apply_multi_package_action
 
 log = logging.getLogger(__name__)
-
-
-def _graph_module():
-    """Return the graph module whose collaborators should be invoked.
-
-    Importing lazily avoids a graph/ wrapper import cycle and, importantly,
-    means monkeypatches applied to graph-level dependency names are observed
-    for every invocation rather than captured during module import.
-    """
-    from remediation_engine.orchestration import graph
-
-    return graph
 
 
 def _qa_workspace_graph_digest(
@@ -104,7 +98,7 @@ def _qa_workspace_graph_digest(
 
         if sandbox is not None:
             return fingerprint(sandbox)
-        with _graph_module().DockerSandbox(
+        with sandbox_runtime.DockerSandbox(
             repo_root=None, workspace_volume=workspace_volume
         ) as active_sandbox:
             return fingerprint(active_sandbox)
@@ -146,7 +140,7 @@ def _create_qa_passed_workspace_snapshot(
     package_manager = next(iter(managers))
     snapshot_id = f"qa-passed-{uuid.uuid4().hex}"
     try:
-        with _graph_module().DockerSandbox(
+        with sandbox_runtime.DockerSandbox(
             repo_root=None, workspace_volume=workspace_volume
         ) as sandbox:
             graph_digest = _qa_workspace_graph_digest(
@@ -203,7 +197,7 @@ def _dispatch_boundary_rejection(
     active_batch_id = state.get("active_dispatch_batch_id")
     active_action = state.get("active_multi_package_action")
     active_action_digest = (
-        _graph_module().instruction_digest(active_action.model_dump_json())
+        instruction_digest(active_action.model_dump_json())
         if isinstance(active_action, MultiPackageAction)
         else None
     )
@@ -302,7 +296,7 @@ def _dispatch_boundary_rejection(
                 and snapshot.selected_plan_issue_ids != task.selected_plan_issue_ids
             )
             or snapshot.instruction != task.instruction
-            or snapshot.instruction_digest != _graph_module().instruction_digest(task.instruction)
+            or snapshot.instruction_digest != instruction_digest(task.instruction)
             or (
                 snapshot.dispatch_node == "update_subagent"
                 and task.strategy != RoutingStrategy.VERSION_BUMP
@@ -414,7 +408,7 @@ def _create_workspace_attempt_snapshot(
         return None, []
 
     try:
-        with _graph_module().DockerSandbox(
+        with sandbox_runtime.DockerSandbox(
             repo_root=None, workspace_volume=workspace_volume
         ) as sandbox:
             sandbox.create_workspace_snapshot(snapshot_id)
@@ -449,7 +443,7 @@ def _finish_workspace_attempt_snapshot(
     errors: list[str] = []
     restore_succeeded = not restore
     try:
-        with _graph_module().DockerSandbox(
+        with sandbox_runtime.DockerSandbox(
             repo_root=None, workspace_volume=workspace_volume
         ) as sandbox:
             if restore:
@@ -485,7 +479,7 @@ def _restore_workspace_snapshot(
         return []
 
     try:
-        with _graph_module().DockerSandbox(
+        with sandbox_runtime.DockerSandbox(
             repo_root=None, workspace_volume=workspace_volume
         ) as sandbox:
             sandbox.restore_workspace_snapshot(snapshot_id)
@@ -586,7 +580,7 @@ def _delta_isolation_provenance(
     return {
         "cluster_id": state.get("active_cluster_id") or action.cluster_id,
         "dispatch_batch_id": state.get("active_dispatch_batch_id") or action.dispatch_batch_id,
-        "action_digest": _graph_module().instruction_digest(action.model_dump_json()),
+        "action_digest": instruction_digest(action.model_dump_json()),
         "source_portfolio_plan_id": source_portfolio_plan_id,
         "attempt_ids_by_task": attempt_ids_by_task,
     }
@@ -692,7 +686,7 @@ def run_delta_isolation_canaries(
     unexpected_error: str | None = None
 
     try:
-        with _graph_module().DockerSandbox(
+        with sandbox_runtime.DockerSandbox(
             repo_root=None, workspace_volume=workspace_volume
         ) as sandbox:
             try:
@@ -1073,7 +1067,45 @@ def _finish_parent_workspace_rollback_anchors(
     return errors
 
 
+def _current_worker_result(
+    state: OrchestratorState,
+    task: RemediationTask,
+    worker_results: Mapping[str, Any],
+) -> Any | None:
+    """Return this task's worker result only when it matches the committed attempt."""
+    attempt_id = task.current_attempt_id
+    snapshots = state.get("attempt_snapshots_by_id", {}) or {}
+    snapshot = snapshots.get(attempt_id) if attempt_id else None
+    result = worker_results.get(attempt_id) if attempt_id else None
+    if snapshot is None or result is None:
+        return None
+
+    def value(item: Any, key: str) -> Any:
+        return item.get(key) if isinstance(item, Mapping) else getattr(item, key, None)
+
+    return (
+        result
+        if (
+            value(result, "attempt_id") == attempt_id
+            and value(result, "task_id") == task.task_id
+            and value(result, "task_revision") == task.task_revision == snapshot.task_revision
+            and value(result, "instruction_digest") == snapshot.instruction_digest
+            and (snapshot.cluster_id is None or value(result, "cluster_id") == snapshot.cluster_id)
+            and (
+                snapshot.dispatch_batch_id is None
+                or value(result, "dispatch_batch_id") == snapshot.dispatch_batch_id
+            )
+            and (
+                snapshot.action_digest is None
+                or value(result, "action_digest") == snapshot.action_digest
+            )
+        )
+        else None
+    )
+
+
 def _worker_attempts_succeeded(
+    state: OrchestratorState,
     result: dict[str, Any],
     target_tasks: list[RemediationTask],
 ) -> bool:
@@ -1083,22 +1115,14 @@ def _worker_attempts_succeeded(
 
     worker_results = result.get("worker_results_by_attempt") or {}
     if worker_results:
-        by_task = {item.task_id: item for item in worker_results.values()}
         return all(
-            (worker_result := by_task.get(task.task_id)) is not None
+            (worker_result := _current_worker_result(state, task, worker_results)) is not None
             and worker_result.status == AgentActionStatus.SUCCESS
             and worker_result.execution_diagnostics.validation_passed
             for task in target_tasks
         )
 
-    summaries = {summary.task_id: summary for summary in result.get("action_summaries", []) or []}
-    if not summaries:
-        return False
-    return all(
-        (summary := summaries.get(task.task_id)) is not None
-        and summary.status == AgentActionStatus.SUCCESS
-        for task in target_tasks
-    )
+    return False
 
 
 def _has_partial_update_success(
@@ -1131,8 +1155,7 @@ def _has_partial_update_success(
     worker_results = result.get("worker_results_by_attempt") or {}
     if not worker_results:
         return False
-    by_task = {item.task_id: item for item in worker_results.values()}
-    outcomes = [by_task.get(task.task_id) for task in target_tasks]
+    outcomes = [_current_worker_result(state, task, worker_results) for task in target_tasks]
     if any(outcome is None for outcome in outcomes):
         return False
     succeeded = [
@@ -1152,7 +1175,7 @@ def _finalize_worker_workspace_snapshot(
     """Keep successful worker archives until QA; restore failed workers."""
     if snapshot_id is None:
         return []
-    if _worker_attempts_succeeded(result, target_tasks):
+    if _worker_attempts_succeeded(state, result, target_tasks):
         # QA owns the next decision. It must still be able to restore this
         # exact candidate if install, scanning, or tests reject it.
         return []
@@ -1521,7 +1544,7 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
         }
 
     try:
-        result = _graph_module().run_update_subagent_node(subagent_state)
+        result = update_agent.run_update_subagent_node(subagent_state)
     except Exception:
         if _workspace_rollback_anchor_ids(state, target_tasks):
             _restore_retained_workspace_anchors(state, target_tasks)
@@ -1686,7 +1709,7 @@ def run_workaround_subagent_from_orchestrator(
         }
 
     try:
-        result = _graph_module().run_workaround_subagent_node(subagent_state)
+        result = workaround_agent.run_workaround_subagent_node(subagent_state)
     except Exception:
         _finish_workspace_attempt_snapshot(
             state,
@@ -1802,7 +1825,7 @@ def _maybe_run_delta_isolation(
             installed_versions_by_task,
         )
     ]
-    max_canary_probes = _graph_module().get_runtime_settings().max_delta_canary_probes
+    max_canary_probes = settings_module.get_runtime_settings().max_delta_canary_probes
 
     def qa_probe(
         sandbox: Any, _action: MultiPackageAction
@@ -1935,7 +1958,7 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
         state.get("attempt_snapshots_by_id") if "attempt_snapshots_by_id" in state else None,
     )
     try:
-        result = _graph_module().run_qa_critic_node(scoped_state)
+        result = qa_agent.run_qa_critic_node(scoped_state)
     except Exception:
         snapshots = state.get("attempt_snapshots_by_id", {}) or {}
         workaround_attempt = bool(target_tasks) and all(
@@ -2149,7 +2172,7 @@ def run_qa_critic_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     scan_snapshot_available = attempt_scan_is_authoritative and (
         "post_remediation_scan_issues" in result or "post_remediation_scan_issues" in state
     )
-    settings = _graph_module().get_runtime_settings()
+    settings = settings_module.get_runtime_settings()
     disable_retriage = settings.remedy_disable_post_qa_triage
     triage_required = (
         not disable_retriage

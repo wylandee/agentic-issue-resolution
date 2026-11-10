@@ -82,7 +82,7 @@ For each observed node, state what it received, what it returned, whether it rou
 
 Do not claim a tool was called merely because its name appears in a prompt or serialized tool list. Count a tool call only when the trace contains a tool span or an explicit tool-call/message record with arguments and a result/error. Distinguish “tool available” from “tool invoked.”
 
-Useful tool families in this repository include dependency-update tools (`modify_npm_dependency`, `validate_manifest_sync`, `revert_workspace_file`), workaround tools (`record_plan`, repository/file/code search and AST inspection, deterministic edit, `validate_workaround`, web search/page reads, and the scoped no-fix dependency removal tool), and QA tools (`run_dependency_install`, `run_security_scan`, `run_unit_tests`, log/diff/file review tools). Treat the names in the actual trace as authoritative because toolbelts can change.
+Useful tool families include dependency-update tools (`modify_and_validate_npm_dependency`, `modify_and_validate_maven_dependency`, `modify_and_validate_python_dependency`, their batch variants, and `revert_workspace_file`); workaround tools (`record_plan`, `read_repository_map`, `read_workspace_file`, `search_codebase_pattern`, `inspect_ast_symbol`, `deterministic_apply_edit_set`, `validate_workaround`, web search/page reads, and scoped no-fix removal); and QA execution evidence for installation, security scans, and tests. QA runs these checks through the engine, so count them from their result fields or spans rather than assuming each is an agent tool call. Tool names can change; use the names in the trace.
 
 ### 4. Decide whether remediation succeeded
 

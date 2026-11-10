@@ -958,8 +958,8 @@ def run_qa_critic_node(state: OrchestratorState) -> dict[str, Any]:
 
     Pipeline:
       Step 0 — Global Execution (deterministic Python, no LLM tools)
-      Evaluator â€” One bounded read-only tool loop with a typed terminal result
-      Guards â€” Python guardrails normalize and validate evaluations
+      Evaluator — One bounded read-only tool loop with a typed terminal result
+      Guards — Python guardrails normalize and validate evaluations
     """
     valid_groups: list[VulnerabilityGroup] = state.get("valid_groups") or []
     workspace_volume: str | None = state.get("workspace_volume")

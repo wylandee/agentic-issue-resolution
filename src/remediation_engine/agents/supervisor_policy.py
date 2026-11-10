@@ -299,17 +299,6 @@ def _next_sca_stage(
     return SCARemediationStage.CODE_WORKAROUND
 
 
-def _selection_for_stage(stage: SCARemediationStage) -> str | None:
-    """Return the registry selection mode for a strategy stage."""
-    if stage in {SCARemediationStage.NPM_SAME_MAJOR, SCARemediationStage.PYPI_SAME_MAJOR}:
-        return "same_major"
-    if stage in {SCARemediationStage.NPM_LATEST, SCARemediationStage.PYPI_LATEST}:
-        return "latest"
-    if stage == SCARemediationStage.MAVEN_LATEST:
-        return "maven_latest"
-    return None
-
-
 def _worker_node_for_strategy(strategy: RoutingStrategy) -> str:
     """Return the worker node that handles a routing strategy."""
     if strategy == RoutingStrategy.VERSION_BUMP:
@@ -355,7 +344,6 @@ _SCA_STAGE_ORDER: dict[SCARemediationStage, int] = {
     SCARemediationStage.CODE_WORKAROUND: 4,
 }
 _OVERRIDE_DEPENDENCY_TYPES = frozenset({"overrides", "resolutions", "pnpm_overrides"})
-_MAX_REGISTRY_CANDIDATES = 3
 
 
 def _supervisor_fetch_registry_candidates(
@@ -1730,7 +1718,7 @@ def _deterministic_routing(
             decision_reason="No actionable tasks remain.",
         )
 
-    # If an active task is optimistically_fixed â†’ route it to qa_critic.
+    # If an active task is optimistically_fixed → route it to qa_critic.
     current_task_qa_ready = _qa_ready_task_ids(
         task_queue,
         preferred_ids=list(active_target_task_ids or []),
@@ -2208,7 +2196,7 @@ def _deterministic_routing(
             decision_reason=(f"Routing task '{target.task_id}' to workaround_subagent."),
         )
 
-    # Unexpected: no workable tasks found â†’ teardown as safe default
+    # Unexpected: no workable tasks found → teardown as safe default
     return SupervisorDecision(
         decision_code=DecisionCode.NO_ACTIONABLE_TASKS,
         next_node="teardown",
@@ -2265,8 +2253,6 @@ def _no_fix_decision_requires_fallback(
             or expected_task_id not in decision.target_task_ids
             or expected_task_id in decision.unfixable_task_ids
             or decision.task_status_updates.get(expected_task_id) == TaskStatus.UNFIXABLE
-            or decision.updated_task_strategies.get(expected_task_id)
-            not in (None, RoutingStrategy.CODE_WORKAROUND)
         )
     if decision.next_node != "workaround_subagent":
         return True
@@ -2275,10 +2261,5 @@ def _no_fix_decision_requires_fallback(
     if expected_task_id in decision.unfixable_task_ids:
         return True
     if decision.task_status_updates.get(expected_task_id) == TaskStatus.UNFIXABLE:
-        return True
-    if decision.updated_task_strategies.get(expected_task_id) not in (
-        None,
-        RoutingStrategy.CODE_WORKAROUND,
-    ):
         return True
     return any(request.parent_task_id == expected_task_id for request in decision.spawn_requests)

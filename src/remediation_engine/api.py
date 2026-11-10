@@ -197,7 +197,7 @@ def run_remediation(
         message = f"remediation outcome: {issue}"
         if message not in errors:
             errors.append(message)
-    if (errors or outcome_issues) and status == "completed":
+    if (errors or outcome_issues) and status in {"completed", "triage_completed_no_work"}:
         status = "completed_with_errors"
     return RemediationResult(
         status=status,

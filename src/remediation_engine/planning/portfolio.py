@@ -22,7 +22,6 @@ from remediation_engine.contracts.schemas import (
     MultiPackageAction,
     PackageFixPlanCandidate,
     PackageMutation,
-    PortfolioPlan,
     RemediationTask,
     RoutingStrategy,
     SCARemediationStage,
@@ -34,15 +33,13 @@ from remediation_engine.contracts.schemas import (
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.state import group_parent_context, select_package_fix_plan
 from remediation_engine.planning.candidates import (
-    apply_portfolio_plan as _apply_solver_portfolio_plan,
-)
-from remediation_engine.planning.candidates import (
-    build_portfolio_plan as _build_solver_portfolio_plan,
-)
-from remediation_engine.planning.candidates import (
-    prepare_portfolio_inputs as _prepare_solver_portfolio_inputs,
+    _group_manager,
+    _missing_sca_plan_diagnostic,
+    apply_portfolio_plan,
+    build_portfolio_plan,
 )
 from remediation_engine.planning.certification import build_certified_portfolio_plan
+from remediation_engine.runtime.path_policy import repository_relative_path
 from remediation_engine.settings import DEFAULT_MAX_DELTA_CANARY_PROBES
 from remediation_engine.tools.npm import npm_range_contains
 
@@ -112,16 +109,7 @@ def _relative_manifest(repo_root: Path, value: str | None) -> str:
     """Normalize a manifest path to a repository-relative POSIX path."""
     if not value:
         return "package.json"
-    path = value.replace("\\", "/").lstrip("/")
-    try:
-        candidate = Path(path)
-        if candidate.is_absolute():
-            path = candidate.relative_to(repo_root).as_posix()
-    except ValueError:
-        return ""
-    if not path or ".." in Path(path).parts:
-        return ""
-    return path
+    return repository_relative_path(value, repo_root) or ""
 
 
 def _group_manifest_path(group: VulnerabilityGroup, repo_root: Path) -> str:
@@ -163,20 +151,6 @@ def _active_leaf_tasks(
         # that the prerequisite has completed, but they are not dispatchable.
         active.append(max(tasks, key=lambda task: (task.task_revision, task.task_id)))
     return active, diagnostics
-
-
-def active_leaf_task_ids(
-    task_queue: dict[str, RemediationTask],
-    group_ids: Iterable[str] | None = None,
-) -> tuple[str, ...]:
-    """Return deterministic active-leaf task IDs, optionally scoped to groups."""
-    allowed_groups = set(group_ids) if group_ids is not None else None
-    tasks, _diagnostics = _active_leaf_tasks(task_queue)
-    return tuple(
-        task.task_id
-        for task in tasks
-        if allowed_groups is None or task.parent_group_id in allowed_groups
-    )
 
 
 def _load_manifests(repo_root: Path) -> tuple[dict[str, dict[str, Any]], str]:
@@ -1431,16 +1405,6 @@ def repository_fingerprint(repo_root: str | Path) -> str:
     return fingerprint
 
 
-__all__ = [
-    "DeltaIsolationResult",
-    "active_leaf_task_ids",
-    "build_portfolio_plan",
-    "isolate_delta_failure",
-    "materialize_synthetic_dependency_tasks",
-    "repository_fingerprint",
-]
-
-
 def prepare_portfolio_inputs(
     repo_root: str | Path,
     groups: Iterable[VulnerabilityGroup],
@@ -1448,7 +1412,7 @@ def prepare_portfolio_inputs(
     target_packages: Iterable[str] | None = None,
     project_language: ProjectLanguage = ProjectLanguage.NODEJS,
 ) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
-    """Prepare the outer portfolio inputs using detached task/group objects.
+    """Create finding-backed and synthetic dependency tasks copy-on-write.
 
     Args:
         repo_root: Repository whose manifests and lockfiles define the portfolio
@@ -1464,73 +1428,45 @@ def prepare_portfolio_inputs(
     Returns:
         Detached prepared groups, task queue, and preparation diagnostics.
     """
-    return _prepare_solver_portfolio_inputs(
+    prepared_groups = [group.model_copy(deep=True) for group in groups]
+    prepared_queue = {task_id: task.model_copy(deep=True) for task_id, task in task_queue.items()}
+    missing_plan_diagnostic = _missing_sca_plan_diagnostic(prepared_groups)
+    if missing_plan_diagnostic:
+        return prepared_groups, prepared_queue, [missing_plan_diagnostic]
+
+    from remediation_engine.orchestration.state import build_initial_remediation_task
+
+    represented = {task.parent_group_id for task in prepared_queue.values()}
+    next_index = 1
+    for group in sorted(prepared_groups, key=lambda item: item.group_id):
+        if group.group_id in represented:
+            continue
+        while f"task-{next_index}" in prepared_queue:
+            next_index += 1
+        task_id = f"task-{next_index}"
+        language = (
+            ProjectLanguage.JAVA if _group_manager(group) == "maven" else ProjectLanguage.NODEJS
+        )
+        prepared_queue[task_id] = build_initial_remediation_task(
+            group, task_id, project_language=language
+        )
+        represented.add(group.group_id)
+        next_index += 1
+
+    if project_language == ProjectLanguage.PYTHON:
+        return prepared_groups, prepared_queue, []
+    if not any(group.issue_type == IssueType.SCA for group in prepared_groups):
+        return prepared_groups, prepared_queue, []
+    return materialize_synthetic_dependency_tasks(
         repo_root,
-        groups,
-        task_queue,
+        prepared_groups,
+        prepared_queue,
         target_packages=target_packages,
-        project_language=project_language,
     )
-
-
-def build_portfolio_plan(
-    repo_root: str | Path,
-    groups: Iterable[VulnerabilityGroup],
-    task_queue: dict[str, RemediationTask],
-    *,
-    target_packages: Iterable[str] | None = None,
-    peer_conflict_pairs: Iterable[tuple[str, str]] = (),
-    forced_singleton_task_ids: Iterable[str] = (),
-    settings: Any | None = None,
-    registry_fetcher: Any | None = None,
-    maven_registry_fetcher: Any | None = None,
-    portfolio_iteration: int = 0,
-    portfolio_replan_request: Any | None = None,
-) -> PortfolioPlan:
-    """Build the solver-backed portfolio plan at the stable public boundary.
-
-    Args:
-        repo_root: Repository whose manifests and lockfiles define the graph.
-        groups: Prepared vulnerability and coordination groups.
-        task_queue: Supervisor-owned task projection.
-        target_packages: Optional development package scope.
-        peer_conflict_pairs: Explicit QA-discovered peer conflict pairs.
-        forced_singleton_task_ids: Tasks that must remain singleton batches.
-        settings: Solver and registry settings.
-        registry_fetcher: Optional fresh raw-packument fetcher for candidate selection.
-        portfolio_iteration: Current outer portfolio iteration.
-        portfolio_replan_request: Optional Supervisor replan constraints.
-
-    Returns:
-        An immutable solver-backed portfolio plan.
-    """
-    return _build_solver_portfolio_plan(
-        repo_root,
-        groups,
-        task_queue,
-        target_packages=target_packages,
-        peer_conflict_pairs=peer_conflict_pairs,
-        forced_singleton_task_ids=forced_singleton_task_ids,
-        settings=settings,
-        registry_fetcher=registry_fetcher,
-        maven_registry_fetcher=maven_registry_fetcher,
-        portfolio_iteration=portfolio_iteration,
-        portfolio_replan_request=portfolio_replan_request,
-    )
-
-
-def apply_portfolio_plan(
-    plan: PortfolioPlan,
-    groups: Iterable[VulnerabilityGroup],
-    task_queue: dict[str, RemediationTask],
-) -> tuple[list[VulnerabilityGroup], dict[str, RemediationTask], list[str]]:
-    """Commit solver-approved decisions to detached task objects."""
-    return _apply_solver_portfolio_plan(plan, groups, task_queue)
 
 
 __all__ = [
     "DeltaIsolationResult",
-    "active_leaf_task_ids",
     "apply_portfolio_plan",
     "build_portfolio_plan",
     "build_certified_portfolio_plan",

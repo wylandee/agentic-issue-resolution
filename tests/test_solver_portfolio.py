@@ -777,6 +777,13 @@ def test_cp_sat_selects_smallest_security_floor_and_deterministic_alternative():
     assert any("CP-SAT raw status" in diagnostic for diagnostic in result.diagnostics)
 
 
+def test_semver_floor_rejects_prerelease_of_the_floor_release():
+    from remediation_engine.solver.cpsat import _at_least
+
+    assert _at_least("1.2.0-rc.2", "1.2.0") is False
+    assert _at_least("1.2.0", "1.2.0") is True
+
+
 def test_cp_sat_uses_compatible_parent_floor_for_transitive_npm_finding():
     from remediation_engine.tools.registry import select_npm_parent_version
 

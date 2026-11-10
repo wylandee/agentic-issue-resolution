@@ -13,9 +13,9 @@ from langchain_core.messages import AIMessage
 import remediation_engine.agents.update as update_subagent_module
 from remediation_engine.agents.update import (
     _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS,
-    _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _UPDATE_WORKER_STATIC_INSTRUCTIONS,
     _attempted_versions_for_current_run,
+    _build_multi_package_static_instructions,
     _build_multi_package_update_prompt,
     _build_update_prompt,
     _build_update_system_prompt,
@@ -304,10 +304,10 @@ class TestUpdateSubagentWrapper:
         assert directive in prompt
         assert "Major-version source/test migration: required." in prompt
         assert "source and test migration to the committed package API is authorized" in (
-            _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS
+            _build_multi_package_static_instructions(ProjectLanguage.NODEJS)
         )
         assert "Do not reselect or change any package name or version" in (
-            _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS
+            _build_multi_package_static_instructions(ProjectLanguage.NODEJS)
         )
 
     def test_mixed_first_pass_and_retry_batch_is_rejected_before_execution(self):
@@ -1573,10 +1573,6 @@ class TestUpdateWorkerPromptLanguageParity:
     def test_batch_prompts_share_authorization_policy_and_expose_matching_tool(
         self, language, ecosystem, package, manifest, expected_tool, wrong_tool
     ):
-        from remediation_engine.agents.update import (
-            _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS,
-        )
-
         action = MultiPackageAction(
             cluster_id="cluster-prompt-test",
             dispatch_batch_id="batch-prompt-test",
@@ -1604,7 +1600,7 @@ class TestUpdateWorkerPromptLanguageParity:
         static_prompt = (
             _MULTI_PACKAGE_PYTHON_UPDATE_WORKER_STATIC_INSTRUCTIONS
             if language == ProjectLanguage.PYTHON
-            else _MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS
+            else _build_multi_package_static_instructions(language)
         )
         normalized_static = " ".join(static_prompt.split())
         normalized_dynamic = " ".join(dynamic_prompt.split())
@@ -1649,8 +1645,6 @@ class TestUpdateSubagentWrapperStage2Parity:
         assert "setup.py is install-only" in update_prompt
         assert "only modify_and_validate_python_dependency" in update_prompt
         assert "Do\nnot search PyPI" in update_prompt
-        assert "get_pypi_versions" not in update_prompt
-        assert "select_python_safe_version" not in update_prompt
         assert "modify_and_validate_npm_dependency" not in update_prompt
 
         group = _sca_group()

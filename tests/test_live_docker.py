@@ -14,9 +14,9 @@ import pytest
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.runtime.sandbox import DockerSandbox, get_docker_client
 from remediation_engine.tools.npm import (
-    build_sliced_lockfile_artifacts,
     load_npm_graph_snapshot_from_documents,
-    resolve_dependency_closure,
+    resolve_dependency_closure_for_target,
+    resolve_target_packages,
 )
 from remediation_engine.tools.odc_parser import parse_python_packages
 from remediation_engine.tools.qa_scan import _parse_report_package_occurrences, _run_targeted_odc
@@ -25,6 +25,18 @@ from remediation_engine.tools.test_execution import (
     _install_error_category,
     parse_peer_conflict_evidence,
 )
+
+
+def _target_closure(packages: dict[str, dict], target_package: str, version: str):
+    resolutions, reason = resolve_target_packages(
+        packages,
+        source_lockfile="package-lock.json",
+        target_package=target_package,
+        target_version=version,
+    )
+    assert reason is None
+    assert len(resolutions) == 1
+    return resolve_dependency_closure_for_target(packages, resolutions[0])
 
 
 @pytest.mark.docker
@@ -73,13 +85,7 @@ def test_generated_targeted_lockfile_reports_all_physical_occurrences() -> None:
         "private": True,
         "dependencies": {"jws": "3.2.3"},
     }
-    closure = resolve_dependency_closure(
-        packages,
-        source_lockfile="package-lock.json",
-        target_package="jws",
-        target_version="3.2.3",
-        lockfile_version=3,
-    )
+    closure = _target_closure(packages, "jws", "3.2.3")
     assert closure.complete
 
     client = get_docker_client()
@@ -154,13 +160,7 @@ def test_trace_esbuild_target_scans_after_batch_staging() -> None:
         "private": True,
         "dependencies": {"esbuild": target_version},
     }
-    closure = resolve_dependency_closure(
-        packages,
-        source_lockfile="package-lock.json",
-        target_package="esbuild",
-        target_version=target_version,
-        lockfile_version=3,
-    )
+    closure = _target_closure(packages, "esbuild", target_version)
     assert closure.complete
 
     client = get_docker_client()
@@ -190,42 +190,6 @@ def test_trace_esbuild_target_scans_after_batch_staging() -> None:
                 and occurrence.ecosystem.casefold() == "npm"
                 for occurrence in occurrences
             )
-    finally:
-        try:
-            client.volumes.get(volume_name).remove(force=True)
-        finally:
-            client.close()
-
-
-@pytest.mark.docker
-@pytest.mark.skipif(
-    os.environ.get("REMEDY_RUN_DOCKER_TESTS") != "1" or shutil.which("docker") is None,
-    reason="opt-in live Docker validation; set REMEDY_RUN_DOCKER_TESTS=1",
-)
-def test_generated_targeted_lockfile_produces_parseable_odc_report() -> None:
-    """Verify the synthetic package-lock shape against the real ODC container."""
-    docker = pytest.importorskip("docker")
-    del docker
-    closure = resolve_dependency_closure(
-        {
-            "": {},
-            "node_modules/a": {"version": "1.0.0"},
-        },
-        target_package="a",
-        target_version="1.0.0",
-    )
-    artifacts = build_sliced_lockfile_artifacts(closure)
-    client = get_docker_client()
-    volume_name = f"remedy-targeted-test-{uuid4().hex[:12]}"
-    client.volumes.create(name=volume_name)
-    try:
-        with DockerSandbox(repo_root=None, workspace_volume=volume_name) as sandbox:
-            for filename, content in artifacts.items():
-                sandbox.write_file(f".odc-targeted/000/{filename}", content)
-            result = _run_targeted_odc(volume_name, ".odc-targeted")
-            assert result.returncode == 0, result.stderr
-            report = sandbox.read_file(".odc-targeted/dependency-check-report.json")
-            assert report is not None
     finally:
         try:
             client.volumes.get(volume_name).remove(force=True)

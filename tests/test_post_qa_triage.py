@@ -406,6 +406,31 @@ def test_post_triage_ignores_historical_accepted_attempt_after_noop_retry():
                     "status": "surrender",
                     "changed_files": [],
                 },
+                "attempt-current": {
+                    "attempt_id": "attempt-current",
+                    "task_id": task.task_id,
+                    "task_revision": 4,
+                    "instruction_digest": "current-instruction-digest",
+                    "cluster_id": None,
+                    "dispatch_batch_id": None,
+                    "action_digest": None,
+                    "status": "success",
+                    "changed_files": ["package.json"],
+                    "execution_diagnostics": {"validation_passed": True},
+                },
+            },
+            "attempt_snapshots_by_id": {
+                "attempt-current": {
+                    "attempt_id": "attempt-current",
+                    "task_id": task.task_id,
+                    "task_revision": 4,
+                    "attempt_number": 2,
+                    "state_revision": 4,
+                    "instruction_digest": "current-instruction-digest",
+                    "cluster_id": None,
+                    "dispatch_batch_id": None,
+                    "action_digest": None,
+                }
             },
             "triage_required": True,
             "new_vulnerability_status": "detected",
@@ -700,7 +725,7 @@ def test_qa_wrapper_propagates_scan_snapshot_and_marks_triage_required():
     post_issue = _issue("CVE-2026-0002")
 
     with patch(
-        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        "remediation_engine.agents.qa.run_qa_critic_node",
         return_value={
             "qa_evaluations": {},
             "eval_status": "all_passed",

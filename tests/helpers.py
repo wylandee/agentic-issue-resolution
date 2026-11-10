@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import tempfile
 from collections.abc import Iterable
-from pathlib import Path
 from unittest.mock import MagicMock
 
 from remediation_engine.agents.supervisor_reasoning import apply_issue_fix_plans_to_group
@@ -286,13 +284,6 @@ def _scan_outcome(
     )
 
 
-def _make_workspace_tmpdir() -> Path:
-    """Create a writable temp directory inside the workspace."""
-    base_dir = Path("data/cache")
-    base_dir.mkdir(exist_ok=True)
-    return Path(tempfile.mkdtemp(dir=base_dir))
-
-
 def _make_minimal_state(
     groups=_MISSING,
     workspace_volume="test-vol",
@@ -352,24 +343,6 @@ def _make_minimal_state(
         "attempt_snapshots_by_id": attempt_snapshots_by_id,
         "worker_results_by_attempt": worker_results_by_attempt,
     }
-
-
-def _make_loop_result(
-    final_text="",
-    tool_events=None,
-    errors=None,
-    structured_output=None,
-):
-    """Build a mocked SubagentRuntimeResult."""
-    from remediation_engine.runtime.agent_runtime import SubagentRuntimeResult
-
-    return SubagentRuntimeResult(
-        final_text=final_text,
-        tool_events=tool_events or [],
-        changed_files=[],
-        errors=errors or [],
-        structured_output=structured_output,
-    )
 
 
 def _make_fully_populated_results(ok=True):

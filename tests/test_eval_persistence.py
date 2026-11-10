@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -690,11 +689,11 @@ def test_single_selected_item_keeps_all_metrics(monkeypatch):
 
 
 def test_unscored_metric_is_not_persisted_as_a_zero_score(monkeypatch):
-    nodeid = "tests/evals/test_business_rules.py::test_missing_telemetry"
+    nodeid = "tests/evals/test_report_eval.py::test_report_missing_score"
     monkeypatch.setattr(
         eval_conftest, "_EVAL_TEST_REPORTS", {nodeid: {"call": _report(nodeid, "passed")}}
     )
-    case = _deep_eval_case("missing-telemetry", "Token Budget")
+    case = _deep_eval_case("missing-score", "HallucinationMetric")
     case.metrics_data[0].score = None
     case.metrics_data[0].success = None
 
@@ -703,7 +702,7 @@ def test_unscored_metric_is_not_persisted_as_a_zero_score(monkeypatch):
     )
 
     assert records[0].metrics == []
-    assert records[0].additional_metadata["unscored_metrics"] == ["Token Budget"]
+    assert records[0].additional_metadata["unscored_metrics"] == ["HallucinationMetric"]
 
 
 def test_explicit_identity_wins_over_case_name_heuristics(monkeypatch):
@@ -742,8 +741,8 @@ def test_session_without_evaluation_items_does_not_import_persistence(monkeypatc
     )
 
 
-def test_report_metric_cases_separate_facts_from_policy(monkeypatch) -> None:
-    """Factual judges get source only; GEval gets separate policy and facts."""
+def test_report_metric_case_uses_only_source_evidence(monkeypatch) -> None:
+    """All report judges receive the same source-grounded case."""
 
     class FakeLLMTestCase:
         def __init__(self, **kwargs: Any) -> None:
@@ -752,25 +751,18 @@ def test_report_metric_cases_separate_facts_from_policy(monkeypatch) -> None:
     monkeypatch.setattr(test_report_eval, "LLMTestCase", FakeLLMTestCase)
     case = test_report_eval._load_golden_cases()[0]
     report = test_report_eval.render_report(case)
-    source_evidence, policy_context = test_report_eval.build_report_context(case)
-    factual_case, policy_case = test_report_eval._build_report_metric_cases(
+    source_evidence = test_report_eval.build_report_context(case)
+    metric_case = test_report_eval._build_report_metric_case(
         case,
         report,
-        [source_evidence, policy_context],
+        source_evidence,
     )
 
-    assert factual_case.input == source_evidence
-    assert factual_case.actual_output == report
-    assert getattr(factual_case, "expected_output", None) is None
-    assert factual_case.context == [source_evidence]
-    assert factual_case.retrieval_context == [source_evidence]
-    assert policy_case.input == source_evidence
-    assert policy_case.actual_output == report
-    assert policy_case.context == [source_evidence, policy_context]
-    policy_expected = json.loads(policy_case.expected_output)
-    assert "code_detail_diff_paths" not in policy_expected
-    assert "forbidden_code_detail_diff_paths" not in policy_expected
-    assert "package.json" not in policy_context
+    assert metric_case.input == source_evidence
+    assert metric_case.actual_output == report
+    assert getattr(metric_case, "expected_output", None) is None
+    assert metric_case.context == [source_evidence]
+    assert metric_case.retrieval_context == [source_evidence]
     assert "expected_contract" not in source_evidence
     assert "report_format" not in source_evidence
 
@@ -786,21 +778,6 @@ def test_summarization_metric_receives_case_specific_questions(monkeypatch) -> N
     monkeypatch.setattr(test_report_eval, "HallucinationMetric", FakeMetric)
     monkeypatch.setattr(test_report_eval, "FaithfulnessMetric", FakeMetric)
     monkeypatch.setattr(test_report_eval, "SummarizationMetric", FakeMetric)
-    monkeypatch.setattr(
-        test_report_eval,
-        "build_judge_score_metric",
-        lambda **kwargs: FakeMetric(**kwargs),
-    )
-    monkeypatch.setattr(
-        test_report_eval,
-        "SingleTurnParams",
-        SimpleNamespace(
-            INPUT="input",
-            ACTUAL_OUTPUT="actual_output",
-            EXPECTED_OUTPUT="expected_output",
-            CONTEXT="context",
-        ),
-    )
     case = test_report_eval._load_golden_cases()[0]
     metrics = test_report_eval._build_metrics(
         SimpleNamespace(judge_model="test-model", judge_llm=None),
@@ -833,7 +810,7 @@ def test_code_detail_files_are_source_only_for_package_removal() -> None:
     report = test_report_eval.render_report(case)
     parsed = test_report_eval.parse_report(report)
     table_files = parsed["successful_rows"][0]["Files Changed"]
-    _, policy_context = test_report_eval.build_report_context(case)
+    source_evidence = test_report_eval.build_report_context(case)
 
     assert "package.json" in table_files
     assert "package-lock.json" in table_files
@@ -841,8 +818,7 @@ def test_code_detail_files_are_source_only_for_package_removal() -> None:
     assert "package.json" not in parsed["code_detail_text"]
     assert "package-lock.json" not in parsed["code_detail_text"]
     assert not test_report_eval.validate_report_contract(report, case["expected_contract"])
-    assert "package.json" not in policy_context
-    assert "forbidden_code_detail_diff_paths" not in policy_context
+    assert "package.json" in source_evidence
 
     tampered_report = report.replace(
         "- **Files changed:** routes/b2bOrder.ts",
@@ -857,22 +833,20 @@ def test_code_detail_files_are_source_only_for_package_removal() -> None:
     )
 
 
-def test_live_report_evaluates_constraint_metric_after_factual_failure(monkeypatch) -> None:
-    """A factual threshold failure does not skip the separate constraint case."""
+def test_live_report_runs_three_metrics_on_one_case(monkeypatch) -> None:
+    """All three report metrics receive the same report and evidence."""
 
     class FakeLLMTestCase:
         def __init__(self, **kwargs: Any) -> None:
             self.__dict__.update(kwargs)
 
-    factual_case = object()
-    policy_case = object()
-    metrics = [object(), object(), object(), object()]
+    metric_case = object()
+    metrics = [object(), object(), object()]
     calls: list[tuple[Any, list[Any]]] = []
 
     def fake_assert_test(test_case: Any, selected_metrics: list[Any]) -> None:
         calls.append((test_case, selected_metrics))
-        if test_case is factual_case:
-            raise AssertionError("factual threshold failure")
+        raise AssertionError("judge threshold failure")
 
     monkeypatch.setattr(test_report_eval, "HAS_DEEPEVAL", True)
     monkeypatch.setattr(test_report_eval, "LLMTestCase", FakeLLMTestCase)
@@ -908,8 +882,8 @@ def test_live_report_evaluates_constraint_metric_after_factual_failure(monkeypat
     )
     monkeypatch.setattr(
         test_report_eval,
-        "_build_report_metric_cases",
-        lambda case, report, context, **_kwargs: (factual_case, policy_case),
+        "_build_report_metric_case",
+        lambda case, report, context, **_kwargs: metric_case,
     )
     monkeypatch.setattr(
         test_report_eval,
@@ -930,26 +904,21 @@ def test_live_report_evaluates_constraint_metric_after_factual_failure(monkeypat
         judge_llm=None,
         app_settings=object(),
     )
-    test_report_eval.TestReportNodeEval().test_report_uses_only_the_four_requested_metrics(
+    test_report_eval.TestReportNodeEval().test_report_uses_the_three_requested_metrics(
         case,
         settings,
     )
 
-    assert calls == [
-        (factual_case, metrics[:3]),
-        (policy_case, metrics[3:]),
-    ]
+    assert calls == [(metric_case, metrics)]
 
 
 def test_report_evidence_documents_build_for_all_golden_cases() -> None:
-    """Every curated case produces source facts and policy guidance."""
+    """Every curated case produces source facts for judging."""
     for case in test_report_eval._load_golden_cases():
-        source_evidence, policy_context = test_report_eval.build_report_context(case)
+        source_evidence = test_report_eval.build_report_context(case)
 
         assert f"Run ID: {case['case_id']}." in source_evidence
         assert "There are exactly" in source_evidence
-        assert "Constraint-adherence rules follow" in policy_context
-        assert "File-path scope is checked deterministically" in policy_context
         for group in case["fixture"].get("groups", []):
             if group.get("package"):
                 assert group["package"] in source_evidence

@@ -422,9 +422,9 @@ class FixPlan(BaseModel):
     Remedy agent to apply the correct type of edit.
 
     Invariants (enforced by model_validator):
-    - ``version_found``    â†’ ``fixed_version`` is set, ``workaround_snippets`` is None.
-    - ``workaround_found`` â†’ ``workaround_snippets`` is non-empty, ``fixed_version`` is None.
-    - ``no_fix``           â†’ both ``fixed_version`` and ``workaround_snippets`` are None.
+    - ``version_found``    → ``fixed_version`` is set, ``workaround_snippets`` is None.
+    - ``workaround_found`` → ``workaround_snippets`` is non-empty, ``fixed_version`` is None.
+    - ``no_fix``           → both ``fixed_version`` and ``workaround_snippets`` are None.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -679,10 +679,9 @@ class LocalizedIssue(BaseModel):
     """
     A ``VulnerabilityIssue`` enriched with AST-level code localization context.
 
-    Produced by the SAST code locator (``locate_sast``) and the SCA manifest
-    locator (``locate_dependency``). This model is a *pure localization result* â€”
-    it contains no fix instructions or remediation planning. Fix planning is the
-    responsibility of the downstream "Plan Fix" agent.
+    Produced by SAST ingestion or the SCA manifest locator. This model is a
+    localization result; it contains no fix instructions or remediation
+    planning.
     """
 
     model_config = ConfigDict(frozen=False)
@@ -709,7 +708,7 @@ class LocalizedIssue(BaseModel):
         description="Brief data-flow notes (e.g. 'taint source: req.params.id').",
     )
     snippet: str | None = Field(
-        None, description="Bounded code snippet around the finding (â‰¤ 30 lines)."
+        None, description="Bounded code snippet around the finding (≤ 30 lines)."
     )
 
     # Manifest context (SCA)
@@ -791,7 +790,7 @@ class LocalizedIssue(BaseModel):
         default=0.0,
         ge=0.0,
         le=1.0,
-        description="0â€“1 confidence score for the localization result.",
+        description="0–1 confidence score for the localization result.",
     )
 
     localized_at: datetime = Field(
@@ -927,7 +926,7 @@ class CVEEnrichment(BaseModel):
 
     Populated by ``remediation_engine.tools.advisories`` from the FIRST EPSS API and the
     CISA Known Exploited Vulnerabilities (KEV) catalogue.  Always returned,
-    even when upstream APIs fail â€” safe defaults indicate "unknown risk".
+    even when upstream APIs fail — safe defaults indicate "unknown risk".
     """
 
     model_config = ConfigDict(frozen=True)
@@ -939,13 +938,13 @@ class CVEEnrichment(BaseModel):
         default=0.0,
         ge=0.0,
         le=1.0,
-        description="EPSS probability score (0â€“1).  0.0 = unknown / API failure.",
+        description="EPSS probability score (0–1).  0.0 = unknown / API failure.",
     )
     epss_percentile: float = Field(
         default=0.0,
         ge=0.0,
         le=1.0,
-        description="EPSS percentile rank (0â€“1).  0.0 = unknown / API failure.",
+        description="EPSS percentile rank (0–1).  0.0 = unknown / API failure.",
     )
 
     # CISA KEV
@@ -1207,7 +1206,7 @@ class TriageResult(BaseModel):
         ...,
         description=(
             "Revised priority using the canonical Severity enum.  "
-            "Guardrails clamp: KEV â†’ CRITICAL; EPSSâ‰¥0.5 or HIGH/CRITICAL original â†’ at least HIGH."
+            "Guardrails clamp: KEV → CRITICAL; EPSS≥0.5 or HIGH/CRITICAL original → at least HIGH."
         ),
     )
     is_unreachable_code: bool = Field(
@@ -2823,13 +2822,6 @@ class SupervisorDecision(BaseModel):
         ...,
         description="The next node to route to in the orchestrator graph.",
     )
-    updated_task_strategies: dict[str, RoutingStrategy] = Field(
-        default_factory=dict,
-        description=(
-            "Requested strategy pivots keyed by parent task_id. "
-            "The supervisor realizes these as child-task spawns rather than mutating the parent task in place."
-        ),
-    )
     target_task_ids: list[str] = Field(
         default_factory=list,
         description=(
@@ -3145,35 +3137,6 @@ class RemediationTask(BaseModel):
     def _normalize_remediation_action(cls, value: Any) -> str | None:
         """Trim an optional Supervisor-authored completion action."""
         return _trim_optional_contract_text(value, "remediation_action")
-
-
-class ReconciliationResult(BaseModel):
-    """Output of worker and QA result reconciliation."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    task_queue: dict[str, RemediationTask]
-    qa_evaluations: dict[str, QAEvaluation] = Field(default_factory=dict)
-    retry_diagnostics_by_task: dict[str, UpdateRetryDiagnostics] = Field(default_factory=dict)
-    consistency_events: list[StateConsistencyEvent] = Field(default_factory=list)
-    auto_constraints: list[str] = Field(default_factory=list)
-    errors: list[str] = Field(default_factory=list)
-
-
-class EligibleActions(BaseModel):
-    """Pure projection of the actions currently eligible for routing."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    non_terminal_tasks: list[str] = Field(default_factory=list)
-    qa_ready_task_ids: list[str] = Field(default_factory=list)
-    workable_tasks: list[str] = Field(default_factory=list)
-    no_fix_workable: list[str] = Field(default_factory=list)
-    exhausted_pivots: list[str] = Field(default_factory=list)
-    retry_version_bumps: list[str] = Field(default_factory=list)
-    new_version_bumps: list[str] = Field(default_factory=list)
-    workaround_tasks: list[str] = Field(default_factory=list)
-    triage_required: bool = False
 
 
 class AuditRecord(BaseModel):

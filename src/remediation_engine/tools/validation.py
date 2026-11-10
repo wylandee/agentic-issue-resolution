@@ -1685,16 +1685,22 @@ def _make_record_plan_tool(
             return "ERROR: [PLAN_REJECTED] evidence_source is required and cannot be empty."
 
         if plan_state.get("require_authoritative_evidence"):
-            evidence_is_authoritative = bool(
-                plan_state.get("has_authoritative_evidence")
-                or _is_authoritative_evidence_source(ev_source)
+            evidence_ledger = set(plan_state.get("evidence_ledger", []) or [])
+            inspected_sources = sorted(
+                (
+                    source
+                    for source in evidence_ledger
+                    if source in ev_source and _is_authoritative_evidence_source(source)
+                ),
+                key=lambda source: (-len(source), source),
             )
-            if not evidence_is_authoritative:
+            if not inspected_sources:
                 return (
                     "ERROR: [MISSING_EVIDENCE] Authoritative evidence is required before accepting a "
                     "QA_REGRESSION_REPAIR plan. Set evidence_source to an official advisory, package "
                     "repository/docs URL, npm registry metadata, or an installed package README/types path."
                 )
+            ev_source = inspected_sources[0]
 
         raw_replacements = planned_replacements
         if isinstance(raw_replacements, str):

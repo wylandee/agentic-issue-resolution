@@ -474,7 +474,7 @@ def _read_report_from_workspace(
         report_path = f"{clean_dir}/{_ODC_REPORT_NAME}".lstrip("/")
         return sandbox.read_file(report_path)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("qa_critic: failed to read ODC report from workspace â€” %s", exc)
+        logger.warning("qa_critic: failed to read ODC report from workspace — %s", exc)
         return None
 
 
@@ -534,7 +534,11 @@ def _parse_report_issues(report_text: str) -> list[VulnerabilityIssue] | None:
     try:
         report = json.loads(report_text)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("qa_critic: failed to decode ODC report JSON â€” %s", exc)
+        logger.warning("qa_critic: failed to decode ODC report JSON — %s", exc)
+        return None
+
+    if not isinstance(report, dict) or not isinstance(report.get("dependencies"), list):
+        logger.warning("qa_critic: ODC report is missing a valid dependencies array.")
         return None
 
     try:
@@ -546,7 +550,7 @@ def _parse_report_issues(report_text: str) -> list[VulnerabilityIssue] | None:
     try:
         return parse_vulnerabilities(report)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("qa_critic: failed to parse ODC vulnerabilities â€” %s", exc)
+        logger.warning("qa_critic: failed to parse ODC vulnerabilities — %s", exc)
         return None
 
 

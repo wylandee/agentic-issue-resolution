@@ -24,7 +24,6 @@ from .schemas import (
     CWEEntry,
     DependencyEvidenceStatus,
     DependencyParentContext,
-    EligibleActions,
     FailureCategory,
     FixPlan,
     FixPlanStatus,
@@ -52,7 +51,6 @@ from .schemas import (
     QAPolicy,
     QASemanticSecurityReview,
     QATestAttribution,
-    ReconciliationResult,
     RemediationTask,
     RoutingStrategy,
     ScanCoverageResult,
@@ -253,7 +251,5 @@ __all__ = [
     "select_maven_version",
     "RegistryCandidate",
     "select_version",
-    "ReconciliationResult",
-    "EligibleActions",
     "AuditRecord",
 ]

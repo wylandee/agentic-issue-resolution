@@ -248,9 +248,14 @@ def _at_least(
             return compare_maven_versions(version, floor) >= 0
         except ValueError:
             return False
-    left = _version_key(version)
-    right = _version_key(floor)
-    return left is not None and right is not None and left >= right
+    try:
+        from semantic_version import Version
+
+        left = Version.coerce(version.strip().lstrip("vV"))
+        right = Version.coerce(floor.strip().lstrip("vV"))
+    except (ImportError, TypeError, ValueError):
+        return False
+    return left >= right
 
 
 def _finding_security_floor(

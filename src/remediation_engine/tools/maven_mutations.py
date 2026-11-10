@@ -630,18 +630,25 @@ def _restore_checkpoint(
     touched_files: set[str],
 ) -> str | None:
     errors: list[str] = []
+    failed_paths: set[str] = set()
     for path, source in checkpoint.files.items():
         try:
             if source is None:
                 result = sandbox.run(f"rm -f -- {shlex.quote(path)}")
                 if result.exit_code != 0:
                     errors.append(f"{path}: delete failed (exit {result.exit_code})")
+                    failed_paths.add(path)
             else:
                 sandbox.write_file(path, source)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{path}: {exc}")
-    touched_files.clear()
-    touched_files.update(checkpoint.touched_files_before)
+            failed_paths.add(path)
+    if errors:
+        touched_files.update(checkpoint.touched_files_before)
+        touched_files.update(failed_paths)
+    else:
+        touched_files.clear()
+        touched_files.update(checkpoint.touched_files_before)
     return "POM rollback failed: " + " | ".join(errors) if errors else None
 
 

@@ -707,11 +707,6 @@ control to the Supervisor. A failed or rolled-back action must be surrendered fo
 a new Supervisor-committed attempt."""
 
 
-_MULTI_PACKAGE_UPDATE_WORKER_STATIC_INSTRUCTIONS = _build_multi_package_static_instructions(
-    ProjectLanguage.NODEJS
-)
-
-
 def _build_multi_package_update_prompt(
     resolved_tasks: Sequence[tuple[RemediationTask, VulnerabilityGroup, Sequence[str]]],
     action: MultiPackageAction,

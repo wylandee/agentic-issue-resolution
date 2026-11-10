@@ -98,7 +98,7 @@ class SerperLLMResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers â€” issue introspection
+# Internal helpers — issue introspection
 # ---------------------------------------------------------------------------
 
 
@@ -130,7 +130,7 @@ def _canonical_maven_coordinate(issue: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers â€” instruction builder
+# Internal helpers — instruction builder
 # ---------------------------------------------------------------------------
 
 
@@ -236,7 +236,7 @@ def _build_instruction(
 
 
 # ---------------------------------------------------------------------------
-# Waterfall step 2 â€” OSV API
+# Waterfall step 2 — OSV API
 # ---------------------------------------------------------------------------
 
 
@@ -719,7 +719,7 @@ def _decode_github_response(resp: Any, target_url: str) -> str:
     return ""
 
 
-def _fetch_page_content(url: str) -> str | None:
+def _fetch_page_content(url: str, *, truncation_marker: bool = False) -> str | None:
     """
     Fetch web page text using a 3-tier waterfall: GitHub API/Raw -> Jina Reader -> Direct HTTP.
 
@@ -729,6 +729,16 @@ def _fetch_page_content(url: str) -> str | None:
     target_url = (url or "").strip()
     if not target_url:
         return None
+
+    def bound(text: str) -> str:
+        if len(text) <= _READ_WEB_PAGE_MAX_CHARS:
+            return text
+        suffix = (
+            f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+            if truncation_marker
+            else ""
+        )
+        return text[:_READ_WEB_PAGE_MAX_CHARS] + suffix
 
     # 1. GitHub API & Raw GitHub fallback
     if "github.com" in target_url and not target_url.startswith(
@@ -745,7 +755,7 @@ def _fetch_page_content(url: str) -> str | None:
                 resp.raise_for_status()
                 text = _decode_github_response(resp, target_url)
                 if text and text.strip():
-                    return text[:_READ_WEB_PAGE_MAX_CHARS]
+                    return bound(text)
             except Exception as exc:
                 log.debug("GitHub API fetch failed for %s: %s", target_url, exc)
 
@@ -759,7 +769,7 @@ def _fetch_page_content(url: str) -> str | None:
             resp.raise_for_status()
             text = resp.text or ""
             if text and text.strip():
-                return text[:_READ_WEB_PAGE_MAX_CHARS]
+                return bound(text)
         except Exception as exc:
             log.debug("Raw GitHub fetch failed for %s: %s", raw_url, exc)
 
@@ -774,7 +784,7 @@ def _fetch_page_content(url: str) -> str | None:
         resp.raise_for_status()
         text = resp.text or ""
         if text and text.strip():
-            return text[:_READ_WEB_PAGE_MAX_CHARS]
+            return bound(text)
     except Exception as exc:
         log.debug("Jina Reader fetch failed for %s: %s", target_url, exc)
 
@@ -784,7 +794,7 @@ def _fetch_page_content(url: str) -> str | None:
         resp.raise_for_status()
         text = resp.text or ""
         if text and text.strip():
-            return text[:_READ_WEB_PAGE_MAX_CHARS]
+            return bound(text)
     except Exception as exc:
         log.debug("Direct page fetch failed for %s: %s", target_url, exc)
 
@@ -815,7 +825,7 @@ def _llm_extract_remediation(
     settings = get_runtime_settings()
     api_key = settings.openai_api_key
     if not api_key:
-        log.info("OPENAI_API_KEY not set â€” skipping LLM page extraction.")
+        log.info("OPENAI_API_KEY not set — skipping LLM page extraction.")
         return None
 
     model_name = settings.triage_llm_model
@@ -873,7 +883,7 @@ def _query_serper(issue: Any, package_name: str) -> list[dict[str, str]] | None:
     """
     api_key = get_runtime_settings().serper_api_key
     if not api_key:
-        log.info("SERPER_API_KEY not set â€” skipping Serper search.")
+        log.info("SERPER_API_KEY not set — skipping Serper search.")
         return None
 
     vuln_id = (
@@ -1233,7 +1243,7 @@ def _fetch_epss_chunk(cve_ids: list[str]) -> dict[str, tuple[float, float]]:
     """
     Query the EPSS API for a chunk of CVE IDs.
 
-    Returns a dict of cve_id â†’ (epss_score, epss_percentile).
+    Returns a dict of cve_id → (epss_score, epss_percentile).
     On failure, returns an empty dict (caller fills in defaults).
     """
     cve_param = ",".join(cve_ids)

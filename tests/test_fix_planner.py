@@ -1,7 +1,7 @@
 """
 Tests for remediation_engine.tools.advisories.
 
-All network calls are mocked â€” no live internet required.
+All network calls are mocked — no live internet required.
 
 Coverage includes OSV advisory parsing, Serper evidence extraction, package
 identity, instruction generation, and ``FixPlan`` model validation. Network
@@ -284,7 +284,7 @@ class TestQueryOsvFixedVersion:
         assert result == ("4.17.21", None)
 
     def test_id_only_triggers_detail_fetch(self):
-        """querybatch returns only {id: ...}, no 'affected' â†’ fall back to GET."""
+        """querybatch returns only {id: ...}, no 'affected' → fall back to GET."""
         querybatch_body = {"results": [{"vulns": [{"id": "GHSA-xxxx"}]}]}
         detail_body = {
             "id": "GHSA-xxxx",

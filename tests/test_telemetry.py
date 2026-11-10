@@ -545,7 +545,6 @@ def test_local_and_uploaded_workspaces_share_canonical_findings(
     summary = tracker.get_dashboard_summary()
     assert len(tracker.active_findings) == local_info.total_findings
     assert summary["severity_counts"] == local_info.severity_counts
-    assert tracker.initial_issues[0] is stored_issues[0]
     assert [issue.model_dump(mode="json") for issue in stored_issues] == original_snapshots
 
 

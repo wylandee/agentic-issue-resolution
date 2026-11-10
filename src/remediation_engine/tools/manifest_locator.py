@@ -1,30 +1,7 @@
-"""
-SCA Manifest Locator â€” finds *where* a vulnerable package is declared.
+"""Locate package declarations in repository manifests and lockfiles.
 
-Separation-of-Concerns refactor
----------------------------------
-This module is a **pure locator**.  It answers:
-
-  "In which file, on which line, and with which package manager is this
-   dependency declared?"
-
-It does **not**:
-  * Call external APIs (OSV, GitHub Advisory, etc.)
-  * Suggest fix versions
-  * Generate natural-language instructions
-
-Fix planning (safe-version lookup, override block generation, PR body) is the
-responsibility of the downstream "Plan Fix" agent which receives a typed
-``LocalizedIssue`` from this tool.
-
-Key capabilities preserved
---------------------------
-* ``normalize_package_name`` â€” handles tgz/jar/scoped/colon-version/PURL forms.
-* ``parse_lockfile_path`` â€” parses ODC lockfile-path ancestry notation.
-* ``_find_nearest_manifest`` â€” walks up from the ODC file path to the closest
-  ``package.json`` still inside the repo root.
-* ``detect_package_manager`` â€” npm / yarn / pnpm heuristic.
-* Line-number and snippet extraction for direct dependencies.
+The locator maps scanner findings to manifest occurrences and dependency
+ancestry. The Supervisor owns version selection and remediation planning.
 """
 
 from __future__ import annotations
@@ -34,16 +11,12 @@ import logging
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote  # noqa: F401 â€” kept for callers that may use it
 
 from semantic_version import NpmSpec, Version
 
 from remediation_engine.contracts import (
     LocalizedIssue,
     VulnerabilityIssue,
-)
-from remediation_engine.contracts.schemas import (
-    CWEEntry,  # noqa: F401 â€” re-exported for convenience
 )
 from remediation_engine.language import ProjectLanguage
 from remediation_engine.runtime.path_policy import (
@@ -80,10 +53,10 @@ def normalize_package_name(raw_name: str) -> str:
     """Normalise noisy ODC identifiers into a bare package name.
 
     Handles:
-    - ``lodash-4.17.21.tgz`` â†’ ``lodash``
-    - ``@tootallnate/once:1.1.2`` â†’ ``@tootallnate/once``
-    - ``pkg:npm/%40tootallnate%2Fonce@1.1.2`` â†’ ``@tootallnate/once``
-    - ``bench.js`` â†’ ``bench`` (non-npm file â€” kept as-is after ext strip)
+    - ``lodash-4.17.21.tgz`` → ``lodash``
+    - ``@tootallnate/once:1.1.2`` → ``@tootallnate/once``
+    - ``pkg:npm/%40tootallnate%2Fonce@1.1.2`` → ``@tootallnate/once``
+    - ``bench.js`` → ``bench`` (non-npm file — kept as-is after ext strip)
     """
     name = (raw_name or "").strip()
     if not name:
@@ -153,13 +126,13 @@ def parse_lockfile_path(file_path: str) -> tuple[str | None, str | None, str | N
     Examples
     --------
     ``/src/package-lock.json?/lodash:2.4.2``
-        â†’ (``/src/package-lock.json``, None, ``lodash``)
+        → (``/src/package-lock.json``, None, ``lodash``)
 
     ``/src/package-lock.json?pdfkit:0.11.0/crypto-js:^3.1.9-1``
-        â†’ (``/src/package-lock.json``, ``pdfkit``, ``crypto-js``)
+        → (``/src/package-lock.json``, ``pdfkit``, ``crypto-js``)
 
     ``/src/node_modules/express-jwt/node_modules/moment/moment.js``
-        â†’ (None, ``express-jwt``, ``moment``)
+        → (None, ``express-jwt``, ``moment``)
     """
     parsed = _parse_dependency_segments(file_path)
     if parsed is not None:
@@ -170,11 +143,11 @@ def parse_lockfile_path(file_path: str) -> tuple[str | None, str | None, str | N
         parent = segments[-2][0] if len(segments) >= 2 else None
         return lockfile, parent, leaf
 
-    # Not a lockfile path â€” may be a node_modules file path.
+    # Not a lockfile path — may be a node_modules file path.
     # Strategy: find all 'node_modules/<immediate-package-name>' occurrences.
     # Each node_modules entry is the directory immediately after 'node_modules/'.
     # e.g. /src/node_modules/express-jwt/node_modules/moment/moment.js
-    #       â†’ packages: ['express-jwt', 'moment'], leaf='moment', parent='express-jwt'
+    #       → packages: ['express-jwt', 'moment'], leaf='moment', parent='express-jwt'
     segments = _node_modules_dependency_segments(file_path)
     if segments:
         leaf = segments[-1][0]
@@ -398,10 +371,10 @@ def detect_package_manager(manifest_dir: Path) -> str:
     Detect the active package manager for a given manifest directory.
 
     Heuristic priority:
-    1. ``pnpm-lock.yaml`` â†’ pnpm
-    2. ``yarn.lock`` â†’ yarn
-    3. ``package-lock.json`` â†’ npm
-    4. Default â†’ npm
+    1. ``pnpm-lock.yaml`` → pnpm
+    2. ``yarn.lock`` → yarn
+    3. ``package-lock.json`` → npm
+    4. Default → npm
     """
     if (manifest_dir / "pnpm-lock.yaml").exists():
         return PackageManagerKind.PNPM
@@ -891,7 +864,7 @@ def locate_dependency(
     raw_dependency_name:
         Raw name from ODC (e.g. ``lodash-4.17.21.tgz``, ``@scope/pkg:1.2.3``).
     odc_file_path:
-        The ``filePath`` field from ODC â€” used to resolve the nearest manifest
+        The ``filePath`` field from ODC — used to resolve the nearest manifest
         and parse lockfile ancestry.
 
     Returns
@@ -945,7 +918,7 @@ def locate_dependency(
     # 3. Detect package manager
     pkg_manager = detect_package_manager(manifest_path.parent)
 
-    # 4. Locate in manifest (pure localization â€” no fix planning)
+    # 4. Locate in manifest (pure localization — no fix planning)
     location = _locate_in_manifest(manifest_path, effective_name, pkg_manager)
     direct_declarations = location.pop("direct_declarations", {})
     parent_name: str | None = None
@@ -1029,7 +1002,7 @@ def locate_from_issue(
             # its normal no-target fallback.
             manifest_rel = None
 
-    # Confidence heuristic: direct + line found â†’ high; transitive â†’ medium; error â†’ low
+    # Confidence heuristic: direct + line found → high; transitive → medium; error → low
     confidence: float
     if not is_success:
         confidence = 0.0
