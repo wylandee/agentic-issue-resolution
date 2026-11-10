@@ -164,6 +164,56 @@ def test_tracker_uses_attempt_scan_occurrence_and_reopens_final_reappearance() -
     assert tracker.active_findings[0].status == "unresolved"
 
 
+def test_tracker_reopens_a_remediated_finding_seen_by_a_later_task_attempt() -> None:
+    target_issue = _issue("target-package", "app/package-lock.json")
+    group = VulnerabilityGroup(
+        group_id="group-target",
+        issue_type=IssueType.SCA,
+        vulnerable_component="target-package",
+        cve_ids=["CVE-2026-12345"],
+        representative_issue_id=target_issue.id,
+        issues=[target_issue],
+    )
+    tracker = FindingsTracker([target_issue])
+    tracker.map_triaged_groups([group])
+
+    def report_attempt(attempt_id: str, revision: int, remaining: bool) -> None:
+        task_id = "task-target"
+        evidence = {
+            "complete": True,
+            "remaining_target_identifiers": ["CVE-2026-12345"] if remaining else [],
+            "found_issues": [target_issue] if remaining else [],
+        }
+        task = {
+            "task_id": task_id,
+            "parent_group_id": group.group_id,
+            "current_attempt_id": attempt_id,
+            "task_revision": revision,
+            "status": "qa_passed",
+        }
+        qa_result = {
+            "attempt_id": attempt_id,
+            "task_id": task_id,
+            "task_revision": revision,
+            "evaluation": {"passed": True, "scan_evidence": evidence},
+        }
+        tracker.process_node_state_update(
+            "supervisor",
+            {
+                "task_queue": {task_id: task},
+                "qa_results_by_attempt": {attempt_id: qa_result},
+            },
+        )
+
+    report_attempt("attempt-clean", revision=1, remaining=False)
+    assert tracker.remediated_count == 1
+
+    report_attempt("attempt-reappeared", revision=2, remaining=True)
+    assert tracker.remediated_count == 0
+    assert len(tracker.active_findings) == 1
+    assert tracker.active_findings[0].status == "unresolved"
+
+
 def test_demo_trajectory_recorders_are_isolated_between_concurrent_runs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
