@@ -222,49 +222,56 @@ class TrajectoryDocument:
 
     def spans_for_agent(self, agent_name: str) -> list[TrajectorySpan]:
         """Filter spans by agent category or prefix."""
-        normalized = agent_name.strip().lower()
-        if normalized in {"triage", "initial_triage"}:
-            return [
-                s
-                for s in self.spans
-                if s.name in {"triage.llm", "initial_triage", "triage"} or "triage" in s.tags
-            ]
-        if normalized in {"update", "update_subagent"}:
-            return [
-                s
-                for s in self.spans
-                if "update_subagent" in s.name.lower()
-                or (s.parent_name and "update_subagent" in s.parent_name.lower())
-            ]
-        if normalized in {"workaround", "workaround_subagent"}:
-            return [
-                s
-                for s in self.spans
-                if "workaround_subagent" in s.name.lower()
-                or (s.parent_name and "workaround_subagent" in s.parent_name.lower())
-            ]
-        if normalized in {"qa", "qa_critic"}:
-            return [
-                s
-                for s in self.spans
-                if "qa_critic" in s.name.lower()
-                or (s.parent_name and "qa_critic" in s.parent_name.lower())
-            ]
-        if normalized in {"report", "report_node"}:
-            return [
-                s
-                for s in self.spans
-                if "report" in s.name.lower()
-                or (s.parent_name and "report" in s.parent_name.lower())
-            ]
-        if normalized in {"supervisor", "tactical_supervisor"}:
-            return [
-                s
-                for s in self.spans
-                if s.name == "supervisor.tactical_reasoner"
-                or s.parent_name == "supervisor.tactical_reasoner"
-            ]
-        return [s for s in self.spans if normalized in s.name.lower()]
+        return _select_agent_spans(self.spans, agent_name, include_triage_tags=True)
+
+
+def _select_agent_spans(
+    spans: list[TrajectorySpan], agent_name: str, *, include_triage_tags: bool
+) -> list[TrajectorySpan]:
+    """Select agent spans with the caller's established triage-tag policy."""
+    normalized = agent_name.strip().lower()
+    if normalized in {"triage", "initial_triage"}:
+        return [
+            s
+            for s in spans
+            if s.name in {"triage.llm", "initial_triage", "triage"}
+            or (include_triage_tags and "triage" in s.tags)
+        ]
+    if normalized in {"update", "update_subagent"}:
+        return [
+            s
+            for s in spans
+            if "update_subagent" in s.name.lower()
+            or (s.parent_name and "update_subagent" in s.parent_name.lower())
+        ]
+    if normalized in {"workaround", "workaround_subagent"}:
+        return [
+            s
+            for s in spans
+            if "workaround_subagent" in s.name.lower()
+            or (s.parent_name and "workaround_subagent" in s.parent_name.lower())
+        ]
+    if normalized in {"qa", "qa_critic"}:
+        return [
+            s
+            for s in spans
+            if "qa_critic" in s.name.lower()
+            or (s.parent_name and "qa_critic" in s.parent_name.lower())
+        ]
+    if normalized in {"report", "report_node"}:
+        return [
+            s
+            for s in spans
+            if "report" in s.name.lower() or (s.parent_name and "report" in s.parent_name.lower())
+        ]
+    if normalized in {"supervisor", "tactical_supervisor"}:
+        return [
+            s
+            for s in spans
+            if s.name == "supervisor.tactical_reasoner"
+            or s.parent_name == "supervisor.tactical_reasoner"
+        ]
+    return [s for s in spans if normalized in s.name.lower()]
 
 
 # ---------------------------------------------------------------------------
@@ -274,11 +281,6 @@ class TrajectoryDocument:
 _FENCE_PATTERN = re.compile(
     r"^`{3,}(?:json|text)?\r?\n(.*?)\r?\n`{3,}$",
     re.MULTILINE | re.DOTALL,
-)
-
-_METADATA_ITEM_PATTERN = re.compile(
-    r"^-\s+(?P<key>[^:]+):\s+(?P<value>.*)$",
-    re.MULTILINE,
 )
 
 _SPAN_HEADER_PATTERN = re.compile(
@@ -781,22 +783,6 @@ def extract_tool_calls(
     return calls
 
 
-def extract_loop_rounds(spans: list[TrajectorySpan], parent_span_id: str) -> int | None:
-    """Count distinct worker model rounds; return None when tracing is unavailable.
-
-    Args:
-        spans: Recorded execution spans.
-        parent_span_id: Worker chain identifier.
-
-    Returns:
-        Count of distinct explicit ``react.llm`` spans, or None without evidence.
-    """
-    rounds = {
-        span.run_id for span in descendant_spans(spans, parent_span_id) if span.name == "react.llm"
-    }
-    return len(rounds) if rounds else None
-
-
 def _serialize_for_test_case(value: Any) -> str:
     """Format an input or output object into a string for LLMTestCase."""
     if value is None:
@@ -896,47 +882,7 @@ def spans_to_test_cases(
         if doc is not None:
             target_spans = doc.spans_for_agent(normalized)
         else:
-            if normalized in {"triage", "initial_triage"}:
-                target_spans = [
-                    s for s in spans if s.name in {"triage.llm", "initial_triage", "triage"}
-                ]
-            elif normalized in {"update", "update_subagent"}:
-                target_spans = [
-                    s
-                    for s in spans
-                    if "update_subagent" in s.name.lower()
-                    or (s.parent_name and "update_subagent" in s.parent_name.lower())
-                ]
-            elif normalized in {"workaround", "workaround_subagent"}:
-                target_spans = [
-                    s
-                    for s in spans
-                    if "workaround_subagent" in s.name.lower()
-                    or (s.parent_name and "workaround_subagent" in s.parent_name.lower())
-                ]
-            elif normalized in {"qa", "qa_critic"}:
-                target_spans = [
-                    s
-                    for s in spans
-                    if "qa_critic" in s.name.lower()
-                    or (s.parent_name and "qa_critic" in s.parent_name.lower())
-                ]
-            elif normalized in {"report", "report_node"}:
-                target_spans = [
-                    s
-                    for s in spans
-                    if "report" in s.name.lower()
-                    or (s.parent_name and "report" in s.parent_name.lower())
-                ]
-            elif normalized in {"supervisor", "tactical_supervisor"}:
-                target_spans = [
-                    s
-                    for s in spans
-                    if s.name == "supervisor.tactical_reasoner"
-                    or s.parent_name == "supervisor.tactical_reasoner"
-                ]
-            else:
-                target_spans = [s for s in spans if normalized in s.name.lower()]
+            target_spans = _select_agent_spans(spans, normalized, include_triage_tags=False)
 
     test_cases: list[LLMTestCase] = []
     for s in target_spans:
@@ -944,75 +890,3 @@ def spans_to_test_cases(
             test_cases.append(trajectory_to_test_case(s, doc=doc))
 
     return test_cases
-
-
-def extract_token_usage(span: TrajectorySpan) -> tuple[int | None, int | None]:
-    """Extract prompt and completion token counts from a TrajectorySpan.
-
-    Args:
-        span: The TrajectorySpan to inspect.
-
-    Returns:
-        A tuple of ``(prompt_tokens, completion_tokens)``.
-    """
-    if span.prompt_tokens is not None and span.completion_tokens is not None:
-        return span.prompt_tokens, span.completion_tokens
-
-    # Search in span.outputs
-    def _search_dict(obj: Any) -> tuple[int | None, int | None]:
-        if isinstance(obj, dict):
-            # 1. Direct token_usage dict
-            tu = obj.get("token_usage")
-            if isinstance(tu, dict):
-                p = tu.get("prompt_tokens")
-                c = tu.get("completion_tokens")
-                if p is not None or c is not None:
-                    return (int(p) if p is not None else None, int(c) if c is not None else None)
-
-            # 2. usage_metadata dict
-            um = obj.get("usage_metadata")
-            if isinstance(um, dict):
-                p = um.get("input_tokens")
-                c = um.get("output_tokens")
-                if p is not None or c is not None:
-                    return (int(p) if p is not None else None, int(c) if c is not None else None)
-
-            # 3. llm_output dict
-            llm_out = obj.get("llm_output")
-            if isinstance(llm_out, dict):
-                res = _search_dict(llm_out)
-                if res != (None, None):
-                    return res
-
-            # 4. generations list
-            gens = obj.get("generations")
-            if isinstance(gens, list):
-                res = _search_dict(gens)
-                if res != (None, None):
-                    return res
-
-            # Recursive search for any nested usage
-            for k, v in obj.items():
-                if k in ("messages", "kwargs", "response_metadata"):
-                    res = _search_dict(v)
-                    if res != (None, None):
-                        return res
-        elif isinstance(obj, list):
-            for item in obj:
-                res = _search_dict(item)
-                if res != (None, None):
-                    return res
-        return None, None
-
-    if span.outputs:
-        p, c = _search_dict(span.outputs)
-        if p is not None and c is not None:
-            return p, c
-
-    if span.metadata:
-        p, c = _search_dict(span.metadata)
-        if p is not None and c is not None:
-            return p, c
-
-    # A total alone cannot establish either independent budget.
-    return span.prompt_tokens, span.completion_tokens

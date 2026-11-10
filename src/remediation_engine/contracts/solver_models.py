@@ -11,7 +11,7 @@ import hashlib
 import re
 from collections.abc import Mapping
 from enum import StrEnum
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -136,8 +136,6 @@ def _normalise_pairs(value: Any, field_name: str) -> list[tuple[str, str]]:
 
 class _SolverModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-
-    _text_fields: ClassVar[tuple[str, ...]] = ()
 
 
 class SolverPackageOccurrence(_SolverModel):

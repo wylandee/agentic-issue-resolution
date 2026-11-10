@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from remediation_engine.contracts.schemas import VulnerabilityIssue
-from remediation_engine.orchestration.issue_identity import (
+from remediation_engine.tools.identity import (
     canonical_issue_components,
     finding_occurrence_key,
 )
@@ -140,15 +140,6 @@ def normalize_findings(
     ]
 
 
-def issue_to_finding_model(
-    issue: VulnerabilityIssue,
-    status: str = "flagged",
-    is_new: bool = False,
-) -> FindingModel:
-    """Convert one contracts issue to its canonical API finding representation."""
-    return normalize_findings([issue], status=status, is_new=is_new)[0]
-
-
 def find_odc_report(repo_root: Path) -> Path | None:
     """Locate an ODC JSON report or issues JSONL inside the repository, prioritizing reports with vulnerabilities."""
     patterns = [
@@ -268,10 +259,18 @@ def create_workspace_from_local_path(local_path_str: str) -> WorkspaceInfo:
             "Please ensure the folder contains an ODC report JSON or baseline issues JSONL."
         )
 
+    workspace_id = f"ws_{uuid.uuid4().hex[:10]}"
+    return _register_workspace(workspace_id, repo_path, odc_path)
+
+
+def _register_workspace(
+    workspace_id: str,
+    repo_path: Path,
+    odc_path: Path,
+) -> WorkspaceInfo:
+    """Parse and store one workspace after its report has been found."""
     issues = parse_findings_from_file(odc_path)
     findings = normalize_findings(issues, status="flagged")
-    workspace_id = f"ws_{uuid.uuid4().hex[:10]}"
-
     info = WorkspaceInfo(
         workspace_id=workspace_id,
         repo_name=repo_path.name,
@@ -308,27 +307,7 @@ def finalize_uploaded_workspace(workspace_id: str, repo_path: Path) -> Workspace
             f"No OWASP Dependency-Check report found in uploaded folder '{repo_path.name}'. "
             "Please ensure the attached folder contains an ODC report JSON file."
         )
-
-    issues = parse_findings_from_file(odc_path)
-    findings = normalize_findings(issues, status="flagged")
-
-    info = WorkspaceInfo(
-        workspace_id=workspace_id,
-        repo_name=repo_path.name,
-        repo_root=str(repo_path),
-        odc_report_path=str(odc_path.relative_to(repo_path)),
-        findings=findings,
-        total_findings=len(findings),
-        severity_counts=calculate_severity_counts(findings),
-    )
-
-    _WORKSPACES[workspace_id] = {
-        "info": info,
-        "repo_root": repo_path,
-        "odc_path": odc_path,
-        "issues": issues,
-    }
-    return info
+    return _register_workspace(workspace_id, repo_path, odc_path)
 
 
 def get_workspace_data(workspace_id: str) -> dict[str, Any] | None:

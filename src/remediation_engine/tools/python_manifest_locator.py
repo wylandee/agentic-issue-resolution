@@ -22,7 +22,7 @@ from remediation_engine.runtime.path_policy import (
     repository_relative_path,
     resolve_repository_path,
 )
-from remediation_engine.tools.package_identity import (
+from remediation_engine.tools.identity import (
     normalize_python_package_name,
     package_name_from_purl,
 )
@@ -113,17 +113,6 @@ def parse_requirements_txt(path: Path) -> list[RequirementEntry]:
         if stripped.endswith("\\"):
             skipping_continuation = True
     return entries
-
-
-def find_dependency_in_requirements(name: str, path: Path) -> RequirementEntry | None:
-    """Find one unambiguous PEP 503-equivalent requirement declaration."""
-    target = _normalized_name(name)
-    if not target:
-        return None
-    matches = [
-        entry for entry in parse_requirements_txt(path) if _normalized_name(entry.name) == target
-    ]
-    return matches[0] if len(matches) == 1 else None
 
 
 def update_requirements_dependency(path: Path, package_name: str, new_version: str) -> str:

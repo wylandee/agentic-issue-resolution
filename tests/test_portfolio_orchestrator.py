@@ -9,6 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from remediation_engine.agents.supervisor import (
+    _deterministic_routing,
+    _portfolio_plan_violations,
+    run_supervisor_node,
+)
+from remediation_engine.agents.supervisor_policy import _portfolio_cluster_targets
 from remediation_engine.cli import _solve_output
 from remediation_engine.contracts import (
     MAX_MULTI_PACKAGE_ACTION_SIZE,
@@ -31,13 +37,23 @@ from remediation_engine.contracts import (
     VulnerabilityIssue,
 )
 from remediation_engine.contracts.solver_models import (
-    PackageResolutionCertificate,
     PackageResolutionStatus,
-    SolverRuntimeFingerprint,
     SolverStatus,
     SolverTaskDecision,
 )
-from remediation_engine.orchestration.portfolio_orchestrator import (
+from remediation_engine.orchestration.state import (
+    build_initial_remediation_task,
+    initial_orchestrator_state,
+)
+from remediation_engine.planning.candidates import (
+    _build_targets_and_findings,
+    _candidate_domains,
+    _fetch_candidate_packuments,
+    _issue_identity,
+    _scope_coupling_enabled,
+)
+from remediation_engine.planning.control import _portfolio_certificate_violations
+from remediation_engine.planning.portfolio import (
     apply_portfolio_plan,
     build_portfolio_plan,
     isolate_delta_failure,
@@ -46,29 +62,16 @@ from remediation_engine.orchestration.portfolio_orchestrator import (
     rank_suspect_tasks_by_suspicion,
     score_suspect_package,
 )
-from remediation_engine.orchestration.portfolio_solver import (
-    _build_targets_and_findings,
-    _candidate_domains,
-    _fetch_candidate_packuments,
-    _issue_identity,
-    _scope_coupling_enabled,
-)
-from remediation_engine.orchestration.qa_test_parsing import parse_peer_conflict_evidence
-from remediation_engine.orchestration.state import initial_orchestrator_state
-from remediation_engine.orchestration.supervisor_node import (
-    _deterministic_routing,
-    _portfolio_plan_violations,
-    run_supervisor_node,
-)
-from remediation_engine.orchestration.supervisor_portfolio import _portfolio_certificate_violations
-from remediation_engine.orchestration.supervisor_routing import _portfolio_cluster_targets
-from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
-from remediation_engine.solver.graph import cluster_packages
-from remediation_engine.solver.subgraph import extract_solver_subgraph
-from remediation_engine.tools.npm_graph import load_npm_graph_snapshot, make_occurrence_id
-from remediation_engine.tools.registry_cache import RegistryPackumentCache
-from tests.fix_plan_fixtures import group_with_fix_plans
+from remediation_engine.solver.graph import cluster_packages, extract_solver_subgraph
+from remediation_engine.tools.npm import load_npm_graph_snapshot, make_occurrence_id
+from remediation_engine.tools.registry import RegistryPackumentCache
+from remediation_engine.tools.test_execution import parse_peer_conflict_evidence
+from tests.helpers import (
+    attach_test_resolution_certificate,
+    group_with_fix_plans,
+    selected_group_plan,
+)
 
 
 def _group(
@@ -124,52 +127,17 @@ def _tasks(*groups):
     }
 
 
-def _attach_test_resolution_certificate(plan):
-    """Attach matching offline evidence for Supervisor contract tests."""
-    solver_plan = plan.solver_plan.model_copy(update={"candidate_catalog_complete": True})
-    selected = solver_plan.selected_plan
-    assert selected is not None
-    assignment_digest = hashlib.sha256(
-        json.dumps(
-            dict(sorted(selected.selected_candidate_versions.items())),
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
-    covered = sorted(
-        coverage_id for batch in selected.batches for coverage_id in batch.resolved_coverage_ids
+def _test_packument_fetcher(package_name: str) -> dict[str, object]:
+    """Return deterministic registry metadata for portfolio authorization tests."""
+    versions = (
+        ("21.2.14", "21.2.15", "22.0.0")
+        if package_name.startswith("@angular/")
+        else ("1.0.0", "1.0.1", "2.0.0", "3.0.0")
     )
-    workaround = sorted(
-        coverage_id for batch in selected.batches for coverage_id in batch.workaround_coverage_ids
-    )
-    assert not any(batch.unresolved_coverage_ids for batch in selected.batches)
-    certificate = PackageResolutionCertificate(
-        status=PackageResolutionStatus.CERTIFIED,
-        portfolio_plan_id=plan.portfolio_plan_id,
-        candidate_plan_id=selected.candidate_plan_id,
-        solver_input_digest=plan.solver_input_digest,
-        repository_fingerprint=plan.repository_fingerprint,
-        task_revisions=plan.task_revisions,
-        workspace_graph_digest=plan.workspace_graph_digest,
-        candidate_catalog_digest=solver_plan.candidate_catalog_digest,
-        candidate_assignment_digest=assignment_digest,
-        resolved_graph_digest="test-resolved-graph-digest",
-        runtime_fingerprint=SolverRuntimeFingerprint(
-            node_version="v22.0.0",
-            npm_version="10.0.0",
-            platform="linux",
-            architecture="x64",
-        ),
-        covered_coverage_ids=covered,
-        workaround_coverage_ids=workaround,
-    )
-    return plan.model_copy(
-        update={
-            "solver_plan": solver_plan,
-            "resolution_certificate": certificate,
-        }
-    )
+    return {
+        "name": package_name,
+        "versions": {version: {"name": package_name, "version": version} for version in versions},
+    }
 
 
 def _apply_single_solver_decision(group, task, decision):
@@ -635,7 +603,23 @@ def test_missing_namespace_dependency_gets_a_coordination_task(tmp_path: Path):
             },
         },
     )
-    core = _group("@angular/core", "package.json")
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "juice-shop",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "juice-shop"},
+                "node_modules/@angular/core": {"version": "21.2.14"},
+                "node_modules/@angular/common": {"version": "21.2.14"},
+                "node_modules/@angular/platform-browser": {"version": "21.2.14"},
+            },
+        },
+    )
+    core = _group(
+        "@angular/core", "package.json", package_version="21.2.14", fixed_version="21.2.14"
+    )
     groups, queue, diagnostics = materialize_synthetic_dependency_tasks(
         tmp_path,
         [core],
@@ -649,12 +633,24 @@ def test_missing_namespace_dependency_gets_a_coordination_task(tmp_path: Path):
         "@angular/platform-browser",
     }
     assert all(not group.cve_ids and not group.ghsa_ids for group in synthetic)
-    assert all(group.fix_plan and group.fix_plan.fixed_version == "2.0.0" for group in synthetic)
+    assert {
+        group.vulnerable_component: selected_group_plan(group).fixed_version
+        for group in synthetic
+        if selected_group_plan(group) is not None
+    } == {
+        "@angular/common": "21.2.14",
+        "@angular/platform-browser": "21.2.14",
+    }
     synthetic_tasks = [task for task in queue.values() if task.is_synthetic]
     assert len(synthetic_tasks) == 2
-    assert all(task.selected_version == "2.0.0" for task in synthetic_tasks)
+    assert all(task.selected_version is None for task in synthetic_tasks)
 
-    plan = build_portfolio_plan(tmp_path, groups, queue)
+    plan = build_portfolio_plan(
+        tmp_path,
+        groups,
+        queue,
+        registry_fetcher=_test_packument_fetcher,
+    )
 
     assert len(plan.clusters) == 1
     assert set(plan.clusters[0].task_ids) == set(queue)
@@ -728,9 +724,8 @@ def test_unflagged_direct_dependency_gets_a_synthetic_task_without_a_seed(tmp_pa
     synthetic_task = next(task for task in queue.values() if task.is_synthetic)
     assert diagnostics == []
     assert synthetic.group_id == "sca:package.json:unflagged-package"
-    assert synthetic.fix_plan is not None
-    assert synthetic.fix_plan.fixed_version == "1.2.3"
-    assert synthetic_task.selected_version == "1.2.3"
+    assert selected_group_plan(synthetic).fixed_version == "1.2.3"
+    assert synthetic_task.selected_version is None
     assert synthetic_task.parent_group_id == synthetic.group_id
 
 
@@ -946,11 +941,11 @@ def test_scoped_angular_mutation_closure_stays_at_nine_packages(tmp_path: Path):
         WorkerAttemptResult,
         WorkerExecutionDiagnostics,
     )
-    from remediation_engine.orchestration.graph_wrappers import (
+    from remediation_engine.orchestration.execution import (
         run_qa_critic_from_orchestrator,
         run_update_subagent_from_orchestrator,
     )
-    from remediation_engine.orchestration.supervisor_planner import instruction_digest
+    from remediation_engine.orchestration.state import instruction_digest
 
     angular_packages = [
         "@angular/animations",
@@ -1210,7 +1205,7 @@ def test_scoped_angular_mutation_closure_stays_at_nine_packages(tmp_path: Path):
     from unittest.mock import patch
 
     with patch(
-        "remediation_engine.orchestration.graph.run_update_subagent_node",
+        "remediation_engine.agents.update.run_update_subagent_node",
         return_value={"worker_results_by_attempt": worker_results, "errors": []},
     ):
         worker_projection = run_update_subagent_from_orchestrator(state)
@@ -1224,7 +1219,7 @@ def test_scoped_angular_mutation_closure_stays_at_nine_packages(tmp_path: Path):
         for task in committed_queue.values()
     }
     with patch(
-        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        "remediation_engine.agents.qa.run_qa_critic_node",
         return_value={
             "qa_evaluations": pass_evaluations,
             "eval_status": "all_passed",
@@ -1364,9 +1359,8 @@ def test_runtime_related_synthetic_package_keeps_its_resolved_version(tmp_path: 
     app_b = next(group for group in groups if group.vulnerable_component == "app-b")
     assert diagnostics == []
     assert app_b.is_synthetic
-    assert app_b.fix_plan is not None
-    assert app_b.fix_plan.fixed_version == "1.0.0"
-    assert queue["task-2"].selected_version == "1.0.0"
+    assert selected_group_plan(app_b).fixed_version == "1.0.0"
+    assert queue["task-2"].selected_version is None
 
 
 def test_synthetic_dependency_materialization_is_idempotent(tmp_path: Path):
@@ -1375,7 +1369,22 @@ def test_synthetic_dependency_materialization_is_idempotent(tmp_path: Path):
         "package.json",
         {"dependencies": {"@angular/core": "^21.2.14", "@angular/common": "^21.2.14"}},
     )
-    core = _group("@angular/core", "package.json")
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/@angular/core": {"version": "21.2.14"},
+                "node_modules/@angular/common": {"version": "21.2.14"},
+            },
+        },
+    )
+    core = _group(
+        "@angular/core", "package.json", package_version="21.2.14", fixed_version="21.2.14"
+    )
     original_queue = _tasks(core)
     first_groups, first_queue, first_diagnostics = materialize_synthetic_dependency_tasks(
         tmp_path,
@@ -1402,6 +1411,19 @@ def test_synthetic_target_refresh_keeps_group_identity(tmp_path: Path):
         "package.json",
         {"dependencies": {"@angular/core": "^21.2.14", "@angular/common": "^21.2.14"}},
     )
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/@angular/core": {"version": "21.2.14"},
+                "node_modules/@angular/common": {"version": "21.2.14"},
+            },
+        },
+    )
     core = _group("@angular/core", "package.json")
     groups, queue, _diagnostics = materialize_synthetic_dependency_tasks(
         tmp_path,
@@ -1419,9 +1441,8 @@ def test_synthetic_target_refresh_keeps_group_identity(tmp_path: Path):
     synthetic_task = next(task for task in refreshed_queue.values() if task.is_synthetic)
     assert diagnostics == []
     assert synthetic_group.group_id == "sca:package.json:@angular/common"
-    assert synthetic_group.fix_plan is not None
-    assert synthetic_group.fix_plan.fixed_version == "3.0.0"
-    assert synthetic_task.selected_version == "3.0.0"
+    assert selected_group_plan(synthetic_group).fixed_version == "3.0.0"
+    assert synthetic_task.selected_version is None
     assert synthetic_task.task_revision == 1
 
 
@@ -1434,7 +1455,22 @@ def test_supervisor_leaves_synthetic_materialization_to_outer_portfolio(
         "package.json",
         {"dependencies": {"@angular/core": "^21.2.14", "@angular/common": "^21.2.14"}},
     )
-    core = _group("@angular/core", "package.json")
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/@angular/core": {"version": "21.2.14"},
+                "node_modules/@angular/common": {"version": "21.2.14"},
+            },
+        },
+    )
+    core = _group(
+        "@angular/core", "package.json", package_version="21.2.14", fixed_version="21.2.14"
+    )
     state = initial_orchestrator_state(str(tmp_path), [core])
 
     portfolio_tool_inputs = []
@@ -1454,7 +1490,7 @@ def test_supervisor_leaves_synthetic_materialization_to_outer_portfolio(
         }
 
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        "remediation_engine.agents.supervisor.run_portfolio_plan_tool",
         run_portfolio_tool,
     )
 
@@ -1518,27 +1554,9 @@ def test_unrelated_package_groups_remain_singletons(tmp_path: Path):
     }
 
 
-def test_delta_isolation_identifies_a_unique_failing_package():
-    result = isolate_delta_failure(
-        ["task-b", "task-a"],
-        lambda subset: "FAIL" if "task-a" in subset else "PASS",
-    )
-
-    assert result.status == "IDENTIFIED"
-    assert result.responsible_task_ids == ("task-a",)
-    assert result.executions == 3
-
-
-def test_delta_isolation_preserves_interaction_and_ambiguity():
-    interaction = isolate_delta_failure(
-        ["a", "b"], lambda subset: "FAIL" if len(subset) == 2 else "PASS"
-    )
-    ambiguous = isolate_delta_failure(["a", "b"], lambda _subset: "FAIL")
-
-    assert interaction.status == "INTERACTION_FAILURE"
-    assert ambiguous.status == "AMBIGUOUS"
-    assert interaction.executions <= 3
-    assert ambiguous.executions <= 3
+def test_delta_isolation_requires_bounded_options():
+    with pytest.raises(ValueError, match="ranked suspects or a canary budget"):
+        isolate_delta_failure(["task-a", "task-b"], lambda _subset: "FAIL")
 
 
 def test_bounded_delta_isolation_probes_only_the_ranked_budgeted_singletons():
@@ -1670,15 +1688,13 @@ def test_bounded_delta_isolation_rejects_above_contract_task_limit_without_probi
     assert probed == []
 
 
-def test_legacy_delta_isolation_keeps_ten_task_guard_without_new_options():
+def test_delta_isolation_requires_bounded_options_even_for_large_clusters():
     probed = []
-    result = isolate_delta_failure(
-        [f"task-{index:02}" for index in range(11)],
-        lambda subset: probed.append(subset) or "FAIL",
-    )
-
-    assert result.status == "INCONCLUSIVE"
-    assert result.executions == 0
+    with pytest.raises(ValueError, match="ranked suspects or a canary budget"):
+        isolate_delta_failure(
+            [f"task-{index:02}" for index in range(11)],
+            lambda subset: probed.append(subset) or "FAIL",
+        )
     assert probed == []
 
 
@@ -1798,87 +1814,157 @@ def test_portfolio_order_dispatches_prerequisite_before_atomic_cluster(tmp_path:
     assert set(atomic_decision.target_task_ids) == {"task-2", "task-3"}
 
 
-def test_supervisor_commits_shared_atomic_provenance_for_cluster(tmp_path: Path, monkeypatch):
-    _write_manifest(tmp_path, "package.json", {"name": "root"})
-    first_group = _group("@example/first", "package.json")
-    second_group = _group("@example/second", "package.json")
-    groups = [first_group, second_group]
+def test_supervisor_commits_shared_atomic_provenance_for_cluster(tmp_path: Path):
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "root",
+            "workspaces": ["packages/*"],
+            "dependencies": {"@angular/core": "1.0.0", "@angular/common": "1.0.0"},
+        },
+    )
+    _write_manifest(tmp_path, "packages/core/package.json", {"name": "@angular/core"})
+    _write_manifest(tmp_path, "packages/common/package.json", {"name": "@angular/common"})
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "root",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "root",
+                    "dependencies": {"@angular/core": "1.0.0", "@angular/common": "1.0.0"},
+                },
+                "node_modules/@angular/core": {"version": "1.0.0"},
+                "node_modules/@angular/common": {"version": "1.0.0"},
+            },
+        },
+    )
+    groups = [
+        _group("@angular/core", "package.json"),
+        _group("@angular/common", "package.json"),
+    ]
     queue = _tasks(*groups)
-    state = initial_orchestrator_state(str(tmp_path), groups)
+    prepared_groups, prepared_queue, prepare_diagnostics = prepare_portfolio_inputs(
+        tmp_path,
+        groups,
+        queue,
+    )
+    assert prepare_diagnostics == []
+    plan = build_portfolio_plan(
+        tmp_path,
+        prepared_groups,
+        prepared_queue,
+        registry_fetcher=_test_packument_fetcher,
+    )
+    plan = attach_test_resolution_certificate(plan)
+    committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
+        plan,
+        prepared_groups,
+        prepared_queue,
+    )
+    assert apply_diagnostics == []
+    assert _portfolio_plan_violations(plan, committed_queue, committed_groups) == []
+
+    state = initial_orchestrator_state(str(tmp_path), committed_groups)
     state.update(
         {
-            "task_queue": queue,
-            "active_target_task_ids": [],
-            "portfolio_plan": SimpleNamespace(portfolio_plan_id="test-plan"),
+            "task_queue": committed_queue,
+            "portfolio_plan": plan,
+            "portfolio_dirty": False,
             "status": "workspace_ready",
         }
-    )
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
-        lambda *args, **kwargs: [],
-    )
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
-        lambda *args, **kwargs: False,
-    )
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._deterministic_routing",
-        lambda *args, **kwargs: SupervisorDecision(
-            next_node="update_subagent",
-            target_task_ids=["task-1", "task-2"],
-            cluster_id="cluster-1",
-            instructions="dispatch cluster",
-            decision_reason="test atomic dispatch",
-        ),
     )
 
     result = run_supervisor_node(state)
 
     assert result["next_routing_step"] == "update_subagent"
-    assert result["active_cluster_id"] == "cluster-1"
+    assert result["active_cluster_id"] == plan.clusters[0].cluster_id
     assert result["active_multi_package_action"] is not None
-    assert set(result["active_target_task_ids"]) == {"task-1", "task-2"}
+    assert set(result["active_target_task_ids"]) == set(committed_queue)
     snapshots = [
         result["attempt_snapshots_by_id"][task.current_attempt_id]
         for task in result["task_queue"].values()
         if task.current_attempt_id
     ]
-    assert {snapshot.cluster_id for snapshot in snapshots} == {"cluster-1"}
+    assert {snapshot.cluster_id for snapshot in snapshots} == {plan.clusters[0].cluster_id}
     assert len({snapshot.dispatch_batch_id for snapshot in snapshots}) == 1
     assert len({snapshot.action_digest for snapshot in snapshots}) == 1
-    assert {snapshot.portfolio_plan_id for snapshot in snapshots} == {"test-plan"}
+    assert {snapshot.portfolio_plan_id for snapshot in snapshots} == {plan.portfolio_plan_id}
 
 
 def test_invalid_atomic_action_requests_portfolio_replan(tmp_path: Path, monkeypatch):
-    _write_manifest(tmp_path, "package.json", {"name": "root"})
-    first_group = _group("@example/first", "package.json")
-    second_group = _group("@example/second", "package.json")
-    groups = [first_group, second_group]
+    _write_manifest(
+        tmp_path,
+        "package.json",
+        {
+            "name": "root",
+            "workspaces": ["packages/*"],
+            "dependencies": {"@angular/core": "1.0.0", "@angular/common": "1.0.0"},
+        },
+    )
+    _write_manifest(tmp_path, "packages/core/package.json", {"name": "@angular/core"})
+    _write_manifest(tmp_path, "packages/common/package.json", {"name": "@angular/common"})
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "root",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "root",
+                    "dependencies": {"@angular/core": "1.0.0", "@angular/common": "1.0.0"},
+                },
+                "node_modules/@angular/core": {"version": "1.0.0"},
+                "node_modules/@angular/common": {"version": "1.0.0"},
+            },
+        },
+    )
+    groups = [
+        _group("@angular/core", "package.json"),
+        _group("@angular/common", "package.json"),
+    ]
     queue = _tasks(*groups)
-    queue["task-1"] = queue["task-1"].model_copy(update={"selected_version": None})
-    state = initial_orchestrator_state(str(tmp_path), groups)
+    prepared_groups, prepared_queue, prepare_diagnostics = prepare_portfolio_inputs(
+        tmp_path,
+        groups,
+        queue,
+    )
+    assert prepare_diagnostics == []
+    plan = build_portfolio_plan(
+        tmp_path,
+        prepared_groups,
+        prepared_queue,
+        registry_fetcher=_test_packument_fetcher,
+    )
+    plan = attach_test_resolution_certificate(plan)
+    committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
+        plan,
+        prepared_groups,
+        prepared_queue,
+    )
+    assert apply_diagnostics == []
+    committed_queue["task-1"] = committed_queue["task-1"].model_copy(
+        update={"selected_version": None}
+    )
+    state = initial_orchestrator_state(str(tmp_path), committed_groups)
     state.update(
         {
-            "task_queue": queue,
-            "active_target_task_ids": [],
-            "portfolio_plan": SimpleNamespace(portfolio_plan_id="test-plan"),
+            "task_queue": committed_queue,
+            "portfolio_plan": plan,
+            "portfolio_dirty": False,
             "status": "workspace_ready",
         }
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
-        lambda *args, **kwargs: [],
-    )
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
-        lambda *args, **kwargs: False,
-    )
-    monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._deterministic_routing",
+        "remediation_engine.agents.supervisor._deterministic_routing",
         lambda *args, **kwargs: SupervisorDecision(
             next_node="update_subagent",
             target_task_ids=["task-1", "task-2"],
-            cluster_id="cluster-1",
+            cluster_id=plan.clusters[0].cluster_id,
             instructions="dispatch cluster",
             decision_reason="test atomic dispatch",
         ),
@@ -1891,7 +1977,7 @@ def test_invalid_atomic_action_requests_portfolio_replan(tmp_path: Path, monkeyp
         return {"status": "portfolio_ready", "errors": []}
 
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        "remediation_engine.agents.supervisor.run_portfolio_plan_tool",
         run_portfolio_tool,
     )
 
@@ -1929,7 +2015,7 @@ def test_supervisor_preserves_all_cluster_targets_through_commit(tmp_path: Path)
     )
     assert prepare_diagnostics == []
     plan = build_portfolio_plan(tmp_path, prepared_groups, prepared_queue)
-    plan = _attach_test_resolution_certificate(plan)
+    plan = attach_test_resolution_certificate(plan)
     committed_groups, committed_queue, apply_diagnostics = apply_portfolio_plan(
         plan,
         prepared_groups,
@@ -1970,7 +2056,7 @@ def test_certified_plan_continues_after_breaking_change_workaround_pivot(
         TaskAttemptSnapshot,
         UpdateRetryDiagnostics,
     )
-    from remediation_engine.orchestration.supervisor_planner import instruction_digest
+    from remediation_engine.orchestration.state import instruction_digest
     from remediation_engine.settings import AppSettings
 
     groups = [
@@ -2134,6 +2220,8 @@ def test_certified_plan_continues_after_breaking_change_workaround_pivot(
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
         portfolio_plan_id=portfolio_plan_id,
+        allowed_target_versions=[attempted_version] if attempted_version is not None else [],
+        allowed_dependency_types=[],
     )
     evaluation = QAEvaluation(
         task_id="task-1",
@@ -2180,15 +2268,15 @@ def test_certified_plan_continues_after_breaking_change_workaround_pivot(
     )
 
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.get_runtime_settings",
+        "remediation_engine.agents.supervisor.get_runtime_settings",
         lambda: AppSettings(openai_api_key=None),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.registry_candidate_sets_for_context",
+        "remediation_engine.agents.supervisor.registry_candidate_sets_for_context",
         lambda _context: ((), None),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.propose_and_verify_tactical_action",
+        "remediation_engine.agents.supervisor.propose_and_verify_tactical_action",
         lambda *_args, **_kwargs: (None, None),
     )
 
@@ -2254,9 +2342,26 @@ def test_apply_rejects_a_mismatched_physical_lockfile_occurrence(tmp_path: Path)
         "package.json",
         {"dependencies": {"lodash": "1.0.0"}},
     )
+    _write_manifest(
+        tmp_path,
+        "package-lock.json",
+        {
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"dependencies": {"lodash": "1.0.0"}},
+                "node_modules/lodash": {"version": "1.0.0"},
+            },
+        },
+    )
     group = _group("lodash", "package.json")
     queue = _tasks(group)
-    plan = build_portfolio_plan(tmp_path, [group], queue)
+    plan = build_portfolio_plan(
+        tmp_path,
+        [group],
+        queue,
+        registry_fetcher=_test_packument_fetcher,
+    )
     selected = plan.solver_plan.selected_plan
     assert selected is not None
     decision = selected.task_decisions[0].model_copy(
@@ -2795,6 +2900,7 @@ def test_scoped_transitive_findings_become_override_solver_tasks(tmp_path: Path)
         prepared_groups,
         queue,
         target_packages=target_packages,
+        registry_fetcher=_test_packument_fetcher,
     )
     selected = plan.solver_plan.selected_plan
     assert selected is not None, (
@@ -2843,7 +2949,7 @@ def test_scoped_transitive_findings_become_override_solver_tasks(tmp_path: Path)
         queue,
     )
     assert apply_diagnostics == []
-    violations = _portfolio_plan_violations(plan, committed_queue, committed_groups)
+    violations = _portfolio_certificate_violations(plan, committed_queue)
     assert violations == ["portfolio plan is missing its package-resolution certificate"]
     assert len(committed_groups) == 5
     for package_name in {"base64url", "jws", "moment"}:

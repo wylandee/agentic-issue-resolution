@@ -37,7 +37,6 @@ export const ReportModal: React.FC<ReportModalProps> = ({ report, onClose }) => 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
       <div className="flex flex-col w-full max-w-4xl h-[85vh] bg-slate-900 border border-slate-800 rounded-xl shadow-2xl overflow-hidden">
-        {/* Modal Header */}
         <div className="flex items-center justify-between px-5 py-3.5 bg-slate-950 border-b border-slate-800">
           <div className="flex items-center gap-3">
             <div className="p-1.5 bg-blue-950 text-blue-400 border border-blue-700/50 rounded-lg">
@@ -54,7 +53,6 @@ export const ReportModal: React.FC<ReportModalProps> = ({ report, onClose }) => 
             </div>
           </div>
 
-          {/* Action buttons & tabs */}
           <div className="flex items-center gap-2">
             <div className="flex items-center p-1 bg-slate-900 border border-slate-800 rounded-lg text-xs">
               <button
@@ -119,7 +117,6 @@ export const ReportModal: React.FC<ReportModalProps> = ({ report, onClose }) => 
           </div>
         </div>
 
-        {/* Modal Body */}
         <div className="flex-1 overflow-y-auto p-6 bg-slate-900/60 terminal-scroll">
           {activeTab === "rendered" && (
             <div className="max-w-none text-slate-200">
@@ -203,26 +200,25 @@ export const ReportModal: React.FC<ReportModalProps> = ({ report, onClose }) => 
                       {children}
                     </blockquote>
                   ),
-                  code: ({ inline, children, ...props }: any) => {
-                    if (inline) {
-                      return (
-                        <code
-                          className="text-blue-300 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800/80 font-mono text-xs"
-                          {...props}
-                        >
-                          {children}
-                        </code>
-                      );
-                    }
+                  code: ({ className, children }) => {
+                    const isBlock = className?.startsWith("language-") ?? false;
                     return (
                       <code
-                        className="block p-3 bg-slate-950 border border-slate-800 rounded-lg font-mono text-xs text-slate-200 overflow-x-auto my-3"
-                        {...props}
+                        className={
+                          isBlock
+                            ? `${className} block p-3 font-mono text-xs text-slate-200`
+                            : "text-blue-300 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800/80 font-mono text-xs"
+                        }
                       >
                         {children}
                       </code>
                     );
                   },
+                  pre: ({ children }) => (
+                    <pre className="my-3 max-w-full overflow-x-auto rounded-lg border border-slate-800 bg-slate-950">
+                      {children}
+                    </pre>
+                  ),
                   hr: () => <hr className="my-8 border-slate-800" />,
                 }}
               >

@@ -3,13 +3,13 @@
     "case_id": "supervisor-direct-version-bump-clean",
     "eval_type": "supervisor",
     "golden_kind": "historical_direct_action",
-    "provenance": "historical_direct_action \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:45712-45720 records direct action evidence for the express-jwt version bump.",
-    "input": "Select a verified direct express-jwt upgrade that meets the committed fixed-version floor.",
+    "provenance": "historical_direct_action — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:45712-45720 records direct action evidence for the express-jwt version bump.",
+    "input": "Use the OSV advisory floor to prepare the express-jwt task, then select an authorized release.",
     "context": [
       "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
-      "Provenance label: historical_direct_action. historical_direct_action \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:45712-45720 records direct action evidence for the express-jwt version bump."
+      "Provenance label: historical_direct_action. historical_direct_action — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:45712-45720 records direct action evidence for the express-jwt version bump."
     ],
-    "expected_output": "Accept express-jwt@6.0.0: the selected version meets the committed 6.0.0 security floor and maps to NEW_VERSION_BUMP.",
+    "expected_output": "The production plan is version_found with fixed_version 6.0.0 from OSV. Refresh the task and accept express-jwt@6.0.0 because it meets the floor and maps to NEW_VERSION_BUMP.",
     "expected_tools": [
       {
         "name": "VersionBumpSupervisorAction",
@@ -21,8 +21,6 @@
         }
       }
     ],
-    "tool_correctness_applicable": true,
-    "expected_tool_correctness_pass": true,
     "expected_completion_pass": true,
     "replay": {
       "input": {
@@ -133,7 +131,12 @@
             "canonical_version": "6.0.0",
             "peer_compatible": true
           }
-        ]
+        ],
+        "planning": {
+          "osv_fixed_version": "6.0.0",
+          "search_results": [],
+          "page_contents": {}
+        }
       }
     },
     "offline_fixture": {
@@ -155,19 +158,23 @@
       "verification_accepted": true,
       "decision_code": "NEW_VERSION_BUMP",
       "spawn_request_count": 0
+    },
+    "planning_expectation": {
+      "status": "version_found",
+      "fixed_version": "6.0.0"
     }
   },
   {
     "case_id": "supervisor-transitive-package-override",
     "eval_type": "supervisor",
     "golden_kind": "historical_outcome_only",
-    "provenance": "historical_outcome_only \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:27040-27041 records package_override stage, version 2.0.1, worker success, and QA pass, but sampled spans do not show emitted action-tool arguments. The scripted proposal is a normalized offline input, not a claimed historical model call.",
-    "input": "Remediate transitive @tootallnate/once through sqlite3 using its authorized npm override.",
+    "provenance": "historical_outcome_only — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:27040-27041 records package_override stage, version 2.0.1, worker success, and QA pass, but sampled spans do not show emitted action-tool arguments. The scripted proposal is a normalized offline input, not a claimed historical model call.",
+    "input": "Plan the transitive @tootallnate/once fix from its package-specific advisory evidence, then apply the authorized npm override through sqlite3.",
     "context": [
       "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
-      "Provenance label: historical_outcome_only. historical_outcome_only \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:27040-27041 records package_override stage, version 2.0.1, worker success, and QA pass, but sampled spans do not show emitted action-tool arguments. The scripted proposal is a normalized offline input, not a claimed historical model call."
+      "Provenance label: historical_outcome_only. historical_outcome_only — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:27040-27041 records package_override stage, version 2.0.1, worker success, and QA pass, but sampled spans do not show emitted action-tool arguments. The scripted proposal is a normalized offline input, not a claimed historical model call."
     ],
-    "expected_output": "Accept PackageOverrideSupervisorAction for @tootallnate/once@2.0.1 and map it to NEW_VERSION_BUMP.",
+    "expected_output": "The production plan is version_found with fixed_version 2.0.1 from the advisory for @tootallnate/once. Refresh the task and accept @tootallnate/once@2.0.1 as NEW_VERSION_BUMP through sqlite3.",
     "expected_tools": [
       {
         "name": "PackageOverrideSupervisorAction",
@@ -179,8 +186,6 @@
         }
       }
     ],
-    "tool_correctness_applicable": true,
-    "expected_tool_correctness_pass": true,
     "expected_completion_pass": true,
     "replay": {
       "input": {
@@ -290,7 +295,26 @@
             "canonical_version": "2.0.1",
             "peer_compatible": true
           }
-        ]
+        ],
+        "planning": {
+          "osv_fixed_version": null,
+          "search_results": [
+            {
+              "url": "https://example.com/advisories/CVE-2026-0002",
+              "title": "CVE-2026-0002 advisory",
+              "snippet": "The @tootallnate/once package is fixed in version 2.0.1."
+            }
+          ],
+          "page_contents": {
+            "https://example.com/advisories/CVE-2026-0002": "Advisory for CVE-2026-0002: @tootallnate/once versions before 2.0.1 are affected. The package-specific remediation is version 2.0.1. The parent sqlite3 package can retain its current version when an npm override pins @tootallnate/once to 2.0.1."
+          },
+          "offline_extraction": {
+            "strategy": "VERSION_BUMP",
+            "fixed_version": "2.0.1",
+            "workaround_snippets": null,
+            "reasoning": "The advisory names the affected package and patched version."
+          }
+        }
       }
     },
     "offline_fixture": {
@@ -312,17 +336,21 @@
       "verification_accepted": true,
       "decision_code": "NEW_VERSION_BUMP",
       "spawn_request_count": 0
+    },
+    "planning_expectation": {
+      "status": "version_found",
+      "fixed_version": "2.0.1"
     }
   },
   {
     "case_id": "supervisor-workaround-pivot-breaking-change",
     "eval_type": "supervisor",
     "golden_kind": "normalized_safe_fixture",
-    "provenance": "normalized_safe_fixture \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55411-55425 contains a workaround proposal, not evidence of a successful accepted pivot. This is a safe normalized source-target policy fixture.",
+    "provenance": "normalized_safe_fixture — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55411-55425 contains a workaround proposal, not evidence of a successful accepted pivot. This is a safe normalized source-target policy fixture.",
     "input": "The express-jwt retry failed QA for BREAKING_CHANGE; propose a safe workaround using only authorized source evidence.",
     "context": [
       "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
-      "Provenance label: normalized_safe_fixture. normalized_safe_fixture \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55411-55425 contains a workaround proposal, not evidence of a successful accepted pivot. This is a safe normalized source-target policy fixture."
+      "Provenance label: normalized_safe_fixture. normalized_safe_fixture — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55411-55425 contains a workaround proposal, not evidence of a successful accepted pivot. This is a safe normalized source-target policy fixture."
     ],
     "expected_output": "Accept the evidence-backed code workaround and pivot to workaround_subagent with one spawn request.",
     "expected_tools": [
@@ -340,8 +368,6 @@
         }
       }
     ],
-    "tool_correctness_applicable": true,
-    "expected_tool_correctness_pass": true,
     "expected_completion_pass": true,
     "replay": {
       "input": {
@@ -497,11 +523,11 @@
     "case_id": "supervisor-portfolio-escalation-peer-conflict",
     "eval_type": "supervisor",
     "golden_kind": "synthetic_policy_case",
-    "provenance": "synthetic_policy_case \u2014 no observed portfolio action is claimed; the case tests deterministic peer-conflict referral policy.",
+    "provenance": "synthetic_policy_case — no observed portfolio action is claimed; the case tests deterministic peer-conflict referral policy.",
     "input": "No compatible verified express-jwt candidate satisfies the peer constraints; decide whether to refer the task.",
     "context": [
       "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
-      "Provenance label: synthetic_policy_case. synthetic_policy_case \u2014 no observed portfolio action is claimed; the case tests deterministic peer-conflict referral policy."
+      "Provenance label: synthetic_policy_case. synthetic_policy_case — no observed portfolio action is claimed; the case tests deterministic peer-conflict referral policy."
     ],
     "expected_output": "Accept PEER_CONFLICT_ESCALATION, mark the task unfixable for teardown referral, and spawn no child.",
     "expected_tools": [
@@ -514,8 +540,6 @@
         }
       }
     ],
-    "tool_correctness_applicable": true,
-    "expected_tool_correctness_pass": true,
     "expected_completion_pass": true,
     "replay": {
       "input": {
@@ -673,11 +697,11 @@
     "case_id": "supervisor-version-advance-after-test-fail",
     "eval_type": "supervisor",
     "golden_kind": "normalized_historical_analogue",
-    "provenance": "normalized_historical_analogue \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55413-55416 supplies the 6.0.0 failure/candidate context; this fixture explicitly normalizes the retry authorization to unattempted versions 6.1.2 and 8.5.1.",
+    "provenance": "normalized_historical_analogue — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55413-55416 supplies the 6.0.0 failure/candidate context; this fixture explicitly normalizes the retry authorization to unattempted versions 6.1.2 and 8.5.1.",
     "input": "The previous express-jwt@6.0.0 attempt failed tests; choose an unattempted registry-authorized candidate.",
     "context": [
       "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
-      "Provenance label: normalized_historical_analogue. normalized_historical_analogue \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55413-55416 supplies the 6.0.0 failure/candidate context; this fixture explicitly normalizes the retry authorization to unattempted versions 6.1.2 and 8.5.1."
+      "Provenance label: normalized_historical_analogue. normalized_historical_analogue — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55413-55416 supplies the 6.0.0 failure/candidate context; this fixture explicitly normalizes the retry authorization to unattempted versions 6.1.2 and 8.5.1."
     ],
     "expected_output": "Accept the unattempted 6.1.2 candidate as RETRY_VERSION_BUMP.",
     "expected_tools": [
@@ -691,8 +715,6 @@
         }
       }
     ],
-    "tool_correctness_applicable": true,
-    "expected_tool_correctness_pass": true,
     "expected_completion_pass": true,
     "replay": {
       "input": {
@@ -950,11 +972,11 @@
     "case_id": "supervisor-error-unverified-version",
     "eval_type": "supervisor",
     "golden_kind": "normalized_historical_rejection",
-    "provenance": "normalized_historical_rejection \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9661-9668 records a rejected version event, with proposals at :100255-100265 and :100644-100655. The replay input is normalized because the local trace candidate context is inconsistent.",
+    "provenance": "normalized_historical_rejection — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9661-9668 records a rejected version event, with proposals at :100255-100265 and :100644-100655. The replay input is normalized because the local trace candidate context is inconsistent.",
     "input": "Select a registry-verified secure version for got; the proposal must respect its committed floor.",
     "context": [
       "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
-      "Provenance label: normalized_historical_rejection. normalized_historical_rejection \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9661-9668 records a rejected version event, with proposals at :100255-100265 and :100644-100655. The replay input is normalized because the local trace candidate context is inconsistent."
+      "Provenance label: normalized_historical_rejection. normalized_historical_rejection — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9661-9668 records a rejected version event, with proposals at :100255-100265 and :100644-100655. The replay input is normalized because the local trace candidate context is inconsistent."
     ],
     "expected_output": "Accept VersionBumpSupervisorAction for got@11.8.6 and map it to NEW_VERSION_BUMP.",
     "expected_tools": [
@@ -968,8 +990,6 @@
         }
       }
     ],
-    "tool_correctness_applicable": true,
-    "expected_tool_correctness_pass": true,
     "expected_completion_pass": true,
     "replay": {
       "input": {
@@ -1116,11 +1136,11 @@
     "case_id": "supervisor-error-unsafe-workaround-path",
     "eval_type": "supervisor",
     "golden_kind": "policy_fixture",
-    "provenance": "policy_fixture \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9680-9688 records rejection for missing authoritative evidence. The exact package.json proposal is a manifest-guard policy fixture, not an observed argument.",
+    "provenance": "policy_fixture — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9680-9688 records rejection for missing authoritative evidence. The exact package.json proposal is a manifest-guard policy fixture, not an observed argument.",
     "input": "The express-jwt retry needs a safe workaround; QA authorizes lib/insecurity.ts and lists package.json as affected.",
     "context": [
       "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
-      "Provenance label: policy_fixture. policy_fixture \u2014 data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9680-9688 records rejection for missing authoritative evidence. The exact package.json proposal is a manifest-guard policy fixture, not an observed argument."
+      "Provenance label: policy_fixture. policy_fixture — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:9680-9688 records rejection for missing authoritative evidence. The exact package.json proposal is a manifest-guard policy fixture, not an observed argument."
     ],
     "expected_output": "Accept the evidence-backed CodeWorkaroundSupervisorAction for lib/insecurity.ts and pivot to workaround_subagent with one spawn request.",
     "expected_tools": [
@@ -1137,8 +1157,6 @@
         }
       }
     ],
-    "tool_correctness_applicable": true,
-    "expected_tool_correctness_pass": true,
     "expected_completion_pass": true,
     "replay": {
       "input": {
@@ -1304,11 +1322,11 @@
     "case_id": "supervisor-error-disallowed-strategy",
     "eval_type": "supervisor",
     "golden_kind": "synthetic_policy_case",
-    "provenance": "synthetic_policy_case \u2014 no historical override proposal is claimed; the case tests rejection of an override for a direct dependency.",
+    "provenance": "synthetic_policy_case — no historical override proposal is claimed; the case tests rejection of an override for a direct dependency.",
     "input": "Choose a remediation for direct express-jwt; no transitive parent permits an npm override.",
     "context": [
       "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
-      "Provenance label: synthetic_policy_case. synthetic_policy_case \u2014 no historical override proposal is claimed; the case tests rejection of an override for a direct dependency."
+      "Provenance label: synthetic_policy_case. synthetic_policy_case — no historical override proposal is claimed; the case tests rejection of an override for a direct dependency."
     ],
     "expected_output": "Accept VersionBumpSupervisorAction for direct express-jwt@6.0.0 and map it to NEW_VERSION_BUMP.",
     "expected_tools": [
@@ -1322,8 +1340,6 @@
         }
       }
     ],
-    "tool_correctness_applicable": true,
-    "expected_tool_correctness_pass": true,
     "expected_completion_pass": true,
     "replay": {
       "input": {
@@ -1469,11 +1485,11 @@
     "case_id": "supervisor-repair-loop-recovery",
     "eval_type": "supervisor",
     "golden_kind": "synthetic_policy_case",
-    "provenance": "synthetic_policy_case \u2014 a normalized current one-repair action trace tests rejection feedback and recovery; no model-authored worker instruction is inferred.",
+    "provenance": "synthetic_policy_case — a normalized current one-repair action trace tests rejection feedback and recovery; no model-authored worker instruction is inferred.",
     "input": "The prior express-jwt@6.0.0 attempt failed; select the lowest authorized unattempted version for this retry.",
     "context": [
       "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
-      "Provenance label: synthetic_policy_case. synthetic_policy_case \u2014 a normalized current one-repair action trace tests rejection feedback and recovery; no model-authored worker instruction is inferred."
+      "Provenance label: synthetic_policy_case. synthetic_policy_case — a normalized current one-repair action trace tests rejection feedback and recovery; no model-authored worker instruction is inferred."
     ],
     "expected_output": "Select express-jwt@6.1.2, the lowest verified unattempted version above the 6.0.0 floor, as RETRY_VERSION_BUMP.",
     "expected_tools": [
@@ -1487,8 +1503,6 @@
         }
       }
     ],
-    "tool_correctness_applicable": true,
-    "expected_tool_correctness_pass": true,
     "expected_completion_pass": true,
     "replay": {
       "input": {
@@ -1697,18 +1711,15 @@
     "case_id": "supervisor-inconclusive-qa-suppressed",
     "eval_type": "supervisor",
     "golden_kind": "synthetic_policy_case",
-    "provenance": "synthetic_policy_case \u2014 data/trajectories/phase5_20260917T155147Z_3d0f8a1b-5c0c-4581-9556-dd874ae60da3.md:21122-21133 records inconclusive QA attribution but no suppression event; the zero-call behavior is tested as policy.",
+    "provenance": "synthetic_policy_case — data/trajectories/phase5_20260917T155147Z_3d0f8a1b-5c0c-4581-9556-dd874ae60da3.md:21122-21133 records inconclusive QA attribution but no suppression event; the zero-call behavior is tested as policy.",
     "input": "QA test attribution is inconclusive for the express-jwt retry; preserve state and do not replan.",
     "context": [
       "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
-      "Provenance label: synthetic_policy_case. synthetic_policy_case \u2014 data/trajectories/phase5_20260917T155147Z_3d0f8a1b-5c0c-4581-9556-dd874ae60da3.md:21122-21133 records inconclusive QA attribution but no suppression event; the zero-call behavior is tested as policy."
+      "Provenance label: synthetic_policy_case. synthetic_policy_case — data/trajectories/phase5_20260917T155147Z_3d0f8a1b-5c0c-4581-9556-dd874ae60da3.md:21122-21133 records inconclusive QA attribution but no suppression event; the zero-call behavior is tested as policy."
     ],
     "expected_output": "QA test attribution is inconclusive, so the Supervisor returns NO_CALL with zero model and registry calls, preserves task/retry state, and stages no tactical transition.",
     "expected_tools": [],
-    "tool_correctness_applicable": false,
-    "expected_tool_correctness_pass": null,
-    "task_completion_applicable": false,
-    "expected_completion_pass": null,
+    "expected_completion_pass": true,
     "replay": {
       "input": {
         "task": {
@@ -1935,8 +1946,8 @@
       "is_reachable": null
     },
     "scenario": "Java Maven dependency org.postgresql:postgresql has a fixed-version floor of 42.7.11.",
-    "input": "Select an approved Maven version for org.postgresql:postgresql at or above security floor 42.7.11.",
-    "expected_output": "Choose the approved Maven release 42.7.11 for exact coordinate org.postgresql:postgresql; preserve the declaration type dependencies.",
+    "input": "Plan the exact Maven coordinate from the OSV security floor, then select an approved stable release.",
+    "expected_output": "The production plan is version_found with fixed_version 42.7.11. Refresh the exact Maven GAV task and select the approved stable 42.7.11 release for dependencies.",
     "expected_tools": [
       {
         "name": "VersionBumpSupervisorAction",
@@ -1948,10 +1959,7 @@
         }
       }
     ],
-    "expected_tool_correctness_pass": true,
-    "tool_correctness_applicable": true,
     "expected_completion_pass": true,
-    "task_completion_applicable": true,
     "context": [
       "Project language: java; package ecosystem: Maven; exact GAV: org.postgresql:postgresql.",
       "Committed security floor: 42.7.11. Dependency declaration: dependencies.",
@@ -2136,7 +2144,12 @@
               "42.7.11"
             ]
           }
-        ]
+        ],
+        "planning": {
+          "osv_fixed_version": "42.7.11",
+          "search_results": [],
+          "page_contents": {}
+        }
       }
     },
     "offline_fixture": {
@@ -2158,6 +2171,10 @@
       "verification_accepted": true,
       "decision_code": "NEW_VERSION_BUMP",
       "spawn_request_count": 0
+    },
+    "planning_expectation": {
+      "status": "version_found",
+      "fixed_version": "42.7.11"
     }
   },
   {
@@ -2186,7 +2203,8 @@
     },
     "scenario": "Java Maven dependency ch.qos.logback:logback-classic has a fixed-version floor of 1.2.13.",
     "input": "Select an approved Maven version for ch.qos.logback:logback-classic at or above security floor 1.2.13.",
-    "expected_output": "Choose the approved Maven release 1.2.13 for exact coordinate ch.qos.logback:logback-classic; preserve the declaration type dependencyManagement.",
+    "completion_task": "Complete the Supervisor version-selection decision. This replay stops at the Supervisor proposal; worker edits, declaration preservation, and QA validation are outside its outcome.",
+    "expected_output": "Choose approved Maven release 1.2.13 for exact coordinate ch.qos.logback:logback-classic.",
     "expected_tools": [
       {
         "name": "VersionBumpSupervisorAction",
@@ -2198,10 +2216,7 @@
         }
       }
     ],
-    "expected_tool_correctness_pass": true,
-    "tool_correctness_applicable": true,
     "expected_completion_pass": true,
-    "task_completion_applicable": true,
     "context": [
       "Project language: java; package ecosystem: Maven; exact GAV: ch.qos.logback:logback-classic.",
       "Committed security floor: 1.2.13. Dependency declaration: dependencyManagement.",
@@ -2436,7 +2451,8 @@
     },
     "scenario": "Java Maven dependency org.example:qualified-version has a fixed-version floor of 1.9.",
     "input": "Select an approved Maven version for org.example:qualified-version at or above security floor 1.9.",
-    "expected_output": "Choose the approved Maven release 1.10.Final for exact coordinate org.example:qualified-version; preserve the declaration type dependencies.",
+    "completion_task": "Complete the Supervisor version-selection decision. This replay stops at the Supervisor proposal; worker edits, declaration preservation, and QA validation are outside its outcome.",
+    "expected_output": "Choose approved Maven release 1.10.Final for exact coordinate org.example:qualified-version.",
     "expected_tools": [
       {
         "name": "VersionBumpSupervisorAction",
@@ -2448,10 +2464,7 @@
         }
       }
     ],
-    "expected_tool_correctness_pass": true,
-    "tool_correctness_applicable": true,
     "expected_completion_pass": true,
-    "task_completion_applicable": true,
     "context": [
       "Project language: java; package ecosystem: Maven; exact GAV: org.example:qualified-version.",
       "Committed security floor: 1.9. Dependency declaration: dependencies.",
@@ -2702,10 +2715,7 @@
         }
       }
     ],
-    "expected_tool_correctness_pass": true,
-    "tool_correctness_applicable": true,
     "expected_completion_pass": true,
-    "task_completion_applicable": true,
     "context": [
       "Project language: java; package ecosystem: Maven; exact GAV: org.postgresql:postgresql.",
       "Committed security floor: 42.7.11. Dependency declaration: dependencies.",
@@ -2928,17 +2938,15 @@
     "eval_type": "supervisor",
     "golden_kind": "historical_analogue",
     "provenance": "PyGoat certifi task selected 2024.7.4 and was QA-passed.",
-    "input": "Verify that Python tasks stay on deterministic Supervisor planning without invoking tactical models or registries.",
+    "input": "Plan certifi from the OSV advisory and preserve deterministic Python Supervisor policy.",
     "context": [
       "PyPI package: certifi",
       "Manifest: requirements.txt",
       "Committed fixed version: 2024.7.4"
     ],
-    "expected_output": "NO_CALL: Python tactical reasoning is disabled; preserve task state and deterministic planning.",
+    "expected_output": "The production plan is version_found with fixed_version 2024.7.4. Refresh the Python task and preserve the policy that disables tactical Supervisor model and registry calls.",
     "expected_tools": [],
-    "tool_correctness_applicable": false,
-    "expected_tool_correctness_pass": null,
-    "expected_completion_pass": null,
+    "expected_completion_pass": true,
     "replay": {
       "input": {
         "task": {
@@ -3046,7 +3054,12 @@
             "peer_compatible": true
           }
         ],
-        "project_language": "python"
+        "project_language": "python",
+        "planning": {
+          "osv_fixed_version": "2024.7.4",
+          "search_results": [],
+          "page_contents": {}
+        }
       }
     },
     "offline_fixture": {
@@ -3066,25 +3079,26 @@
       }
     ],
     "evaluation_note": "Python tactical reasoning is disabled in production; deterministic Supervisor planning remains authoritative. This case asserts suppression, not a historical tactical proposal.",
-    "task_completion_applicable": false
+    "planning_expectation": {
+      "status": "version_found",
+      "fixed_version": "2024.7.4"
+    }
   },
   {
     "case_id": "python-supervisor-pyjwt-workaround-pivot",
     "eval_type": "supervisor",
     "golden_kind": "historical_scenario_projection",
     "provenance": "PyGoat recorded a deterministic pivot to a Python workaround child after the PyJWT update path was exhausted; this tactical proposal is a policy-suite projection of that transition.",
-    "input": "Verify that Python tasks stay on deterministic Supervisor planning without invoking tactical models or registries.",
+    "input": "Plan the PyJWT mitigation from its advisory page and preserve deterministic Python Supervisor policy.",
     "context": [
       "PyPI package: pyjwt",
       "Manifest: requirements.txt",
       "Python source hint: introduction/views.py",
       "The historical workaround did not validate; the case tests only Supervisor authorization."
     ],
-    "expected_output": "NO_CALL: Python tactical reasoning is disabled; preserve task state and deterministic planning.",
+    "expected_output": "The production plan is workaround_found with a source-backed JOSE critical-header mitigation. Refresh the task and preserve Python policy: no tactical Supervisor model or registry calls.",
     "expected_tools": [],
-    "tool_correctness_applicable": false,
-    "expected_tool_correctness_pass": null,
-    "expected_completion_pass": null,
+    "expected_completion_pass": true,
     "replay": {
       "input": {
         "task": {
@@ -3206,7 +3220,28 @@
           "evidence_inconclusive": false,
           "scan_evidence": null
         },
-        "project_language": "python"
+        "project_language": "python",
+        "planning": {
+          "osv_fixed_version": null,
+          "search_results": [
+            {
+              "url": "https://example.com/advisories/GHSA-752W-5FWX-JX9F",
+              "title": "PyJWT JOSE critical header mitigation",
+              "snippet": "Reject unsupported JOSE critical headers before token verification."
+            }
+          ],
+          "page_contents": {
+            "https://example.com/advisories/GHSA-752W-5FWX-JX9F": "For PyJWT applications affected by GHSA-752W-5FWX-JX9F, reject tokens with unsupported critical JOSE header parameters before verification. Keep normal signature, issuer, and audience checks enabled. This is a source mitigation; the advisory does not identify a fixed version in this page."
+          },
+          "offline_extraction": {
+            "strategy": "CODE_WORKAROUND",
+            "fixed_version": null,
+            "workaround_snippets": [
+              "Reject unsupported JOSE critical header parameters before verification while preserving signature, issuer, and audience checks."
+            ],
+            "reasoning": "The advisory gives a code mitigation and does not provide a version."
+          }
+        }
       }
     },
     "offline_fixture": {
@@ -3226,7 +3261,10 @@
       }
     ],
     "evaluation_note": "Python tactical reasoning is disabled in production; deterministic Supervisor planning remains authoritative. This case asserts suppression, not a historical tactical proposal.",
-    "task_completion_applicable": false
+    "planning_expectation": {
+      "status": "workaround_found",
+      "fixed_version": null
+    }
   },
   {
     "case_id": "python-supervisor-inconclusive-qa-suppressed",
@@ -3241,10 +3279,7 @@
     ],
     "expected_output": "Suppress the tactical model and preserve the current Python task state while QA remains inconclusive.",
     "expected_tools": [],
-    "tool_correctness_applicable": false,
-    "expected_tool_correctness_pass": null,
-    "task_completion_applicable": false,
-    "expected_completion_pass": null,
+    "expected_completion_pass": true,
     "replay": {
       "input": {
         "task": {
@@ -3445,6 +3480,542 @@
       "verification_accepted": null,
       "decision_code": null,
       "spawn_request_count": 0
+    }
+  },
+  {
+    "case_id": "supervisor-plan-npm-workaround",
+    "eval_type": "supervisor",
+    "golden_kind": "normalized_safe_fixture",
+    "provenance": "normalized_safe_fixture — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55411-55425 contains a workaround proposal, not evidence of a successful accepted pivot. This is a safe normalized source-target policy fixture.",
+    "input": "Plan an express-jwt source workaround from the advisory page, then apply the QA-authorized source-only pivot.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: normalized_safe_fixture. normalized_safe_fixture — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:55411-55425 contains a workaround proposal, not evidence of a successful accepted pivot. This is a safe normalized source-target policy fixture."
+    ],
+    "expected_output": "The production plan is workaround_found with a source-backed mitigation. Refresh the task, accept CodeWorkaroundSupervisorAction, preserve both authorized source paths, and route to workaround_subagent.",
+    "expected_tools": [
+      {
+        "name": "CodeWorkaroundSupervisorAction",
+        "args": {
+          "selected_strategy": "code_workaround",
+          "diagnostic_basis": "QA classifies the failed update as a breaking change and authorizes both source files.",
+          "rationale": "Use a source-only compatibility pivot instead of repeating the broken dependency update.",
+          "workaround_hypothesis": "Adapt the JWT middleware to the verified express-jwt API while preserving the existing authorization checks.",
+          "target_files_hint": [
+            "lib/insecurity.ts",
+            "server.ts"
+          ]
+        }
+      }
+    ],
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-plan-npm-workaround",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-plan-npm-workaround",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "needs_retry",
+          "retry_count": 1,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-plan-npm-workaround",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0003"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "1ac3144d-a32d-5992-ba74-82ce0f7486c4",
+          "issues": [
+            {
+              "id": "1ac3144d-a32d-5992-ba74-82ce0f7486c4",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0003",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [],
+        "evaluation": {
+          "task_id": "task-supervisor-plan-npm-workaround",
+          "passed": false,
+          "failure_category": "breaking_change",
+          "retry_feedback": "The express-jwt update caused a breaking API change; use the authorized source evidence.",
+          "failure_evidence": {
+            "exact_diagnostics": [],
+            "failed_tests": [
+              "authorization middleware regression"
+            ],
+            "source_locations": [
+              "lib/insecurity.ts",
+              "server.ts"
+            ],
+            "affected_files": [],
+            "raw_excerpt": "",
+            "attempt_id": "",
+            "task_revision": 0
+          },
+          "deterministic_gates": null,
+          "semantic_security_review": null,
+          "test_attribution": null,
+          "contract_error": false,
+          "contract_error_reason": "",
+          "evidence_inconclusive": false,
+          "scan_evidence": null
+        },
+        "planning": {
+          "osv_fixed_version": null,
+          "search_results": [
+            {
+              "url": "https://example.com/advisories/CVE-2026-0001-workaround",
+              "title": "express-jwt compatibility mitigation",
+              "snippet": "Reject unsupported critical JOSE headers before authorization checks."
+            }
+          ],
+          "page_contents": {
+            "https://example.com/advisories/CVE-2026-0001-workaround": "For affected express-jwt integrations, reject tokens containing unsupported JOSE critical header parameters before middleware authorization. Preserve the current signature and authorization checks. This code mitigation is independent of package version selection."
+          },
+          "offline_extraction": {
+            "strategy": "CODE_WORKAROUND",
+            "fixed_version": null,
+            "workaround_snippets": [
+              "Reject unsupported JOSE critical headers before middleware authorization while retaining signature checks."
+            ],
+            "reasoning": "The advisory describes a source-level mitigation."
+          }
+        }
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 1 model proposal(s); production replay expectation: Accept the evidence-backed code workaround and pivot to workaround_subagent with one spawn request.",
+      "actual_tools": [
+        {
+          "name": "CodeWorkaroundSupervisorAction",
+          "args": {
+            "selected_strategy": "code_workaround",
+            "diagnostic_basis": "QA classifies the failed update as a breaking change and authorizes both source files.",
+            "rationale": "Use a source-only compatibility pivot instead of repeating the broken dependency update.",
+            "workaround_hypothesis": "Adapt the JWT middleware to the verified express-jwt API while preserving the existing authorization checks.",
+            "target_files_hint": [
+              "lib/insecurity.ts",
+              "server.ts"
+            ]
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "WORKAROUND_DISPATCH",
+      "spawn_request_count": 0
+    },
+    "planning_expectation": {
+      "status": "workaround_found",
+      "fixed_version": null
+    }
+  },
+  {
+    "case_id": "supervisor-plan-npm-no-fix",
+    "eval_type": "supervisor",
+    "golden_kind": "synthetic_policy_case",
+    "provenance": "synthetic_policy_case — no observed portfolio action is claimed; the case tests deterministic peer-conflict referral policy.",
+    "input": "Plan the advisory disposition from source evidence and keep the npm task in its deterministic no-fix mitigation stage without an unsupported tactical proposal.",
+    "context": [
+      "The advisory page provides no supported fixed release or code mitigation.",
+      "The no-fix plan initializes package-removal mitigation. Current QA evidence does not authorize tactical model or registry calls."
+    ],
+    "expected_output": "The production plan is no_fix after advisory extraction. Refresh the task into the package-removal mitigation stage and emit no tactical proposal while evidence is inconclusive; make no model or registry calls.",
+    "expected_tools": [],
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-plan-npm-no-fix",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-plan-npm-no-fix",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-plan-npm-no-fix",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0004"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "0b651dc5-cce5-5964-9bc3-baf0f6e5b83e",
+          "issues": [
+            {
+              "id": "0b651dc5-cce5-5964-9bc3-baf0f6e5b83e",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0004",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "6.0.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [],
+        "evaluation": {
+          "task_id": "task-supervisor-plan-npm-no-fix",
+          "passed": false,
+          "failure_category": "peer_conflict",
+          "retry_feedback": "The only direct candidate conflicts with the dependency peer requirements.",
+          "failure_evidence": {
+            "exact_diagnostics": [
+              "No compatible registry-verified candidate satisfies the peer constraints."
+            ],
+            "failed_tests": [],
+            "source_locations": [],
+            "affected_files": [],
+            "raw_excerpt": "",
+            "attempt_id": "",
+            "task_revision": 0
+          },
+          "deterministic_gates": null,
+          "semantic_security_review": null,
+          "test_attribution": null,
+          "contract_error": false,
+          "contract_error_reason": "",
+          "evidence_inconclusive": false,
+          "scan_evidence": null
+        },
+        "planning": {
+          "osv_fixed_version": null,
+          "search_results": [
+            {
+              "url": "https://example.com/advisories/CVE-2026-0001-status",
+              "title": "express-jwt advisory status",
+              "snippet": "The advisory currently has no supported fixed release or source workaround."
+            }
+          ],
+          "page_contents": {
+            "https://example.com/advisories/CVE-2026-0001-status": "The maintainers confirm that this advisory has no supported fixed release and no practical source workaround. No version or code change is recommended by this notice."
+          },
+          "offline_extraction": {
+            "strategy": "NO_FIX",
+            "fixed_version": null,
+            "workaround_snippets": null,
+            "reasoning": "The advisory identifies no fixed version or actionable mitigation."
+          }
+        }
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 1 model proposal(s); production replay expectation: Accept PEER_CONFLICT_ESCALATION, mark the task unfixable for teardown referral, and spawn no child.",
+      "actual_tools": []
+    },
+    "expected_replay": {
+      "model_invocations": 0,
+      "verification_accepted": null,
+      "decision_code": null,
+      "spawn_request_count": 0
+    },
+    "planning_expectation": {
+      "status": "no_fix",
+      "fixed_version": null
+    }
+  },
+  {
+    "case_id": "supervisor-plan-npm-prerelease",
+    "eval_type": "supervisor",
+    "golden_kind": "historical_direct_action",
+    "provenance": "historical_direct_action — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:45712-45720 records direct action evidence for the express-jwt version bump.",
+    "input": "Plan the advisory floor and reject prerelease candidates when selecting the authorized express-jwt release.",
+    "context": [
+      "Tactical decisions are Supervisor-owned; workers receive only Python-rendered authorized instructions.",
+      "Provenance label: historical_direct_action. historical_direct_action — data/trajectories/phase5_20260921T084506Z_e0ee8826-3ea0-475d-a336-f64dd802a140.md:45712-45720 records direct action evidence for the express-jwt version bump."
+    ],
+    "expected_output": "The production plan is version_found with fixed_version 1.2.0. The prerelease 1.2.0-rc.1 is below the stable floor; accept the stable authorized 1.2.0 candidate and map it to NEW_VERSION_BUMP.",
+    "expected_tools": [
+      {
+        "name": "VersionBumpSupervisorAction",
+        "args": {
+          "selected_strategy": "version_bump",
+          "diagnostic_basis": "The registry-verified 6.0.0 candidate meets the committed security floor.",
+          "rationale": "Choose the lowest verified release that fixes the finding.",
+          "target_version": "1.2.0"
+        }
+      }
+    ],
+    "expected_completion_pass": true,
+    "replay": {
+      "input": {
+        "task": {
+          "task_id": "task-supervisor-plan-npm-prerelease",
+          "task_revision": 0,
+          "current_attempt_id": null,
+          "parent_group_id": "supervisor:supervisor-plan-npm-prerelease",
+          "parent_task_id": null,
+          "qa_policy": null,
+          "strategy": "version_bump",
+          "strategy_stage": "osv_minimum",
+          "target_package_name": "express-jwt",
+          "target_dependency_type": "dependencies",
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_minimum_version": null,
+          "no_fix_stage": null,
+          "selected_version": null,
+          "exhausted_update_path": false,
+          "instruction": "",
+          "status": "pending",
+          "retry_count": 0,
+          "ancestry_depth": 0
+        },
+        "group": {
+          "group_id": "supervisor:supervisor-plan-npm-prerelease",
+          "issue_type": "sca",
+          "vulnerable_component": "express-jwt",
+          "file_path": "package.json",
+          "file_paths": [
+            "package.json"
+          ],
+          "cve_ids": [
+            "CVE-2026-0001"
+          ],
+          "ghsa_ids": [],
+          "versions": [
+            "5.3.1"
+          ],
+          "dependency_ancestry": [
+            "express-jwt"
+          ],
+          "dependency_versions": {
+            "express-jwt": "5.3.1"
+          },
+          "parent_package_name": null,
+          "parent_package_version": null,
+          "parent_declaration_type": null,
+          "parent_contexts": [],
+          "sources": [
+            "odc"
+          ],
+          "representative_issue_id": "6fdee8fe-d6a0-53b6-a96b-41fe54343c76",
+          "issues": [
+            {
+              "id": "6fdee8fe-d6a0-53b6-a96b-41fe54343c76",
+              "finding_id": null,
+              "source": "odc",
+              "issue_type": "sca",
+              "repo_url": null,
+              "base_ref": null,
+              "rule_id": null,
+              "cve_id": "CVE-2026-0001",
+              "ghsa_id": null,
+              "cwe": [],
+              "owasp": [],
+              "severity": "HIGH",
+              "confidence": null,
+              "file_path": "package.json",
+              "line_range": null,
+              "package_name": "express-jwt",
+              "package_version": "5.3.1",
+              "fixed_version": "1.2.0",
+              "purl": null,
+              "ecosystem": "npm",
+              "message": "express-jwt has a security finding with fixed-version floor 6.0.0.",
+              "finding_url": null,
+              "dataflow_trace": null,
+              "validation_profile": null,
+              "raw_payload": null,
+              "ingested_at": "2026-09-21T12:00:00+00:00"
+            }
+          ],
+          "localized_issues": [],
+          "fix_plan": {
+            "status": "version_found",
+            "fixed_version": "6.0.0",
+            "workaround_snippets": null,
+            "instruction": "Upgrade express-jwt to the committed security floor 6.0.0.",
+            "strategy_used": "osv_minimum"
+          },
+          "enrichment": null,
+          "is_reachable": null,
+          "grouped_at": "2026-09-21T12:00:00Z"
+        },
+        "candidate_sets": [
+          {
+            "strategy": "version_bump",
+            "target_package_name": "express-jwt",
+            "dependency_type": "dependencies",
+            "security_floor": "1.2.0",
+            "versions": [
+              "1.2.0-rc.1",
+              "1.2.0",
+              "1.2.1"
+            ],
+            "canonical_version": "1.2.0",
+            "peer_compatible": true
+          }
+        ],
+        "planning": {
+          "osv_fixed_version": "1.2.0",
+          "search_results": [],
+          "page_contents": {}
+        }
+      }
+    },
+    "offline_fixture": {
+      "actual_output": "Scripted proposal trace contains 1 model proposal(s); production replay expectation: Accept VersionBumpSupervisorAction for express-jwt@6.0.0 and map it to NEW_VERSION_BUMP.",
+      "actual_tools": [
+        {
+          "name": "VersionBumpSupervisorAction",
+          "args": {
+            "selected_strategy": "version_bump",
+            "diagnostic_basis": "The registry-verified 6.0.0 candidate meets the committed security floor.",
+            "rationale": "Choose the lowest verified release that fixes the finding.",
+            "target_version": "1.2.0"
+          }
+        }
+      ]
+    },
+    "expected_replay": {
+      "model_invocations": 1,
+      "verification_accepted": true,
+      "decision_code": "NEW_VERSION_BUMP",
+      "spawn_request_count": 0
+    },
+    "planning_expectation": {
+      "status": "version_found",
+      "fixed_version": "1.2.0"
     }
   }
 ]

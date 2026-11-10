@@ -25,6 +25,7 @@ from remediation_engine.contracts.schemas import (
     MultiPackageAction,
     NoFixMitigationStage,
     ODCScanEvidence,
+    PackageFixPlanCandidate,
     PackageMutation,
     QADependencyEvidence,
     QAEvaluation,
@@ -48,9 +49,10 @@ from remediation_engine.language import ProjectLanguage
 from remediation_engine.orchestration.state import (
     initial_update_subagent_state,
     initial_workaround_subagent_state,
+    instruction_digest,
+    select_package_fix_plan,
 )
-from remediation_engine.orchestration.supervisor_policy import instruction_digest
-from remediation_engine.orchestration.trajectory_exporter import (
+from remediation_engine.runtime.telemetry import (
     TrajectoryRecorder,
     use_trajectory_recorder,
 )
@@ -64,6 +66,7 @@ from tests.evals.replay_harness import (
     build_vulnerability_group,
     make_temp_repo,
     output_with_trace,
+    patch_runtime_loop,
     seed_replay_files,
     serialize_result,
     serialize_tool_events,
@@ -77,11 +80,6 @@ def _replay_input(case: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(replay, Mapping) and isinstance(replay.get("input"), Mapping):
         return dict(replay["input"])
     return {}
-
-
-def _project_language(case: Mapping[str, Any]) -> ProjectLanguage:
-    """Resolve a replay language while preserving the historical Node default."""
-    return _case_project_language(case)
 
 
 def _recorder_token_fields(recorder: TrajectoryRecorder) -> dict[str, Any]:
@@ -148,7 +146,7 @@ def _group_for_case(case: Mapping[str, Any], *, component: str) -> Vulnerability
         or case.get("target_package_name")
         or "replay-package"
     )
-    language = _project_language(case)
+    language = _case_project_language(case)
     default_manifest = {
         ProjectLanguage.NODEJS: "package.json",
         ProjectLanguage.JAVA: "pom.xml",
@@ -211,31 +209,40 @@ def _group_for_case(case: Mapping[str, Any], *, component: str) -> Vulnerability
         )
 
     if str(case.get("qa_policy", "")).startswith("no_fix"):
+        plan = FixPlan(
+            status=FixPlanStatus.NO_FIX,
+            instruction="No upstream patch or workaround was found.",
+            strategy_used="NO_FIX",
+        )
         group = group.model_copy(
             update={
-                "fix_plan": FixPlan(
-                    status=FixPlanStatus.NO_FIX,
-                    instruction="No upstream patch or workaround was found.",
-                    strategy_used="NO_FIX",
-                )
+                "fix_plan_candidates": [
+                    PackageFixPlanCandidate(
+                        issue_id=group.representative_issue_id,
+                        plan=plan,
+                    )
+                ]
             }
         )
     return group
 
 
-def _policy_for_case(case: Mapping[str, Any], component: str) -> QAPolicy | None:
-    """Convert a golden policy into its typed contract."""
+def _policy_for_case(case: Mapping[str, Any], component: str) -> QAPolicy:
+    """Resolve a replay fixture's historical policy into the current contract."""
     raw = case.get("qa_policy")
     if raw:
         try:
             return raw if isinstance(raw, QAPolicy) else QAPolicy(str(raw))
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise ValueError(f"Unknown replay QA policy: {raw!r}") from exc
+    no_fix_stage = _no_fix_stage_for_case(case)
+    if no_fix_stage == NoFixMitigationStage.PACKAGE_REMOVAL:
+        return QAPolicy.NO_FIX_PACKAGE_REMOVAL
+    if no_fix_stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL:
+        return QAPolicy.NO_FIX_CODE_REMOVAL
     if component == "update":
         return QAPolicy.VERSION_BUMP
-    if component == "workaround":
-        return QAPolicy.INITIAL_CODE_WORKAROUND
-    return None
+    return QAPolicy.INITIAL_CODE_WORKAROUND
 
 
 def _strategy_for_case(case: Mapping[str, Any], component: str) -> RoutingStrategy:
@@ -259,6 +266,36 @@ def _no_fix_stage_for_case(case: Mapping[str, Any]) -> NoFixMitigationStage | No
     if "no-fix" in case_id:
         return NoFixMitigationStage.VULNERABLE_CODE_REMOVAL
     return None
+
+
+def _current_task_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize historical replay task fields at the fixture boundary."""
+    payload = dict(raw)
+    if payload.get("qa_policy") is None:
+        stage = payload.get("no_fix_stage")
+        strategy = payload.get("strategy")
+        if stage == NoFixMitigationStage.PACKAGE_REMOVAL.value:
+            policy = QAPolicy.NO_FIX_PACKAGE_REMOVAL
+        elif stage == NoFixMitigationStage.VULNERABLE_CODE_REMOVAL.value:
+            policy = QAPolicy.NO_FIX_CODE_REMOVAL
+        elif strategy == RoutingStrategy.VERSION_BUMP.value:
+            policy = QAPolicy.VERSION_BUMP
+        else:
+            policy = QAPolicy.INITIAL_CODE_WORKAROUND
+        payload["qa_policy"] = policy.value
+    return payload
+
+
+def _current_attempt_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize historical replay authorization fields at the fixture boundary."""
+    payload = dict(raw)
+    if not isinstance(payload.get("allowed_target_versions"), list):
+        selected_version = payload.get("selected_version")
+        payload["allowed_target_versions"] = [selected_version] if selected_version else []
+    if not isinstance(payload.get("allowed_dependency_types"), list):
+        dependency_type = payload.get("target_dependency_type")
+        payload["allowed_dependency_types"] = [dependency_type] if dependency_type else []
+    return payload
 
 
 def _build_task(
@@ -337,7 +374,7 @@ def _build_snapshot(
     if task.target_dependency_type and task.target_dependency_type not in dependency_types:
         dependency_types.append(task.target_dependency_type)
     digest = hashlib.sha256(task.instruction.strip().encode("utf-8")).hexdigest()
-    project_language = _project_language(case)
+    project_language = _case_project_language(case)
     is_maven = project_language == ProjectLanguage.JAVA
     is_python = project_language == ProjectLanguage.PYTHON
     manifest_path = (
@@ -399,9 +436,9 @@ def _build_snapshot(
 def _worker_files(case: Mapping[str, Any]) -> dict[str, str]:
     """Seed worker files and ensure the target package is declared."""
     files = seed_replay_files(case)
-    if _project_language(case) == ProjectLanguage.JAVA:
+    if _case_project_language(case) == ProjectLanguage.JAVA:
         return files
-    if _project_language(case) == ProjectLanguage.PYTHON:
+    if _case_project_language(case) == ProjectLanguage.PYTHON:
         return files or {"requirements.txt": "replay-package==1.0.0\n"}
     package_json_path = "package.json"
     try:
@@ -559,8 +596,7 @@ def replay_triage_case(
     Returns:
         The typed triage result and any deterministic selection evidence.
     """
-    from remediation_engine.triage.agent import run_triage
-    from remediation_engine.triage.pipeline import select_issues_for_remediation
+    from remediation_engine.agents.triage import run_triage, select_issues_for_remediation
 
     group = build_vulnerability_group(case)
     context = build_system_context(case)
@@ -605,7 +641,7 @@ def replay_triage_case(
 
 def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str) -> Any:
     """Build deterministic QA results, including optional execution metadata."""
-    import remediation_engine.orchestration.qa_types as qa
+    import remediation_engine.tools.qa_scan as qa
 
     replay = _replay_input(case)
     execution = replay.get("execution_context", case.get("execution_context", {}))
@@ -677,7 +713,7 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str
                 return parsed
         return ()
 
-    is_maven = _project_language(case) == ProjectLanguage.JAVA
+    is_maven = _case_project_language(case) == ProjectLanguage.JAVA
     install_label = "mvn -B -q -DskipTests clean package" if is_maven else "npm install"
     test_label = "mvn test" if is_maven else "npm test"
     install_summary = str(logs.get("install_log", "replay install result"))
@@ -901,7 +937,7 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str
 def _qa_files(case: Mapping[str, Any]) -> dict[str, str]:
     """Seed QA workspace files and ensure candidate changed files exist."""
     files = seed_replay_files(case)
-    if _project_language(case) in {ProjectLanguage.JAVA, ProjectLanguage.PYTHON}:
+    if _case_project_language(case) in {ProjectLanguage.JAVA, ProjectLanguage.PYTHON}:
         return files
     vulnerability = case.get("vulnerability_context", {})
     vulnerability = vulnerability if isinstance(vulnerability, Mapping) else {}
@@ -962,9 +998,9 @@ def replay_qa_case(
     Returns:
         The typed QA evaluation and captured in-memory side effects.
     """
-    import remediation_engine.orchestration.qa_critic as qa
-    import remediation_engine.orchestration.qa_evaluator as qa_evaluator
-    from remediation_engine.orchestration.graph_wrappers import run_qa_critic_from_orchestrator
+    import remediation_engine.agents.qa as qa
+    import remediation_engine.agents.qa_evaluation as qa_evaluator
+    from remediation_engine.orchestration.execution import run_qa_critic_from_orchestrator
 
     group = _group_for_case(case, component="qa")
     project_language = _case_project_language(case)
@@ -1131,7 +1167,7 @@ def replay_qa_case(
             stack.enter_context(use_trajectory_recorder(recorder))
             stack.enter_context(patch.object(qa, "DockerSandbox", return_value=sandbox))
             stack.enter_context(
-                patch("remediation_engine.orchestration.graph.DockerSandbox", return_value=sandbox)
+                patch("remediation_engine.runtime.sandbox.DockerSandbox", return_value=sandbox)
             )
             if llm is not None:
                 stack.enter_context(
@@ -1141,16 +1177,7 @@ def replay_qa_case(
                     )
                 )
             stack.enter_context(patch.object(qa, "_run_global_execution", return_value=results))
-            original_loop = qa_evaluator.run_bounded_subagent_loop
-
-            def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
-                value = original_loop(*args, **kwargs)
-                loop_outputs.append(value)
-                return value
-
-            stack.enter_context(
-                patch.object(qa_evaluator, "run_bounded_subagent_loop", side_effect=wrapped_loop)
-            )
+            stack.enter_context(patch_runtime_loop(qa_evaluator, loop_outputs))
             output = run_qa_critic_from_orchestrator(state)
             final_files = dict(sandbox.files)
     events = serialize_tool_events(
@@ -1188,7 +1215,7 @@ def _update_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
     """Build deterministic package transaction responses for update replays."""
     responses = build_command_responses(case)
     case_id = str(case.get("case_id", ""))
-    if _project_language(case) == ProjectLanguage.JAVA:
+    if _case_project_language(case) == ProjectLanguage.JAVA:
         if not any("dependency:resolve" in str(key) for key in responses):
             failed = case_id == "update-maven-sync-rollback"
             responses["dependency:resolve"] = {
@@ -1310,10 +1337,10 @@ def replay_update_case(
         The typed worker result and captured in-memory side effects.
     """
     del eval_settings
-    import remediation_engine.orchestration.update_subagent as update
+    import remediation_engine.agents.update as update
 
     replay = _replay_input(case)
-    project_language = _project_language(case)
+    project_language = _case_project_language(case)
     raw_tasks = replay.get("tasks")
     raw_groups = replay.get("groups")
     multi_package_action: MultiPackageAction | None = None
@@ -1323,14 +1350,17 @@ def replay_update_case(
     if raw_tasks is not None or raw_groups is not None:
         if not isinstance(raw_tasks, list) or not isinstance(raw_groups, list):
             raise TypeError("Batch replay requires serialized tasks and groups lists.")
-        tasks = [RemediationTask.model_validate(item) for item in raw_tasks]
+        tasks = [RemediationTask.model_validate(_current_task_payload(item)) for item in raw_tasks]
         groups = [VulnerabilityGroup.model_validate(item) for item in raw_groups]
         raw_snapshots = replay.get("attempt_snapshots")
         if not isinstance(raw_snapshots, list):
             raise TypeError("Batch replay requires serialized attempt_snapshots list.")
         snapshots = {
             item.task_id: item
-            for item in (TaskAttemptSnapshot.model_validate(raw) for raw in raw_snapshots)
+            for item in (
+                TaskAttemptSnapshot.model_validate(_current_attempt_payload(raw))
+                for raw in raw_snapshots
+            )
         }
         raw_action = replay.get("multi_package_action")
         if not isinstance(raw_action, Mapping):
@@ -1439,16 +1469,7 @@ def replay_update_case(
                         side_effect=lambda *_args, **_kwargs: llm,
                     )
                 )
-            original_loop = update.run_bounded_subagent_loop
-
-            def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
-                value = original_loop(*args, **kwargs)
-                loop_outputs.append(value)
-                return value
-
-            stack.enter_context(
-                patch.object(update, "run_bounded_subagent_loop", side_effect=wrapped_loop)
-            )
+            stack.enter_context(patch_runtime_loop(update, loop_outputs))
             output = update.run_update_subagent_node(state)
             final_files = dict(sandbox.files)
     events = serialize_tool_events(
@@ -1462,36 +1483,6 @@ def replay_update_case(
     }
     if prior_tools:
         payload["prior_attempts"] = prior_tools
-        if case_id == "update-stagnation-recovery":
-            payload["summary"] = (
-                "APPLIED: The worker recovered after two repeated failed attempts for candidate 4.17.21 "
-                "(blocked with RETRY_PARAMETERS_UNCHANGED), changed candidates, and completed lodash@4.17.22."
-            )
-            payload["recovery_summary"] = (
-                "The worker recovered from the repeated failed candidate 4.17.21 "
-                "(blocked with RETRY_PARAMETERS_UNCHANGED) and completed lodash@4.17.22."
-            )
-        elif case_id == "update-retry-invalid-manifest":
-            payload["recovery_summary"] = (
-                "The worker recovered from the invalid build-manifest target "
-                "(workspace/build/package.json rejected with TARGET_NOT_ALLOWED) "
-                "and completed express-jwt@6.1.2 in package.json."
-            )
-        elif case_id == "update-retry-invalid-version":
-            payload["recovery_summary"] = (
-                "The worker recovered from the invalid version argument "
-                "and completed lodash@4.17.21 in package.json."
-            )
-        elif case_id == "update-retry-invalid-dependency-type":
-            payload["recovery_summary"] = (
-                "The worker recovered from the invalid dependency-type argument "
-                "and completed socket.io@4.6.2 in dependencies."
-            )
-        elif case_id == "update-retry-after-manifest-sync-failure":
-            payload["recovery_summary"] = (
-                "The worker recovered from the manifest synchronization failure "
-                "and completed cookie@0.7.2 as a direct dependency."
-            )
     trace_events = prior_tools + events if prior_tools else events
     return ReplayCapture(
         case_id=case_id,
@@ -1543,8 +1534,8 @@ def replay_workaround_case(
         The typed worker result and captured in-memory side effects.
     """
     del eval_settings
-    import remediation_engine.orchestration.remedy_tools as remedy_tools
-    import remediation_engine.orchestration.workaround_subagent as workaround
+    import remediation_engine.agents.workaround as workaround
+    import remediation_engine.tools.workspace as workspace_tools
 
     group = _group_for_case(case, component="workaround")
     task = _build_task(case, group, "workaround")
@@ -1624,20 +1615,13 @@ def replay_workaround_case(
                     )
                 )
             stack.enter_context(
-                patch.object(remedy_tools, "get_runtime_settings", return_value=tool_settings)
+                patch.object(workaround, "get_runtime_settings", return_value=tool_settings)
             )
-            stack.enter_context(patch.object(remedy_tools.requests, "post", side_effect=fake_post))
-            stack.enter_context(patch.object(remedy_tools.requests, "get", side_effect=fake_get))
-            original_loop = workaround.run_bounded_subagent_loop
-
-            def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
-                value = original_loop(*args, **kwargs)
-                loop_outputs.append(value)
-                return value
-
             stack.enter_context(
-                patch.object(workaround, "run_bounded_subagent_loop", side_effect=wrapped_loop)
+                patch.object(workspace_tools.requests, "post", side_effect=fake_post)
             )
+            stack.enter_context(patch.object(workspace_tools.requests, "get", side_effect=fake_get))
+            stack.enter_context(patch_runtime_loop(workaround, loop_outputs))
             output = workaround.run_workaround_subagent_node(state)
             final_files = dict(sandbox.files)
     events = serialize_tool_events(
@@ -1694,20 +1678,129 @@ def replay_supervisor_case(
             committed group floor.
         ValidationError: If a Pydantic replay payload is invalid.
     """
-    import remediation_engine.orchestration.supervisor_node as supervisor_node
-    import remediation_engine.orchestration.tactical_supervisor as tactical_supervisor
+    import remediation_engine.agents.supervisor as supervisor_node
+    import remediation_engine.agents.supervisor_reasoning as tactical_supervisor
 
     replay_input = _replay_input(case)
+    planning_input = replay_input.get("planning")
+    if planning_input is not None and not isinstance(planning_input, Mapping):
+        raise TypeError("replay.input.planning must be an object")
     raw_task = replay_input.get("task")
     raw_group = replay_input.get("group")
     if not isinstance(raw_task, Mapping):
         raise TypeError("replay.input.task must be an object")
     if not isinstance(raw_group, Mapping):
         raise TypeError("replay.input.group must be an object")
-    task = RemediationTask.model_validate(dict(raw_task))
-    group = VulnerabilityGroup.model_validate(dict(raw_group))
-    if group.fix_plan is None or not group.fix_plan.fixed_version:
-        raise ValueError("Supervisor replay group requires a committed fixed-version floor.")
+    task = RemediationTask.model_validate(_current_task_payload(raw_task))
+    group_payload = dict(raw_group)
+    # Golden replay inputs intentionally retain their historical serialization.
+    # Normalize that fixture boundary into the current candidate-only contract.
+    legacy_plan = group_payload.pop("fix_plan", None)
+    if (
+        planning_input is None
+        and legacy_plan is not None
+        and not group_payload.get("fix_plan_candidates")
+    ):
+        group_payload["fix_plan_candidates"] = [
+            {
+                "issue_id": group_payload["representative_issue_id"],
+                "plan": legacy_plan,
+            }
+        ]
+    if planning_input is not None:
+        group_payload["fix_plan_candidates"] = []
+        group_payload.pop("fix_plan", None)
+    group = VulnerabilityGroup.model_validate(group_payload)
+    settings_api_key = (
+        "scripted-replay" if llm is not None else getattr(eval_settings, "openai_api_key", "") or ""
+    )
+    settings = dataclasses.replace(
+        AppSettings.from_env(),
+        openai_api_key=settings_api_key,
+    )
+    recorder = TrajectoryRecorder()
+    planning_result: dict[str, Any] | None = None
+    if isinstance(planning_input, Mapping):
+        import remediation_engine.agents.supervisor_reasoning as planning
+        import remediation_engine.tools.advisories as advisories
+
+        page_contents = planning_input.get("page_contents", {})
+        search_results = planning_input.get("search_results", [])
+        if not isinstance(page_contents, Mapping) or not isinstance(search_results, list):
+            raise TypeError("replay.input.planning page_contents/search_results have invalid types")
+
+        def _extract_osv(_issue: Any, *, maven_mode: bool | None = None) -> tuple[Any, Any]:
+            del maven_mode
+            return (
+                planning_input.get("osv_fixed_version"),
+                planning_input.get("osv_workaround_snippets"),
+            )
+
+        class _ScriptedPlannerModel:
+            def with_structured_output(self, schema: Any) -> _ScriptedPlannerModel:
+                self.schema = schema
+                return self
+
+            def invoke(self, prompt: str) -> Any:
+                if case.get("expected_output") and str(case["expected_output"]) in prompt:
+                    raise AssertionError(
+                        "Supervisor acceptance criteria leaked into planning input"
+                    )
+                result = planning_input.get("offline_extraction")
+                if not isinstance(result, Mapping):
+                    raise TypeError("Offline planning replay requires offline_extraction")
+                return self.schema.model_validate(dict(result))
+
+        plan_stack = ExitStack()
+        plan_stack.enter_context(use_trajectory_recorder(recorder))
+        plan_stack.enter_context(
+            patch.object(advisories, "get_runtime_settings", return_value=settings)
+        )
+        plan_stack.enter_context(
+            patch.object(advisories, "_query_osv_fixed_version", side_effect=_extract_osv)
+        )
+        plan_stack.enter_context(
+            patch.object(
+                advisories,
+                "_query_serper",
+                return_value=[dict(item) for item in search_results],
+            )
+        )
+        plan_stack.enter_context(
+            patch.object(advisories, "_fetch_page_content", side_effect=page_contents.get)
+        )
+        if llm is not None:
+            plan_stack.enter_context(
+                patch.object(
+                    advisories,
+                    "create_chat_model",
+                    return_value=_ScriptedPlannerModel(),
+                )
+            )
+        with plan_stack:
+            planned_groups, refreshed_queue, pending_refresh_ids = (
+                planning.prepare_supervisor_fix_plan_state(
+                    [group],
+                    {task.task_id: task},
+                    [task.task_id],
+                    _case_project_language(case),
+                )
+            )
+        if len(planned_groups) != 1:
+            raise ValueError("Supervisor planning replay must retain exactly one group")
+        group = planned_groups[0]
+        task = refreshed_queue[task.task_id]
+        selected_plan = select_package_fix_plan(group).plan
+        if selected_plan is None:
+            raise ValueError("Supervisor planning replay did not produce a typed fix plan")
+        planning_result = {
+            "plan": selected_plan.model_dump(mode="json"),
+            "refreshed_task": task.model_dump(mode="json"),
+            "pending_refresh_ids": pending_refresh_ids,
+        }
+    selected_plan = select_package_fix_plan(group).plan
+    if selected_plan is None:
+        raise ValueError("Supervisor replay group requires a committed fix plan.")
 
     raw_candidate_sets = replay_input.get("candidate_sets")
     if not isinstance(raw_candidate_sets, list):
@@ -1755,7 +1848,9 @@ def replay_supervisor_case(
                 f"replay.input.candidate_sets[{index}].approved_version_pool "
                 "must be a list of strings"
             )
-        if security_floor != group.fix_plan.fixed_version:
+        if selected_plan.fixed_version is None:
+            raise ValueError("Supervisor candidate sets require a committed version floor.")
+        if security_floor != selected_plan.fixed_version:
             raise ValueError(
                 f"Candidate set {index} security floor does not match the group fix-plan floor."
             )
@@ -1791,17 +1886,11 @@ def replay_supervisor_case(
     if not isinstance(raw_prior_attempts, list):
         raise TypeError("replay.input.prior_attempts must be a list")
     prior_attempts = [
-        TaskAttemptSnapshot.model_validate(snapshot) for snapshot in raw_prior_attempts
+        TaskAttemptSnapshot.model_validate(_current_attempt_payload(snapshot))
+        for snapshot in raw_prior_attempts
     ]
 
     typed_candidate_sets = tuple(candidate_sets)
-    settings_api_key = (
-        "scripted-replay" if llm is not None else getattr(eval_settings, "openai_api_key", "") or ""
-    )
-    settings = dataclasses.replace(
-        AppSettings.from_env(),
-        openai_api_key=settings_api_key,
-    )
     task_queue = {task.task_id: task}
     group_by_id = {group.group_id: group}
     qa_evaluations = {task.task_id: evaluation} if evaluation is not None else {}
@@ -1822,7 +1911,6 @@ def replay_supervisor_case(
         "model_factory_calls": 0,
         "registry_resolution_calls": 0,
     }
-    recorder = TrajectoryRecorder()
     original_proposer = supervisor_node.propose_and_verify_tactical_action
     original_invoker = tactical_supervisor.invoke_with_trajectory
 
@@ -1917,7 +2005,7 @@ def replay_supervisor_case(
             worker_results_by_attempt=worker_results_by_attempt,
             attempt_snapshots_by_id=attempt_snapshots_by_id,
             target_task_id=task.task_id,
-            project_language=_project_language(case),
+            project_language=_case_project_language(case),
             consistency_events=consistency_events,
             errors=errors,
             staged_resolutions=staged_resolutions,
@@ -1929,7 +2017,7 @@ def replay_supervisor_case(
         status = "NO_CALL"
         reason = (
             "Python tactical reasoning is disabled; deterministic planning remains authoritative."
-            if _project_language(case) == ProjectLanguage.PYTHON
+            if _case_project_language(case) == ProjectLanguage.PYTHON
             else "QA evidence is inconclusive; tactical reasoning was suppressed before model or registry resolution."
             if counters["model_invocations"] == 0 and counters["registry_resolution_calls"] == 0
             else "No tactical proposal was produced."
@@ -2008,7 +2096,7 @@ def replay_supervisor_case(
             "task_state_unchanged": task_before == task_after,
             "retry_diagnostics_unchanged": retry_before == retry_after,
             "staged_resolution_count": len(staged_resolutions),
-            "security_floor": group.fix_plan.fixed_version,
+            "security_floor": selected_plan.fixed_version,
             "authorized_target_versions": (
                 list(verification.allowed_target_versions) if verification is not None else []
             ),
@@ -2033,6 +2121,7 @@ def replay_supervisor_case(
             "rationale": getattr(action, "rationale", None),
             "reason": reason,
             "instruction": (verification.instruction if verification is not None else None),
+            "planning": planning_result,
             "action": action_payload,
             "verification": verification_payload,
             "decision": decision_payload,
@@ -2056,6 +2145,7 @@ def replay_supervisor_case(
         "model_factory_calls": counters["model_factory_calls"],
         "registry_resolution_calls": counters["registry_resolution_calls"],
         "model_invocation_messages": list(getattr(llm, "invocation_messages", []) or []),
+        "planning_result": planning_result,
         "task_queue": task_queue,
         "retry_diagnostics_by_task": retry_diagnostics_by_task,
         "worker_results_by_attempt": worker_results_by_attempt,

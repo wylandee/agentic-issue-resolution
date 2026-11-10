@@ -1,152 +1,83 @@
 # Remediation Engine
 
-`remediation-engine` is an agentic AppSec workflow that ingests Dependency-Check
-or Semgrep findings, triages them, and produces a proposed remediation patch.
-The host repository is never edited: work happens in temporary Docker volumes,
-which are cleaned up during teardown.
+The Remediation Engine ingests Dependency-Check or Semgrep findings, triages
+them, and proposes a patch through an isolated remediation workflow. Its public
+Python API and CLI return typed results and a unified diff. The engine does not
+modify the host repository.
 
-## Install
+## Install and configure
+
+Python 3.11 or newer and Docker are required for remediation runs. Install the
+engine and development tools, then configure provider credentials locally:
 
 ```bash
 python -m pip install -e ".[dev]"
+cp .env.example .env
 ```
 
-Python 3.11 or newer and Docker are required. Copy `.env.example` to `.env`.
-
-Before running a Python project, build the reusable workspace image once from
-the repository root:
+Set `OPENAI_API_KEY` for model-backed agents. Unset role-specific model values
+inherit `REMEDY_LLM_MODEL`. Python projects also need the reusable workspace
+image, built once from the repository root:
 
 ```bash
 docker build -f docker/python-workspace.Dockerfile \
   -t remediation-engine-python:3.11 .
 ```
 
-The engine uses this local image for Python sandboxes. It includes the
-PostgreSQL and Python development headers and compiler toolchain needed by
-dependencies that build native extensions.
+`AppSettings` reads configuration at application boundaries. Preserve these
+environment interfaces when integrating the package:
 
-Each fresh Python virtual environment also upgrades pip to the verified
-`26.2.1` release before project dependencies are installed, updating pip's
-bundled certificate store for that workspace.
-
-Set `OPENAI_API_KEY` to enable the QA-aware tactical Supervisor and other
-LLM-backed agents. The tactical Supervisor uses a stable system prompt plus a
-bounded dynamic context, may select an immediate remediation pivot, and falls
-back to the deterministic router when the key or model is unavailable. Python
-validates targets, authorized candidate versions, and the worker instruction.
-The Supervisor owns version policy; a worker may use an alternate only when
-the committed attempt explicitly allows it. QA checks the effective version
-actually executed. Portfolio planning and certification remain deterministic,
-and triage/advisory proposals do not authorize mutations.
-
-The runtime reads these environment names:
-
-* **Provider and node models:** `OPENAI_API_KEY`, `REMEDY_LLM_MODEL`,
-  `TRIAGE_LLM_ENABLED`, `TRIAGE_LLM_MODEL`, `UPDATE_LLM_MODEL`,
-  `WORKAROUND_LLM_MODEL`, `QA_LLM_MODEL`, `SERPER_API_KEY`, and
-  `GITHUB_TOKEN`.
-* **Scanning and workflow controls:** `ODC_EXTRA_ARGS`,
-  `REMEDY_BYPASS_WORKAROUND_SUBAGENT`, `REMEDY_DISABLE_POST_QA_TRIAGE`,
-  `REMEDY_RETRIAGE_LIMIT_ENABLED`, `REMEDY_RETRIAGE_LIMIT`, and
-  `REMEDY_MAX_DELTA_CANARY_PROBES`. Set `REMEDY_FINAL_FULL_SCAN_ENABLED=true`
-  to opt into a final full-repository Dependency-Check scan; it is disabled by
-  default, which leaves the final result scoped to incremental dependency-input
-  scan coverage.
-* **Caching, reports, and tracing:** `TRIAGE_CACHE_DIR`,
-  `REMEDIATION_SOLVER_CACHE_DIR`, `REMEDIATION_TRAJECTORY_DIR`,
-  `REMEDIATION_REPORT_DIR`, `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`,
-  `LANGSMITH_PROJECT`, and `LANGSMITH_ENDPOINT`.
-* **Portfolio solver controls:** `REMEDY_SOLVER_TIMEOUT_SECONDS`,
+- Models and providers: `OPENAI_API_KEY`, `REMEDY_LLM_MODEL`,
+  `TRIAGE_LLM_ENABLED`, `TRIAGE_LLM_MODEL`, `SUPERVISOR_LLM_MODEL`,
+  `UPDATE_LLM_MODEL`, `WORKAROUND_LLM_MODEL`, `QA_LLM_MODEL`, `SERPER_API_KEY`,
+  and `GITHUB_TOKEN`.
+- Scans and workflow: `ODC_EXTRA_ARGS`,
+  `REMEDY_FINAL_FULL_SCAN_ENABLED`, `REMEDY_BYPASS_WORKAROUND_SUBAGENT`,
+  `REMEDY_DISABLE_POST_QA_TRIAGE`, `REMEDY_RETRIAGE_LIMIT_ENABLED`,
+  `REMEDY_RETRIAGE_LIMIT`, and `REMEDY_MAX_DELTA_CANARY_PROBES`.
+- Storage and tracing: `TRIAGE_CACHE_DIR`, `REMEDIATION_SOLVER_CACHE_DIR`,
+  `REMEDIATION_TRAJECTORY_DIR`, `REMEDIATION_REPORT_DIR`,
+  `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, and
+  `LANGSMITH_ENDPOINT`.
+- Evaluation: `EVAL_JUDGE_MODEL`, `EVAL_JUDGE_REASONING_EFFORT`, and
+  `EVAL_DB_PATH`.
+- Solver controls: `REMEDY_SOLVER_TIMEOUT_SECONDS`,
   `REMEDY_SOLVER_CERTIFICATION_TIMEOUT_SECONDS`, `REMEDY_SOLVER_TOP_K`,
-  `REMEDY_SOLVER_PHASE_BUDGET`,
-  `REMEDY_SOLVER_ACCEPT_FEASIBLE`, `REMEDY_SOLVER_RANDOM_SEED`,
-  `REMEDY_SOLVER_NUM_SEARCH_WORKERS`,
+  `REMEDY_SOLVER_PHASE_BUDGET`, `REMEDY_SOLVER_ACCEPT_FEASIBLE`,
+  `REMEDY_SOLVER_RANDOM_SEED`, `REMEDY_SOLVER_NUM_SEARCH_WORKERS`,
   `REMEDY_SOLVER_MAX_CANDIDATES_PER_TARGET`,
   `REMEDY_SOLVER_MAX_MODEL_VARIABLES`, `REMEDY_SOLVER_LLM_ENABLED`, and
-  `SOLVER_LLM_MODEL`.
+  `SOLVER_LLM_MODEL` (the last two are parsed for compatibility but are not
+  currently used by the production solver).
 
-Unset node-specific model values use `REMEDY_LLM_MODEL`. The retriage limit is
-a development guard and is unlimited by default.
+Do not commit `.env`, credentials, clones, reports, or trajectories. The final
+full-repository Dependency-Check scan is opt-in with
+`REMEDY_FINAL_FULL_SCAN_ENABLED=true`; otherwise terminal scan evidence covers
+the dependency inputs scanned incrementally.
 
-## CLI
+## Run the CLI
 
-The canonical issue interchange format is JSONL: one validated issue object per
-line. `ingest` accepts `odc-json`, `semgrep-json`, or canonical `jsonl` input
-(`--format auto` detects `.jsonl` and `.ndjson`; use an explicit format for
-scanner reports) and writes canonical JSONL. `triage` consumes canonical JSONL
-and writes its JSON group result. `solve` consumes pre-triaged groups JSON and
-builds a deterministic, offline portfolio/DAG plan without workers or host
-repository mutation; pass `--tasks` for an optional task-queue fixture. `run`
-consumes canonical JSONL and writes a typed result JSON, with an optional
-reviewable unified diff and Markdown report.
-
-For a solver dry run:
+Canonical issue JSONL contains one validated issue object per line. `ingest`
+accepts ODC JSON, Semgrep JSON, or canonical JSONL; `triage` writes grouped
+findings; `solve` previews a portfolio without dispatching workers; and `run`
+executes remediation and writes a typed result, optional patch, and report.
 
 ```bash
-remedy solve /tmp/remediation-groups.json --repo "$REPO_ROOT" \
-  --output /tmp/portfolio-plan.json
+remedy ingest scanner-report.json --format odc-json --output findings.jsonl
+remedy triage findings.jsonl --repo "$REPO_ROOT" --output groups.json
+remedy solve groups.json --repo "$REPO_ROOT" --output portfolio.json
+remedy run findings.jsonl --format jsonl --repo "$REPO_ROOT" \
+  --output result.json --patch-out proposed.patch --report-out report.md
 ```
 
-After cloning a target repository, run the maintained Juice Shop fixture
-through the complete flow:
+`solve` is an offline planning preview: package resolution is `NOT_RUN`, the
+result is non-dispatchable, and it does not mutate the repository. `run` uses
+temporary Docker workspaces. Exit status is `0` for a clean completion, `1`
+for a completed run with remediation errors or unresolved tasks, and `2` for
+invalid input or missing prerequisites. Review the returned diff before using
+any proposed change.
 
-```bash
-git clone https://github.com/juice-shop/juice-shop.git data/clones/juice-shop
-REPO_ROOT="$(pwd)/data/clones/juice-shop"
-remedy ingest examples/juice_shop/fixtures/dependency-check-report-baseline.json \
-  --format odc-json --output /tmp/remediation-findings.jsonl
-remedy triage /tmp/remediation-findings.jsonl --repo "$REPO_ROOT" \
-  --output /tmp/remediation-groups.json
-remedy run /tmp/remediation-findings.jsonl --format jsonl --repo "$REPO_ROOT" \
-  --output /tmp/remediation-result.json \
-  --patch-out /tmp/remediation.patch \
-  --report-out /tmp/remediation-report.md
-```
-
-`run` executes the Phase 5 task queue. Update and workaround workers execute
-Supervisor-committed attempts in isolation. QA runs deterministic install,
-security-scan, and test gates, then performs a bounded read-only evaluation
-for each task. QA results remain keyed to their task. By default, the terminal
-result reports incremental dependency-input scan coverage and is not an
-authoritative full-repository scan. Set `REMEDY_FINAL_FULL_SCAN_ENABLED=true`
-to request the optional final full scan before teardown.
-
-Tactical supervision is single-task and QA-aware. It uses a stable
-system prompt plus a bounded, deterministically ordered context so task facts
-do not invalidate the reusable prompt prefix. The model returns only a typed
-diagnostic basis and strategy proposal; Python verifies the normalized
-security floor, candidate whitelist, task identity, dependency type, and
-relative file hints, then renders and digests the exact worker instruction.
-Breaking-change evidence can pivot directly to a workaround. Peer conflicts
-are referred to the Supervisor's deterministic portfolio-planning function,
-which owns package clustering and multi-package planning; tactical decisions
-remain single-task.
-Without an API key, or when the model returns no accepted action, the
-deterministic router remains authoritative. If registry verification fails,
-the affected task becomes inconclusive with its retry budget preserved, and
-the Supervisor re-enters routing for any remaining tasks; no unverified
-package version is dispatched.
-
-Workaround retries restore only the child source-edit snapshot when QA rejects
-an intermediate hypothesis, preserving the resolved dependency candidate.
-The original parent rollback anchor is consumed only after workaround success
-or terminal abandonment. A successful `validate_workaround` gate terminates
-the bounded worker loop after all tool responses in that model turn are
-recorded, so a later max-round guard cannot turn a passing workaround into a
-surrender.
-
-`remedy run` exits with `0` for a completed run without errors, `1` for a
-completed run with remediation errors or unfixable tasks, and `2` for invalid
-input or missing prerequisites. Offline `remedy solve` exits with `0` for an
-`OPTIMAL` or `FEASIBLE` solver status without diagnostics, `1` for other solver
-statuses or diagnostics, and `2` for invalid input or missing prerequisites.
-`solve` is a non-dispatchable preview: package resolution remains `NOT_RUN` and
-`dispatchable` is false. `--output` and `--patch-out` write files; without an
-output path, serialized output is written to stdout.
-
-## Python API
-
-The public package exports `RemediationRequest`, `RemediationResult`,
+The package API exports `RemediationRequest`, `RemediationResult`,
 `run_remediation`, and `triage_issues`:
 
 ```python
@@ -154,57 +85,127 @@ from pathlib import Path
 
 from remediation_engine import RemediationRequest, run_remediation
 
-# Run this after cloning the target in the Install/CLI example.
-repo_root = (Path.cwd() / "data/clones/juice-shop").resolve()
-request = RemediationRequest(repo_root=repo_root, issues=[])
+request = RemediationRequest(repo_root=Path("/path/to/checkout"), issues=[])
 result = run_remediation(request)
-
-print(result.status)
-print(result.diff)  # reviewable unified diff; may be empty
-print(result.errors)
+print(result.status, result.diff, result.errors)
 ```
 
-`repo_root` must resolve to an existing absolute directory. The typed
-`RemediationResult` includes `status`, `changed_files`, `diff`, `errors`, and
-optional trajectory/report paths. The API and CLI never apply changes to the
-host repository. Use `triage_issues` when callers need to create actionable
-groups explicitly; internal graph state, workers, and Docker clients are not
-public API.
+## Shared example batch runner
 
-The immutable portfolio surface is available from
-`remediation_engine.orchestration` for callers that already have validated
-triage groups and a repository workspace:
+The maintained examples are four canonical finding baselines. They are input
+data, not runnable clones:
 
-```python
-from remediation_engine.orchestration import (
-    apply_portfolio_plan,
-    build_portfolio_plan,
-    prepare_portfolio_inputs,
-)
+| `--codebase` | Example baseline | Ecosystem |
+| --- | --- | --- |
+| `juice_shop` | `examples/juice_shop/baseline_issues.jsonl` | npm / JavaScript |
+| `nodegoat` | `examples/nodegoat/baseline_issues.jsonl` | npm / JavaScript |
+| `vulnado` | `examples/vulnado/baseline_issues.jsonl` | Maven / Java |
+| `pygoat` | `examples/pygoat/baseline_issues.jsonl` | PyPI / Python |
 
-groups, task_queue, diagnostics = prepare_portfolio_inputs(repo_root, groups, task_queue)
-plan = build_portfolio_plan(repo_root, groups, task_queue)
-groups, task_queue, diagnostics = apply_portfolio_plan(plan, groups, task_queue)
-```
-
-These functions are copy-on-write and return typed plan/task projections; they
-do not dispatch workers or mutate the repository. The lower-level occurrence
-solver entry points remain under `remediation_engine.solver`.
-
-## Development and evaluation
+One interface lists profile-specific actionable packages, prepares a bounded
+seeded sample without external services, or runs a selected batch against a
+caller-owned clone:
 
 ```bash
-python -m pytest
-ruff check .
-ruff format --check .
-python -m compileall -q src
+python scripts/run_batch.py --codebase juice_shop --list-packages
+python scripts/run_batch.py --codebase juice_shop --iterations 3 \
+  --batch-size 2 --seed 17 --dry-run
+python scripts/run_batch.py --codebase juice_shop --repo data/clones/juice-shop \
+  --packages express-jwt lodash --output-dir data/evals/batch-runs
+```
+
+Use `--codebase nodegoat`, `vulnado`, or `pygoat` for the other profiles; pass
+`--baseline PATH` to override a baseline. Explicit `--packages` selects one
+batch. The runner validates ecosystem identity, scopes findings to selected
+packages, and stores per-batch issues, result, patch, and a run summary under
+the output directory. It does not overwrite the caller's clone. Dry runs do
+not need clones, API keys, Docker, or network services.
+
+## Workflow and safety contracts
+
+The graph runs `initial_triage` → `workspace_builder` →
+`workspace_setup_scan` → `supervisor` → committed update/workaround workers and
+QA → `teardown` → `report`. No-work and setup failures can route directly to
+teardown. Post-QA reconciliation and the optional final full scan run only
+when required.
+
+The Supervisor invokes portfolio planning and resolver certification. The
+task queue and sealed attempt snapshots are the execution authority: every
+worker result must match the current attempt and task revision, and workers
+cannot query registries or broaden the committed candidate set. Multi-package
+mutations are atomic and carry per-attempt provenance. Failed-batch isolation
+uses bounded canary checks and assigns blame only after restoration is
+verified. Workaround children preserve the approved dependency candidate and
+parent rollback anchors remain until success or terminal abandonment.
+
+QA maps scanner observations to physical dependency occurrences and evaluates
+each task against its task-scoped evidence. Repository-wide findings are
+reconciliation context, not evidence against unrelated tasks. Infrastructure
+or incomplete scan coverage is inconclusive and does not consume a remediation
+retry. Docker volumes are removed during teardown on every path.
+
+## Tests and evaluations
+
+Unit and offline evaluation tests mock Docker, HTTP, subprocess, and model
+boundaries. In restricted environments the repository-local virtualenv,
+telemetry opt-out, and disabled pytest rerun listener keep tests self-contained:
+
+```bash
+DEEPEVAL_TELEMETRY_OPT_OUT=YES .venv/bin/python -m pytest \
+  -p no:rerunfailures -m 'not docker and not network and not llm' -q
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
 remedy --help
+python scripts/run_batch.py --help
 python scripts/eval_compare.py --help
 ```
 
-Evaluation tests and their registered datasets are documented in `EVALS.md`.
-For maintained end-to-end workflows, see
-[`examples/juice_shop/README.md`](examples/juice_shop/README.md) and
-[`examples/NodeGoat/README.md`](examples/NodeGoat/README.md). NodeGoat is a
-secondary fixture set; architecture and package-boundary details are in
-[`docs/architecture.md`](docs/architecture.md).
+The seven maintained evaluation datasets contain 14 report, 20 triage, 22
+update-worker, 19 workaround-worker, 31 QA, 20 Supervisor, and 10 end-to-end
+cases. The Supervisor cases include eight fix-planning scenarios. Offline replay invokes production node boundaries
+with scripted model, scanner, registry, and workspace doubles. Observed
+historical traces are kept separate from independently authored expectations.
+Offline evaluation makes no judge calls. Model-judged suites require
+`.[eval]`, a usable `OPENAI_API_KEY`, and `--run-eval-live`. Fresh end-to-end
+goldens additionally run the real engine with Docker and its configured
+scanner/model services; replay or rescoring a saved trajectory is not a fresh
+remediation run.
+
+The end-to-end evaluator uses one Task Completion metric at threshold `0.70`.
+Deterministic checks enforce attempt lineage, authorized versions, QA evidence,
+patch support, rollback, host preservation, and cleanup. Judge scores are
+diagnostic unless `--e2e-strict` is selected. The Supervisor suite also uses
+one Task Completion metric per case for its combined planning and disposition.
+The live report suite requires a generated Executive Summary and records three
+diagnostic metrics: Hallucination (`0.70`), Faithfulness (`0.85`), and
+Summarization (`0.80`). Operational token, latency, and tool-call limits remain
+runtime controls and telemetry, not evaluation scores. A fallback summary does
+not count as generated in live mode.
+
+Evaluation runs and metric results are persisted to SQLite at
+`data/evals/eval_results.db` by default. Set `EVAL_DB_PATH` to use another
+database; use `--eval-tag` and `--eval-baseline` to label and compare pytest
+runs. `scripts/eval_compare.py --list`, `--latest`, or `--run-a TAG --run-b TAG`
+compares persisted runs. Comparisons are diagnostic, not a substitute for
+pytest results or remediation outcome evidence.
+
+Install the optional evaluation dependencies with
+`python -m pip install -e ".[dev,eval]"`.
+Launch the evaluation dashboard with `remedy-ui` (or
+`python -m remediation_engine.evals.ui`).
+
+## Local web demo
+
+The demo provides a local dashboard for attaching a codebase and findings,
+viewing run events, and inspecting the final report and patch. Install its
+backend dependencies and build the frontend once:
+
+```bash
+python -m pip install -r demo/backend/requirements.txt
+cd demo/frontend && npm ci && npm run build && cd ../..
+./demo/start_demo.sh
+```
+
+For Vite hot reload, run `./demo/start_demo.sh --dev`. The demo is a local
+operator interface; attach a repository that contains both its source and
+findings report or canonical JSONL input.

@@ -13,7 +13,7 @@
     "live": {
       "ecosystem": "npm",
       "clone_dir": "juice-shop",
-      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "fixture_path": "examples/juice_shop/baseline_issues.jsonl",
       "target_packages": ["@tootallnate/once"]
     },
     "provenance": {
@@ -35,7 +35,7 @@
     "live": {
       "ecosystem": "npm",
       "clone_dir": "juice-shop",
-      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "fixture_path": "examples/juice_shop/baseline_issues.jsonl",
       "target_packages": ["@angular/common", "@angular/compiler", "@angular/core"]
     },
     "expected_closure": [
@@ -68,7 +68,7 @@
     "live": {
       "ecosystem": "npm",
       "clone_dir": "juice-shop",
-      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "fixture_path": "examples/juice_shop/baseline_issues.jsonl",
       "target_packages": ["crypto-js"]
     },
     "provenance": {
@@ -90,7 +90,7 @@
     "live": {
       "ecosystem": "npm",
       "clone_dir": "juice-shop",
-      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "fixture_path": "examples/juice_shop/baseline_issues.jsonl",
       "target_packages": ["express-jwt"]
     },
     "provenance": {
@@ -112,7 +112,7 @@
     "live": {
       "ecosystem": "npm",
       "clone_dir": "juice-shop",
-      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "fixture_path": "examples/juice_shop/baseline_issues.jsonl",
       "target_packages": ["notevil"]
     },
     "provenance": {
@@ -135,7 +135,7 @@
     "live": {
       "ecosystem": "npm",
       "clone_dir": "juice-shop",
-      "fixture_path": "examples/juice_shop/fixtures/baseline_issues.jsonl",
+      "fixture_path": "examples/juice_shop/baseline_issues.jsonl",
       "target_packages": ["@angular/common", "@angular/compiler", "@angular/core", "express-jwt", "notevil"]
     },
     "expected_closure": [
@@ -168,7 +168,7 @@
     "live": {
       "ecosystem": "python",
       "clone_dir": "pygoat",
-      "fixture_path": "examples/pygoat/fixtures/baseline_issues.jsonl",
+      "fixture_path": "examples/pygoat/baseline_issues.jsonl",
       "target_packages": ["pyyaml"]
     },
     "provenance": {
@@ -190,7 +190,7 @@
     "live": {
       "ecosystem": "python",
       "clone_dir": "pygoat",
-      "fixture_path": "examples/pygoat/fixtures/baseline_issues.jsonl",
+      "fixture_path": "examples/pygoat/baseline_issues.jsonl",
       "target_packages": ["certifi", "sqlparse"]
     },
     "provenance": {
@@ -212,7 +212,7 @@
     "live": {
       "ecosystem": "java",
       "clone_dir": "vulnado",
-      "fixture_path": "examples/Vulnado/fixtures/baseline_issues.jsonl",
+      "fixture_path": "examples/vulnado/baseline_issues.jsonl",
       "target_packages": ["org.postgresql:postgresql"]
     },
     "provenance": {
@@ -234,7 +234,7 @@
     "live": {
       "ecosystem": "java",
       "clone_dir": "vulnado",
-      "fixture_path": "examples/Vulnado/fixtures/baseline_issues.jsonl",
+      "fixture_path": "examples/vulnado/baseline_issues.jsonl",
       "target_packages": ["ch.qos.logback:logback-classic", "ch.qos.logback:logback-core"]
     },
     "provenance": {

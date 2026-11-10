@@ -5,13 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
+
+from remediation_engine.runtime.path_policy import (
+    normalize_workspace_path,
+    resolve_repository_path,
+)
 
 from .engine_bridge import get_run_session, start_remediation_run
 from .models import ReportResponse, RunState, WorkspaceInfo
@@ -91,20 +96,33 @@ async def upload_folder(request: Request) -> WorkspaceInfo:
         )
 
     try:
-        first_path_item = raw_paths[0]
-        if isinstance(first_path_item, UploadFile):
-            first_path_str = (
-                (await first_path_item.read()).decode("utf-8", errors="replace").strip()
+        normalized_paths: list[str] = []
+        for path_item in raw_paths:
+            if isinstance(path_item, UploadFile):
+                path_text = (await path_item.read()).decode("utf-8", errors="replace").strip()
+                await path_item.seek(0)
+            else:
+                path_text = str(path_item).strip()
+            normalized_paths.append(
+                normalize_workspace_path(path_text, allow_workspace_prefix=False)
             )
-            await first_path_item.seek(0)
-        else:
-            first_path_str = str(first_path_item).strip()
 
-        first_rel = Path(first_path_str)
-        root_name = first_rel.parts[0] if first_rel.parts else "uploaded_repo"
+        root_name = PurePosixPath(normalized_paths[0]).parts[0]
+        if normalize_workspace_path(root_name, allow_workspace_prefix=False) != root_name:
+            raise ValueError("Upload root must be one safe path component.")
+        sub_paths = []
+        for normalized_path in normalized_paths:
+            parts = PurePosixPath(normalized_path).parts
+            sub_path = (
+                PurePosixPath(*parts[1:]).as_posix()
+                if len(parts) > 1 and parts[0] == root_name
+                else normalized_path
+            )
+            sub_paths.append(normalize_workspace_path(sub_path, allow_workspace_prefix=False))
+
         workspace_id, repo_path = create_workspace_from_upload(root_name)
 
-        for upload_file, rel_path_item in zip(raw_files, raw_paths, strict=False):
+        for upload_file, sub_path in zip(raw_files, sub_paths, strict=True):
             if hasattr(upload_file, "read"):
                 content = await upload_file.read()
             elif isinstance(upload_file, bytes):
@@ -114,20 +132,7 @@ async def upload_folder(request: Request) -> WorkspaceInfo:
             else:
                 continue
 
-            if hasattr(rel_path_item, "read"):
-                rel_path_str = (
-                    (await rel_path_item.read()).decode("utf-8", errors="replace").strip()
-                )
-            else:
-                rel_path_str = str(rel_path_item).strip()
-
-            rel_parts = Path(rel_path_str).parts
-            if len(rel_parts) > 1 and rel_parts[0] == root_name:
-                sub_rel = Path(*rel_parts[1:])
-            else:
-                sub_rel = Path(rel_path_str)
-
-            dest_file = repo_path / sub_rel
+            dest_file = resolve_repository_path(repo_path, sub_path)
             dest_file.parent.mkdir(parents=True, exist_ok=True)
             with open(dest_file, "wb") as f:
                 f.write(content)
@@ -168,50 +173,15 @@ async def start_run(req: StartRunRequest) -> dict[str, str]:
 
     repo_root = str(ws_data["repo_root"])
     issues = ws_data["issues"]
-    available_packages: dict[str, str] = {}
-    for issue in issues:
-        if issue.package_name and issue.package_name.strip():
-            available_packages.setdefault(
-                issue.package_name.strip().casefold(),
-                issue.package_name.strip(),
-            )
-
-    if req.target_packages is None:
-        requested_packages = list(available_packages.values())
-    elif not req.target_packages:
-        raise HTTPException(status_code=400, detail="Select at least one detected package.")
-    else:
-        requested_packages = req.target_packages
-
-    target_packages: list[str] = []
-    unknown_packages: list[str] = []
-    selected_keys: set[str] = set()
-    for requested in requested_packages:
-        package_name = requested.strip()
-        key = package_name.casefold()
-        if not package_name or key not in available_packages:
-            unknown_packages.append(requested)
-        elif key not in selected_keys:
-            selected_keys.add(key)
-            target_packages.append(available_packages[key])
-
-    if unknown_packages:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Target packages must have findings in this workspace: {', '.join(unknown_packages)}",
+    try:
+        session = start_remediation_run(
+            req.workspace_id,
+            repo_root,
+            issues,
+            target_packages=req.target_packages,
         )
-    if not target_packages:
-        raise HTTPException(
-            status_code=400,
-            detail="No package findings were detected; targeted remediation cannot start.",
-        )
-
-    session = start_remediation_run(
-        req.workspace_id,
-        repo_root,
-        issues,
-        target_packages=target_packages,
-    )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"run_id": session.run_id, "status": session.state.status}
 
 

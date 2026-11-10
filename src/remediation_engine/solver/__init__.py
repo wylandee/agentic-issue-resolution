@@ -5,12 +5,18 @@ public functions consume immutable graph snapshots and typed solver contracts.
 """
 
 from .cpsat import solve_portfolio
-from .graph import build_dependency_dag, cluster_packages, schedule_batches
-from .subgraph import extract_solver_subgraph
+from .graph import (
+    build_dependency_dag,
+    cluster_packages,
+    expand_candidate_relations,
+    extract_solver_subgraph,
+    schedule_batches,
+)
 
 __all__ = [
     "build_dependency_dag",
     "cluster_packages",
+    "expand_candidate_relations",
     "extract_solver_subgraph",
     "schedule_batches",
     "solve_portfolio",

@@ -10,6 +10,10 @@ Tests have been updated to use the task-centric architecture:
 
 from __future__ import annotations
 
+import atexit
+import json
+import shutil
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -17,6 +21,29 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from remediation_engine.agents.supervisor import (
+    MAX_RETRIES,
+    _authorize_update_dispatch,
+    _build_multi_package_action,
+    _calculate_cumulative_scan_metrics,
+    _create_attempt_snapshot,
+    _deterministic_routing,
+    _incremental_scan_coverage_complete,
+    _maven_attempt_target_operation,
+    _maven_attempt_target_paths,
+    _nonterminal_sca_task_ids,
+    _ordered_update_candidates,
+    _peer_conflict_escalation,
+    _repair_invalid_planner_plans,
+    _task_scan_record_from_qa_result,
+    _validated_delta_replay_task_ids,
+    _verified_absent_package_tasks,
+    run_supervisor_node,
+    supervisor_router,
+)
+from remediation_engine.agents.supervisor_reasoning import (
+    _materialize_spawn_requests,
+)
 from remediation_engine.contracts import DecisionCode
 from remediation_engine.contracts.schemas import (
     MAX_MULTI_PACKAGE_ACTION_SIZE,
@@ -49,6 +76,7 @@ from remediation_engine.contracts.schemas import (
     Severity,
     SupervisorDecision,
     SupervisorRetryPlan,
+    SystemContext,
     TaskAttemptSnapshot,
     TaskCluster,
     TaskScanRecord,
@@ -62,36 +90,105 @@ from remediation_engine.contracts.schemas import (
     WorkerExecutionDiagnostics,
 )
 from remediation_engine.contracts.solver_models import PortfolioReplanRequest
-from remediation_engine.contracts.version_policy import RegistryCandidate
+from remediation_engine.contracts.version_policy import MavenRegistryCandidate, RegistryCandidate
 from remediation_engine.language import ProjectLanguage
-from remediation_engine.orchestration.supervisor_node import (
-    MAX_RETRIES,
-    _authorize_update_dispatch,
-    _build_consistency_event,
-    _build_multi_package_action,
-    _calculate_cumulative_scan_metrics,
-    _create_attempt_snapshot,
-    _deterministic_routing,
-    _incremental_scan_coverage_complete,
-    _materialize_spawn_requests,
-    _maven_attempt_target_operation,
-    _maven_attempt_target_paths,
-    _nonterminal_sca_task_ids,
+from remediation_engine.orchestration.state import (
+    TERMINAL_TASK_STATUSES,
     _normalize_target_task_ids_for_node,
-    _ordered_update_candidates,
-    _peer_conflict_escalation,
-    _repair_invalid_planner_plans,
-    _task_scan_record_from_qa_result,
     _validate_committed_state,
-    _validated_delta_replay_task_ids,
-    _verified_absent_package_tasks,
+    build_initial_remediation_task,
+    derive_initial_strategy,
     instruction_digest,
     reconcile_phase5_state_before_teardown,
-    run_supervisor_node,
-    supervisor_router,
 )
-from remediation_engine.orchestration.task_utils import derive_initial_strategy
 from remediation_engine.settings import AppSettings
+from tests.helpers import commit_test_portfolio_plan, qa_policy_for_task
+
+
+@pytest.fixture(autouse=True)
+def _stub_supervisor_registry_adapters(monkeypatch: pytest.MonkeyPatch):
+    """Keep Supervisor unit tests offline with deterministic registry evidence.
+
+    The mock returns stable releases at or above each requested floor. Tests
+    that need a specific registry response replace this adapter in their own
+    monkeypatch scope. Candidate authorization still comes from the committed
+    task snapshot and is enforced by the production policy.
+    """
+
+    def npm_candidates(package_name, security_floor, attempted_versions=None):
+        del package_name
+        attempted = {str(value) for value in (attempted_versions or set())}
+        parts = tuple(int(part) for part in str(security_floor).split(".")[:3])
+        major, minor, patch = (parts + (0, 0, 0))[:3]
+        versions = (
+            (f"{major}.{minor}.{patch}", ("osv_minimum", "same_major")),
+            (f"{major}.{minor + 1}.0", ("same_major",)),
+            (f"{major + 1}.0.0", ("npm_latest",)),
+        )
+        return [
+            RegistryCandidate(
+                version=version,
+                semver_key=tuple(int(part) for part in version.split(".")),
+                security_floor_met=True,
+                is_stable=True,
+                same_major=major == int(version.split(".")[0]),
+                already_attempted=version in attempted,
+                selection_roles=roles,
+            )
+            for version, roles in versions
+        ]
+
+    def pypi_candidates(package_name, security_floor, attempted_versions=None):
+        del package_name
+        from packaging.version import Version
+
+        floor = Version(str(security_floor))
+        release = (*floor.release, 0, 0, 0)[:3]
+        major, minor, patch = release
+        versions = (
+            (f"{major}.{minor}.{patch}", ("osv_minimum", "same_major")),
+            (f"{major}.{minor + 1}.0", ("same_major",)),
+            (f"{major + 1}.0.0", ("pypi_latest",)),
+        )
+        attempted = {str(value) for value in (attempted_versions or set())}
+        return [
+            RegistryCandidate(
+                version=version,
+                ecosystem="pypi",
+                security_floor_met=True,
+                is_stable=True,
+                same_major=major == Version(version).major,
+                already_attempted=version in attempted,
+                selection_roles=roles,
+            )
+            for version, roles in versions
+        ]
+
+    def maven_candidates(package_name, security_floor, attempted_versions=None):
+        del package_name
+        attempted = {str(value) for value in (attempted_versions or set())}
+        return [
+            MavenRegistryCandidate(
+                version=str(security_floor),
+                security_floor_met=True,
+                is_stable=True,
+                already_attempted=str(security_floor) in attempted,
+                selection_roles=("maven_minimum", "maven_latest"),
+            )
+        ]
+
+    monkeypatch.setattr(
+        "remediation_engine.agents.supervisor_policy.fetch_registry_candidates",
+        npm_candidates,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.agents.supervisor_policy.fetch_pypi_registry_candidates",
+        pypi_candidates,
+    )
+    monkeypatch.setattr(
+        "remediation_engine.agents.supervisor_policy.fetch_maven_registry_candidates",
+        maven_candidates,
+    )
 
 
 def _issue() -> VulnerabilityIssue:
@@ -143,11 +240,37 @@ def _sca_group(group_id="g1", fix_status=FixPlanStatus.VERSION_FOUND) -> Vulnera
         issues=[issue],
         localized_issues=[localized],
         fix_plan_candidates=[PackageFixPlanCandidate(issue_id=issue.id, plan=fix_plan)],
-        fix_plan=fix_plan,
+    )
+
+
+def _rename_sca_group_package(
+    group: VulnerabilityGroup,
+    package_name: str,
+) -> VulnerabilityGroup:
+    """Give a separate test task a distinct package-manager target."""
+    issues_by_id = {
+        issue.id: issue.model_copy(
+            update={
+                "package_name": package_name,
+                "purl": f"pkg:npm/{package_name}@{issue.package_version or '1.0.0'}",
+            }
+        )
+        for issue in group.issues
+    }
+    return group.model_copy(
+        update={
+            "vulnerable_component": package_name,
+            "issues": list(issues_by_id.values()),
+            "localized_issues": [
+                localized.model_copy(update={"issue": issues_by_id[localized.issue.id]})
+                for localized in group.localized_issues
+            ],
+        }
     )
 
 
 def _sast_group(group_id="g2") -> VulnerabilityGroup:
+    issue = _issue()
     fix_plan = FixPlan(
         status=FixPlanStatus.WORKAROUND_FOUND,
         fixed_version=None,
@@ -163,9 +286,9 @@ def _sast_group(group_id="g2") -> VulnerabilityGroup:
         cve_ids=[],
         versions=[],
         sources=[IssueSource.SEMGREP],
-        representative_issue_id=str(uuid4()),
-        issues=[_issue()],
-        fix_plan=fix_plan,
+        representative_issue_id=issue.id,
+        issues=[issue],
+        fix_plan_candidates=[PackageFixPlanCandidate(issue_id=issue.id, plan=fix_plan)],
     )
 
 
@@ -182,24 +305,209 @@ def _make_task(
         strategy=strategy,
         status=status,
         retry_count=retry_count,
+        qa_policy=qa_policy_for_task(strategy),
     )
+
+
+def _authorize_test_update(task: RemediationTask, group: VulnerabilityGroup) -> RemediationTask:
+    """Attach one explicit, floor-safe candidate to a pending SCA test task."""
+    package_name = group.vulnerable_component or "test-pkg"
+    instruction = (
+        f'Update "{package_name}" in package.json (dependencies) '
+        'to the exact solver-approved version "1.2.3".'
+    )
+    return task.model_copy(
+        update={
+            "portfolio_plan_id": "portfolio-current",
+            "selected_version": "1.2.3",
+            "target_package_name": package_name,
+            "target_dependency_type": "dependencies",
+            "allowed_target_versions": ["1.2.3"],
+            "allowed_dependency_types": ["dependencies"],
+            "qa_policy": QAPolicy.VERSION_BUMP,
+            "instruction": instruction,
+        }
+    )
+
+
+def _test_repository(groups) -> Path:
+    """Create an isolated repository fixture for portfolio discovery tests."""
+    repo_root = Path(__file__).parents[1] / ".pytest-tmp" / f"supervisor-{uuid4().hex}"
+    repo_root.mkdir(parents=True)
+    atexit.register(shutil.rmtree, str(repo_root), ignore_errors=True)
+
+    npm_dependencies: dict[str, str] = {}
+    python_requirements: set[str] = set()
+    maven_dependencies: set[tuple[str, str, str]] = set()
+    for group in groups or []:
+        issues = list(getattr(group, "issues", []) or [])
+        localized_issues = list(getattr(group, "localized_issues", []) or [])
+        for issue in issues:
+            package_name = str(
+                getattr(issue, "package_name", None)
+                or getattr(group, "vulnerable_component", None)
+                or "test-package"
+            )
+            version = str(getattr(issue, "package_version", None) or "1.0.0")
+            localized = next(
+                (
+                    item
+                    for item in localized_issues
+                    if getattr(item, "issue_id", None) == getattr(issue, "id", None)
+                ),
+                localized_issues[0] if localized_issues else None,
+            )
+            manager = str(getattr(localized, "package_manager", "") or "").casefold()
+            manifest = str(
+                getattr(localized, "manifest_file", None) or getattr(group, "file_path", None) or ""
+            )
+            if manager in {"npm", "pnpm", "yarn"} or manifest.endswith("package.json"):
+                npm_dependencies[package_name] = version
+            elif manager in {"pip", "pypi", "python"} or manifest.endswith("requirements.txt"):
+                python_requirements.add(f"{package_name}=={version}")
+            elif manager == "maven" or manifest.endswith("pom.xml"):
+                if ":" in package_name:
+                    group_id, artifact_id = package_name.split(":", 1)
+                else:
+                    group_id, artifact_id = "test", package_name
+                maven_dependencies.add((group_id, artifact_id, version))
+
+    if npm_dependencies:
+        package_json = {
+            "name": "supervisor-test-fixture",
+            "version": "1.0.0",
+            "dependencies": dict(sorted(npm_dependencies.items())),
+        }
+        lock_packages = {
+            "": {
+                "name": package_json["name"],
+                "version": package_json["version"],
+                "dependencies": dict(sorted(npm_dependencies.items())),
+            },
+            **{
+                f"node_modules/{name}": {"version": version}
+                for name, version in sorted(npm_dependencies.items())
+            },
+        }
+        (repo_root / "package.json").write_text(json.dumps(package_json, indent=2) + "\n")
+        (repo_root / "package-lock.json").write_text(
+            json.dumps(
+                {
+                    "name": package_json["name"],
+                    "version": package_json["version"],
+                    "lockfileVersion": 3,
+                    "requires": True,
+                    "packages": lock_packages,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+    if python_requirements:
+        (repo_root / "requirements.txt").write_text("\n".join(sorted(python_requirements)) + "\n")
+    if maven_dependencies:
+        from xml.etree.ElementTree import Element, SubElement, tostring
+
+        project = Element("project")
+        SubElement(project, "modelVersion").text = "4.0.0"
+        SubElement(project, "groupId").text = "test"
+        SubElement(project, "artifactId").text = "supervisor-test-fixture"
+        SubElement(project, "version").text = "1.0.0"
+        dependencies = SubElement(project, "dependencies")
+        for group_id, artifact_id, version in sorted(maven_dependencies):
+            dependency = SubElement(dependencies, "dependency")
+            SubElement(dependency, "groupId").text = group_id
+            SubElement(dependency, "artifactId").text = artifact_id
+            SubElement(dependency, "version").text = version
+        (repo_root / "pom.xml").write_bytes(
+            tostring(project, encoding="utf-8", xml_declaration=True)
+        )
+    return repo_root
 
 
 def _base_state(groups, **overrides) -> dict:
     state = {
-        "repo_root": "/tmp/repo",
+        "repo_root": str(_test_repository(groups)),
         "valid_groups": groups,
         "task_queue": {},
         "active_target_task_ids": [],
         "qa_evaluations": {},
         "action_summaries": [],
         "constraints_ledger": [],
-        "feedback_by_group": {},
         "feedback_by_task": {},
+        "consistency_events": [],
         "eval_status": "",
         "status": "supervisor_entered",
     }
     state.update(overrides)
+
+    # Graph-entry tests model the real initial-triage projection: groups have
+    # tasks before Supervisor entry, and SCA tasks arrive with a committed
+    # solver plan. Tests for missing/stale plans pass that state explicitly.
+    if "task_queue" not in overrides:
+        state["task_queue"] = {
+            f"task-{index}": build_initial_remediation_task(group, f"task-{index}")
+            for index, group in enumerate(groups or [], start=1)
+        }
+    if (
+        "portfolio_plan" not in overrides
+        and state["task_queue"]
+        and any(group.issue_type == IssueType.SCA for group in groups or [])
+        and not any(task.current_attempt_id for task in state["task_queue"].values())
+    ):
+        # Model an existing committed plan that was created before some tasks
+        # reached a terminal state. The solver fixture needs dispatchable task
+        # inputs to certify that prior plan; overlay the supplied terminal
+        # statuses after commit so no terminal task regains worker authority.
+        pivot_related_task_ids = {
+            related_task_id
+            for task in state["task_queue"].values()
+            for related_task_id in (task.task_id, task.parent_task_id)
+            if task.parent_task_id is not None
+        }
+        planning_queue = {
+            task_id: (
+                task.model_copy(
+                    update={
+                        "status": TaskStatus.PENDING,
+                        "current_attempt_id": None,
+                        "selected_version": None,
+                    }
+                )
+                if task.status in TERMINAL_TASK_STATUSES and task_id not in pivot_related_task_ids
+                else task
+            )
+            for task_id, task in state["task_queue"].items()
+        }
+        if planning_queue:
+            plan, committed_groups, committed_queue = commit_test_portfolio_plan(
+                Path(state["repo_root"]),
+                groups,
+                planning_queue,
+            )
+            committed_group_by_id = {group.group_id: group for group in committed_groups}
+            terminal_queue = {
+                task_id: committed_queue.get(task_id, task).model_copy(
+                    update={
+                        "status": task.status,
+                        "current_attempt_id": None,
+                        "selected_version": None,
+                        "instruction": task.instruction,
+                    }
+                )
+                for task_id, task in state["task_queue"].items()
+                if task.status in TERMINAL_TASK_STATUSES
+            }
+            state.update(
+                {
+                    "valid_groups": [
+                        committed_group_by_id.get(group.group_id, group) for group in groups
+                    ],
+                    "task_queue": {**committed_queue, **terminal_queue},
+                    "portfolio_plan": plan,
+                    "portfolio_dirty": False,
+                }
+            )
 
     # Test fixtures emit the same committed attempt envelope as graph
     # dispatch.  Production no longer accepts uncorrelated summaries.
@@ -207,6 +515,20 @@ def _base_state(groups, **overrides) -> dict:
     snapshots = dict(state.get("attempt_snapshots_by_id") or {})
     worker_results = dict(state.get("worker_results_by_attempt") or {})
     summaries = list(state.get("action_summaries") or [])
+    summarized_task_ids = {summary.task_id for summary in summaries}
+    summaries.extend(
+        AgentActionSummary(
+            task_id=task.task_id,
+            status=AgentActionStatus.SUCCESS,
+            summary="Committed test update is ready for QA.",
+        )
+        for task in task_queue.values()
+        if task.task_id not in summarized_task_ids
+        and task.status == TaskStatus.OPTIMISTICALLY_FIXED
+        and task.strategy == RoutingStrategy.VERSION_BUMP
+        and task.current_attempt_id is None
+        and task.selected_version
+    )
     normalized_summaries: list[AgentActionSummary] = []
     for summary in summaries:
         task = task_queue.get(summary.task_id)
@@ -229,6 +551,7 @@ def _base_state(groups, **overrides) -> dict:
             task_id=task.task_id,
             state_revision=1,
             task_revision=task_revision,
+            portfolio_plan_id=task.portfolio_plan_id,
             strategy_stage=task.strategy_stage,
             qa_policy=task.qa_policy,
             selected_version=task.selected_version,
@@ -239,6 +562,10 @@ def _base_state(groups, **overrides) -> dict:
                 if task.strategy == RoutingStrategy.CODE_WORKAROUND
                 else "update_subagent"
             ),
+            allowed_target_versions=[task.selected_version]
+            if task.selected_version is not None
+            else [],
+            allowed_dependency_types=[],
         )
         tagged_summary = summary.model_copy(
             update={
@@ -264,21 +591,81 @@ def _base_state(groups, **overrides) -> dict:
         state["attempt_snapshots_by_id"] = snapshots
     if worker_results:
         state["worker_results_by_attempt"] = worker_results
+
+    # QA results are correlated with the current attempt just as they are at
+    # the graph boundary. Bare task-keyed evaluations remain only the compact
+    # view consumed by prompts and older caller projections.
+    qa_evaluations = dict(state.get("qa_evaluations") or {})
+    qa_results = dict(state.get("qa_results_by_attempt") or {})
+    for task_id, evaluation in qa_evaluations.items():
+        task = task_queue.get(task_id)
+        if task is None:
+            continue
+        attempt_id = task.current_attempt_id or f"test-qa-attempt-{task_id}"
+        task_revision = max(1, task.task_revision)
+        task = task.model_copy(
+            update={
+                "current_attempt_id": attempt_id,
+                "task_revision": task_revision,
+                "instruction": task.instruction or "test worker instruction",
+            }
+        )
+        task_queue[task_id] = task
+        snapshot = snapshots.get(attempt_id)
+        if snapshot is None:
+            dispatch_node = (
+                "workaround_subagent"
+                if task.strategy == RoutingStrategy.CODE_WORKAROUND
+                else "update_subagent"
+            )
+            policy = task.qa_policy or QAPolicy.VERSION_BUMP
+            snapshot = TaskAttemptSnapshot(
+                attempt_id=attempt_id,
+                task_id=task_id,
+                state_revision=1,
+                task_revision=task_revision,
+                portfolio_plan_id=task.portfolio_plan_id,
+                strategy_stage=task.strategy_stage,
+                qa_policy=policy,
+                selected_version=task.selected_version,
+                target_package_name=task.target_package_name,
+                target_dependency_type=task.target_dependency_type,
+                allowed_target_versions=list(task.allowed_target_versions),
+                allowed_dependency_types=list(task.allowed_dependency_types),
+                instruction=task.instruction,
+                instruction_digest=instruction_digest(task.instruction),
+                dispatch_node=dispatch_node,
+            )
+            snapshots[attempt_id] = snapshot
+        if not any(result.task_id == task_id for result in qa_results.values()):
+            qa_results[attempt_id] = QAAttemptResult(
+                attempt_id=attempt_id,
+                task_id=task_id,
+                task_revision=task_revision,
+                qa_policy=snapshot.qa_policy or QAPolicy.VERSION_BUMP,
+                qa_policy_source="attempt_snapshot",
+                evaluation=evaluation,
+            )
+    state["task_queue"] = task_queue
+    if snapshots:
+        state["attempt_snapshots_by_id"] = snapshots
+    if qa_results:
+        state["qa_results_by_attempt"] = qa_results
     return state
 
 
 def _keep_portfolio_current(monkeypatch):
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
+        "remediation_engine.agents.supervisor_policy.fetch_registry_candidates",
         lambda *args, **kwargs: [],
         raising=False,
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+        "remediation_engine.agents.supervisor._portfolio_plan_violations",
         lambda *args, **kwargs: [],
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+        "remediation_engine.agents.supervisor._portfolio_plan_is_stale",
         lambda *args, **kwargs: False,
     )
 
@@ -286,20 +673,30 @@ def _keep_portfolio_current(monkeypatch):
 def _stub_portfolio_plan_tool(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     portfolio_tool = MagicMock(return_value={"status": "portfolio_ready", "errors": []})
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        "remediation_engine.agents.supervisor.run_portfolio_plan_tool",
         portfolio_tool,
     )
     return portfolio_tool
 
 
-def _portfolio_stub():
+def _portfolio_stub(task_ids=()):
+    ordered_task_ids = list(task_ids)
+    cluster_by_task = {task_id: f"cluster-{task_id}" for task_id in ordered_task_ids}
     return SimpleNamespace(
         portfolio_plan_id="portfolio-current",
-        task_ids=[],
-        clusters=[],
-        cluster_order=[],
-        task_order=[],
-        task_to_cluster={},
+        task_ids=ordered_task_ids,
+        clusters=[
+            SimpleNamespace(
+                cluster_id=cluster_by_task[task_id],
+                task_ids=[task_id],
+                dependencies=[],
+                dispatchable=True,
+            )
+            for task_id in ordered_task_ids
+        ],
+        cluster_order=[cluster_by_task[task_id] for task_id in ordered_task_ids],
+        task_order=ordered_task_ids,
+        task_to_cluster=cluster_by_task,
         diagnostics=[],
     )
 
@@ -403,19 +800,6 @@ class TestSupervisorDecisionSchema:
             )
 
 
-def test_deferred_consistency_action_is_mapped_to_typed_rejection():
-    event = _build_consistency_event(
-        error_code="REGISTRY_VERIFICATION_PENDING",
-        task_id="task-1",
-        expected_attempt_id=None,
-        received_attempt_id=None,
-        action="deferred",
-        details="registry lookup is pending",
-    )
-
-    assert event.action == "rejected"
-
-
 def test_registry_verification_pending_reenters_supervisor_without_forcing_final_scan(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -431,7 +815,7 @@ def test_registry_verification_pending_reenters_supervisor_without_forcing_final
     )
     _keep_portfolio_current(monkeypatch)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.registry_candidate_sets_for_context",
+        "remediation_engine.agents.supervisor.registry_candidate_sets_for_context",
         lambda _context: ((), "registry temporarily unavailable"),
     )
 
@@ -441,19 +825,6 @@ def test_registry_verification_pending_reenters_supervisor_without_forcing_final
     assert result["next_routing_step"] == "supervisor"
     assert result["task_queue"][task.task_id].status == TaskStatus.INCONCLUSIVE
     assert result["task_queue"][task.task_id].retry_count == task.retry_count
-
-
-def test_attempt_snapshot_allowlists_default_for_legacy_payloads():
-    """New candidate fields remain readable when historical snapshots omit them."""
-    snapshot = TaskAttemptSnapshot(
-        task_id="task-1",
-        instruction="Update test-pkg.",
-        instruction_digest=instruction_digest("Update test-pkg."),
-        dispatch_node="update_subagent",
-    )
-
-    assert snapshot.allowed_target_versions == []
-    assert snapshot.allowed_dependency_types == []
 
 
 def test_ordered_update_candidates_excludes_attempted_versions_and_types():
@@ -657,6 +1028,8 @@ def test_committed_state_rejects_active_empty_update_authorization():
         instruction=task.instruction,
         instruction_digest=instruction_digest(task.instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
 
     events, errors = _validate_committed_state(
@@ -690,6 +1063,8 @@ def test_committed_state_refuses_snapshot_revision_rewind():
         instruction="Update test-pkg to 1.0.0.",
         instruction_digest=instruction_digest("Update test-pkg to 1.0.0."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["1.0.0"],
+        allowed_dependency_types=[],
     )
     queue = {"task-1": task}
 
@@ -722,6 +1097,8 @@ def test_committed_state_rejects_foreign_task_snapshot_identity():
         instruction="Update test-pkg to 9.9.9.",
         instruction_digest=instruction_digest("Update test-pkg to 9.9.9."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["9.9.9"],
+        allowed_dependency_types=[],
     )
     queue = {"task-1": task}
 
@@ -754,6 +1131,8 @@ def test_committed_state_repairs_mutated_inputs_for_same_snapshot_revision():
         instruction=committed_instruction,
         instruction_digest=instruction_digest(committed_instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["1.0.0"],
+        allowed_dependency_types=[],
     )
     queue = {"task-1": task}
 
@@ -769,7 +1148,7 @@ def test_committed_state_repairs_mutated_inputs_for_same_snapshot_revision():
 
 
 # ===========================================================================
-# derive_initial_strategy (now in task_utils)
+# derive_initial_strategy (now in orchestration/state)
 # ===========================================================================
 
 
@@ -788,7 +1167,7 @@ class TestDeriveInitialStrategy:
 
     def test_missing_fix_plan_yields_code_workaround(self):
         g = _sast_group()
-        g.fix_plan = None
+        g.fix_plan_candidates = []
         assert derive_initial_strategy(g) == RoutingStrategy.CODE_WORKAROUND
 
 
@@ -861,7 +1240,7 @@ def test_supervisor_calls_portfolio_tool_for_initial_and_post_triage_entries(
         }
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        "remediation_engine.agents.supervisor.run_portfolio_plan_tool",
         portfolio_tool,
     )
 
@@ -896,7 +1275,7 @@ def test_supervisor_overlays_replan_patch_on_portfolio_tool_input(
         task_queue={"old-task": _make_task("old-task", "g1")},
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._run_supervisor_decision_node",
+        "remediation_engine.agents.supervisor._run_supervisor_decision_node",
         lambda _state: supervisor_patch,
     )
     portfolio_plan = _portfolio_stub()
@@ -909,7 +1288,7 @@ def test_supervisor_overlays_replan_patch_on_portfolio_tool_input(
         }
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        "remediation_engine.agents.supervisor.run_portfolio_plan_tool",
         portfolio_tool,
     )
 
@@ -928,7 +1307,7 @@ def test_supervisor_overlays_replan_patch_on_portfolio_tool_input(
 
 
 # ===========================================================================
-# run_supervisor_node â€” task initialization
+# run_supervisor_node — task initialization
 # ===========================================================================
 
 
@@ -955,7 +1334,11 @@ class TestRunSupervisorNodeNormalization:
     def test_backfills_missing_policy_on_uncommitted_existing_task(self):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         existing_task = _make_task("task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP)
-        state = _base_state([g1], task_queue={"task-1": existing_task})
+        state = _base_state(
+            [g1],
+            task_queue={"task-1": existing_task},
+            portfolio_plan=None,
+        )
 
         result = run_supervisor_node(state)
 
@@ -975,25 +1358,22 @@ class TestRunSupervisorNodeNormalization:
     def test_candidate_less_update_is_rejected_before_snapshot_creation(self, monkeypatch):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
         monkeypatch.setattr(
-            "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
+            "remediation_engine.agents.supervisor_policy.fetch_registry_candidates",
             lambda *_args, **_kwargs: [],
         )
 
-        result = run_supervisor_node(_base_state([g1]))
+        result = run_supervisor_node(_base_state([g1], portfolio_plan=None))
 
         assert result["active_target_task_ids"] == []
         assert all(
             snapshot.dispatch_node != "update_subagent"
             for snapshot in result.get("attempt_snapshots_by_id", {}).values()
         )
-        assert any(
-            event.error_code == "UPDATE_DISPATCH_WITHOUT_CANDIDATE"
-            for event in result["consistency_events"]
-        )
+        assert result["next_routing_step"] != "update_subagent"
 
 
 # ===========================================================================
-# run_supervisor_node â€” routing decisions
+# run_supervisor_node — routing decisions
 # ===========================================================================
 
 
@@ -1021,6 +1401,16 @@ class TestRunSupervisorNodeVersionBump:
                     "file_paths": ["requirements.txt"],
                     "sources": [IssueSource.ODC],
                     "issues": [issue],
+                    "localized_issues": [
+                        LocalizedIssue(
+                            issue=issue,
+                            manifest_file="requirements.txt",
+                            package_manager="pip",
+                            declaration_type="requirements",
+                            is_direct_dependency=True,
+                            localization_confidence=1.0,
+                        )
+                    ],
                 }
             )
             groups[group_id] = group
@@ -1037,6 +1427,7 @@ class TestRunSupervisorNodeVersionBump:
             ["task-1", "task-2"],
             tasks,
             groups,
+            project_language=ProjectLanguage.PYTHON,
         )
 
         assert action is not None
@@ -1055,10 +1446,11 @@ class TestRunSupervisorNodeVersionBump:
             ("requirements.txt", "sqlparse", "0.4.4", "requirements", "pypi"),
         ]
 
-    def test_first_active_update_task_is_the_only_registry_target(self, monkeypatch):
+    def test_one_active_update_task_is_the_only_registry_target(self, monkeypatch):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
-        g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND).model_copy(
-            update={"vulnerable_component": "other-pkg"}
+        g2 = _rename_sca_group_package(
+            _sca_group("g2", FixPlanStatus.VERSION_FOUND),
+            "zz-other-pkg",
         )
         calls: list[tuple[str, str, set[str]]] = []
 
@@ -1066,8 +1458,8 @@ class TestRunSupervisorNodeVersionBump:
             calls.append((package_name, security_floor, set(attempted_versions or set())))
             return [
                 RegistryCandidate(
-                    version="2.0.0",
-                    semver_key=(2, 0, 0),
+                    version="1.2.3",
+                    semver_key=(1, 2, 3),
                     security_floor_met=True,
                     is_stable=True,
                     same_major=True,
@@ -1076,24 +1468,31 @@ class TestRunSupervisorNodeVersionBump:
             ]
 
         monkeypatch.setattr(
-            "remediation_engine.orchestration.supervisor_planner.fetch_registry_candidates",
+            "remediation_engine.agents.supervisor_policy.fetch_registry_candidates",
             candidates,
         )
         monkeypatch.setattr(
-            "remediation_engine.orchestration.supervisor_node.get_runtime_settings",
+            "remediation_engine.agents.supervisor.get_runtime_settings",
             lambda: AppSettings(openai_api_key=""),
         )
 
-        result = run_supervisor_node(_base_state([g1, g2]))
+        state = _base_state([g1, g2])
+        result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "update_subagent"
-        assert result["active_target_task_ids"] == ["task-1"]
+        active_task_ids = result["active_target_task_ids"]
+        assert active_task_ids == ["task-1"]
+        assert len(active_task_ids) == 1
+        assert len(calls) == 1
         assert calls == [("test-pkg", "1.2.3", set())]
-        assert result["task_queue"]["task-2"].selected_version is None
+        assert result["task_queue"]["task-2"].current_attempt_id is None
 
     def test_version_bump_tasks_dispatch_one_at_a_time(self):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
-        g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
+        g2 = _rename_sca_group_package(
+            _sca_group("g2", FixPlanStatus.VERSION_FOUND),
+            "other-pkg",
+        )
         state = _base_state([g1, g2])
 
         result = run_supervisor_node(state)
@@ -1101,7 +1500,13 @@ class TestRunSupervisorNodeVersionBump:
         assert result["active_target_task_ids"] == ["task-1"]
 
     def test_deterministic_routing_caps_update_dispatch_at_one(self):
-        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(12)]
+        groups = [
+            _rename_sca_group_package(
+                _sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND),
+                f"test-pkg-{i}",
+            )
+            for i in range(12)
+        ]
         state = _base_state(groups)
 
         result = run_supervisor_node(state)
@@ -1406,6 +1811,10 @@ class TestRunSupervisorNodeToQA:
                 instruction=instruction,
                 instruction_digest=instruction_digest(instruction),
                 dispatch_node="update_subagent",
+                allowed_target_versions=[task.selected_version]
+                if task.selected_version is not None
+                else [],
+                allowed_dependency_types=["dependencies"],
             )
             tasks[task_id] = task
             snapshots[attempt_id] = snapshot
@@ -1443,13 +1852,13 @@ class TestRunSupervisorNodeToQA:
 
     def test_all_optimistically_fixed_tasks_route_to_qa_within_limit(self):
         g1 = _sca_group("g1")
-        g2 = _sca_group("g2")
+        g2 = _rename_sca_group_package(_sca_group("g2"), "other-pkg")
         task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
         task2 = _make_task("task-2", "g2", status=TaskStatus.OPTIMISTICALLY_FIXED)
         state = _base_state(
             [g1, g2],
             task_queue={"task-1": task1, "task-2": task2},
-            # No active_target_task_ids â€” all tasks are already optimistically fixed
+            # No active_target_task_ids — all tasks are already optimistically fixed
             active_target_task_ids=[],
         )
 
@@ -1459,7 +1868,13 @@ class TestRunSupervisorNodeToQA:
 
     def test_current_task_routes_to_qa_before_more_updates(self):
         # 12 groups: first 10 are optimistically fixed, 2 are pending.
-        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(12)]
+        groups = [
+            _rename_sca_group_package(
+                _sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND),
+                f"test-pkg-{i}",
+            )
+            for i in range(12)
+        ]
         tasks = {
             f"task-{i + 1}": _make_task(
                 f"task-{i + 1}",
@@ -1480,7 +1895,13 @@ class TestRunSupervisorNodeToQA:
         assert result["active_target_task_ids"] == [f"task-{index}" for index in range(1, 11)]
 
     def test_mixed_update_results_route_successful_subset_to_qa(self):
-        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(5)]
+        groups = [
+            _rename_sca_group_package(
+                _sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND),
+                f"test-pkg-{i}",
+            )
+            for i in range(5)
+        ]
         tasks = {
             f"task-{i + 1}": _make_task(
                 f"task-{i + 1}",
@@ -1531,9 +1952,28 @@ class TestRunSupervisorNodeToQA:
         assert result["task_queue"]["task-5"].status == TaskStatus.NEEDS_RETRY
 
     def test_terminal_tasks_in_active_batch_are_omitted_from_qa_targets(self):
-        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
+        groups = [
+            _rename_sca_group_package(
+                _sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND),
+                f"test-pkg-{i}",
+            )
+            for i in range(3)
+        ]
         tasks = {
-            "task-1": _make_task("task-1", "g0", status=TaskStatus.OPTIMISTICALLY_FIXED),
+            "task-1": _make_task(
+                "task-1",
+                "g0",
+                status=TaskStatus.OPTIMISTICALLY_FIXED,
+            ).model_copy(
+                update={
+                    "selected_version": "1.2.3",
+                    "allowed_target_versions": ["1.2.3"],
+                    "target_package_name": "test-pkg-0",
+                    "target_dependency_type": "dependencies",
+                    "qa_policy": QAPolicy.VERSION_BUMP,
+                    "instruction": "Update test-pkg-0 to exact version 1.2.3.",
+                }
+            ),
             "task-2": _make_task("task-2", "g1", status=TaskStatus.QA_PASSED),
             "task-3": _make_task("task-3", "g2", status=TaskStatus.UNFIXABLE),
         }
@@ -1541,6 +1981,7 @@ class TestRunSupervisorNodeToQA:
             groups,
             task_queue=tasks,
             active_target_task_ids=["task-1", "task-2", "task-3"],
+            portfolio_plan=None,
         )
 
         result = run_supervisor_node(state)
@@ -1551,7 +1992,10 @@ class TestRunSupervisorNodeToQA:
     @patch("langchain_openai.ChatOpenAI")
     def test_optimistically_fixed_task_routes_to_qa_before_retry_planning(self, mock_chat):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
-        g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
+        g2 = _rename_sca_group_package(
+            _sca_group("g2", FixPlanStatus.VERSION_FOUND),
+            "other-pkg",
+        )
         task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
         task2 = _make_task("task-2", "g2", status=TaskStatus.NEEDS_RETRY, retry_count=1)
         state = _base_state(
@@ -1574,6 +2018,7 @@ class TestRunSupervisorNodeToTeardown:
         state = _base_state(
             [g1],
             task_queue={"task-1": task},
+            portfolio_plan=None,
         )
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "teardown"
@@ -1584,18 +2029,19 @@ class TestRunSupervisorNodeToTeardown:
         state = _base_state(
             [g1],
             task_queue={"task-1": task},
+            portfolio_plan=None,
         )
         result = run_supervisor_node(state)
         assert result["next_routing_step"] == "teardown"
 
 
 # ===========================================================================
-# run_supervisor_node â€” QA evaluation updates
+# run_supervisor_node — QA evaluation updates
 # ===========================================================================
 
 
 class TestRunSupervisorNodeQAUpdates:
-    def test_qa_failed_retry_uses_deterministic_planning(self):
+    def test_qa_failed_retry_preserves_committed_solver_candidate(self):
         g1 = _sca_group("g1")
         task = _make_task("task-1", "g1", status=TaskStatus.NEEDS_RETRY)
         state = _base_state(
@@ -1612,13 +2058,26 @@ class TestRunSupervisorNodeQAUpdates:
                 )
             },
         )
+        task = state["task_queue"]["task-1"]
+        attempt_id = task.current_attempt_id
+        assert task.allowed_target_versions == ["1.2.3"]
+        assert state["attempt_snapshots_by_id"][attempt_id].portfolio_plan_id == (
+            task.portfolio_plan_id
+        )
 
         result = run_supervisor_node(state)
 
         assert result["next_routing_step"] == "update_subagent"
-        assert result["task_queue"]["task-1"].selected_version == "2.0.0"
-        assert result["task_queue"]["task-1"].strategy_stage == SCARemediationStage.NPM_LATEST
-        assert "exact version 2.0.0" in result["task_queue"]["task-1"].instruction
+        retried_task = result["task_queue"]["task-1"]
+        assert retried_task.selected_version == "1.2.3"
+        assert retried_task.allowed_target_versions == ["1.2.3"]
+        assert retried_task.strategy_stage == task.strategy_stage
+        diagnostics = result["retry_diagnostics_by_task"]["task-1"]
+        assert diagnostics.candidate_versions_considered == ["1.2.3"]
+        assert not diagnostics.registry_query_performed
+        qa_result = result["qa_results_by_attempt"][attempt_id]
+        assert qa_result.task_revision == task.task_revision
+        assert retried_task.current_attempt_id != attempt_id
 
     def test_qa_completed_passed_marks_task_qa_passed(self):
         g1 = _sca_group("g1")
@@ -1653,6 +2112,7 @@ class TestRunSupervisorNodeQAUpdates:
             task_queue={"task-1": task},
             active_target_task_ids=["task-1"],
             qa_evaluations={"task-1": QAEvaluation(task_id="task-1", passed=True)},
+            portfolio_plan=None,
         )
 
         result = run_supervisor_node(state)
@@ -1673,6 +2133,8 @@ class TestRunSupervisorNodeQAUpdates:
             instruction=instruction,
             instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
+            allowed_target_versions=["1.2.3"],
+            allowed_dependency_types=["overrides"],
         )
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
             update={
@@ -1746,6 +2208,8 @@ class TestRunSupervisorNodeQAUpdates:
             instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
             qa_policy=QAPolicy.VERSION_BUMP,
+            allowed_target_versions=["1.2.3"],
+            allowed_dependency_types=[],
         )
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
             update={
@@ -1807,6 +2271,8 @@ class TestRunSupervisorNodeQAUpdates:
             instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
             qa_policy=QAPolicy.VERSION_BUMP,
+            allowed_target_versions=["1.2.3"],
+            allowed_dependency_types=[],
         )
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
             update={
@@ -1961,9 +2427,12 @@ class TestRunSupervisorNodeQAUpdates:
 
         assert result["task_queue"]["task-2"].status == TaskStatus.NEEDS_RETRY
         assert result["task_queue"]["task-2"].retry_count == 1
-        assert result["task_queue"]["task-2"].selected_version == "2.0.0"
-        assert result["task_queue"]["task-2"].strategy_stage == SCARemediationStage.NPM_LATEST
-        assert "exact version 2.0.0" in result["task_queue"]["task-2"].instruction
+        assert result["task_queue"]["task-2"].selected_version == "1.2.3"
+        assert result["task_queue"]["task-2"].strategy_stage == SCARemediationStage.OSV_MINIMUM
+        assert "exact version 1.2.3" in result["task_queue"]["task-2"].instruction
+        assert result["retry_diagnostics_by_task"]["task-2"].candidate_versions_considered == [
+            "1.2.3"
+        ]
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-2"]
 
@@ -1984,9 +2453,9 @@ class TestRunSupervisorNodeQAUpdates:
 
         assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
         assert result["task_queue"]["task-1"].instruction.startswith(
-            "Apply the supervisor-selected test-pkg dependency version"
+            "Apply the outer-solver-approved dependency decision for test-pkg"
         )
-        assert "exact version 2.0.0" in result["task_queue"]["task-1"].instruction
+        assert "exact version 1.2.3" in result["task_queue"]["task-1"].instruction
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
 
@@ -2005,9 +2474,9 @@ class TestRunSupervisorNodeQAUpdates:
         result = run_supervisor_node(state)
 
         committed = result["task_queue"]["task-1"]
-        assert committed.selected_version == "2.0.0"
-        assert committed.strategy_stage == SCARemediationStage.NPM_LATEST
-        assert "exact version 2.0.0" in committed.instruction
+        assert committed.selected_version == "1.2.3"
+        assert committed.strategy_stage == SCARemediationStage.NPM_SAME_MAJOR
+        assert "exact version 1.2.3" in committed.instruction
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
         assert any("replanning deterministically" in error for error in result["errors"])
@@ -2026,9 +2495,11 @@ class TestRunSupervisorNodeQAUpdates:
         assert result["next_routing_step"] == "update_subagent"
         assert result["active_target_task_ids"] == ["task-1"]
         committed_instruction = result["task_queue"]["task-1"].instruction
-        assert committed_instruction.startswith("Apply the supervisor-selected test-pkg")
+        assert committed_instruction.startswith(
+            "Apply the outer-solver-approved dependency decision for test-pkg"
+        )
         assert "test-pkg" in committed_instruction
-        assert "2.0.0" in committed_instruction
+        assert "1.2.3" in committed_instruction
 
 
 def test_invalid_latest_repair_pivots_instead_of_reusing_stale_candidate():
@@ -2103,27 +2574,6 @@ def test_exhausted_deterministic_guardrail_routes_workaround_child():
                 ),
             )
         },
-        qa_results_by_attempt={
-            "update-attempt-1": QAAttemptResult(
-                attempt_id="update-attempt-1",
-                task_id="task-1",
-                task_revision=1,
-                qa_policy=QAPolicy.VERSION_BUMP,
-                qa_policy_source="attempt_snapshot",
-                evaluation=QAEvaluation(
-                    task_id="task-1",
-                    passed=False,
-                    failure_category=FailureCategory.SECURITY_FLAG,
-                    retry_feedback="Repair the express-jwt compatibility regression.",
-                    failure_evidence=QAFailureEvidence(
-                        attempt_id="update-attempt-1",
-                        task_revision=1,
-                        exact_diagnostics=["(0, import_express_jwt.default) is not a function"],
-                        source_locations=["/workspace/lib/insecurity.ts:54:35"],
-                    ),
-                ),
-            )
-        },
         retry_diagnostics_by_task={
             "task-1": UpdateRetryDiagnostics(
                 task_id="task-1",
@@ -2136,6 +2586,25 @@ def test_exhausted_deterministic_guardrail_routes_workaround_child():
         },
         status="supervisor_entered",
     )
+    task = state["task_queue"]["task-1"]
+    attempt_id = task.current_attempt_id
+    qa_result = state["qa_results_by_attempt"][attempt_id]
+    evaluation = qa_result.evaluation
+    assert evaluation.failure_evidence is not None
+    correlated_evaluation = evaluation.model_copy(
+        update={
+            "failure_evidence": evaluation.failure_evidence.model_copy(
+                update={
+                    "attempt_id": attempt_id,
+                    "task_revision": qa_result.task_revision,
+                }
+            )
+        }
+    )
+    state["qa_results_by_attempt"][attempt_id] = qa_result.model_copy(
+        update={"evaluation": correlated_evaluation}
+    )
+    state["qa_evaluations"]["task-1"] = correlated_evaluation
 
     result = run_supervisor_node(state)
 
@@ -2155,7 +2624,7 @@ def test_exhausted_deterministic_guardrail_routes_workaround_child():
     ]
 
 
-def test_deterministic_latest_selection_skips_attempted_versions():
+def test_deterministic_latest_selection_skips_attempted_versions(monkeypatch):
     group = _sca_group("g1")
     task = _make_task(
         "task-1",
@@ -2179,10 +2648,14 @@ def test_deterministic_latest_selection_skips_attempted_versions():
             "task-1": UpdateRetryDiagnostics(
                 task_id="task-1",
                 strategy_stage=SCARemediationStage.NPM_LATEST,
-                attempted_versions=["6.0.0", "6.1.2"],
+                attempted_versions=["6.0.0", "6.1.2", "1.2.3"],
                 latest_version_seen="8.5.1",
             )
         },
+    )
+    monkeypatch.setattr(
+        "remediation_engine.agents.supervisor_policy.fetch_registry_candidates",
+        lambda *_args, **_kwargs: [],
     )
 
     result = run_supervisor_node(state)
@@ -2216,10 +2689,14 @@ def test_empty_same_major_stage_advances_or_pivots_without_unversioned_dispatch(
             "task-1": UpdateRetryDiagnostics(
                 task_id="task-1",
                 strategy_stage=SCARemediationStage.NPM_SAME_MAJOR,
-                attempted_versions=["2.17.7"],
+                attempted_versions=["2.17.7", "1.2.3"],
                 latest_version_seen="2.17.7",
             )
         },
+    )
+    monkeypatch.setattr(
+        "remediation_engine.agents.supervisor_policy.fetch_registry_candidates",
+        lambda *_args, **_kwargs: [],
     )
 
     result = run_supervisor_node(state)
@@ -2246,6 +2723,8 @@ def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
         instruction="Update test-pkg to 1.0.0.",
         instruction_digest=instruction_digest("Update test-pkg to 1.0.0."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["1.0.0"],
+        allowed_dependency_types=[],
     )
     new_snapshot = TaskAttemptSnapshot(
         attempt_id="attempt-new",
@@ -2257,6 +2736,8 @@ def test_stale_worker_result_is_ignored_when_new_attempt_is_committed():
         instruction="Update test-pkg to 2.0.0.",
         instruction_digest=instruction_digest("Update test-pkg to 2.0.0."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     task = _make_task(
         "task-1",
@@ -2317,6 +2798,8 @@ def test_worker_result_under_current_key_must_carry_current_attempt_id():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
         update={
@@ -2398,6 +2881,8 @@ def test_worker_result_persists_attempts_by_target_and_override_usage():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["1.2.3"],
+        allowed_dependency_types=["overrides"],
     )
     task = _make_task("task-1", "g1").model_copy(
         update={
@@ -2587,6 +3072,8 @@ def test_successful_no_fix_package_removal_routes_to_qa_without_odc(mock_chat):
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="workaround_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
     task = _make_task(
         "task-1",
@@ -2634,15 +3121,22 @@ def test_successful_no_fix_package_removal_routes_to_qa_without_odc(mock_chat):
 
 
 def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
     group = _sca_group("g1")
-    old_instruction = "Update test-pkg to 1.0.0."
+    old_instruction = "Update test-pkg to 1.2.3."
     old_snapshot = TaskAttemptSnapshot(
         attempt_id="attempt-failed",
         task_id="task-1",
         state_revision=1,
         task_revision=1,
+        portfolio_plan_id="portfolio-current",
         strategy_stage=SCARemediationStage.NPM_SAME_MAJOR,
-        selected_version="1.0.0",
+        selected_version="1.2.3",
+        target_package_name="test-pkg",
+        target_dependency_type="dependencies",
+        allowed_target_versions=["1.2.3", "2.0.0"],
+        allowed_dependency_types=["dependencies"],
+        qa_policy=QAPolicy.VERSION_BUMP,
         instruction=old_instruction,
         instruction_digest=instruction_digest(old_instruction),
         dispatch_node="update_subagent",
@@ -2657,6 +3151,12 @@ def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch
             "current_attempt_id": old_snapshot.attempt_id,
             "strategy_stage": old_snapshot.strategy_stage,
             "selected_version": old_snapshot.selected_version,
+            "target_package_name": old_snapshot.target_package_name,
+            "target_dependency_type": old_snapshot.target_dependency_type,
+            "allowed_target_versions": old_snapshot.allowed_target_versions,
+            "allowed_dependency_types": old_snapshot.allowed_dependency_types,
+            "qa_policy": old_snapshot.qa_policy,
+            "portfolio_plan_id": old_snapshot.portfolio_plan_id,
             "instruction": old_snapshot.instruction,
         }
     )
@@ -2665,10 +3165,10 @@ def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch
         task_id="task-1",
         task_revision=1,
         status=AgentActionStatus.SURRENDER,
-        executed_versions=["1.0.0"],
+        executed_versions=["1.2.3"],
         execution_diagnostics=WorkerExecutionDiagnostics(
-            attempted_versions=["1.0.0"],
-            executed_versions=["1.0.0"],
+            attempted_versions=["1.2.3"],
+            executed_versions=["1.2.3"],
             validation_passed=False,
         ),
         instruction_digest=old_snapshot.instruction_digest,
@@ -2680,12 +3180,14 @@ def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch
             active_target_task_ids=["task-1"],
             attempt_snapshots_by_id={old_snapshot.attempt_id: old_snapshot},
             worker_results_by_attempt={old_snapshot.attempt_id: worker_result},
+            portfolio_plan=_portfolio_stub(),
             retry_diagnostics_by_task={
                 "task-1": UpdateRetryDiagnostics(
                     task_id="task-1",
                     strategy_stage=SCARemediationStage.NPM_SAME_MAJOR,
-                    attempted_versions=["1.0.0"],
-                    candidate_versions_considered=["2.0.0"],
+                    attempted_versions=["1.2.3"],
+                    candidate_versions_considered=["1.2.3", "2.0.0"],
+                    latest_version_seen="2.0.0",
                 )
             },
         )
@@ -2694,7 +3196,7 @@ def test_failed_update_attempt_is_closed_before_retry_planner_commit(monkeypatch
     committed = result["task_queue"]["task-1"]
     assert committed.current_attempt_id != old_snapshot.attempt_id
     assert committed.selected_version == "2.0.0"
-    assert committed.strategy_stage == SCARemediationStage.NPM_LATEST
+    assert committed.strategy_stage == SCARemediationStage.NPM_SAME_MAJOR
     assert committed.task_revision > old_snapshot.task_revision
     assert (
         result["attempt_snapshots_by_id"][committed.current_attempt_id].selected_version == "2.0.0"
@@ -2716,6 +3218,8 @@ def test_stale_qa_result_does_not_increment_retry_count():
         instruction="Update test-pkg to 2.0.0.",
         instruction_digest=instruction_digest("Update test-pkg to 2.0.0."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     stale_qa = QAAttemptResult(
         attempt_id="attempt-old",
@@ -2772,6 +3276,8 @@ def test_qa_envelope_attempt_id_must_match_current_attempt_map_key() -> None:
         instruction="Update test-pkg to 2.0.0.",
         instruction_digest=instruction_digest("Update test-pkg to 2.0.0."),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     occurrence = PackageScanOccurrence(
         source_input_path="package-lock.json",
@@ -2858,6 +3364,8 @@ def test_missing_qa_result_cannot_dispatch_same_attempt_forever():
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
         qa_policy=QAPolicy.VERSION_BUMP,
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
         update={
@@ -2929,6 +3437,8 @@ def test_inconclusive_active_qa_attempt_is_rechecked_before_other_tasks():
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
         qa_policy=QAPolicy.VERSION_BUMP,
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     active_task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
         update={
@@ -2970,6 +3480,7 @@ def test_terminal_task_cannot_retain_retry_plan():
     state = _base_state(
         [group],
         task_queue={"task-1": task},
+        portfolio_plan=None,
         retry_plans_by_task={
             "task-1": SupervisorRetryPlan(
                 task_id="task-1",
@@ -2981,9 +3492,11 @@ def test_terminal_task_cannot_retain_retry_plan():
 
     result = run_supervisor_node(state)
 
-    assert "task-1" not in result["retry_plans_by_task"]
+    final_state = reconcile_phase5_state_before_teardown({**state, **result})
+    assert "task-1" not in final_state["retry_plans_by_task"]
     assert any(
-        event.error_code == "TERMINAL_TASK_PLAN_CLEARED" for event in result["consistency_events"]
+        event.error_code == "TERMINAL_TASK_PLAN_CLEARED"
+        for event in final_state["consistency_events"]
     )
 
 
@@ -3000,6 +3513,8 @@ def test_teardown_barrier_detaches_terminal_attempt_and_is_idempotent():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="workaround_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
     task = _make_task(
         "task-1",
@@ -3066,6 +3581,7 @@ def test_terminal_pivot_parent_is_not_reseeded_from_initial_osv_plan():
         _base_state(
             [group],
             task_queue={"task-1": task},
+            portfolio_plan=None,
             retry_diagnostics_by_task={
                 "task-1": UpdateRetryDiagnostics(
                     task_id="task-1",
@@ -3081,10 +3597,11 @@ def test_terminal_pivot_parent_is_not_reseeded_from_initial_osv_plan():
     assert committed.selected_version is None
     assert committed.instruction == pivot_instruction
     assert committed.current_attempt_id is None
-    assert "task-1" not in result["retry_plans_by_task"]
+    assert "task-1" not in result.get("retry_plans_by_task", {})
 
 
-def test_pivot_detaches_previous_update_attempt_before_child_dispatch():
+def test_pivot_detaches_previous_update_attempt_before_child_dispatch(monkeypatch):
+    _keep_portfolio_current(monkeypatch)
     group = _sca_group("g1")
     instruction = "Apply the selected dependency version 8.5.1."
     snapshot = TaskAttemptSnapshot(
@@ -3092,8 +3609,14 @@ def test_pivot_detaches_previous_update_attempt_before_child_dispatch():
         task_id="task-1",
         state_revision=2,
         task_revision=2,
+        portfolio_plan_id="portfolio-current",
         strategy_stage=SCARemediationStage.NPM_LATEST,
         selected_version="8.5.1",
+        target_package_name="test-pkg",
+        target_dependency_type="dependencies",
+        allowed_target_versions=["8.5.1"],
+        allowed_dependency_types=["dependencies"],
+        qa_policy=QAPolicy.VERSION_BUMP,
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
@@ -3109,23 +3632,45 @@ def test_pivot_detaches_previous_update_attempt_before_child_dispatch():
             "current_attempt_id": snapshot.attempt_id,
             "strategy_stage": snapshot.strategy_stage,
             "selected_version": snapshot.selected_version,
+            "target_package_name": snapshot.target_package_name,
+            "target_dependency_type": snapshot.target_dependency_type,
+            "allowed_target_versions": snapshot.allowed_target_versions,
+            "allowed_dependency_types": snapshot.allowed_dependency_types,
+            "qa_policy": snapshot.qa_policy,
+            "portfolio_plan_id": snapshot.portfolio_plan_id,
             "instruction": snapshot.instruction,
             "exhausted_update_path": False,
         }
+    )
+    worker_result = WorkerAttemptResult(
+        attempt_id=snapshot.attempt_id,
+        task_id=task.task_id,
+        task_revision=snapshot.task_revision,
+        status=AgentActionStatus.SURRENDER,
+        executed_versions=[snapshot.selected_version],
+        execution_diagnostics=WorkerExecutionDiagnostics(
+            attempted_versions=[snapshot.selected_version],
+            executed_versions=[snapshot.selected_version],
+            validation_passed=False,
+        ),
+        instruction_digest=snapshot.instruction_digest,
     )
     result = run_supervisor_node(
         _base_state(
             [group],
             status="qa_completed",
             task_queue={"task-1": task},
-            active_target_task_ids=[],
+            active_target_task_ids=["task-1"],
             attempt_snapshots_by_id={snapshot.attempt_id: snapshot},
+            worker_results_by_attempt={snapshot.attempt_id: worker_result},
+            portfolio_plan=_portfolio_stub(["task-1"]),
             retry_diagnostics_by_task={
                 "task-1": UpdateRetryDiagnostics(
                     task_id="task-1",
                     strategy_stage=SCARemediationStage.NPM_LATEST,
                     selected_version="8.5.1",
                     attempted_versions=["6.0.0", "6.1.2", "8.5.1"],
+                    candidate_versions_considered=["8.5.1"],
                     latest_version_seen="8.5.1",
                     exhausted_update_path=True,
                 )
@@ -3152,7 +3697,7 @@ def test_pivot_detaches_previous_update_attempt_before_child_dispatch():
 
 
 # ===========================================================================
-# run_supervisor_node â€” action summary updates
+# run_supervisor_node — action summary updates
 # ===========================================================================
 
 
@@ -3160,7 +3705,10 @@ class TestRunSupervisorNodeActionSummary:
     @patch("langchain_openai.ChatOpenAI")
     def test_qa_passed_subset_is_removed_before_retry_routing(self, mock_chat):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
-        g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
+        g2 = _rename_sca_group_package(
+            _sca_group("g2", FixPlanStatus.VERSION_FOUND),
+            "other-pkg",
+        )
         task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
         task2 = _make_task("task-2", "g2", status=TaskStatus.NEEDS_RETRY, retry_count=1)
         state = _base_state(
@@ -3242,13 +3790,14 @@ class TestRunSupervisorNodeActionSummaryUpdates:
             task_queue={"task-1": task},
             action_summaries=[summary],
             active_target_task_ids=["task-1"],
+            portfolio_plan=None,
         )
         result = run_supervisor_node(state)
         assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
 
     def test_handles_multiple_action_summaries(self):
         g1 = _sca_group("g1")
-        g2 = _sca_group("g2")
+        g2 = _rename_sca_group_package(_sca_group("g2"), "other-pkg")
         task1 = _make_task("task-1", "g1", status=TaskStatus.PENDING)
         task2 = _make_task("task-2", "g2", status=TaskStatus.PENDING)
         summary1 = AgentActionSummary(
@@ -3284,20 +3833,23 @@ class TestRunSupervisorNodeActionSummaryUpdates:
             task_queue={"task-1": task},
             action_summaries=[summary],
             active_target_task_ids=["task-1"],
+            portfolio_plan=None,
         )
         result = run_supervisor_node(state)
-        # QA_PASSED is terminal â€” must not be overwritten
+        # QA_PASSED is terminal — must not be overwritten
         assert result["task_queue"]["task-1"].status == TaskStatus.QA_PASSED
 
     def test_does_not_update_non_active_targets_from_action_summary(self):
         g1 = _sca_group("g1")
-        g2 = _sca_group("g2")
+        g2 = _rename_sca_group_package(_sca_group("g2"), "other-pkg")
         task1 = _make_task("task-1", "g1", status=TaskStatus.NEEDS_RETRY)
         task2 = _make_task("task-2", "g2", status=TaskStatus.PENDING)
         summary_g1 = AgentActionSummary(
             task_id="task-1",
             status=AgentActionStatus.SUCCESS,
             summary="fixed it",
+            attempt_id="historical-attempt",
+            task_revision=1,
         )
         # task-1 has a SUCCESS summary but is NOT in active_target_task_ids.
         state = _base_state(
@@ -3312,7 +3864,7 @@ class TestRunSupervisorNodeActionSummaryUpdates:
 
 
 # ===========================================================================
-# run_supervisor_node â€” max retries / unfixable marking
+# run_supervisor_node — max retries / unfixable marking
 # ===========================================================================
 
 
@@ -3320,7 +3872,10 @@ class TestRunSupervisorNodeTargetGuardrails:
     @patch("langchain_openai.ChatOpenAI")
     def test_llm_update_targets_drop_terminal_tasks(self, mock_chat):
         g1 = _sca_group("g1", FixPlanStatus.VERSION_FOUND)
-        g2 = _sca_group("g2", FixPlanStatus.VERSION_FOUND)
+        g2 = _rename_sca_group_package(
+            _sca_group("g2", FixPlanStatus.VERSION_FOUND),
+            "other-pkg",
+        )
         task1 = _make_task("task-1", "g1", status=TaskStatus.QA_PASSED)
         task2 = _make_task("task-2", "g2", status=TaskStatus.PENDING)
         state = _base_state(
@@ -3337,7 +3892,7 @@ class TestRunSupervisorNodeTargetGuardrails:
             target_task_ids=["task-1", "task-2"],
             revised_instructions={
                 "task-1": "Do not dispatch terminal tasks.",
-                "task-2": 'Update "test-pkg" in package.json to version "1.2.4".',
+                "task-2": 'Update "other-pkg" in package.json to version "1.2.3".',
             },
             instructions="route update batch",
             decision_reason="router included one stale terminal task",
@@ -3398,7 +3953,7 @@ class TestRunSupervisorMaxRetries:
         assert "task-1" not in result["active_target_task_ids"]
 
     @patch(
-        "remediation_engine.orchestration.supervisor_node.get_runtime_settings",
+        "remediation_engine.agents.supervisor.get_runtime_settings",
         return_value=AppSettings(openai_api_key=""),
     )
     def test_qa_failure_at_retry_cap_pivots_before_terminalization(self, _settings):
@@ -3415,6 +3970,17 @@ class TestRunSupervisorMaxRetries:
             status="qa_completed",
             task_queue={"task-1": task},
             active_target_task_ids=["task-1"],
+            retry_diagnostics_by_task={
+                "task-1": UpdateRetryDiagnostics(
+                    task_id="task-1",
+                    strategy_stage=SCARemediationStage.NPM_LATEST,
+                    attempted_versions=["1.2.3"],
+                    candidate_versions_considered=["1.2.3"],
+                    selected_version="1.2.3",
+                    latest_version_seen="1.2.3",
+                    exhausted_update_path=True,
+                )
+            },
             qa_evaluations={
                 "task-1": QAEvaluation(
                     task_id="task-1",
@@ -3435,8 +4001,8 @@ class TestRunSupervisorMaxRetries:
     @patch("langchain_openai.ChatOpenAI")
     def test_all_terminal_after_retry_cap_skips_router_and_tears_down(self, mock_chat):
         g1 = _sca_group("g1")
-        g2 = _sca_group("g2")
-        g3 = _sca_group("g3")
+        g2 = _rename_sca_group_package(_sca_group("g2"), "other-pkg")
+        g3 = _rename_sca_group_package(_sca_group("g3"), "third-pkg")
         task1 = _make_task("task-1", "g1", status=TaskStatus.QA_PASSED)
         task2 = _make_task(
             "task-2",
@@ -3486,19 +4052,24 @@ class TestRunSupervisorMaxRetries:
 
 def test_newly_unfixable_sca_transition_replans_before_dispatch(monkeypatch):
     _keep_portfolio_current(monkeypatch)
-    groups = [_sca_group("g1"), _sca_group("g2"), _sca_group("g3")]
+    groups = [
+        _sca_group("g1"),
+        _rename_sca_group_package(_sca_group("g2"), "other-pkg"),
+        _rename_sca_group_package(_sca_group("g3"), "third-pkg"),
+    ]
     task1 = _make_task(
         "task-1",
         "g1",
         status=TaskStatus.NEEDS_RETRY,
         retry_count=MAX_RETRIES,
     )
-    task2 = _make_task("task-2", "g2")
-    task3 = _make_task("task-3", "g3")
+    task2 = _authorize_test_update(_make_task("task-2", "g2"), groups[1])
+    task3 = _authorize_test_update(_make_task("task-3", "g3"), groups[2])
+    plan = _portfolio_stub(["task-2", "task-3"])
     state = _base_state(
         groups,
         task_queue={"task-3": task3, "task-1": task1, "task-2": task2},
-        portfolio_plan=_portfolio_stub(),
+        portfolio_plan=plan,
     )
     portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
 
@@ -3528,14 +4099,23 @@ def test_newly_unfixable_sca_transition_replans_before_dispatch(monkeypatch):
 
 def test_existing_unfixable_sca_does_not_trigger_another_replan(monkeypatch):
     _keep_portfolio_current(monkeypatch)
-    groups = [_sca_group("g1"), _sca_group("g2")]
+    groups = [_sca_group("g1"), _rename_sca_group_package(_sca_group("g2"), "other-pkg")]
+    pending_task = _make_task("task-2", "g2").model_copy(
+        update={
+            "portfolio_plan_id": "portfolio-current",
+            "target_package_name": "other-pkg",
+            "target_dependency_type": "dependencies",
+            "selected_version": "1.2.3",
+            "allowed_target_versions": ["1.2.3"],
+            "allowed_dependency_types": ["dependencies"],
+            "instruction": "Update other-pkg in package.json to exact version 1.2.3.",
+        }
+    )
     state = _base_state(
         groups,
         task_queue={
             "task-1": _make_task("task-1", "g1", status=TaskStatus.UNFIXABLE),
-            "task-2": _make_task("task-2", "g2").model_copy(
-                update={"instruction": "Update the package to an approved version."}
-            ),
+            "task-2": pending_task,
         },
         portfolio_plan=_portfolio_stub(),
     )
@@ -3551,7 +4131,7 @@ def test_existing_unfixable_sca_does_not_trigger_another_replan(monkeypatch):
 
 def test_pending_unfixable_replan_waits_for_open_attempt_reconciliation(monkeypatch):
     _keep_portfolio_current(monkeypatch)
-    groups = [_sca_group("g1"), _sca_group("g2")]
+    groups = [_sca_group("g1"), _rename_sca_group_package(_sca_group("g2"), "other-pkg")]
     open_task = _make_task(
         "task-open",
         "g2",
@@ -3559,6 +4139,10 @@ def test_pending_unfixable_replan_waits_for_open_attempt_reconciliation(monkeypa
     ).model_copy(
         update={
             "qa_policy": QAPolicy.VERSION_BUMP,
+            "portfolio_plan_id": "portfolio-current",
+            "selected_version": "2.0.0",
+            "target_package_name": "other-pkg",
+            "target_dependency_type": "dependencies",
             "instruction": "Verify the committed package update.",
         }
     )
@@ -3597,16 +4181,19 @@ def test_pending_unfixable_replan_waits_for_open_attempt_reconciliation(monkeypa
 
 def test_pending_unfixable_replan_routes_when_attempt_barrier_is_clear(monkeypatch):
     _keep_portfolio_current(monkeypatch)
-    groups = [_sca_group("g1"), _sca_group("g2")]
+    groups = [_sca_group("g1"), _rename_sca_group_package(_sca_group("g2"), "other-pkg")]
     request = PortfolioReplanRequest(reason="UNFIXABLE_REPLAN")
+    plan = _portfolio_stub(["task-2"])
+    request = request.model_copy(update={"source_portfolio_plan_id": plan.portfolio_plan_id})
+    pending_task = _authorize_test_update(_make_task("task-2", "g2"), groups[1])
     state = _base_state(
         groups,
         task_queue={
             "task-1": _make_task("task-1", "g1", status=TaskStatus.UNFIXABLE),
-            "task-2": _make_task("task-2", "g2"),
+            "task-2": pending_task,
         },
         portfolio_replan_request=request,
-        portfolio_plan=_portfolio_stub(),
+        portfolio_plan=plan,
     )
 
     portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
@@ -3747,7 +4334,7 @@ def test_early_stale_plan_route_preserves_typed_pending_request(monkeypatch):
         portfolio_plan=_portfolio_stub(),
     )
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+        "remediation_engine.agents.supervisor._portfolio_plan_violations",
         lambda *args, **kwargs: ["committed plan is stale"],
     )
 
@@ -3762,7 +4349,7 @@ def test_early_stale_plan_route_preserves_typed_pending_request(monkeypatch):
 
 
 # ===========================================================================
-# run_supervisor_node â€” strategy pivots
+# run_supervisor_node — strategy pivots
 # ===========================================================================
 
 
@@ -3879,63 +4466,6 @@ class TestRunSupervisorNodePeerConflict:
         assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
 
     @patch("langchain_openai.ChatOpenAI")
-    def test_strategy_pivot_without_child_instruction_fails_closed(self, mock_chat):
-        g1 = _sca_group("g1")
-        task = _make_task(
-            "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
-        )
-        state = _base_state(
-            [g1],
-            task_queue={"task-1": task},
-        )
-
-        mock_llm = MagicMock()
-        mock_chat.return_value = mock_llm
-        mock_llm.with_structured_output.return_value.invoke.return_value = SupervisorDecision(
-            next_node="workaround_subagent",
-            target_task_ids=["task-1"],
-            updated_task_strategies={"task-1": RoutingStrategy.CODE_WORKAROUND},
-            instructions="retry with a workaround",
-            decision_reason="pivot the task after the retry failed",
-        )
-
-        result = run_supervisor_node(state)
-
-        assert result["next_routing_step"] == "update_subagent"
-        assert result["active_target_task_ids"] == ["task-1"]
-        assert "task-2" not in result["task_queue"]
-        assert result["task_queue"]["task-1"].status == TaskStatus.NEEDS_RETRY
-
-    @patch("langchain_openai.ChatOpenAI")
-    def legacy_breaking_change_fallback_spawns_child_instead_of_retrying_parent(self, mock_chat):
-        g1 = _sca_group("g1")
-        task = _make_task(
-            "task-1", "g1", strategy=RoutingStrategy.VERSION_BUMP, status=TaskStatus.NEEDS_RETRY
-        )
-        state = _base_state(
-            [g1],
-            task_queue={"task-1": task},
-            qa_evaluations={
-                "task-1": QAEvaluation(
-                    task_id="task-1",
-                    passed=False,
-                    failure_category=FailureCategory.BREAKING_CHANGE,
-                    retry_feedback="jsonwebtoken v9 broke runtime expectations",
-                )
-            },
-        )
-
-        mock_chat.side_effect = ImportError("No module named langchain_openai")
-
-        result = run_supervisor_node(state)
-
-        assert result["next_routing_step"] == "workaround_subagent"
-        assert result["active_target_task_ids"] == ["task-2"]
-        assert result["task_queue"]["task-1"].status == TaskStatus.PIVOTED
-        assert result["task_queue"]["task-2"].parent_task_id == "task-1"
-        assert result["task_queue"]["task-2"].strategy == RoutingStrategy.CODE_WORKAROUND
-
-    @patch("langchain_openai.ChatOpenAI")
     def test_exhausted_update_path_fallback_spawns_child_and_terminalizes_parent(self, mock_chat):
         g1 = _sca_group("g1")
         task = _make_task(
@@ -4033,7 +4563,13 @@ class TestRunSupervisorNodePeerConflict:
 
     @patch("langchain_openai.ChatOpenAI")
     def test_deterministic_routing_ignores_multi_spawn_advisory(self, mock_chat):
-        groups = [_sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND) for i in range(3)]
+        groups = [
+            _rename_sca_group_package(
+                _sca_group(f"g{i}", FixPlanStatus.VERSION_FOUND),
+                f"test-pkg-{i}",
+            )
+            for i in range(3)
+        ]
         tasks = {
             f"task-{i + 1}": _make_task(
                 f"task-{i + 1}",
@@ -4091,7 +4627,7 @@ class TestRunSupervisorNodePeerConflict:
 
 
 # ===========================================================================
-# run_supervisor_node â€” deterministic routing
+# run_supervisor_node — deterministic routing
 # ===========================================================================
 
 
@@ -4117,6 +4653,7 @@ class TestBugFixes:
             strategy_stage=SCARemediationStage.CODE_WORKAROUND,
             status=TaskStatus.NEEDS_RETRY,
             instruction="Bump express",
+            qa_policy=qa_policy_for_task(RoutingStrategy.VERSION_BUMP),
         )
         task_queue = {"task-1": task}
         group_by_id = {group_id: g}
@@ -4299,6 +4836,7 @@ class TestBugFixes:
             strategy=RoutingStrategy.CODE_WORKAROUND,
             status=TaskStatus.PENDING,
             instruction="Apply workaround",
+            qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
         )
         task_queue = {parent_task.task_id: parent_task, existing_child.task_id: existing_child}
         spawn_req = TaskSpawnRequest(
@@ -4378,9 +4916,10 @@ class TestBugFixes:
         assert result["active_target_task_ids"] == []
 
     @patch("langchain_openai.ChatOpenAI")
-    def test_terminal_pivot_child_releases_other_pending_tasks(self, mock_chat):
+    def test_terminal_pivot_child_releases_other_pending_tasks(self, mock_chat, monkeypatch):
         """A terminal pivot child must not starve unrelated pending tasks."""
-        groups = [_sca_group("g1"), _sca_group("g2")]
+        _keep_portfolio_current(monkeypatch)
+        groups = [_sca_group("g1"), _rename_sca_group_package(_sca_group("g2"), "other-pkg")]
         parent_task = _make_task(
             "task-1",
             "g1",
@@ -4414,13 +4953,18 @@ class TestBugFixes:
             },
         )
         mock_chat.side_effect = ImportError("No module named langchain_openai")
+        portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
 
         result = run_supervisor_node(state)
 
         assert result["task_queue"]["task-1"].status == TaskStatus.UNFIXABLE
         assert result["task_queue"]["task-2"].status == TaskStatus.UNFIXABLE
-        assert result["next_routing_step"] == "update_subagent"
-        assert result["active_target_task_ids"] == ["task-3"]
+        portfolio_tool.assert_called_once()
+        portfolio_input = portfolio_tool.call_args.args[0]
+        assert portfolio_input["task_queue"]["task-3"].status == TaskStatus.PENDING
+        assert result["portfolio_replan_request"].reason == "UNFIXABLE_REPLAN"
+        assert result["next_routing_step"] == "supervisor"
+        assert result["active_target_task_ids"] == []
 
     def test_bug3_reject_workaround_to_workaround_spawn(self):
         parent_task = RemediationTask(
@@ -4429,6 +4973,7 @@ class TestBugFixes:
             strategy=RoutingStrategy.CODE_WORKAROUND,
             status=TaskStatus.NEEDS_RETRY,
             instruction="Workaround",
+            qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
         )
         task_queue = {"task-1": parent_task}
         spawn_req = TaskSpawnRequest(
@@ -4461,6 +5006,7 @@ class TestBugFixes:
             status=TaskStatus.NEEDS_RETRY,
             retry_count=3,  # MAX_RETRIES
             instruction="Workaround",
+            qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
         )
         task_queue = {"task-1": task}
 
@@ -4475,7 +5021,9 @@ class TestBugFixes:
         assert decision.target_task_ids == []
 
     @patch("langchain_openai.ChatOpenAI")
-    def test_bug4_programmatic_feedback_injection_for_workaround_retries(self, mock_chat_openai):
+    def test_bug4_programmatic_feedback_injection_for_workaround_retries(
+        self, mock_chat_openai, tmp_path, monkeypatch
+    ):
         mock_llm = MagicMock()
         mock_structured = MagicMock()
         mock_structured.invoke.return_value = SupervisorDecision(
@@ -4502,6 +5050,8 @@ class TestBugFixes:
             status=TaskStatus.NEEDS_RETRY,
             retry_count=1,
             instruction="Workaround",
+            portfolio_plan_id="portfolio-current",
+            qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
         )
         task_queue = {"task-2": task}
         qa_evaluations = {
@@ -4513,24 +5063,24 @@ class TestBugFixes:
             )
         }
 
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        _keep_portfolio_current(monkeypatch)
+        portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
         result = run_supervisor_node(
-            {
-                "repo_root": "/tmp",
-                "issues": [],
-                "system_context": MagicMock(),
-                "constraints_ledger": [],
-                "retry_counts": {},
-                "group_strategies": {},
-                "action_summaries": [],
-                "retry_plans_by_task": {},
-                "task_queue": task_queue,
-                "valid_groups": [g],
-                "qa_evaluations": qa_evaluations,
-                "active_target_task_ids": ["task-2"],
-                "retry_diagnostics_by_task": {},
-            }
+            _base_state(
+                [g],
+                repo_root=str(repo_root),
+                system_context=SystemContext(primary_language="javascript"),
+                task_queue=task_queue,
+                qa_evaluations=qa_evaluations,
+                active_target_task_ids=["task-2"],
+                retry_diagnostics_by_task={},
+                portfolio_plan=_portfolio_stub(),
+            )
         )
 
+        portfolio_tool.assert_not_called()
         assert result["next_routing_step"] == "workaround_subagent"
         assert result["feedback_by_task"]["task-2"] == "Real feedback from QA"
 
@@ -4589,6 +5139,9 @@ def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
             instruction=instruction,
             instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
+            allowed_dependency_types=[task.target_dependency_type]
+            if task.target_dependency_type is not None
+            else [],
         )
         evaluation = QAEvaluation(
             task_id=task_id,
@@ -4636,22 +5189,22 @@ def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
         "source_portfolio_plan_id": source_plan_id,
         "attempt_ids_by_task": attempt_ids_by_task,
     }
-    escalation = {
-        "reason": "DELTA_ISOLATION_ATTRIBUTION",
-        "forced_singleton_task_ids": ["task-b"],
-        "triggering_attempt_id": "attempt-b",
-        "source_portfolio_plan_id": source_plan_id,
-    }
+    escalation = PortfolioReplanRequest(
+        reason="DELTA_ISOLATION_ATTRIBUTION",
+        forced_singleton_task_ids=["task-b"],
+        triggering_attempt_id="attempt-b",
+        source_portfolio_plan_id=source_plan_id,
+    )
     if delta_case == "stale_attempt":
         record["attempt_ids_by_task"] = {
             **attempt_ids_by_task,
             "task-b": "attempt-old",
         }
     elif delta_case == "foreign_forced_task":
-        escalation["forced_singleton_task_ids"] = ["task-foreign"]
+        escalation = escalation.model_copy(update={"forced_singleton_task_ids": ["task-foreign"]})
     elif delta_case == "stale_source":
         record["source_portfolio_plan_id"] = "portfolio-old"
-        escalation["source_portfolio_plan_id"] = "portfolio-old"
+        escalation = escalation.model_copy(update={"source_portfolio_plan_id": "portfolio-old"})
 
     state = _base_state(
         [group_a, group_b],
@@ -4666,7 +5219,7 @@ def _atomic_cluster_delta_failure_state(*, delta_case="valid"):
         delta_isolation_by_cluster=(
             {cluster_id: record} if delta_case != "ordinary_failure" else {}
         ),
-        portfolio_escalation=(escalation if delta_case != "ordinary_failure" else None),
+        portfolio_replan_request=(escalation if delta_case != "ordinary_failure" else None),
     )
     return state, tasks, snapshots
 
@@ -4726,7 +5279,7 @@ def test_delta_isolation_requeues_unblamed_peer_for_authoritative_singleton_qa(
     state, _original_tasks, _snapshots = _atomic_cluster_delta_failure_state()
     _keep_portfolio_current(monkeypatch)
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node._apply_tactical_supervisor",
+        "remediation_engine.agents.supervisor._apply_tactical_supervisor",
         lambda *args, **kwargs: None,
     )
 
@@ -4763,7 +5316,6 @@ def test_delta_isolation_requeues_unblamed_peer_for_authoritative_singleton_qa(
             "portfolio_solver_plan": None,
             "portfolio_iteration": 1,
             "portfolio_replan_request": None,
-            "portfolio_escalation": None,
             "portfolio_dirty": False,
             "valid_groups": portfolio_input["valid_groups"],
             "task_queue": task_queue,
@@ -4775,7 +5327,7 @@ def test_delta_isolation_requeues_unblamed_peer_for_authoritative_singleton_qa(
         }
 
     monkeypatch.setattr(
-        "remediation_engine.orchestration.supervisor_node.run_portfolio_plan_tool",
+        "remediation_engine.agents.supervisor.run_portfolio_plan_tool",
         rebuild_portfolio,
     )
 
@@ -4889,7 +5441,6 @@ def test_atomic_cluster_stale_delta_provenance_retries_every_member(delta_case):
         assert committed.retry_count == task.retry_count + 1
         assert committed.current_attempt_id is None
         assert committed.task_revision > task.task_revision
-    assert result["portfolio_escalation"]["forced_singleton_task_ids"] == []
     request = result["portfolio_replan_request"]
     assert request.forced_singleton_task_ids == []
     assert request.triggering_attempt_id is None
@@ -4912,6 +5463,8 @@ def test_supervisor_commits_complete_passing_scan_into_ledgers():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     old_occurrence = PackageScanOccurrence(
         source_input_path="package-lock.json",
@@ -5099,6 +5652,8 @@ def _workerless_absence_state(
         instruction=source_instruction,
         instruction_digest=instruction_digest(source_instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     source_scan_evidence = ODCScanEvidence(
         requested_scope=ScanScope.TARGETED,
@@ -5143,7 +5698,13 @@ def _workerless_absence_state(
                 "task_revision": 1,
                 "current_attempt_id": "attempt-open",
                 "qa_policy": QAPolicy.VERSION_BUMP,
-                "instruction": "Upgrade the open package.",
+                "portfolio_plan_id": "portfolio-current",
+                "selected_version": "1.2.3",
+                "target_package_name": open_group.vulnerable_component,
+                "target_dependency_type": "dependencies",
+                "allowed_target_versions": ["1.2.3"],
+                "allowed_dependency_types": ["dependencies"],
+                "instruction": f"Upgrade {open_group.vulnerable_component} to exact version 1.2.3.",
             }
         )
         waiting_task = _make_task("task-waiting", waiting_group.group_id).model_copy(
@@ -5154,7 +5715,13 @@ def _workerless_absence_state(
             task_id="task-open",
             state_revision=1,
             task_revision=1,
+            portfolio_plan_id="portfolio-current",
             qa_policy=QAPolicy.VERSION_BUMP,
+            selected_version="1.2.3",
+            target_package_name=open_group.vulnerable_component,
+            target_dependency_type="dependencies",
+            allowed_target_versions=["1.2.3"],
+            allowed_dependency_types=["dependencies"],
             instruction=open_task.instruction,
             instruction_digest=instruction_digest(open_task.instruction),
             dispatch_node="update_subagent",
@@ -5312,11 +5879,11 @@ def test_supervisor_completes_absent_package_without_worker_attempt() -> None:
 
     with (
         patch(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            "remediation_engine.agents.supervisor._portfolio_plan_violations",
             return_value=[],
         ),
         patch(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            "remediation_engine.agents.supervisor._portfolio_plan_is_stale",
             return_value=False,
         ),
     ):
@@ -5354,11 +5921,11 @@ def test_verified_absent_portfolio_member_requires_replan_before_workers(
 
     with (
         patch(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            "remediation_engine.agents.supervisor._portfolio_plan_violations",
             return_value=[],
         ),
         patch(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            "remediation_engine.agents.supervisor._portfolio_plan_is_stale",
             return_value=False,
         ),
     ):
@@ -5390,11 +5957,11 @@ def test_verified_absent_portfolio_member_waits_for_open_attempts_then_replans(
     portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
     with (
         patch(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            "remediation_engine.agents.supervisor._portfolio_plan_violations",
             return_value=[],
         ),
         patch(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            "remediation_engine.agents.supervisor._portfolio_plan_is_stale",
             return_value=False,
         ),
     ):
@@ -5423,11 +5990,11 @@ def test_verified_absence_does_not_dispatch_remaining_members_while_worker_attem
     portfolio_tool = _stub_portfolio_plan_tool(monkeypatch)
     with (
         patch(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_violations",
+            "remediation_engine.agents.supervisor._portfolio_plan_violations",
             return_value=[],
         ),
         patch(
-            "remediation_engine.orchestration.supervisor_node._portfolio_plan_is_stale",
+            "remediation_engine.agents.supervisor._portfolio_plan_is_stale",
             return_value=False,
         ),
     ):
@@ -5459,6 +6026,8 @@ def test_retained_regression_candidate_does_not_commit_batch_scan_findings():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="update_subagent",
+        allowed_target_versions=["2.0.0"],
+        allowed_dependency_types=[],
     )
     task_evidence = ODCScanEvidence(
         requested_scope=ScanScope.TARGETED,
@@ -6235,6 +6804,8 @@ def test_setup_scan_findings_persist_until_accepted_task_scan_replaces_them():
         instruction=instruction,
         instruction_digest=instruction_digest(instruction),
         dispatch_node="workaround_subagent",
+        allowed_target_versions=[],
+        allowed_dependency_types=[],
     )
     clean_evidence = ODCScanEvidence(
         requested_scope=ScanScope.TARGETED,
@@ -6326,32 +6897,26 @@ def test_later_clean_task_scan_clears_prior_incremental_vulnerability():
 
 # Stage-2 behavior retained during the architecture merge.
 class TestSupervisorDecisionSchemaStage2Parity:
-    def test_update_subagent_rejects_more_than_ten_targets(self):
-        with pytest.raises(ValidationError):
-            SupervisorDecision(
-                next_node="update_subagent",
-                target_task_ids=[f"t{i}" for i in range(11)],
-                instructions="test",
-                decision_reason="test",
-            )
+    def test_update_dispatch_normalization_caps_large_target_advisory(self):
+        task_ids = [f"task-{index}" for index in range(11)]
+        decision = SupervisorDecision(
+            next_node="update_subagent",
+            target_task_ids=task_ids,
+            instructions="test",
+            decision_reason="test",
+        )
+        task_queue = {
+            task_id: _make_task(task_id, task_id, status=TaskStatus.PENDING) for task_id in task_ids
+        }
 
-
-class TestRunSupervisorNodeToQAStage2Parity:
-    def test_all_optimistically_fixed_tasks_route_to_qa_one_at_a_time(self):
-        g1 = _sca_group("g1")
-        g2 = _sca_group("g2")
-        task1 = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED)
-        task2 = _make_task("task-2", "g2", status=TaskStatus.OPTIMISTICALLY_FIXED)
-        state = _base_state(
-            [g1, g2],
-            task_queue={"task-1": task1, "task-2": task2},
-            # No active_target_task_ids â€” all tasks are already optimistically fixed
-            active_target_task_ids=[],
+        normalized_targets = _normalize_target_task_ids_for_node(
+            "update_subagent",
+            decision.target_task_ids,
+            task_queue,
         )
 
-        result = run_supervisor_node(state)
-        assert result["next_routing_step"] == "qa_critic"
-        assert result["active_target_task_ids"] == ["task-1"]
+        assert len(normalized_targets) == 1
+        assert normalized_targets[0] in task_ids
 
 
 class TestRunSupervisorNodeQAUpdatesStage2Parity:
@@ -6394,6 +6959,8 @@ class TestRunSupervisorNodeQAUpdatesStage2Parity:
             instruction_digest=instruction_digest(instruction),
             dispatch_node="update_subagent",
             qa_policy=QAPolicy.VERSION_BUMP,
+            allowed_target_versions=["1.2.3"],
+            allowed_dependency_types=[],
         )
         task = _make_task("task-1", "g1", status=TaskStatus.OPTIMISTICALLY_FIXED).model_copy(
             update={
@@ -6491,6 +7058,7 @@ class TestBugFixesStage2Parity:
             },
             workspace_volume="workspace-volume",
             final_full_scan_completed=False,
+            final_full_scan_enabled=True,
         )
         mock_chat.side_effect = ImportError("No module named langchain_openai")
 

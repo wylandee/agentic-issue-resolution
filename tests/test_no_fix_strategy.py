@@ -6,6 +6,15 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+from remediation_engine.agents.supervisor import (
+    _create_attempt_snapshot,
+    _deterministic_routing,
+    _no_fix_decision_requires_fallback,
+)
+from remediation_engine.agents.workaround import (
+    _WORKAROUND_STATIC_INSTRUCTIONS,
+    _build_workaround_prompt,
+)
 from remediation_engine.contracts import NoFixMitigationStage
 from remediation_engine.contracts.schemas import (
     CommandResult,
@@ -15,6 +24,7 @@ from remediation_engine.contracts.schemas import (
     IssueSource,
     IssueType,
     LocalizedIssue,
+    PackageFixPlanCandidate,
     QAEvaluation,
     QAFailureEvidence,
     QAPolicy,
@@ -27,29 +37,23 @@ from remediation_engine.contracts.schemas import (
     WorkaroundExecutionPhase,
     WorkaroundPhase,
 )
-from remediation_engine.orchestration._qa_runtime import _collect_group_package_state
-from remediation_engine.orchestration.remedy_tools import build_workaround_toolbelt
-from remediation_engine.orchestration.supervisor_node import (
-    _create_attempt_snapshot,
-    _deterministic_routing,
-    _no_fix_decision_requires_fallback,
+from remediation_engine.language import ProjectLanguage
+from remediation_engine.orchestration.state import (
     _no_fix_failure_transition,
     _normalize_qa_evaluations_for_tasks,
-)
-from remediation_engine.orchestration.task_utils import (
     advance_no_fix_stage,
     build_initial_remediation_task,
     build_no_fix_package_removal_instruction,
     build_no_fix_retry_instruction,
 )
-from remediation_engine.orchestration.tools_validation import _make_validate_workaround_tool
-from remediation_engine.orchestration.workaround_subagent import (
-    _WORKAROUND_STATIC_INSTRUCTIONS,
-    _build_workaround_prompt,
-)
+from remediation_engine.tools.qa_workspace import _collect_group_package_state
+from remediation_engine.tools.validation import _make_validate_workaround_tool
+from remediation_engine.tools.workers import build_workaround_toolbelt
+from tests.helpers import qa_policy_for_task
 
 
 def _group() -> VulnerabilityGroup:
+    issue_id = str(uuid4())
     return VulnerabilityGroup(
         group_id="sca:package.json:notevil",
         issue_type=IssueType.SCA,
@@ -58,12 +62,17 @@ def _group() -> VulnerabilityGroup:
         file_paths=["package.json"],
         cve_ids=["CVE-2021-23771"],
         ghsa_ids=["GHSA-8G4M-CJM2-96WQ"],
-        representative_issue_id=str(uuid4()),
-        fix_plan=FixPlan(
-            status=FixPlanStatus.NO_FIX,
-            instruction="No upstream patch or workaround was found. Inform the user.",
-            strategy_used="test",
-        ),
+        representative_issue_id=issue_id,
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=issue_id,
+                plan=FixPlan(
+                    status=FixPlanStatus.NO_FIX,
+                    instruction="No upstream patch or workaround was found. Inform the user.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
 
 
@@ -92,11 +101,16 @@ def _maven_group() -> VulnerabilityGroup:
         representative_issue_id=str(issue.id),
         issues=[issue],
         localized_issues=[localized],
-        fix_plan=FixPlan(
-            status=FixPlanStatus.NO_FIX,
-            instruction="No fix is available.",
-            strategy_used="test",
-        ),
+        fix_plan_candidates=[
+            PackageFixPlanCandidate(
+                issue_id=str(issue.id),
+                plan=FixPlan(
+                    status=FixPlanStatus.NO_FIX,
+                    instruction="No fix is available.",
+                    strategy_used="test",
+                ),
+            )
+        ],
     )
 
 
@@ -110,15 +124,17 @@ def _task(stage: NoFixMitigationStage, *, retry_count: int = 0) -> RemediationTa
         retry_count=retry_count,
         status=TaskStatus.PENDING,
         instruction="stage instruction",
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND, no_fix_stage=stage),
     )
 
 
-def test_no_fix_contracts_round_trip_and_defaults():
+def test_no_fix_stage_defaults_to_none():
     assert NoFixMitigationStage.PACKAGE_REMOVAL.value == "package_removal"
     task = RemediationTask(
         task_id="task-1",
         parent_group_id="group-1",
         strategy=RoutingStrategy.CODE_WORKAROUND,
+        qa_policy=qa_policy_for_task(RoutingStrategy.CODE_WORKAROUND),
     )
     assert task.no_fix_stage is None
     assert RemediationTask.model_validate_json(task.model_dump_json()).no_fix_stage is None
@@ -140,26 +156,38 @@ def test_initial_and_non_no_fix_task_creation_are_distinct():
     assert "PACKAGE REMOVAL" in no_fix_task.instruction
     assert "Inform the user" not in no_fix_task.instruction
 
-    version_group = _group().model_copy(
+    version_base = _group()
+    version_group = version_base.model_copy(
         update={
             "group_id": "version-group",
-            "fix_plan": FixPlan(
-                status=FixPlanStatus.VERSION_FOUND,
-                fixed_version="1.2.3",
-                instruction="update it",
-                strategy_used="test",
-            ),
+            "fix_plan_candidates": [
+                PackageFixPlanCandidate(
+                    issue_id=version_base.representative_issue_id,
+                    plan=FixPlan(
+                        status=FixPlanStatus.VERSION_FOUND,
+                        fixed_version="1.2.3",
+                        instruction="update it",
+                        strategy_used="test",
+                    ),
+                )
+            ],
         }
     )
-    workaround_group = _group().model_copy(
+    workaround_base = _group()
+    workaround_group = workaround_base.model_copy(
         update={
             "group_id": "workaround-group",
-            "fix_plan": FixPlan(
-                status=FixPlanStatus.WORKAROUND_FOUND,
-                workaround_snippets=["safe workaround"],
-                instruction="use the workaround",
-                strategy_used="test",
-            ),
+            "fix_plan_candidates": [
+                PackageFixPlanCandidate(
+                    issue_id=workaround_base.representative_issue_id,
+                    plan=FixPlan(
+                        status=FixPlanStatus.WORKAROUND_FOUND,
+                        workaround_snippets=["safe workaround"],
+                        instruction="use the workaround",
+                        strategy_used="test",
+                    ),
+                )
+            ],
         }
     )
     assert build_initial_remediation_task(version_group, "task-2").no_fix_stage is None
@@ -339,6 +367,31 @@ class _PackageSandbox:
     def run(self, command: str, **_kwargs):
         self.commands.append(command)
         return self.sync_result
+
+
+def test_package_removal_validator_rejects_explicit_language_mismatch():
+    sandbox = _PackageSandbox({"module/pom.xml": "<project/>"})
+    plan_state = {
+        "no_fix_stage": NoFixMitigationStage.PACKAGE_REMOVAL.value,
+        "no_fix_package_manager": "maven",
+        "no_fix_package_name": "org.example:widget",
+        "no_fix_manifest_paths": ["module/pom.xml"],
+        "package_removal_planned": True,
+        "no_fix_package_removed": True,
+    }
+    validate = _make_validate_workaround_tool(
+        sandbox,
+        set(),
+        plan_state,
+        [],
+        language=ProjectLanguage.NODEJS,
+    )
+
+    result = validate.invoke({"modified_files": ["module/pom.xml"]})
+
+    assert "[PACKAGE_REMOVAL]" in result
+    assert "conflicts with the explicit validation language" in result
+    assert sandbox.commands == []
 
 
 def test_maven_qa_package_state_requires_exact_pom_and_dependency_tree_evidence():

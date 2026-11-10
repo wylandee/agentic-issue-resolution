@@ -27,7 +27,6 @@ GOLDEN_DATASET_NAMES = (
     "workaround_subagent_cases",
     "supervisor_cases",
     "report_cases",
-    "fix_planner_cases",
     "end_to_end_cases",
 )
 
@@ -97,6 +96,44 @@ def _validate_supervisor_replay_input(
         or not all(isinstance(attempt, Mapping) for attempt in prior_attempts)
     ):
         violations.append(f"{label}.replay.input.prior_attempts must be a list of objects")
+    planning = replay_input.get("planning")
+    if planning is not None:
+        if not isinstance(planning, Mapping):
+            violations.append(f"{label}.replay.input.planning must be an object")
+        else:
+            fixed_version = planning.get("osv_fixed_version")
+            if fixed_version is not None and not isinstance(fixed_version, str):
+                violations.append(
+                    f"{label}.replay.input.planning.osv_fixed_version must be a string or null"
+                )
+            snippets = planning.get("osv_workaround_snippets")
+            if snippets is not None and (
+                not isinstance(snippets, list)
+                or not all(isinstance(item, str) for item in snippets)
+            ):
+                violations.append(
+                    f"{label}.replay.input.planning.osv_workaround_snippets must be a list of strings or null"
+                )
+            results = planning.get("search_results", [])
+            if not isinstance(results, list) or not all(
+                isinstance(item, Mapping) for item in results
+            ):
+                violations.append(
+                    f"{label}.replay.input.planning.search_results must be a list of objects"
+                )
+            contents = planning.get("page_contents", {})
+            if not isinstance(contents, Mapping) or not all(
+                isinstance(url, str) and isinstance(content, str)
+                for url, content in contents.items()
+            ):
+                violations.append(
+                    f"{label}.replay.input.planning.page_contents must map strings to strings"
+                )
+            extraction = planning.get("offline_extraction")
+            if extraction is not None and not isinstance(extraction, Mapping):
+                violations.append(
+                    f"{label}.replay.input.planning.offline_extraction must be an object"
+                )
     return violations
 
 
@@ -251,7 +288,7 @@ def validate_golden_case(
         not isinstance(case.get("ecosystem"), str) or not case.get("ecosystem", "").strip()
     ):
         violations.append(f"{label}.ecosystem must be a non-empty string")
-    if eval_type in {"triage", "report", "fix_planner"} and expected_tools not in ([], None):
+    if eval_type in {"triage", "report"} and expected_tools not in ([], None):
         violations.append(f"{label} {eval_type} cases must define expected_tools as []")
     if eval_type in LIVE_REPLAY_EVAL_TYPES:
         replay = case.get("replay")

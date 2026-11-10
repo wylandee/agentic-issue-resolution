@@ -122,25 +122,6 @@ def build_update_test_case(
     )
 
 
-def _measure_expected(
-    metric: Any,
-    test_case: Any,
-    *,
-    expected_pass: bool,
-    case_id: str,
-    label: str,
-) -> None:
-    """Measure and register an expected-positive or expected-negative metric."""
-    measure_expected(
-        metric,
-        test_case,
-        expected_pass=expected_pass,
-        case_id=case_id,
-        label=label,
-        register=assert_test,
-    )
-
-
 def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
     """Run one real update worker replay per process."""
     return cached_replay(
@@ -188,12 +169,13 @@ class TestUpdateSubagentEval:
                     should_consider_ordering=True,
                     should_exact_match=True,
                 )
-                _measure_expected(
+                measure_expected(
                     tool_metric,
                     test_case,
                     expected_pass=bool(case.get("expected_tool_correctness_pass", True)),
                     case_id=str(case["case_id"]),
                     label="update tool correctness",
+                    register=assert_test,
                 )
             if DeepEvalTaskCompletionMetric is not None:
                 task_metric = DeepEvalTaskCompletionMetric(
@@ -201,12 +183,13 @@ class TestUpdateSubagentEval:
                     model=eval_settings.judge_llm or eval_settings.judge_model,
                     async_mode=False,
                 )
-                _measure_expected(
+                measure_expected(
                     task_metric,
                     test_case,
                     expected_pass=bool(case.get("expected_completion_pass", True)),
                     case_id=str(case["case_id"]),
                     label="update task completion",
+                    register=assert_test,
                 )
 
 

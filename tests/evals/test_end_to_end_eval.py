@@ -98,15 +98,8 @@ class Metric:
         return self.score >= self.threshold
 
 
-def metrics(scores=(1.0, 1.0)):
-    return [
-        Metric(name, score)
-        for name, score in zip(
-            ("Task Completion", "System Safety and Contract Adherence"),
-            scores,
-            strict=True,
-        )
-    ]
+def metrics(score=1.0):
+    return [Metric("Task Completion", score)]
 
 
 @pytest.fixture(autouse=True)
@@ -207,7 +200,7 @@ def test_complete_run_uses_original_goal_and_independent_evidence(evidence):
     assert "qa_results_by_attempt" in selected[0].calls[0].actual_output
     assert selected[0].calls[0].tools_called == []
     assert record.additional_metadata["source_run_id"] == "source-1"
-    assert len(record.metrics) == 2
+    assert len(record.metrics) == 1
 
 
 def test_golden_expectation_reaches_judge_without_becoming_a_pass_gate(evidence):
@@ -230,13 +223,13 @@ def test_golden_expectation_reaches_judge_without_becoming_a_pass_gate(evidence)
         == hashlib.sha256(golden.fixture_path.read_bytes()).hexdigest()
     )
     assert record.additional_metadata["golden"]["fixture_path"].endswith(
-        "examples/juice_shop/fixtures/baseline_issues.jsonl"
+        "examples/juice_shop/baseline_issues.jsonl"
     )
-    assert golden.expected_output in selected[0].calls[0].actual_output
-    assert golden.case_id in selected[0].calls[0].actual_output
+    assert golden.expected_output in selected[0].calls[0].input
+    assert golden.case_id in selected[0].calls[0].input
 
 
-def test_whole_run_metrics_use_structured_safety_scoring(monkeypatch):
+def test_whole_run_uses_one_task_completion_metric(monkeypatch):
     import deepeval.metrics
 
     class Metric:
@@ -247,10 +240,8 @@ def test_whole_run_metrics_use_structured_safety_scoring(monkeypatch):
 
     monkeypatch.setattr(deepeval.metrics, "TaskCompletionMetric", Metric)
     metrics = e2e.build_metrics("gpt-4o")
-    assert [metric.threshold for metric in metrics] == [0.70, 0.70]
+    assert [metric.threshold for metric in metrics] == [0.70]
     assert metrics[0].kwargs["model"] == "gpt-4o"
-    assert metrics[1].name == "System Safety and Contract Adherence"
-    assert metrics[1].evaluation_model == "gpt-4o"
 
 
 @pytest.mark.eval
@@ -344,10 +335,10 @@ def test_end_to_end_live_selected_run(
 
 @pytest.mark.parametrize("strict,status", [(False, "PASSED"), (True, "FAILED")])
 def test_thresholds_are_diagnostic_unless_strict(evidence, strict, status):
-    selected = metrics((0.2, 0.3))
+    selected = metrics(0.2)
     record = e2e.evaluate_run(evidence, strict=strict, metrics_factory=lambda _: selected)
     assert record.status == status
-    assert len(record.metrics) == 2
+    assert len(record.metrics) == 1
     assert all(len(metric.calls) == 1 for metric in selected)
 
 
@@ -355,7 +346,7 @@ def test_thresholds_are_diagnostic_unless_strict(evidence, strict, status):
 def test_safe_partial_run_is_not_a_contract_failure(evidence, status):
     evidence.final_state["status"] = "completed_with_errors"
     evidence.final_state["task_queue"]["task-1"]["status"] = status
-    record = e2e.evaluate_run(evidence, metrics_factory=lambda _: metrics((0.2, 1)))
+    record = e2e.evaluate_run(evidence, metrics_factory=lambda _: metrics(0.2))
     assert record.status == "PASSED"
     assert not record.additional_metadata["assessment"]["remediation_complete"]
     assert record.additional_metadata["assessment"]["unresolved"]
@@ -421,6 +412,7 @@ def test_contract_failures_cannot_be_overruled_by_judge(evidence, mutation):
         ("stale_worker", "Stale or unrelated current worker"),
         ("atomic_rollback", "Atomic candidate rollback was not verified"),
         ("unsupported_report", "Report claims every finding is resolved"),
+        ("incorrect_report_outcome", "Report labels the run successful"),
     ],
 )
 def test_safety_contracts_catch_stale_workers_rollback_and_unsupported_claims(
@@ -432,10 +424,14 @@ def test_safety_contracts_catch_stale_workers_rollback_and_unsupported_claims(
         evidence.final_state["delta_isolation_by_cluster"] = {
             "cluster-1": {"candidate_restored": False, "status": "INCONCLUSIVE"}
         }
-    else:
+    elif mutation == "unsupported_report":
         evidence.final_state["status"] = "completed_with_errors"
         evidence.final_state["task_queue"]["task-1"]["status"] = "unfixable"
         evidence.final_state["report_markdown"] = "All findings were successfully resolved."
+    else:
+        evidence.final_state["status"] = "completed_with_errors"
+        evidence.final_state["task_queue"]["task-1"]["status"] = "unfixable"
+        evidence.final_state["report_markdown"] = "| Metric | Value |\n| Run outcome | Successful |"
 
     assessment = assess_contracts(evidence)
     assert any(expected_fragment in violation for violation in assessment.violations)
@@ -489,14 +485,13 @@ def test_no_work_run_requires_no_invented_tool_sequence():
     assert e2e.evaluate_run(evidence, metrics_factory=lambda _: metrics()).status == "PASSED"
 
 
-def test_judge_error_is_not_a_negative_measurement_and_other_metrics_run(evidence):
+def test_judge_error_is_not_a_negative_measurement(evidence):
     selected = metrics()
     selected[0].error = RuntimeError("provider failed")
     result = e2e.evaluate_run(evidence, metrics_factory=lambda _: selected)
     assert result.status == "ERROR"
-    assert len(result.metrics) == 1
-    assert result.metrics[0].metric_name == "System Safety and Contract Adherence"
-    assert all(metric.calls for metric in selected)
+    assert result.metrics == []
+    assert len(selected[0].calls) == 1
 
 
 def test_missing_report_is_an_error(evidence):
@@ -524,6 +519,91 @@ def test_compaction_keeps_all_terminal_failures(evidence):
     assert "task-1" in outcome and "attempt-1" in outcome
     assert omitted["tool_output_characters_omitted"] > 0
     assert tools[0]["output"]["error"] == "failure"
+
+
+def test_judge_payload_includes_bounded_report_and_list_action_summaries(evidence):
+    evidence.final_state["report_markdown"] = "report detail " * 2_000
+    evidence.final_state["diff"] = "diff detail " * 2_000
+    evidence.final_state["final_full_scan_result"] = {
+        "found_identifiers": [f"CVE-2026-{index:04d}" for index in range(20)],
+        "found_issues": [{"issue_id": f"issue-{index}"} for index in range(8)],
+    }
+    evidence.final_state["qa_results_by_attempt"]["attempt-1"]["evaluation"].update(
+        deterministic_gates={
+            "status": "pass",
+            "dependency_evidence": {
+                "status": "verified",
+                "target_package": "demo-package",
+                "expected_version": "2.0.0",
+                "resolved_versions": ["2.0.0"],
+                "lockfile_versions": ["2.0.0"],
+                "declarations": {"package.json": "2.0.0"},
+            },
+        },
+        scan_evidence={
+            "covered_input_paths": [
+                "frontend/package.json",
+                "frontend/package-lock.json",
+            ],
+            "closure_package_names": ["demo-package", "transitive-package"],
+            "closure_lockfile_keys": ["node_modules/demo-package"],
+            "found_issues": [{"issue_id": f"scan-{index}"} for index in range(8)],
+            "covered_occurrences": [
+                {
+                    "package_name": "demo-package",
+                    "found_identifiers": ["CVE-2026-1234"],
+                },
+                {
+                    "package_name": "transitive-package",
+                    "found_identifiers": ["CVE-2026-5678"],
+                },
+            ],
+        },
+    )
+    evidence.final_state["action_summaries"] = [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "task_revision": 1,
+            "status": "success",
+            "summary": "Validated the authorized update.",
+        }
+    ]
+
+    _, outcome, _, omissions = judge_payload(evidence, assess_contracts(evidence))
+    payload = json.loads(outcome)["evidence"]
+
+    assert payload["report_markdown"].startswith("report detail")
+    assert len(payload["report_markdown"]) <= 1_000
+    assert omissions["report_markdown_characters_omitted"] > 0
+    assert len(payload["diff"]) <= 800
+    assert omissions["diff_characters_omitted"] > 0
+    assert payload["final_full_scan_result"]["found_issues_count"] == 8
+    assert len(payload["final_full_scan_result"]["found_issues"]) == 1
+    assert payload["final_full_scan_result"]["found_identifiers_count"] == 20
+    assert len(payload["final_full_scan_result"]["found_identifiers"]) == 8
+    qa = payload["qa_results_by_attempt"]["attempt-1"]["evaluation"]
+    assert qa["deterministic_gates"]["dependency_evidence"]["expected_version"] == "2.0.0"
+    assert qa["scan_evidence"]["closure_package_names_count"] == 2
+    assert qa["scan_evidence"]["covered_input_path_count"] == 2
+    assert qa["scan_evidence"]["closure_lockfile_keys_count"] == 1
+    assert qa["scan_evidence"]["covered_package_count"] == 2
+    assert qa["scan_evidence"]["covered_identifier_count"] == 2
+    assert "closure_package_names" not in qa["scan_evidence"]
+    assert "covered_input_paths" not in qa["scan_evidence"]
+    assert "closure_lockfile_keys" not in qa["scan_evidence"]
+    assert "covered_packages" not in qa["scan_evidence"]
+    assert "covered_identifiers" not in qa["scan_evidence"]
+    assert len(qa["scan_evidence"]["found_issues"]) == 1
+    assert payload["action_summaries"] == [
+        {
+            "task_id": "task-1",
+            "attempt_id": "attempt-1",
+            "task_revision": 1,
+            "status": "success",
+            "summary": "Validated the authorized update.",
+        }
+    ]
 
 
 def test_incomplete_trajectory_is_rejected(tmp_path):
@@ -556,7 +636,7 @@ def test_cli_scores_explicit_cohort_and_persists_judge_errors(evidence, monkeypa
     database = EvalDatabase(path)
     run = database.get_runs()[0]
     assert run["suite_name"] == "end_to_end" and run["total_tests"] == 2
-    assert len(database.get_test_cases(run["run_id"])[0]["metrics"]) == 2
+    assert all(len(case["metrics"]) == 1 for case in database.get_test_cases(run["run_id"]))
     monkeypatch.setattr(
         e2e, "load_run", lambda _: (_ for _ in ()).throw(ValueError("bad evidence"))
     )
@@ -568,7 +648,7 @@ def test_cli_exit_policy_separates_diagnostic_and_strict_thresholds(
     evidence, monkeypatch, tmp_path, strict, expected_exit, capsys
 ):
     monkeypatch.setattr(e2e, "load_run", lambda _: evidence)
-    monkeypatch.setattr(e2e, "build_metrics", lambda _, **kwargs: metrics((0.2, 0.3)))
+    monkeypatch.setattr(e2e, "build_metrics", lambda _, **kwargs: metrics(0.2))
     args = ["score", "--trajectory", "selected.md", "--db-path", str(tmp_path / "eval.db")]
     if strict:
         args.append("--strict")

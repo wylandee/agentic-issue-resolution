@@ -1,4 +1,4 @@
-"""Focused deterministic tests for the occurrence-aware portfolio solver."""
+"""Focused tests for solver portfolio."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ import pytest
 from pydantic import ValidationError
 
 from remediation_engine.contracts.solver_models import (
+    CertificationStatistics,
+    PackageResolutionCertificate,
+    PackageResolutionStatus,
     SolverCandidateConflict,
     SolverCandidateCutKind,
     SolverCandidateLiteral,
@@ -27,20 +30,23 @@ from remediation_engine.contracts.solver_models import (
     SolverTaskDecision,
     SolverVersionCandidate,
 )
-from remediation_engine.orchestration.portfolio_solver import (
+from remediation_engine.planning.candidates import (
     _candidate_metadata,
     _effective_candidate_requirements,
 )
+from remediation_engine.planning.certification import _candidate_conflict
 from remediation_engine.settings import AppSettings
 from remediation_engine.solver.cpsat import _trace_solver_inputs, solve_portfolio
-from remediation_engine.solver.graph import build_dependency_dag, cluster_packages, schedule_batches
-from remediation_engine.solver.subgraph import (
+from remediation_engine.solver.graph import (
     _build_ancestry_edges,
     _child_target,
+    build_dependency_dag,
+    cluster_packages,
     expand_candidate_relations,
     extract_solver_subgraph,
+    schedule_batches,
 )
-from remediation_engine.tools.npm_graph import (
+from remediation_engine.tools.npm import (
     NpmLockfilePackage,
     check_npm_range,
     load_npm_graph_snapshot,
@@ -771,8 +777,15 @@ def test_cp_sat_selects_smallest_security_floor_and_deterministic_alternative():
     assert any("CP-SAT raw status" in diagnostic for diagnostic in result.diagnostics)
 
 
+def test_semver_floor_rejects_prerelease_of_the_floor_release():
+    from remediation_engine.solver.cpsat import _at_least
+
+    assert _at_least("1.2.0-rc.2", "1.2.0") is False
+    assert _at_least("1.2.0", "1.2.0") is True
+
+
 def test_cp_sat_uses_compatible_parent_floor_for_transitive_npm_finding():
-    from remediation_engine.tools.registry_tools import select_npm_parent_version
+    from remediation_engine.tools.registry import select_npm_parent_version
 
     parent_selection = select_npm_parent_version(
         {
@@ -1974,3 +1987,181 @@ def test_maven_portfolio_uses_native_qualifier_order_for_security_floor():
     decision = result.selected_plan.task_decisions[0]
     assert decision.selected_version == "1.0"
     assert decision.selected_strategy == "version_bump"
+
+
+def test_maven_prerelease_floor_allows_the_next_stable_release():
+    target = _target().model_copy(
+        update={"installed_version": "1.0-alpha1", "version_scheme": "maven"}
+    )
+    finding = _finding_for_target(target, "CVE-MAVEN-PRERELEASE", "1.0-RC1")
+    result = solve_portfolio(
+        _solver_subgraph(targets=[target], findings=[finding]),
+        {
+            target.occurrence_id: [
+                SolverVersionCandidate(version="1.0-alpha1", version_scheme="maven"),
+                SolverVersionCandidate(version="1.0-RC1", version_scheme="maven"),
+                SolverVersionCandidate(version="1.0", version_scheme="maven"),
+            ]
+        },
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+    )
+
+    assert result.selected_plan is not None
+    decision = result.selected_plan.task_decisions[0]
+    assert decision.selected_version == "1.0"
+    assert "invalid security floor" not in " ".join(result.diagnostics)
+
+
+def test_malformed_maven_candidate_is_diagnostic_and_never_selected():
+    target = _target().model_copy(
+        update={"installed_version": "1.0-RC1", "version_scheme": "maven"}
+    )
+    finding = _finding_for_target(target, "CVE-MAVEN-MALFORMED", "1.0")
+    result = solve_portfolio(
+        _solver_subgraph(targets=[target], findings=[finding]),
+        {
+            target.occurrence_id: [
+                SolverVersionCandidate(
+                    version="-",
+                    version_scheme="maven",
+                    source="current",
+                ),
+                SolverVersionCandidate(version="1.0", version_scheme="maven"),
+            ]
+        },
+        settings=AppSettings(solver_top_k=1, solver_num_search_workers=1),
+    )
+
+    assert result.selected_plan is not None
+    assert result.selected_plan.task_decisions[0].selected_version == "1.0"
+    assert any("invalid Maven candidate '-' ignored" in item for item in result.diagnostics)
+
+
+def _digest(value: str = "evidence") -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _conflict(**overrides: object) -> SolverCandidateConflict:
+    values: dict[str, object] = {
+        "assignment_digest": _digest("assignment"),
+        "reason_code": "dependency_range",
+        "cut_kind": "pair",
+        "literals": [
+            {"variable_id": "source", "version": "v2.0.0"},
+            {"variable_id": "child", "version": "1.0.0"},
+        ],
+        "evidence_digest": _digest(),
+        "summary": "resolved dependency misses the published range",
+    }
+    values.update(overrides)
+    return SolverCandidateConflict.model_validate(values)
+
+
+def test_candidate_conflict_canonicalizes_literals_and_versions() -> None:
+    conflict = _conflict()
+
+    assert [(literal.variable_id, literal.version) for literal in conflict.literals] == [
+        ("child", "1.0.0"),
+        ("source", "2.0.0"),
+    ]
+    assert SolverCandidateConflict.model_validate_json(conflict.model_dump_json()) == conflict
+
+
+def test_candidate_literal_is_frozen_and_normalizes_identifier() -> None:
+    literal = SolverCandidateLiteral(variable_id=" occurrence-1 ", version="V3.2.1")
+
+    assert literal.variable_id == "occurrence-1"
+    assert literal.version == "3.2.1"
+    with pytest.raises(ValidationError):
+        literal.version = "4.0.0"  # type: ignore[misc]
+
+
+def test_candidate_conflict_rejects_duplicate_variables_and_wrong_cut_shape() -> None:
+    duplicate = [
+        {"variable_id": "same", "version": "1.0.0"},
+        {"variable_id": "same", "version": "2.0.0"},
+    ]
+    with pytest.raises(ValidationError, match="unique variable IDs"):
+        _conflict(literals=duplicate)
+    with pytest.raises(ValidationError, match="unary cuts require"):
+        _conflict(reason_code="dependency_range", cut_kind="unary", literals=[duplicate[0]])
+
+
+def test_candidate_conflict_requires_sha256_digests_and_bounded_summary() -> None:
+    with pytest.raises(ValidationError, match="SHA-256"):
+        _conflict(evidence_digest="not-a-digest")
+    with pytest.raises(ValidationError):
+        _conflict(summary="x" * 501)
+
+
+def test_candidate_conflict_digests_are_stable_for_canonical_evidence() -> None:
+    first = _candidate_conflict(
+        {"z": "v2.0.0", "a": "1.0.0"},
+        SolverCandidateRejectionReason.DEPENDENCY_RANGE,
+        cut_kind=SolverCandidateCutKind.PAIR,
+        literal_ids=("z", "a"),
+        evidence={"package_name": "child", "required_range": "^1.0.0"},
+        summary="range mismatch",
+    )
+    second = _candidate_conflict(
+        {"a": "1.0.0", "z": "2.0.0"},
+        SolverCandidateRejectionReason.DEPENDENCY_RANGE,
+        cut_kind=SolverCandidateCutKind.PAIR,
+        literal_ids=("a", "z"),
+        evidence={"required_range": "^1.0.0", "package_name": "child"},
+        summary="range mismatch",
+    )
+    changed_assignment = _candidate_conflict(
+        {"a": "1.0.0", "z": "2.0.0", "extra": "3.0.0"},
+        SolverCandidateRejectionReason.DEPENDENCY_RANGE,
+        cut_kind=SolverCandidateCutKind.PAIR,
+        literal_ids=("a", "z"),
+        evidence={"package_name": "child", "required_range": "^1.0.0"},
+        summary="range mismatch",
+    )
+
+    assert first.assignment_digest == second.assignment_digest
+    assert first.evidence_digest == second.evidence_digest
+    assert first.assignment_digest != changed_assignment.assignment_digest
+
+
+def test_certification_statistics_have_empty_compatible_defaults() -> None:
+    statistics = CertificationStatistics.model_validate_json("{}")
+
+    assert statistics.solver_calls == 0
+    assert statistics.rejection_counts_by_reason == {}
+    assert CertificationStatistics.model_validate_json(statistics.model_dump_json()) == statistics
+
+    with pytest.raises(ValidationError):
+        CertificationStatistics(metadata_bytes_read=-1)
+    with pytest.raises(ValidationError):
+        CertificationStatistics(rejection_counts_by_reason={"unknown": 1})
+
+
+def test_old_certificate_payload_defaults_to_empty_conflict_evidence() -> None:
+    payload = {
+        "status": PackageResolutionStatus.UNKNOWN.value,
+        "portfolio_plan_id": "plan-1",
+        "solver_input_digest": "solver",
+        "repository_fingerprint": "repository",
+        "workspace_graph_digest": "workspace",
+        "candidate_catalog_digest": "catalog",
+        "candidate_assignment_digest": "assignment",
+        "resolved_graph_digest": "resolved",
+        "runtime_fingerprint": {
+            "node_version": "22.0.0",
+            "npm_version": "10.0.0",
+            "platform": "darwin",
+            "architecture": "arm64",
+        },
+    }
+
+    certificate = PackageResolutionCertificate.model_validate_json(json.dumps(payload))
+
+    assert certificate.rejection_conflicts == []
+    assert certificate.candidate_plan_id is None
+    assert certificate.certification_statistics == CertificationStatistics()
+    assert (
+        PackageResolutionCertificate.model_validate_json(certificate.model_dump_json())
+        == certificate
+    )

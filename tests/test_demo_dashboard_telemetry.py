@@ -104,7 +104,6 @@ def test_local_and_uploaded_workspaces_share_canonical_findings(
     summary = tracker.get_dashboard_summary()
     assert len(tracker.active_findings) == local_info.total_findings
     assert summary["severity_counts"] == local_info.severity_counts
-    assert tracker.initial_issues[0] is stored_issues[0]
     assert [issue.model_dump(mode="json") for issue in stored_issues] == original_snapshots
 
 
@@ -354,7 +353,7 @@ def test_tool_label_resolves_queued_package_without_active_targets() -> None:
 
 
 def test_failed_workaround_restores_prematurely_remediated_finding_as_unresolved() -> None:
-    from remediation_engine.contracts.schemas import RemediationTask, TaskStatus, VulnerabilityGroup
+    from remediation_engine.contracts.schemas import VulnerabilityGroup
 
     issue = _issue(cve_id=_CVE, package_name="express-jwt")
     tracker = FindingsTracker([issue])
@@ -369,38 +368,50 @@ def test_failed_workaround_restores_prematurely_remediated_finding_as_unresolved
     )
     tracker.map_triaged_groups([group])
 
-    from remediation_engine.contracts.schemas import RoutingStrategy
-
     # Simulate step 1: version bump passes QA temporarily
-    task_passed = RemediationTask(
-        task_id="task-1",
-        parent_group_id="group-1",
-        target_package_name="express-jwt",
-        strategy=RoutingStrategy.VERSION_BUMP,
-        status=TaskStatus.QA_PASSED,
+    task_passed = {
+        "task_id": "task-1",
+        "parent_group_id": "group-1",
+        "target_package_name": "express-jwt",
+        "current_attempt_id": "attempt-1",
+        "task_revision": 0,
+        "status": "qa_passed",
+    }
+    qa_result = {
+        "attempt_id": "attempt-1",
+        "task_id": "task-1",
+        "task_revision": 0,
+        "evaluation": {
+            "passed": True,
+            "scan_evidence": {
+                "complete": True,
+                "remaining_target_identifiers": [],
+                "found_issues": [],
+            },
+        },
+    }
+    tracker.process_node_state_update(
+        "supervisor",
+        {
+            "task_queue": {"task-1": task_passed},
+            "qa_results_by_attempt": {"attempt-1": qa_result},
+        },
     )
-    tracker.process_node_state_update("supervisor", {"task_queue": {"task-1": task_passed}})
     assert tracker.remediated_count == 1
     assert len(tracker.active_findings) == 0
 
     # Simulate final state: task pivoted to workaround which failed/surrendered
-    task_pivoted = RemediationTask(
-        task_id="task-1",
-        parent_group_id="group-1",
-        target_package_name="express-jwt",
-        strategy=RoutingStrategy.VERSION_BUMP,
-        status=TaskStatus.PIVOTED,
-    )
-    task_workaround_failed = RemediationTask(
-        task_id="task-2",
-        parent_group_id="group-1",
-        target_package_name="express-jwt",
-        strategy=RoutingStrategy.CODE_WORKAROUND,
-        status=TaskStatus.UNFIXABLE,
-    )
+    task_pivoted = {**task_passed, "status": "pivoted"}
+    task_workaround_failed = {
+        "task_id": "task-2",
+        "parent_group_id": "group-1",
+        "target_package_name": "express-jwt",
+        "status": "unfixable",
+    }
     tracker.reconcile_final_state(
         {
             "task_queue": {"task-1": task_pivoted, "task-2": task_workaround_failed},
+            "qa_results_by_attempt": {"attempt-1": qa_result},
             "remaining_target_identifiers": [_CVE],
         }
     )
@@ -558,9 +569,7 @@ def test_concurrent_demo_runs_keep_telemetry_bound_to_each_session(
     from demo.backend import engine_bridge
 
     from remediation_engine.api import RemediationResult
-    from remediation_engine.orchestration.trajectory_exporter import (
-        get_active_trajectory_recorder,
-    )
+    from remediation_engine.runtime.telemetry import get_active_trajectory_recorder
 
     fixture_names = ("fixture-alpha", "fixture-beta")
     sessions = []

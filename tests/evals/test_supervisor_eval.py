@@ -1,4 +1,4 @@
-"""DeepEval evaluation suite for the tactical Supervisor boundary."""
+"""DeepEval evaluation of Supervisor planning and tactical decisions."""
 
 from __future__ import annotations
 
@@ -10,13 +10,12 @@ from typing import Any
 
 import pytest
 
+from remediation_engine.agents.supervisor_reasoning import _safe_relative_file_hints
 from remediation_engine.contracts.schemas import DecisionCode, TaskStatus
-from remediation_engine.orchestration.tactical_supervisor import _safe_relative_file_hints
 from tests.evals.conftest import EvalSettings
 from tests.evals.eval_case_helpers import (
     as_output_text,
     case_metadata,
-    collect_metric_assertions,
     context_strings,
     expected_tools,
     make_tool_calls,
@@ -35,8 +34,7 @@ from tests.evals.replay_harness import (
 try:
     from deepeval import assert_test
     from deepeval.metrics import TaskCompletionMetric as DeepEvalTaskCompletionMetric
-    from deepeval.metrics import ToolCorrectnessMetric as DeepEvalToolCorrectnessMetric
-    from deepeval.test_case import LLMTestCase, ToolCallParams
+    from deepeval.test_case import LLMTestCase
 
     HAS_DEEPEVAL = True
 except ImportError:
@@ -47,8 +45,6 @@ except ImportError:
     HAS_DEEPEVAL = False
     assert_test = None  # type: ignore[assignment]
     DeepEvalTaskCompletionMetric = None  # type: ignore[assignment,misc]
-    DeepEvalToolCorrectnessMetric = None  # type: ignore[assignment,misc]
-    ToolCallParams = None  # type: ignore[assignment,misc]
 
 
 _GOLDEN_FILE = Path(__file__).resolve().parent / "golden" / "supervisor_cases.json"
@@ -96,25 +92,6 @@ def build_supervisor_test_case(
     )
 
 
-def _measure_expected(
-    metric: Any,
-    test_case: LLMTestCase,
-    *,
-    expected_pass: bool,
-    case_id: str,
-    label: str,
-) -> None:
-    """Measure an expected-positive or expected-negative metric."""
-    measure_expected(
-        metric,
-        test_case,
-        expected_pass=expected_pass,
-        case_id=case_id,
-        label=label,
-        register=assert_test,
-    )
-
-
 def test_task_completion_input_contains_decision_acceptance_criteria() -> None:
     case = next(
         case
@@ -128,9 +105,21 @@ def test_task_completion_input_contains_decision_acceptance_criteria() -> None:
     assert "Accept PEER_CONFLICT_ESCALATION" in test_case.input
     assert "spawn no child" in test_case.input
 
+    for case_id in ("supervisor-maven-managed-minimum", "supervisor-maven-qualified-version"):
+        case = next(item for item in _SUPERVISOR_CASES if item["case_id"] == case_id)
+        scoped_case = build_supervisor_test_case(
+            case,
+            {"decision": "accepted"},
+            [],
+            "offline_fixture",
+            ReplayCapture(case_id=case_id, component="supervisor"),
+        )
+        assert "worker edits" in scoped_case.input
+        assert "outside its outcome" in scoped_case.input
+
 
 def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
-    """Run and cache one live tactical Supervisor decision per case."""
+    """Run and cache one production Supervisor replay per case."""
     return cached_replay(
         _LIVE_CACHE,
         "supervisor",
@@ -145,8 +134,6 @@ def _assert_live_proposal_matches_expected(
     """Return the single canonical proposal after deterministic target checks."""
     expected = case["expected_tools"]
     if not expected:
-        assert case["tool_correctness_applicable"] is False
-        assert case["expected_tool_correctness_pass"] is None
         assert observed_tools == []
         return []
 
@@ -190,98 +177,8 @@ def _tool_signature(tool_calls: list[dict[str, Any]]) -> list[tuple[str, dict[st
     return [(str(call.get("name", "")), dict(call.get("args", {}) or {})) for call in tool_calls]
 
 
-_STABLE_TOOL_ARGUMENT_KEYS = ("selected_strategy", "target_version", "target_files_hint")
-
-
-def _project_supervisor_tool_calls(
-    tool_calls: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Keep only deterministic action fields for ToolCorrectness judging."""
-    projected = []
-    for call in tool_calls:
-        arguments = call.get("args", {})
-        if not isinstance(arguments, dict):
-            raise TypeError("Supervisor proposal arguments must be an object.")
-        projected.append(
-            {
-                "name": call.get("name", ""),
-                "args": {
-                    key: arguments[key] for key in _STABLE_TOOL_ARGUMENT_KEYS if key in arguments
-                },
-            }
-        )
-    return projected
-
-
-def _tool_correctness_test_case(
-    test_case: LLMTestCase,
-    case: dict[str, Any],
-    observed_tools: list[dict[str, Any]],
-) -> LLMTestCase:
-    """Build a metric view that leaves free-form evidence text to completion judging."""
-    projected_case = {
-        **case,
-        "expected_tools": _project_supervisor_tool_calls(case["expected_tools"]),
-    }
-    return LLMTestCase(
-        name=test_case.name,
-        input=test_case.input,
-        actual_output=test_case.actual_output,
-        expected_output=test_case.expected_output,
-        context=test_case.context,
-        tools_called=make_tool_calls(
-            _project_supervisor_tool_calls(observed_tools),
-            component="supervisor",
-        ),
-        expected_tools=expected_tools(projected_case, component="supervisor"),
-        token_cost=test_case.token_cost,
-        additional_metadata=test_case.additional_metadata,
-    )
-
-
-def test_tool_correctness_view_ignores_flexible_action_text() -> None:
-    """Preserve prose in observations while judging only deterministic arguments."""
-    for case_id in (
-        "supervisor-direct-version-bump-clean",
-        "supervisor-workaround-pivot-breaking-change",
-    ):
-        case = next(item for item in _SUPERVISOR_CASES if item["case_id"] == case_id)
-        expected_call = case["expected_tools"][0]
-        observed_args = dict(expected_call["args"])
-        observed_args["diagnostic_basis"] = "A different concise evidence summary."
-        observed_args["rationale"] = "A different concise decision rationale."
-        if "workaround_hypothesis" in observed_args:
-            observed_args["workaround_hypothesis"] = "A different bounded workaround hypothesis."
-        observed_tools = [{"name": expected_call["name"], "args": observed_args}]
-        capture = ReplayCapture(
-            case_id=case_id,
-            component="supervisor",
-            actual_output="ACCEPTED: metric projection fixture.",
-            actual_tools=observed_tools,
-        )
-
-        full_case = build_supervisor_test_case(
-            case,
-            capture.actual_output,
-            observed_tools,
-            "metric_projection_test",
-            capture,
-        )
-        metric_case = _tool_correctness_test_case(full_case, case, observed_tools)
-
-        called_args = metric_case.tools_called[0].input_parameters
-        expected_args = metric_case.expected_tools[0].input_parameters
-        assert called_args == expected_args
-        assert set(called_args) == set(_STABLE_TOOL_ARGUMENT_KEYS).intersection(
-            expected_call["args"]
-        )
-        assert "diagnostic_basis" in full_case.tools_called[0].input_parameters
-        assert "rationale" in full_case.tools_called[0].input_parameters
-        assert "A different concise evidence summary." in full_case.actual_output
-
-
 def test_live_proposal_matcher_keeps_one_canonical_action_from_a_repair_trace() -> None:
-    """The metric view can score a repaired action without hiding the full trace."""
+    """The deterministic gate finds the accepted action in a repaired trace."""
     case = next(
         item
         for item in _SUPERVISOR_CASES
@@ -356,7 +253,7 @@ class TestSupervisorEval:
             pytest.skip("OPENAI_API_KEY is required for live evaluations.")
 
         capture = _live_capture(case, eval_settings)
-        matching_tools = _assert_live_proposal_matches_expected(case, capture.actual_tools)
+        _assert_live_proposal_matches_expected(case, capture.actual_tools)
         test_case = build_supervisor_test_case(
             case,
             capture.actual_output,
@@ -364,52 +261,20 @@ class TestSupervisorEval:
             "production_live",
             capture,
         )
-        with collect_metric_assertions():
-            if case.get("tool_correctness_applicable", True):
-                assert DeepEvalToolCorrectnessMetric is not None
-                assert ToolCallParams is not None
-                assert case.get("expected_tool_correctness_pass") is True
-                tool_metric = DeepEvalToolCorrectnessMetric(
-                    threshold=1.0,
-                    model=eval_settings.judge_llm or eval_settings.judge_model,
-                    evaluation_params=[ToolCallParams.INPUT_PARAMETERS],
-                    should_consider_ordering=True,
-                    should_exact_match=False,
-                )
-                tool_metric_case = _tool_correctness_test_case(
-                    test_case,
-                    case,
-                    matching_tools,
-                )
-                _measure_expected(
-                    tool_metric,
-                    tool_metric_case,
-                    expected_pass=bool(case["expected_tool_correctness_pass"]),
-                    case_id=str(case["case_id"]),
-                    label="Supervisor tool correctness",
-                )
-            else:
-                assert case["expected_tools"] == []
-                assert case["expected_tool_correctness_pass"] is None
-
-            if (
-                case.get("task_completion_applicable", True)
-                and DeepEvalTaskCompletionMetric is not None
-            ):
-                task_metric = DeepEvalTaskCompletionMetric(
-                    threshold=0.70,
-                    model=eval_settings.judge_llm or eval_settings.judge_model,
-                    async_mode=False,
-                )
-                _measure_expected(
-                    task_metric,
-                    test_case,
-                    expected_pass=bool(case.get("expected_completion_pass", True)),
-                    case_id=str(case["case_id"]),
-                    label="Supervisor task completion",
-                )
-            elif not case.get("task_completion_applicable", True):
-                assert case.get("expected_completion_pass") is None
+        assert DeepEvalTaskCompletionMetric is not None
+        task_metric = DeepEvalTaskCompletionMetric(
+            threshold=0.70,
+            model=eval_settings.judge_llm or eval_settings.judge_model,
+            async_mode=False,
+        )
+        measure_expected(
+            task_metric,
+            test_case,
+            expected_pass=bool(case.get("expected_completion_pass", True)),
+            case_id=str(case["case_id"]),
+            label="Supervisor Task Completion",
+            register=assert_test,
+        )
 
 
 @pytest.mark.parametrize(
@@ -436,6 +301,14 @@ def test_supervisor_offline_production_replay(
     assert capture.component == "supervisor"
     assert capture.external_calls == []
     assert capture.actual_tools == scripted_tools
+    if expectation := case.get("planning_expectation"):
+        planning_result = typed["planning_result"]
+        plan = planning_result["plan"]
+        assert plan["status"] == expectation["status"]
+        assert plan["fixed_version"] == expectation["fixed_version"]
+        assert plan["strategy_used"]
+        assert planning_result["pending_refresh_ids"] == []
+        assert planning_result["refreshed_task"]["task_id"] == typed["task_after"]["task_id"]
     assert _tool_signature(capture.actual_tools) == _tool_signature(scripted_tools)
     assert typed["model_invocations"] == model.invocation_count == expected["model_invocations"]
     assert capture.task_revision == case["replay"]["input"]["task"]["task_revision"]
@@ -474,6 +347,13 @@ def test_supervisor_offline_production_replay(
         assert typed["staged_resolutions"] == []
         assert typed["task_before"] == typed["task_after"]
         assert typed["retry_diagnostics_before"] == typed["retry_diagnostics_after"]
+        if case["case_id"] == "supervisor-plan-npm-no-fix":
+            assert typed["planning_result"]["plan"]["status"] == "no_fix"
+            assert typed["planning_result"]["refreshed_task"]["no_fix_stage"] == "package_removal"
+            assert (
+                typed["planning_result"]["refreshed_task"]["qa_policy"] == "no_fix_package_removal"
+            )
+            return
         python_suppressed = case["case_id"] in {
             "python-supervisor-version-bump-certifi",
             "python-supervisor-pyjwt-workaround-pivot",
@@ -522,7 +402,7 @@ def test_supervisor_offline_production_replay(
 
 
 def test_supervisor_eval_case_labels_and_expected_action_contract() -> None:
-    """Keep Node, Java, and Python cases explicit about metric applicability."""
+    """Keep Node, Java, and Python cases explicit about their policy traces."""
     existing_npm_ids = {
         "supervisor-direct-version-bump-clean",
         "supervisor-transitive-package-override",
@@ -549,27 +429,36 @@ def test_supervisor_eval_case_labels_and_expected_action_contract() -> None:
     assert existing_npm_ids <= set(_SUPERVISOR_CASE_IDS)
     assert required_java_ids <= set(_SUPERVISOR_CASE_IDS)
     assert required_python_ids <= set(_SUPERVISOR_CASE_IDS)
-    assert len(_SUPERVISOR_CASES) == 17
-    assert len(set(_SUPERVISOR_CASE_IDS)) == 17
-    no_call_cases = [case for case in _SUPERVISOR_CASES if not case["tool_correctness_applicable"]]
+    assert len(_SUPERVISOR_CASES) == 20
+    assert len(set(_SUPERVISOR_CASE_IDS)) == 20
+    planning_ids = {
+        "supervisor-direct-version-bump-clean",
+        "supervisor-transitive-package-override",
+        "supervisor-plan-npm-workaround",
+        "supervisor-plan-npm-no-fix",
+        "supervisor-plan-npm-prerelease",
+        "python-supervisor-version-bump-certifi",
+        "python-supervisor-pyjwt-workaround-pivot",
+        "supervisor-maven-direct-minimum",
+    }
+    assert {
+        case["case_id"] for case in _SUPERVISOR_CASES if case.get("planning_expectation")
+    } == planning_ids
+    no_call_cases = [case for case in _SUPERVISOR_CASES if not case["expected_tools"]]
     assert {case["case_id"] for case in no_call_cases} == {
         "python-supervisor-version-bump-certifi",
         "python-supervisor-pyjwt-workaround-pivot",
         "supervisor-inconclusive-qa-suppressed",
+        "supervisor-plan-npm-no-fix",
         "python-supervisor-inconclusive-qa-suppressed",
     }
     for case in _SUPERVISOR_CASES:
-        if case["tool_correctness_applicable"]:
-            assert case["expected_tool_correctness_pass"] is True
-            assert case.get("task_completion_applicable", True) is True
-            assert case["expected_completion_pass"] is True
+        assert case["expected_completion_pass"] in {True, None}
+        if case["expected_tools"]:
             assert len(case["expected_tools"]) == 1
             assert case["expected_tools"][0]["name"] in _EXPECTED_BOUND_TOOL_NAMES
         else:
             assert case["expected_tools"] == []
-            assert case["expected_tool_correctness_pass"] is None
-            assert case["task_completion_applicable"] is False
-            assert case["expected_completion_pass"] is None
 
 
 def test_java_inconclusive_qa_does_not_consume_a_remediation_retry(

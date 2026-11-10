@@ -13,7 +13,7 @@ import logging
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from functools import lru_cache
+from functools import cmp_to_key, lru_cache
 from typing import Any
 
 from langsmith import traceable
@@ -33,6 +33,10 @@ from remediation_engine.contracts.solver_models import (
     SolverTarget,
     SolverTaskDecision,
     SolverVersionCandidate,
+)
+from remediation_engine.contracts.version_policy import (
+    compare_maven_versions,
+    is_stable_maven_version,
 )
 from remediation_engine.settings import DEFAULT_SOLVER_MAX_CANDIDATES_PER_TARGET
 
@@ -170,6 +174,26 @@ def _candidate_key(candidate: SolverVersionCandidate) -> tuple[Any, ...]:
     return key, candidate.version, candidate.source
 
 
+def _compare_maven_version_strings(left: str, right: str) -> int:
+    """Compare valid Maven versions with a deterministic lexical tie-break.
+
+    Args:
+        left: First version string to compare.
+        right: Second version string to compare.
+
+    Returns:
+        A negative value, zero, or a positive value according to Maven ordering,
+        then lexical ordering when Maven considers the versions equivalent.
+
+    Raises:
+        ValueError: If either version is not accepted by the Maven comparator.
+    """
+    comparison = compare_maven_versions(left, right)
+    if comparison:
+        return comparison
+    return (left > right) - (left < right)
+
+
 def _version_key(value: str | None) -> tuple[int, ...] | None:
     """Parse the stable numeric portion of an npm version."""
     if not value:
@@ -199,13 +223,39 @@ def _stable_semver_major(value: str | None) -> int | None:
     return None if parsed.prerelease else parsed.major
 
 
-def _at_least(version: str, floor: str | None) -> bool:
-    """Return whether a candidate version is at least a security floor."""
+def _at_least(
+    version: str,
+    floor: str | None,
+    *,
+    version_scheme: str = "semver",
+) -> bool:
+    """Return whether a candidate version meets an ecosystem security floor.
+
+    Args:
+        version: Candidate or installed version to compare.
+        floor: Minimum acceptable version, or ``None`` when no floor applies.
+        version_scheme: ``"maven"`` selects native Maven ordering; other values
+            use the solver's semver ordering.
+
+    Returns:
+        Whether ``version`` is at least ``floor``. An absent floor passes;
+        malformed versions fail closed.
+    """
     if not floor:
         return True
-    left = _version_key(version)
-    right = _version_key(floor)
-    return left is not None and right is not None and left >= right
+    if version_scheme == "maven":
+        try:
+            return compare_maven_versions(version, floor) >= 0
+        except ValueError:
+            return False
+    try:
+        from semantic_version import Version
+
+        left = Version.coerce(version.strip().lstrip("vV"))
+        right = Version.coerce(floor.strip().lstrip("vV"))
+    except (ImportError, TypeError, ValueError):
+        return False
+    return left >= right
 
 
 def _finding_security_floor(
@@ -214,26 +264,23 @@ def _finding_security_floor(
 ) -> str | None:
     """Return the applicable target floor while retaining child-finding evidence.
 
-    npm transitive findings retain the vulnerable child's fixed version in
-    ``fixed_version``. When the authorized mutation target is its direct parent,
-    the compatible parent minimum is the version floor for that target. Python
-    parent targets have no npm lockfile key and keep their adapter's PEP 440
-    candidate evidence; Maven targets retain their native version handling.
+    Transitive findings retain the vulnerable child's fixed version in
+    ``fixed_version``. When a proof-backed mutation target matches the direct
+    parent identity, its compatible parent minimum is the floor for that target.
+    This applies to both physical npm lockfile targets and Pipfile parent targets,
+    which do not have a lockfile package key.
 
     Args:
         target: Mutation target associated with the finding, if present.
         finding: Vulnerability requirement whose target-specific floor is needed.
 
     Returns:
-        The proof-backed parent minimum for a matching npm parent target, or the
-        finding's vulnerable-package fixed version for other targets.
+        The proof-backed parent minimum for a matching direct-parent target, or
+        the finding's vulnerable-package fixed version for other targets.
     """
     parent_floor = finding.direct_parent_minimum_version
     if (
         target is not None
-        and target.version_scheme == "semver"
-        and target.lockfile_package_key
-        and target.package_name.casefold() != target.target_package_name.casefold()
         and finding.direct_parent_name
         and finding.direct_parent_name.casefold() == target.target_package_name.casefold()
         and parent_floor
@@ -242,10 +289,48 @@ def _finding_security_floor(
     return finding.fixed_version
 
 
-def _distance_above(version: str, floor: str | None) -> int:
-    """Return a bounded numeric distance above a floor for objective ranking."""
+def _distance_above(
+    version: str,
+    floor: str | None,
+    *,
+    version_scheme: str = "semver",
+    candidate_versions: Sequence[str] = (),
+) -> int:
+    """Return a bounded version distance above a floor for objective ranking.
+
+    Args:
+        version: Candidate version being ranked.
+        floor: Minimum acceptable version, or ``None`` when no floor applies.
+        version_scheme: ``"maven"`` uses native Maven ordering; other values
+            use the semver numeric distance.
+        candidate_versions: Versions in this target's domain. Maven ranking
+            uses their native order to distinguish candidates above the floor.
+
+    Returns:
+        A bounded distance. Equivalent-to-floor versions rank at zero,
+        versions below the floor or malformed values rank at the upper bound,
+        and valid newer versions rank by their native position above the floor.
+    """
     if not floor:
         return 0
+    if version_scheme == "maven":
+        try:
+            comparison = compare_maven_versions(version, floor)
+        except ValueError:
+            return 1_000_000_000
+        if comparison < 0:
+            return 1_000_000_000
+        if comparison == 0:
+            return 0
+        above_floor: list[str] = []
+        for candidate in (*candidate_versions, version):
+            try:
+                if compare_maven_versions(candidate, floor) > 0 and candidate not in above_floor:
+                    above_floor.append(candidate)
+            except ValueError:
+                continue
+        ordered = sorted(above_floor, key=cmp_to_key(_compare_maven_version_strings))
+        return min(1_000_000_000, ordered.index(version) + 1)
     current = _version_key(version)
     minimum = _version_key(floor)
     if current is None or minimum is None:
@@ -267,7 +352,7 @@ def _range_matches(version_range: str | None, version: str) -> bool | None:
     if not version_range or version_range.strip() in {"*", "latest"}:
         return True
     try:
-        from remediation_engine.tools.npm_graph import npm_range_contains
+        from remediation_engine.tools.npm import npm_range_contains
 
         return npm_range_contains(version_range, version)
     except (ImportError, TypeError, ValueError):
@@ -339,7 +424,12 @@ def _objective_weights(
     max_distance = sum(
         max(
             (
-                _distance_above(candidate.version, floors[target.occurrence_id])
+                _distance_above(
+                    candidate.version,
+                    floors[target.occurrence_id],
+                    version_scheme=target.version_scheme,
+                    candidate_versions=[item.version for item in domains[target.occurrence_id]],
+                )
                 for candidate in domains[target.occurrence_id]
             ),
             default=0,
@@ -419,6 +509,18 @@ def _as_domain(
     The installed version is always retained as the status-quo assignment. If
     the normalized domain exceeds the configured resource bound, the caller
     must fail closed rather than claim an optimum over a pruned subset.
+
+    Args:
+        target: Mutation target that determines the version scheme.
+        candidate_domains: Candidate lists keyed by occurrence or task identity.
+        max_candidates: Bound used to report oversized domains; candidates are
+            not silently discarded.
+        security_floor: Target's authoritative minimum version, if available.
+        diagnostics: Mutable list that receives bounded input diagnostics.
+
+    Returns:
+        A deterministic candidate list containing every valid supplied
+        candidate and the installed version when it was not already present.
     """
     raw = candidate_domains.get(target.occurrence_id)
     if raw is None:
@@ -427,13 +529,29 @@ def _as_domain(
             _diagnostic(
                 diagnostics, f"candidate domain used task-id compatibility key for {target.task_id}"
             )
-    candidates = sorted(tuple(raw or ()), key=_candidate_key)
+    raw_candidates = tuple(raw or ())
     unique: list[SolverVersionCandidate] = []
     seen: set[str] = set()
-    for candidate in candidates:
+    for candidate in raw_candidates:
         if not isinstance(candidate, SolverVersionCandidate):
             _diagnostic(diagnostics, f"invalid candidate for occurrence {target.occurrence_id}")
             continue
+        if target.version_scheme == "maven":
+            try:
+                compare_maven_versions(candidate.version, candidate.version)
+            except ValueError:
+                _diagnostic(
+                    diagnostics,
+                    f"invalid Maven candidate {candidate.version!r} ignored for "
+                    f"{target.occurrence_id}",
+                )
+                continue
+            candidate = candidate.model_copy(
+                update={
+                    "meets_security_floor": candidate.meets_security_floor
+                    and is_stable_maven_version(candidate.version)
+                }
+            )
         if candidate.version in seen:
             _diagnostic(
                 diagnostics,
@@ -445,22 +563,62 @@ def _as_domain(
 
     installed_version = str(target.installed_version or "").strip().lstrip("vV")
     if installed_version and installed_version not in seen:
-        installed_key = _version_key(installed_version)
+        installed_key = (
+            _version_key(installed_version) if target.version_scheme == "semver" else None
+        )
+        installed_is_valid = True
+        if target.version_scheme == "maven":
+            try:
+                compare_maven_versions(installed_version, installed_version)
+            except ValueError:
+                installed_is_valid = False
         unique.append(
             SolverVersionCandidate(
                 version=installed_version,
+                version_scheme=target.version_scheme,
                 semver_key=installed_key or (),
                 source="current",
-                meets_security_floor=_at_least(installed_version, security_floor),
+                meets_security_floor=installed_is_valid
+                and (target.version_scheme != "maven" or is_stable_maven_version(installed_version))
+                and _at_least(
+                    installed_version,
+                    security_floor,
+                    version_scheme=target.version_scheme,
+                ),
             )
         )
         seen.add(installed_version)
-        if installed_key is None:
+        if installed_key is None and target.version_scheme == "semver":
             _diagnostic(
                 diagnostics,
                 f"installed version {installed_version!r} is non-semver; retained only as "
                 f"the status-quo candidate for {target.occurrence_id}",
             )
+        elif not installed_is_valid:
+            _diagnostic(
+                diagnostics,
+                f"installed Maven version {installed_version!r} is invalid; retained only as "
+                f"the status-quo candidate for {target.occurrence_id}",
+            )
+
+    if target.version_scheme == "maven":
+        valid_maven: list[SolverVersionCandidate] = []
+        invalid_maven: list[SolverVersionCandidate] = []
+        for candidate in unique:
+            try:
+                compare_maven_versions(candidate.version, candidate.version)
+            except ValueError:
+                invalid_maven.append(candidate)
+            else:
+                valid_maven.append(candidate)
+        unique = sorted(
+            valid_maven,
+            key=cmp_to_key(
+                lambda left, right: _compare_maven_version_strings(left.version, right.version)
+            ),
+        ) + sorted(invalid_maven, key=lambda item: (item.version, item.source))
+    else:
+        unique.sort(key=_candidate_key)
 
     if len(unique) > max_candidates:
         _diagnostic(
@@ -468,7 +626,7 @@ def _as_domain(
             f"candidate resource guard exceeded for {target.occurrence_id}: "
             f"{len(unique)}>{max_candidates}; no candidates were pruned",
         )
-    return sorted(unique, key=_candidate_key)
+    return unique
 
 
 def _floor_for_target(
@@ -476,7 +634,18 @@ def _floor_for_target(
     findings: Mapping[str, SolverFindingRequirement],
     diagnostics: list[str],
 ) -> str | None:
-    """Return the greatest valid fixed version required by a target's findings."""
+    """Return the greatest syntactically valid finding floor for a target.
+
+    Args:
+        target: Target whose ecosystem defines the comparison scheme.
+        findings: Finding requirements keyed by coverage identity.
+        diagnostics: Mutable list receiving one diagnostic per invalid floor.
+
+    Returns:
+        The greatest floor in Maven or semver order, or ``None`` when no valid
+        floor is present. Syntactically valid Maven prerelease floors are kept;
+        candidate stability is checked separately.
+    """
     requirements = sorted(
         (
             finding
@@ -490,7 +659,15 @@ def _floor_for_target(
         floor = _finding_security_floor(target, finding)
         if not floor:
             continue
-        if _version_key(floor) is None:
+        if target.version_scheme == "maven":
+            try:
+                compare_maven_versions(floor, floor)
+                valid_floor = True
+            except ValueError:
+                valid_floor = False
+        else:
+            valid_floor = _version_key(floor) is not None
+        if not valid_floor:
             _diagnostic(
                 diagnostics,
                 f"invalid security floor {floor!r} for {finding.coverage_id}",
@@ -499,6 +676,8 @@ def _floor_for_target(
         floors.append(floor)
     if not floors:
         return None
+    if target.version_scheme == "maven":
+        return max(floors, key=cmp_to_key(_compare_maven_version_strings))
     return max(floors, key=lambda item: _version_key(item) or ())
 
 
@@ -768,7 +947,11 @@ def _compatible_alternatives(
         if (
             index == selected_index
             or not candidate.meets_security_floor
-            or not _at_least(candidate.version, floor)
+            or not _at_least(
+                candidate.version,
+                floor,
+                version_scheme=target.version_scheme,
+            )
         ):
             continue
         is_compatible = True
@@ -903,6 +1086,8 @@ def _project_candidate_plan(
         _distance_above(
             domains[occurrence_id][selected_indices[occurrence_id]].version,
             floors[occurrence_id],
+            version_scheme=target_by_id[occurrence_id].version_scheme,
+            candidate_versions=[item.version for item in domains[occurrence_id]],
         )
         for occurrence_id in selected_indices
     )
@@ -1829,7 +2014,12 @@ def solve_portfolio(
         plan_diagnostics = list(values.get("diagnostics") or ())
         _diagnostic(plan_diagnostics, timing_diagnostic)
         values["diagnostics"] = plan_diagnostics
+        values.setdefault("unresolved_finding_ids", issue_finding_ids)
         return SolverRemediationPlan(
+            input_digest=input_digest,
+            domain_digest=domain_digest,
+            repository_digest=repository_digest,
+            task_revisions=revisions,
             candidate_catalog_complete=candidate_catalog_complete,
             candidate_catalog_digest=candidate_catalog_digest,
             **values,
@@ -1842,11 +2032,6 @@ def solve_portfolio(
         )
         return make_plan(
             status=SolverStatus.UNKNOWN,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
@@ -1864,11 +2049,6 @@ def solve_portfolio(
             _diagnostic(diagnostics, "invalid forbidden-assignment or conflict input")
         return make_plan(
             status=SolverStatus.UNKNOWN,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
@@ -1880,11 +2060,6 @@ def solve_portfolio(
         _diagnostic(diagnostics, f"CP-SAT import failed: {exc}")
         return make_plan(
             status=SolverStatus.FALLBACK,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
@@ -1893,11 +2068,6 @@ def solve_portfolio(
     if any(not domains.get(target.occurrence_id) for target in eligible):
         return make_plan(
             status=SolverStatus.INFEASIBLE if candidate_catalog_complete else SolverStatus.UNKNOWN,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
     base_estimated_variables = (
@@ -1914,7 +2084,15 @@ def solve_portfolio(
                     )
                 )
                 and candidate.meets_security_floor
-                and _at_least(candidate.version, floor)
+                and _at_least(
+                    candidate.version,
+                    floor,
+                    version_scheme=(
+                        target_by_id[finding.target_occurrence_id].version_scheme
+                        if finding.target_occurrence_id in target_by_id
+                        else "semver"
+                    ),
+                )
             )
             for finding in finding_list
         )
@@ -1941,11 +2119,6 @@ def solve_portfolio(
         )
         return make_plan(
             status=SolverStatus.UNKNOWN,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
@@ -1989,7 +2162,11 @@ def solve_portfolio(
                 not floor_required
                 or all(
                     candidate.meets_security_floor
-                    and _at_least(candidate.version, floors[target.occurrence_id])
+                    and _at_least(
+                        candidate.version,
+                        floors[target.occurrence_id],
+                        version_scheme=target.version_scheme,
+                    )
                     for _ in target_findings
                 )
             )
@@ -2029,11 +2206,6 @@ def solve_portfolio(
             )
             return make_plan(
                 status=SolverStatus.INFEASIBLE,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         vars_by_id[target.occurrence_id] = model.NewIntVarFromDomain(
@@ -2236,11 +2408,6 @@ def solve_portfolio(
         if fixed_source is None:
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=[
                     *diagnostics,
                     f"fixed peer source {peer.source_occurrence_id!r} is absent from evidence",
@@ -2263,11 +2430,6 @@ def solve_portfolio(
         if invalid:
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=[
                     *diagnostics,
                     f"invalid fixed peer range {peer.version_range!r} for {target_id!r}",
@@ -2320,11 +2482,6 @@ def solve_portfolio(
             )
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         source_baseline = installed_index(source_id)
@@ -2343,11 +2500,6 @@ def solve_portfolio(
             )
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         allowed_mask = matched
@@ -2406,11 +2558,6 @@ def solve_portfolio(
         if evidence_variable is None:
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=[*diagnostics, "evidence variable map is incomplete"],
             )
         source_index = version_indices_by_id[source_id].get(relation.source_candidate_version)
@@ -2422,11 +2569,6 @@ def solve_portfolio(
             )
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         evidence_versions = evidence_versions_by_id[relation.evidence_variable_id]
@@ -2444,11 +2586,6 @@ def solve_portfolio(
             )
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         if not matched:
@@ -2502,11 +2639,6 @@ def solve_portfolio(
         if matched is None:
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=[
                     *diagnostics,
                     f"invalid modeled peer range {relation.version_range!r}",
@@ -2525,16 +2657,13 @@ def solve_portfolio(
     mark_timing_phase("fixed_peer_constraints")
 
     findings_covered: dict[str, Any] = {}
-    findings_version: dict[str, Any] = {}
     findings_workaround: dict[str, Any] = {}
-    coverage_meta: dict[str, tuple[list[int], str | None]] = {}
     for finding in finding_list:
         covered = model.NewBoolVar(f"finding_covered_{finding.coverage_id}")
         workaround = model.NewBoolVar(f"finding_workaround_{finding.coverage_id}")
         version_bool = model.NewBoolVar(f"finding_version_{finding.coverage_id}")
         findings_covered[finding.coverage_id] = covered
         findings_workaround[finding.coverage_id] = workaround
-        findings_version[finding.coverage_id] = version_bool
         occurrence_var = vars_by_id.get(finding.target_occurrence_id)
         candidates = domains.get(finding.target_occurrence_id, ())
         target = target_by_id.get(finding.target_occurrence_id)
@@ -2544,7 +2673,12 @@ def solve_portfolio(
             good_indices = [
                 index
                 for index, candidate in enumerate(candidates)
-                if candidate.meets_security_floor and _at_least(candidate.version, floor)
+                if candidate.meets_security_floor
+                and _at_least(
+                    candidate.version,
+                    floor,
+                    version_scheme=target.version_scheme if target is not None else "semver",
+                )
             ]
         terminal_status = (
             target.terminal_status if target is not None and target.is_terminal else None
@@ -2553,7 +2687,11 @@ def solve_portfolio(
             status_quo_covered = (
                 terminal_status == "qa_passed"
                 and floor is not None
-                and _at_least(target.installed_version, floor)
+                and _at_least(
+                    target.installed_version,
+                    floor,
+                    version_scheme=target.version_scheme,
+                )
             )
             model.Add(version_bool == int(status_quo_covered))
         elif occurrence_var is not None and good_indices:
@@ -2585,7 +2723,6 @@ def solve_portfolio(
                 # workaround carries the plan IDs that authorize it.
                 model.Add(workaround == 1)
         model.AddMaxEquality(covered, [version_bool, workaround])
-        coverage_meta[finding.coverage_id] = (good_indices, floor)
 
     candidate_literals: dict[str, list[Any]] = {}
     for target in eligible:
@@ -2645,7 +2782,13 @@ def solve_portfolio(
         )
         distance_terms.append(
             sum(
-                _distance_above(candidate.version, floor) * literals[index]
+                _distance_above(
+                    candidate.version,
+                    floor,
+                    version_scheme=target.version_scheme,
+                    candidate_versions=[item.version for item in values],
+                )
+                * literals[index]
                 for index, candidate in enumerate(values)
             )
         )
@@ -2746,11 +2889,6 @@ def solve_portfolio(
                         _add_statistics_diagnostic(diagnostics, solver_statistics)
                         return make_plan(
                             status=status,
-                            input_digest=input_digest,
-                            domain_digest=domain_digest,
-                            repository_digest=repository_digest,
-                            task_revisions=revisions,
-                            unresolved_finding_ids=issue_finding_ids,
                             diagnostics=diagnostics,
                             solver_statistics=solver_statistics,
                         )
@@ -2765,11 +2903,6 @@ def solve_portfolio(
                     _add_statistics_diagnostic(diagnostics, solver_statistics)
                     return make_plan(
                         status=SolverStatus.UNKNOWN,
-                        input_digest=input_digest,
-                        domain_digest=domain_digest,
-                        repository_digest=repository_digest,
-                        task_revisions=revisions,
-                        unresolved_finding_ids=issue_finding_ids,
                         diagnostics=diagnostics,
                         solver_statistics=solver_statistics,
                     )
@@ -2788,11 +2921,6 @@ def solve_portfolio(
         _add_statistics_diagnostic(diagnostics, solver_statistics)
         return make_plan(
             status=SolverStatus.FALLBACK,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
             solver_statistics=solver_statistics,
         )
@@ -2807,10 +2935,6 @@ def solve_portfolio(
     )
     return make_plan(
         status=final_status,
-        input_digest=input_digest,
-        domain_digest=domain_digest,
-        repository_digest=repository_digest,
-        task_revisions=revisions,
         candidate_plans=candidate_plans,
         selected_plan=selected_plan,
         unresolved_finding_ids=(

@@ -1,7 +1,7 @@
 """
-Tests for remediation_engine.tools.fix_planner.
+Tests for remediation_engine.tools.advisories.
 
-All network calls are mocked â€” no live internet required.
+All network calls are mocked — no live internet required.
 
 Coverage includes OSV advisory parsing, Serper evidence extraction, package
 identity, instruction generation, and ``FixPlan`` model validation. Network
@@ -22,7 +22,7 @@ from remediation_engine.contracts import (
     Severity,
     VulnerabilityIssue,
 )
-from remediation_engine.tools.fix_planner import (
+from remediation_engine.tools.advisories import (
     SerperLLMResult,
     _build_instruction,
     _extract_fixed_from_osv_vuln,
@@ -217,14 +217,14 @@ class TestFetchOsvVulnDetail:
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"id": "GHSA-xxxx", "affected": []}
         mock_resp.raise_for_status = MagicMock()
-        with patch("remediation_engine.tools.fix_planner.requests.get", return_value=mock_resp):
+        with patch("remediation_engine.tools.advisories.requests.get", return_value=mock_resp):
             result = _fetch_osv_vuln_detail("GHSA-xxxx")
         assert result is not None
         assert result["id"] == "GHSA-xxxx"
 
     def test_network_failure_returns_none(self):
         with patch(
-            "remediation_engine.tools.fix_planner.requests.get", side_effect=Exception("timeout")
+            "remediation_engine.tools.advisories.requests.get", side_effect=Exception("timeout")
         ):
             result = _fetch_osv_vuln_detail("GHSA-xxxx")
         assert result is None
@@ -232,7 +232,7 @@ class TestFetchOsvVulnDetail:
     def test_http_error_returns_none(self):
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = Exception("404")
-        with patch("remediation_engine.tools.fix_planner.requests.get", return_value=mock_resp):
+        with patch("remediation_engine.tools.advisories.requests.get", return_value=mock_resp):
             result = _fetch_osv_vuln_detail("GHSA-xxxx")
         assert result is None
 
@@ -277,14 +277,14 @@ class TestQueryOsvFixedVersion:
             ]
         }
         with patch(
-            "remediation_engine.tools.fix_planner.requests.post", return_value=self._post_mock(body)
+            "remediation_engine.tools.advisories.requests.post", return_value=self._post_mock(body)
         ):
             issue = _make_vuln_issue()
             result = _query_osv_fixed_version(issue)
         assert result == ("4.17.21", None)
 
     def test_id_only_triggers_detail_fetch(self):
-        """querybatch returns only {id: ...}, no 'affected' â†’ fall back to GET."""
+        """querybatch returns only {id: ...}, no 'affected' → fall back to GET."""
         querybatch_body = {"results": [{"vulns": [{"id": "GHSA-xxxx"}]}]}
         detail_body = {
             "id": "GHSA-xxxx",
@@ -306,8 +306,8 @@ class TestQueryOsvFixedVersion:
         get_mock.raise_for_status = MagicMock()
 
         with (
-            patch("remediation_engine.tools.fix_planner.requests.post", return_value=post_mock),
-            patch("remediation_engine.tools.fix_planner.requests.get", return_value=get_mock),
+            patch("remediation_engine.tools.advisories.requests.post", return_value=post_mock),
+            patch("remediation_engine.tools.advisories.requests.get", return_value=get_mock),
         ):
             issue = _make_vuln_issue()
             result = _query_osv_fixed_version(issue)
@@ -334,7 +334,7 @@ class TestQueryOsvFixedVersion:
             ]
         }
         with patch(
-            "remediation_engine.tools.fix_planner.requests.post", return_value=self._post_mock(body)
+            "remediation_engine.tools.advisories.requests.post", return_value=self._post_mock(body)
         ):
             result = _query_osv_fixed_version(_make_vuln_issue())
         assert result == (
@@ -344,7 +344,7 @@ class TestQueryOsvFixedVersion:
 
     def test_network_failure_returns_none(self):
         with patch(
-            "remediation_engine.tools.fix_planner.requests.post", side_effect=Exception("timeout")
+            "remediation_engine.tools.advisories.requests.post", side_effect=Exception("timeout")
         ):
             result = _query_osv_fixed_version(_make_vuln_issue())
         assert result == (None, None)
@@ -352,7 +352,7 @@ class TestQueryOsvFixedVersion:
     def test_empty_results_returns_none(self):
         body = {"results": [{}]}
         with patch(
-            "remediation_engine.tools.fix_planner.requests.post", return_value=self._post_mock(body)
+            "remediation_engine.tools.advisories.requests.post", return_value=self._post_mock(body)
         ):
             result = _query_osv_fixed_version(_make_vuln_issue())
         assert result == (None, None)
@@ -360,7 +360,7 @@ class TestQueryOsvFixedVersion:
     def test_no_package_name_returns_none(self):
         issue = _make_vuln_issue(package_name=None, purl=None)
         # No network calls should be made
-        with patch("remediation_engine.tools.fix_planner.requests.post") as mock_post:
+        with patch("remediation_engine.tools.advisories.requests.post") as mock_post:
             result = _query_osv_fixed_version(issue)
         mock_post.assert_not_called()
         assert result == (None, None)
@@ -403,7 +403,7 @@ class TestQueryOsvFixedVersion:
         response = self._post_mock(body)
 
         with patch(
-            "remediation_engine.tools.fix_planner.requests.post", return_value=response
+            "remediation_engine.tools.advisories.requests.post", return_value=response
         ) as post:
             result = _query_osv_fixed_version(issue)
 
@@ -447,7 +447,7 @@ class TestQuerySerper:
         mock_resp = MagicMock()
         mock_resp.json.return_value = body
         mock_resp.raise_for_status = MagicMock()
-        with patch("remediation_engine.tools.fix_planner.requests.post", return_value=mock_resp):
+        with patch("remediation_engine.tools.advisories.requests.post", return_value=mock_resp):
             result = _query_serper(_make_vuln_issue(), "lodash")
         assert result is not None
         assert len(result) == 3
@@ -457,7 +457,7 @@ class TestQuerySerper:
 
     def test_returns_none_when_no_key(self, monkeypatch):
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
-        with patch("remediation_engine.tools.fix_planner.requests.post") as mock_post:
+        with patch("remediation_engine.tools.advisories.requests.post") as mock_post:
             result = _query_serper(_make_vuln_issue(), "lodash")
         mock_post.assert_not_called()
         assert result is None
@@ -465,7 +465,7 @@ class TestQuerySerper:
     def test_network_failure_returns_none(self, monkeypatch):
         monkeypatch.setenv("SERPER_API_KEY", "test-key")
         with patch(
-            "remediation_engine.tools.fix_planner.requests.post", side_effect=Exception("timeout")
+            "remediation_engine.tools.advisories.requests.post", side_effect=Exception("timeout")
         ):
             result = _query_serper(_make_vuln_issue(), "lodash")
         assert result is None
@@ -475,7 +475,7 @@ class TestQuerySerper:
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"organic": []}
         mock_resp.raise_for_status = MagicMock()
-        with patch("remediation_engine.tools.fix_planner.requests.post", return_value=mock_resp):
+        with patch("remediation_engine.tools.advisories.requests.post", return_value=mock_resp):
             result = _query_serper(_make_vuln_issue(), "lodash")
         assert result is None
 
@@ -491,7 +491,7 @@ class TestFetchPageContent:
         mock_resp.text = "GitHub advisory content"
         mock_resp.json.side_effect = Exception("Not JSON")
         mock_resp.raise_for_status = MagicMock()
-        with patch("remediation_engine.tools.fix_planner.requests.get", return_value=mock_resp):
+        with patch("remediation_engine.tools.advisories.requests.get", return_value=mock_resp):
             result = _fetch_page_content("https://github.com/foo/bar/issues/1")
         assert result == "GitHub advisory content"
 
@@ -505,7 +505,7 @@ class TestFetchPageContent:
                 mock.raise_for_status = MagicMock()
             return mock
 
-        with patch("remediation_engine.tools.fix_planner.requests.get", side_effect=fake_get):
+        with patch("remediation_engine.tools.advisories.requests.get", side_effect=fake_get):
             result = _fetch_page_content("https://github.com/foo/bar/blob/main/README.md")
         assert result == "Raw github file content"
 
@@ -519,7 +519,7 @@ class TestFetchPageContent:
                 mock.raise_for_status.side_effect = Exception("Failed")
             return mock
 
-        with patch("remediation_engine.tools.fix_planner.requests.get", side_effect=fake_get):
+        with patch("remediation_engine.tools.advisories.requests.get", side_effect=fake_get):
             result = _fetch_page_content("https://example.com/advisory")
         assert result == "Jina reader markdown"
 
@@ -533,13 +533,13 @@ class TestFetchPageContent:
                 mock.raise_for_status = MagicMock()
             return mock
 
-        with patch("remediation_engine.tools.fix_planner.requests.get", side_effect=fake_get):
+        with patch("remediation_engine.tools.advisories.requests.get", side_effect=fake_get):
             result = _fetch_page_content("https://example.com/advisory")
         assert result == "Direct HTML content"
 
     def test_all_tiers_fail_returns_none(self):
         with patch(
-            "remediation_engine.tools.fix_planner.requests.get",
+            "remediation_engine.tools.advisories.requests.get",
             side_effect=Exception("network fail"),
         ):
             result = _fetch_page_content("https://example.com/advisory")
@@ -549,7 +549,7 @@ class TestFetchPageContent:
         mock_resp = MagicMock()
         mock_resp.text = "A" * 20_000
         mock_resp.raise_for_status = MagicMock()
-        with patch("remediation_engine.tools.fix_planner.requests.get", return_value=mock_resp):
+        with patch("remediation_engine.tools.advisories.requests.get", return_value=mock_resp):
             result = _fetch_page_content("https://example.com/advisory")
         assert result is not None
         assert len(result) == 16_000
@@ -644,11 +644,11 @@ class TestPlanFixSerperFallback:
         llm_dict = {"strategy": "VERSION_BUMP", "fixed_version": "4.17.21"}
         with (
             patch(
-                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                "remediation_engine.tools.advisories._query_osv_fixed_version",
                 return_value=(None, None),
             ),
             patch(
-                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                "remediation_engine.tools.advisories._serper_search_and_extract",
                 return_value=llm_dict,
             ),
         ):
@@ -663,11 +663,11 @@ class TestPlanFixSerperFallback:
         llm_dict = {"strategy": "CODE_WORKAROUND", "workaround_snippets": ["Sanitize input"]}
         with (
             patch(
-                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                "remediation_engine.tools.advisories._query_osv_fixed_version",
                 return_value=(None, None),
             ),
             patch(
-                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                "remediation_engine.tools.advisories._serper_search_and_extract",
                 return_value=llm_dict,
             ),
         ):
@@ -681,11 +681,11 @@ class TestPlanFixSerperFallback:
         loc = _make_localized()
         with (
             patch(
-                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                "remediation_engine.tools.advisories._query_osv_fixed_version",
                 return_value=(None, None),
             ),
             patch(
-                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                "remediation_engine.tools.advisories._serper_search_and_extract",
                 return_value=None,
             ),
         ):
@@ -699,11 +699,11 @@ class TestPlanFixSerperFallback:
         llm_dict = {"strategy": "NO_FIX"}
         with (
             patch(
-                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                "remediation_engine.tools.advisories._query_osv_fixed_version",
                 return_value=(None, None),
             ),
             patch(
-                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                "remediation_engine.tools.advisories._serper_search_and_extract",
                 return_value=llm_dict,
             ),
         ):
@@ -724,7 +724,7 @@ class TestPlanFixRoundTrip:
     def test_version_found_validates(self):
         loc = _make_localized()
         with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=("4.17.21", None),
         ):
             result = plan_fix(loc)
@@ -738,7 +738,7 @@ class TestPlanFixRoundTrip:
         loc = _make_localized(issue=issue)
         snippets = ["patch A"]
         with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=(None, snippets),
         ):
             result = plan_fix(loc)
@@ -752,11 +752,11 @@ class TestPlanFixRoundTrip:
         llm_dict = {"strategy": "VERSION_BUMP", "fixed_version": "4.17.21"}
         with (
             patch(
-                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                "remediation_engine.tools.advisories._query_osv_fixed_version",
                 return_value=(None, None),
             ),
             patch(
-                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                "remediation_engine.tools.advisories._serper_search_and_extract",
                 return_value=llm_dict,
             ),
         ):
@@ -771,11 +771,11 @@ class TestPlanFixRoundTrip:
         llm_dict = {"strategy": "CODE_WORKAROUND", "workaround_snippets": ["step 1"]}
         with (
             patch(
-                "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+                "remediation_engine.tools.advisories._query_osv_fixed_version",
                 return_value=(None, None),
             ),
             patch(
-                "remediation_engine.tools.fix_planner._serper_search_and_extract",
+                "remediation_engine.tools.advisories._serper_search_and_extract",
                 return_value=llm_dict,
             ),
         ):
@@ -790,7 +790,7 @@ class TestPlanFixRoundTrip:
         issue = _make_vuln_issue(message="No hint.")
         loc = _make_localized(issue=issue)
         with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=(None, None),
         ):
             result = plan_fix(loc)
@@ -801,7 +801,7 @@ class TestPlanFixRoundTrip:
     def test_json_round_trip(self):
         loc = _make_localized()
         with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=("4.17.21", None),
         ):
             result = plan_fix(loc)
@@ -821,7 +821,7 @@ class TestPlanFixInstructionContent:
     def test_direct_dep_instruction_mentions_update(self):
         loc = _make_localized(is_direct_dependency=True, manifest_file="package.json")
         with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=("4.17.21", None),
         ):
             result = plan_fix(loc)
@@ -836,7 +836,7 @@ class TestPlanFixInstructionContent:
             manifest_file="package.json",
         )
         with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=("4.17.21", None),
         ):
             result = plan_fix(loc)
@@ -849,7 +849,7 @@ class TestPlanFixInstructionContent:
             manifest_file="package.json",
         )
         with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=("4.17.21", None),
         ):
             result = plan_fix(loc)
@@ -862,7 +862,7 @@ class TestPlanFixInstructionContent:
             manifest_file="package.json",
         )
         with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=("4.17.21", None),
         ):
             result = plan_fix(loc)
@@ -882,7 +882,7 @@ class TestPlanFixInstructionContent:
             declaration_type="dependencies",
         )
         with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=("2.32.0", None),
         ):
             result = plan_fix(loc)
@@ -905,7 +905,7 @@ class TestPlanFixInstructionContent:
             declaration_type=None,
         )
         with patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=("2.32.0", None),
         ):
             result = plan_fix(loc)
@@ -1025,7 +1025,7 @@ class TestOsvAliasAndExtractedEvents:
         with (
             patch("requests.post") as mock_post,
             patch(
-                "remediation_engine.tools.fix_planner._fetch_osv_vuln_detail",
+                "remediation_engine.tools.advisories._fetch_osv_vuln_detail",
                 side_effect=mock_fetch,
             ),
         ):
@@ -1076,8 +1076,8 @@ def test_maven_instruction_names_exact_gav_authorized_pom_and_target():
 
 def test_maven_without_authorized_pom_is_explicit_no_fix_without_npm_targets():
     with (
-        patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv,
-        patch("remediation_engine.tools.fix_planner._serper_search_and_extract") as serper,
+        patch("remediation_engine.tools.advisories._query_osv_fixed_version") as osv,
+        patch("remediation_engine.tools.advisories._serper_search_and_extract") as serper,
     ):
         plan = plan_fix(_make_maven_localized(manifest_file=None))
 
@@ -1093,11 +1093,11 @@ def test_maven_without_authorized_pom_is_explicit_no_fix_without_npm_targets():
 def test_maven_serper_version_bump_is_not_authorized():
     with (
         patch(
-            "remediation_engine.tools.fix_planner._query_osv_fixed_version",
+            "remediation_engine.tools.advisories._query_osv_fixed_version",
             return_value=(None, None),
         ),
         patch(
-            "remediation_engine.tools.fix_planner._serper_search_and_extract",
+            "remediation_engine.tools.advisories._serper_search_and_extract",
             return_value={"strategy": "VERSION_BUMP", "fixed_version": "99.0"},
         ),
     ):
@@ -1112,9 +1112,9 @@ def test_skip_osv_mode_accepts_workaround_evidence_but_rejects_version_only_resu
     issue = _make_localized()
     version_only = {"strategy": "VERSION_BUMP", "fixed_version": "99.0"}
     with (
-        patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv,
+        patch("remediation_engine.tools.advisories._query_osv_fixed_version") as osv,
         patch(
-            "remediation_engine.tools.fix_planner._serper_search_and_extract",
+            "remediation_engine.tools.advisories._serper_search_and_extract",
             return_value=version_only,
         ) as serper,
     ):
@@ -1126,9 +1126,9 @@ def test_skip_osv_mode_accepts_workaround_evidence_but_rejects_version_only_resu
     assert version_plan["fixed_version"] is None
 
     with (
-        patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv,
+        patch("remediation_engine.tools.advisories._query_osv_fixed_version") as osv,
         patch(
-            "remediation_engine.tools.fix_planner._serper_search_and_extract",
+            "remediation_engine.tools.advisories._serper_search_and_extract",
             return_value={
                 "strategy": "CODE_WORKAROUND",
                 "workaround_snippets": ["Disable the affected option."],
@@ -1144,8 +1144,8 @@ def test_skip_osv_mode_accepts_workaround_evidence_but_rejects_version_only_resu
 
 def test_skip_osv_mode_keeps_maven_manifest_authorization():
     with (
-        patch("remediation_engine.tools.fix_planner._query_osv_fixed_version") as osv,
-        patch("remediation_engine.tools.fix_planner._serper_search_and_extract") as serper,
+        patch("remediation_engine.tools.advisories._query_osv_fixed_version") as osv,
+        patch("remediation_engine.tools.advisories._serper_search_and_extract") as serper,
     ):
         plan = plan_fix(_make_maven_localized(manifest_file=None), skip_osv=True)
 
@@ -1219,7 +1219,7 @@ def test_query_osv_passes_maven_ecosystem_and_uses_maven_floor_ordering():
         ]
     }
     with patch(
-        "remediation_engine.tools.fix_planner.requests.post",
+        "remediation_engine.tools.advisories.requests.post",
         return_value=response,
     ) as post:
         fixed, snippets = _query_osv_fixed_version(issue)

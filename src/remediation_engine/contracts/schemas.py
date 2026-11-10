@@ -14,6 +14,7 @@ Design principles
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import PurePosixPath, PureWindowsPath
@@ -24,7 +25,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    RootModel,
     TypeAdapter,
     field_serializer,
     field_validator,
@@ -385,7 +385,7 @@ class CommandResult(BaseModel):
     """
     Output of a command executed inside a ``DockerSandbox``.
 
-    Produced by ``remediation_engine.runtime.sandbox_mgr.DockerSandbox.run``.
+    Produced by ``remediation_engine.runtime.sandbox.DockerSandbox.run``.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -418,13 +418,13 @@ class FixPlan(BaseModel):
     """
     Structured output of the fix-planner waterfall.
 
-    Produced by ``remediation_engine.tools.fix_planner`` and consumed by the downstream
+    Produced by ``remediation_engine.tools.advisories`` and consumed by the downstream
     Remedy agent to apply the correct type of edit.
 
     Invariants (enforced by model_validator):
-    - ``version_found``    â†’ ``fixed_version`` is set, ``workaround_snippets`` is None.
-    - ``workaround_found`` â†’ ``workaround_snippets`` is non-empty, ``fixed_version`` is None.
-    - ``no_fix``           â†’ both ``fixed_version`` and ``workaround_snippets`` are None.
+    - ``version_found``    → ``fixed_version`` is set, ``workaround_snippets`` is None.
+    - ``workaround_found`` → ``workaround_snippets`` is non-empty, ``fixed_version`` is None.
+    - ``no_fix``           → both ``fixed_version`` and ``workaround_snippets`` are None.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -679,10 +679,9 @@ class LocalizedIssue(BaseModel):
     """
     A ``VulnerabilityIssue`` enriched with AST-level code localization context.
 
-    Produced by the SAST code locator (``locate_sast``) and the SCA manifest
-    locator (``locate_dependency``). This model is a *pure localization result* â€”
-    it contains no fix instructions or remediation planning. Fix planning is the
-    responsibility of the downstream "Plan Fix" agent.
+    Produced by SAST ingestion or the SCA manifest locator. This model is a
+    localization result; it contains no fix instructions or remediation
+    planning.
     """
 
     model_config = ConfigDict(frozen=False)
@@ -709,7 +708,7 @@ class LocalizedIssue(BaseModel):
         description="Brief data-flow notes (e.g. 'taint source: req.params.id').",
     )
     snippet: str | None = Field(
-        None, description="Bounded code snippet around the finding (â‰¤ 30 lines)."
+        None, description="Bounded code snippet around the finding (≤ 30 lines)."
     )
 
     # Manifest context (SCA)
@@ -791,7 +790,7 @@ class LocalizedIssue(BaseModel):
         default=0.0,
         ge=0.0,
         le=1.0,
-        description="0â€“1 confidence score for the localization result.",
+        description="0–1 confidence score for the localization result.",
     )
 
     localized_at: datetime = Field(
@@ -925,9 +924,9 @@ class CVEEnrichment(BaseModel):
     """
     External threat-intelligence enrichment for a single CVE identifier.
 
-    Populated by ``remediation_engine.triage.enrichment`` from the FIRST EPSS API and the
+    Populated by ``remediation_engine.tools.advisories`` from the FIRST EPSS API and the
     CISA Known Exploited Vulnerabilities (KEV) catalogue.  Always returned,
-    even when upstream APIs fail â€” safe defaults indicate "unknown risk".
+    even when upstream APIs fail — safe defaults indicate "unknown risk".
     """
 
     model_config = ConfigDict(frozen=True)
@@ -939,13 +938,13 @@ class CVEEnrichment(BaseModel):
         default=0.0,
         ge=0.0,
         le=1.0,
-        description="EPSS probability score (0â€“1).  0.0 = unknown / API failure.",
+        description="EPSS probability score (0–1).  0.0 = unknown / API failure.",
     )
     epss_percentile: float = Field(
         default=0.0,
         ge=0.0,
         le=1.0,
-        description="EPSS percentile rank (0â€“1).  0.0 = unknown / API failure.",
+        description="EPSS percentile rank (0–1).  0.0 = unknown / API failure.",
     )
 
     # CISA KEV
@@ -983,7 +982,7 @@ class VulnerabilityGroup(BaseModel):
     A set of ``VulnerabilityIssue`` records that share the same vulnerable
     component (SCA) or code location (SAST).
 
-    Produced by ``remediation_engine.triage.grouper``.  The grouper deduplicates
+    Produced by ``remediation_engine.agents.triage``.  The grouper deduplicates
     cross-tool findings and merges overlapping CVE/component/file triples into
     a single authoritative group for downstream triage. The Supervisor may
     additionally create an ``is_synthetic`` coordination group for a direct
@@ -1107,13 +1106,6 @@ class VulnerabilityGroup(BaseModel):
             "alternative strategies."
         ),
     )
-    fix_plan: FixPlan | None = Field(
-        None,
-        description=(
-            "Compatibility summary of the package plans. New orchestration code "
-            "must use fix_plan_candidates for strategy selection."
-        ),
-    )
 
     # Enrichment (attached after grouping, before triage)
     enrichment: CVEEnrichment | None = Field(
@@ -1173,7 +1165,7 @@ class TriageResult(BaseModel):
     """
     Deterministic or LLM-assisted triage verdict for one ``VulnerabilityGroup``.
 
-    Produced by ``remediation_engine.triage.agent``.  The triage agent may use an LLM for
+    Produced by ``remediation_engine.agents.triage``.  The triage agent may use an LLM for
     initial reasoning, but deterministic guardrails (KEV, EPSS, original
     severity) are always applied afterwards to prevent the LLM from
     under-ranking exploitable issues.
@@ -1214,7 +1206,7 @@ class TriageResult(BaseModel):
         ...,
         description=(
             "Revised priority using the canonical Severity enum.  "
-            "Guardrails clamp: KEV â†’ CRITICAL; EPSSâ‰¥0.5 or HIGH/CRITICAL original â†’ at least HIGH."
+            "Guardrails clamp: KEV → CRITICAL; EPSS≥0.5 or HIGH/CRITICAL original → at least HIGH."
         ),
     )
     is_unreachable_code: bool = Field(
@@ -1348,96 +1340,6 @@ class WorkaroundValidationResult(BaseModel):
     infrastructure_diagnostics: str | None = None
 
 
-class TacticalSupervisorAction(BaseModel):
-    """Legacy input compatibility envelope for tactical actions.
-
-    New Supervisor model calls use the strategy-specific contracts below.  This
-    permissive envelope remains importable for callers that construct historical
-    decisions directly; it is not passed to ``with_structured_output`` and does
-    not authorize a worker or identify the active task.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    diagnostic_basis: str = Field(
-        ...,
-        min_length=10,
-        max_length=1200,
-        description=(
-            "Bounded evidence-to-rule summary. This is not a hidden reasoning transcript "
-            "and is never used as a worker instruction."
-        ),
-    )
-    selected_strategy: TacticalStrategy
-    target_version: str | None = None
-    workaround_hypothesis: str | None = None
-    target_files_hint: list[str] = Field(
-        default_factory=list,
-        max_length=5,
-        description="Normalized relative path hints, not worker authorization.",
-    )
-    rationale: str = Field(..., min_length=1, max_length=600)
-
-    @field_validator("selected_strategy", mode="before")
-    @classmethod
-    def _normalize_tactical_strategy(cls, value: Any) -> Any:
-        """Trim a tactical strategy string before enum validation."""
-        return value.strip() if isinstance(value, str) else value
-
-    @field_validator("target_version", "workaround_hypothesis", mode="before")
-    @classmethod
-    def _normalize_tactical_optional_text(cls, value: Any, info: Any) -> str | None:
-        """Normalize optional tactical action text fields."""
-        return _trim_optional_contract_text(value, info.field_name)
-
-    @field_validator("target_files_hint", mode="before")
-    @classmethod
-    def _normalize_tactical_file_hints(cls, value: Any) -> list[str]:
-        """Normalize safe relative file hints and reject duplicates."""
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            raise ValueError("target_files_hint must be a list of relative paths.")
-        result = [_normalize_relative_file_hint(item) for item in value]
-        if len(result) != len(set(result)):
-            raise ValueError("target_files_hint must not contain duplicates.")
-        return result
-
-    @field_validator("diagnostic_basis", "rationale", mode="before")
-    @classmethod
-    def _normalize_tactical_text(cls, value: Any, info: Any) -> str:
-        """Require trimmed tactical diagnostic and rationale text."""
-        return _trim_required_contract_text(value, info.field_name)
-
-    @model_validator(mode="after")
-    def _validate_tactical_strategy_fields(self) -> TacticalSupervisorAction:
-        """Reject strategy fields that contradict the selected action."""
-        if self.selected_strategy == TacticalStrategy.CODE_WORKAROUND:
-            if self.target_version is not None:
-                raise ValueError("code_workaround actions must not specify target_version.")
-            if self.workaround_hypothesis is None:
-                raise ValueError("code_workaround actions require workaround_hypothesis.")
-        elif self.selected_strategy in {
-            TacticalStrategy.VERSION_BUMP,
-            TacticalStrategy.PACKAGE_OVERRIDE,
-        }:
-            if self.target_version is None:
-                raise ValueError(f"{self.selected_strategy.value} actions require target_version.")
-            if self.workaround_hypothesis is not None:
-                raise ValueError(
-                    f"{self.selected_strategy.value} actions must not specify "
-                    "workaround_hypothesis."
-                )
-        else:
-            if self.target_version is not None:
-                raise ValueError("escalation actions must not specify target_version.")
-            if self.workaround_hypothesis is not None:
-                raise ValueError("escalation actions must not specify workaround_hypothesis.")
-            if self.target_files_hint:
-                raise ValueError("escalation actions must not specify target_files_hint.")
-        return self
-
-
 class _TacticalSupervisorActionBase(BaseModel):
     """Common bounded fields shared by the four model-output contracts."""
 
@@ -1525,17 +1427,7 @@ SupervisorTacticalAction = Annotated[
 ]
 
 
-class TacticalSupervisorDecision(RootModel[SupervisorTacticalAction]):
-    """Internal compatibility adapter for discriminated tactical actions.
-
-    This root union remains useful for validating persisted or legacy callers,
-    but it must not be passed to an OpenAI response-format schema. The live
-    Supervisor provider boundary binds each concrete action contract as a
-    separate function tool so the provider never receives a root ``oneOf``.
-    """
-
-
-TACTICAL_SUPERVISOR_ACTION_ADAPTER = TypeAdapter(SupervisorTacticalAction)
+SUPERVISOR_TACTICAL_ACTION_ADAPTER = TypeAdapter(SupervisorTacticalAction)
 
 
 class QAFailureEvidence(BaseModel):
@@ -1841,15 +1733,15 @@ class IncrementalScanRecord(BaseModel):
     recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
-class FinalFullScanResult(BaseModel):
-    """Legacy-shaped projection of full or incremental ODC findings."""
+class ScanCoverageResult(BaseModel):
+    """Typed evidence describing the coverage of a completed or failed scan."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    completed: bool = False
-    authoritative: bool = True
-    coverage_scope: Literal["full_workspace", "incremental_dependency_inputs"] = "full_workspace"
-    coverage_complete: bool | None = None
+    completed: bool
+    authoritative: bool
+    coverage_scope: Literal["full_workspace", "incremental_dependency_inputs"]
+    coverage_complete: bool | None
     found_identifiers: list[str] = Field(default_factory=list)
     remaining_target_identifiers: list[str] = Field(default_factory=list)
     new_identifiers: list[str] = Field(default_factory=list)
@@ -2047,7 +1939,7 @@ class TaskAttemptSnapshot(BaseModel):
     strategy_stage: SCARemediationStage = SCARemediationStage.OSV_MINIMUM
     no_fix_stage: NoFixMitigationStage | None = Field(default=None)
     selected_version: str | None = None
-    allowed_target_versions: list[str] = Field(default_factory=list)
+    allowed_target_versions: list[str]
     target_package_name: str | None = None
     target_dependency_type: str | None = None
     maven_target_operation: MavenTargetOperation | None = Field(
@@ -2062,7 +1954,7 @@ class TaskAttemptSnapshot(BaseModel):
         default_factory=list,
         description="Repository-relative Maven POM targets committed for this attempt.",
     )
-    allowed_dependency_types: list[str] = Field(default_factory=list)
+    allowed_dependency_types: list[str]
     parent_minimum_version: str | None = None
     instruction: str = Field(..., min_length=1)
     instruction_digest: str = Field(..., min_length=1)
@@ -2930,13 +2822,6 @@ class SupervisorDecision(BaseModel):
         ...,
         description="The next node to route to in the orchestrator graph.",
     )
-    updated_task_strategies: dict[str, RoutingStrategy] = Field(
-        default_factory=dict,
-        description=(
-            "Requested strategy pivots keyed by parent task_id. "
-            "The supervisor realizes these as child-task spawns rather than mutating the parent task in place."
-        ),
-    )
     target_task_ids: list[str] = Field(
         default_factory=list,
         description=(
@@ -3149,12 +3034,8 @@ class RemediationTask(BaseModel):
             "None for initial (depth-0) tasks."
         ),
     )
-    qa_policy: QAPolicy | None = Field(
-        default=None,
-        description=(
-            "Supervisor-owned QA gate policy. None is retained only for legacy "
-            "state so missing provenance can fail closed."
-        ),
+    qa_policy: QAPolicy = Field(
+        ..., description="Supervisor-owned QA gate policy committed for this task."
     )
     strategy: RoutingStrategy = Field(
         ...,
@@ -3256,3 +3137,32 @@ class RemediationTask(BaseModel):
     def _normalize_remediation_action(cls, value: Any) -> str | None:
         """Trim an optional Supervisor-authored completion action."""
         return _trim_optional_contract_text(value, "remediation_action")
+
+
+class AuditRecord(BaseModel):
+    """Deterministic supervisor decision audit record."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    decision_code: DecisionCode
+    next_node: str
+    target_task_ids: list[str] = Field(default_factory=list)
+    reasoning: str = ""
+    state_revision: int = 0
+    consistency_events: list[StateConsistencyEvent] = Field(default_factory=list)
+
+
+def model_or_dict_value(item: Any, key: str, default: Any = None) -> Any:
+    """Read a field from either a Pydantic object or a mapping.
+
+    Args:
+        item: Object or mapping containing the requested field.
+        key: Field name to read.
+        default: Value returned when the field is absent.
+
+    Returns:
+        The field value, or ``default`` when it is absent.
+    """
+    if isinstance(item, Mapping):
+        return item.get(key, default)
+    return getattr(item, key, default)

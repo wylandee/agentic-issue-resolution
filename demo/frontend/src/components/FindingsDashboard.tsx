@@ -92,7 +92,6 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
 
   return (
     <div className="flex flex-col h-full bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-lg">
-      {/* Top Metric Cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4 bg-slate-950/60 border-b border-slate-800">
         <div className="flex flex-col p-3 bg-slate-900/90 rounded-lg border border-slate-800">
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
@@ -155,7 +154,6 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
         </div>
       </div>
 
-      {/* Filter and Search Bar */}
       <div className="flex flex-wrap items-center justify-between gap-2 p-3 bg-slate-900/80 border-b border-slate-800">
         <div className="relative flex-1 min-w-[200px] max-w-sm">
           <Search className="w-4 h-4 text-slate-500 absolute left-2.5 top-2.5" />
@@ -186,7 +184,6 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
         </div>
       </div>
 
-      {/* Findings List */}
       <div className="flex-1 overflow-y-auto p-4 space-y-2.5 terminal-scroll">
         {filteredFindings.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-48 text-center text-slate-500">
@@ -194,8 +191,8 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
               remediatedCount > 0 ? (
                 <>
                   <CheckCircle2 className="w-10 h-10 text-emerald-400 mb-2 animate-bounce" />
-                  <p className="text-sm font-medium text-emerald-300">All findings remediated!</p>
-                  <p className="text-xs text-slate-400 mt-1">Zero active vulnerabilities remain in the codebase.</p>
+                  <p className="text-sm font-medium text-emerald-300">No loaded findings remain active.</p>
+                  <p className="text-xs text-slate-400 mt-1">The dashboard has no unresolved findings in its current scan scope.</p>
                 </>
               ) : attachedWorkspace ? (
                 <div className="flex flex-col items-center max-w-md px-4 text-center">
@@ -207,7 +204,7 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
                     The report at <code className="text-amber-300 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">{attachedWorkspace.odc_report_path || "report.json"}</code> contains 0 flagged vulnerabilities.
                   </p>
                   <p className="text-xs text-slate-400 mt-2">
-                    To test with vulnerabilities, load the benchmark fixture <strong className="text-blue-400">examples/juice_shop</strong> (which contains 173 baseline vulnerabilities).
+                    Attach a repository with findings or select a baseline report to start a remediation run.
                   </p>
                 </div>
               ) : (
@@ -235,12 +232,9 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
                 className={`flex flex-col bg-slate-950/70 border rounded-lg transition overflow-hidden ${
                   finding.is_new
                     ? "border-amber-500/60 bg-amber-950/10 shadow-sm"
-                    : finding.status === "remediating"
-                    ? "border-blue-500/60 bg-blue-950/10 shadow-sm"
                     : "border-slate-800 hover:border-slate-700"
                 }`}
               >
-                {/* Finding Header Item */}
                 <div
                   onClick={() => toggleExpand(finding.id)}
                   className="flex items-center justify-between p-3 cursor-pointer select-none gap-3"
@@ -270,12 +264,6 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
                       </span>
                     )}
 
-                    {finding.status === "remediating" && (
-                      <span className="px-1.5 py-0.5 text-[10px] font-medium bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded flex items-center gap-1">
-                        <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-ping" />
-                        Remediating
-                      </span>
-                    )}
                   </div>
 
                   <div className="flex items-center gap-3 flex-shrink-0">
@@ -292,7 +280,6 @@ export const FindingsDashboard: React.FC<FindingsDashboardProps> = ({
                   </div>
                 </div>
 
-                {/* Expanded Details */}
                 {isExpanded && (
                   <div className="px-3 pb-3 pt-1 border-t border-slate-900 bg-slate-950/40 text-xs text-slate-300 space-y-2">
                     {finding.description && (

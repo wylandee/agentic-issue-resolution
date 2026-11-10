@@ -11,8 +11,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from remediation_engine.orchestration.task_utils import terminal_outcome_issues
-from remediation_engine.orchestration.trajectory_exporter import to_jsonable
+from remediation_engine.orchestration.state import terminal_outcome_issues
+from remediation_engine.runtime.telemetry import to_jsonable
 
 from .trajectories import TrajectoryDocument, extract_tool_calls, parse_trajectory_markdown
 
@@ -206,7 +206,7 @@ def _golden_diff_excerpt(diff: str, golden: Mapping[str, Any]) -> str:
     }
     sections = re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE)
     selected: list[str] = []
-    remaining = 28_000
+    remaining = 900
     for section in sections:
         if not section.strip():
             continue
@@ -448,6 +448,21 @@ def assess_contracts(evidence: RunEvidence) -> ContractAssessment:
             "Run claims clean completion despite unresolved outcomes or errors"
         )
     report = str(state.get("report_markdown") or "")
+    outcome_match = re.search(
+        r"^\|\s*Run outcome\s*\|\s*([^|]+?)\s*\|\s*$",
+        report,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    report_outcome = outcome_match.group(1).strip().casefold() if outcome_match else ""
+    unsuccessful_state = (
+        state.get("status") in {"completed_with_errors", "failed", "error"}
+        or bool(assessment.unresolved)
+        or bool(state.get("errors"))
+    )
+    if report_outcome in {"successful", "completed with new findings"} and unsuccessful_state:
+        assessment.violations.append(
+            "Report labels the run successful despite unresolved outcomes, errors, or terminal failure"
+        )
     if report and (assessment.unresolved or state.get("errors")):
         for sentence in re.split(r"[.!?\n]+", report):
             normalized = sentence.casefold()
@@ -515,8 +530,9 @@ def judge_payload(
         if len(text) <= limit:
             return text
         omissions[label] += len(text) - limit
-        half = limit // 2
-        return text[:half] + "\n[detail omitted]\n" + text[-half:]
+        marker = "\n[detail omitted]\n"
+        half = max(0, (limit - len(marker)) // 2)
+        return text[:half] + marker + text[-half:]
 
     def mapping(value: Any) -> Mapping[str, Any]:
         return value if isinstance(value, Mapping) else {}
@@ -613,30 +629,9 @@ def judge_payload(
         if len(value) > len(selected):
             omissions[f"{label}_items_omitted"] += len(value) - len(selected)
         return [
-            compact_tree(pick(item, fields), label, string_limit=600, list_limit=16)
+            compact_tree(pick(item, fields), label, string_limit=300, list_limit=16)
             for item in selected
         ]
-
-    def project_map(
-        value: Any,
-        fields: tuple[str, ...],
-        *,
-        bounded: tuple[str, ...] = (),
-        limit: int = 64,
-    ) -> dict[str, Any]:
-        items = sorted(mapping(value).items())
-        if len(items) > limit:
-            omissions["projected_map_items_omitted"] += len(items) - limit
-            items = items[:limit]
-        return {
-            key: compact_tree(
-                pick(item, fields, bounded=bounded),
-                "projected_map_value",
-                string_limit=600,
-                list_limit=16,
-            )
-            for key, item in items
-        }
 
     def bounded_map_entries(
         value: Any,
@@ -700,9 +695,11 @@ def judge_payload(
         for key in ("found_identifiers", "new_identifiers", "remaining_target_identifiers"):
             if key in scan:
                 scan[f"{key}_count"] = len(scan[key]) if isinstance(scan[key], list) else 0
-                scan[key] = project_strings(scan[key], f"scan_{key}", limit=64)
+                scan[key] = project_strings(scan[key], f"scan_{key}", limit=8)
+        found_issues = source.get("found_issues")
+        scan["found_issues_count"] = len(found_issues) if isinstance(found_issues, list) else 0
         scan["found_issues"] = project_list(
-            source.get("found_issues"),
+            found_issues,
             (
                 "issue_id",
                 "cve_id",
@@ -712,7 +709,7 @@ def judge_payload(
                 "package_version",
                 "severity",
             ),
-            limit=8,
+            limit=1,
             label="scan_found_issues",
         )
         occurrences = source.get("covered_occurrences")
@@ -736,6 +733,8 @@ def judge_payload(
                         if isinstance(identifier, str) and identifier:
                             identifiers.add(identifier)
             scan["covered_occurrence_count"] = len(occurrences)
+            scan["covered_package_count"] = len(packages)
+            scan["covered_identifier_count"] = len(identifiers)
             scan["covered_packages"] = sorted(packages)[:24]
             scan["covered_identifiers"] = sorted(identifiers)[:64]
             if len(packages) > 24:
@@ -753,20 +752,11 @@ def judge_payload(
                 "task_revision",
                 "cluster_id",
                 "dispatch_batch_id",
-                "action_digest",
                 "status",
                 "executed_versions",
                 "changed_files",
-                "instruction_digest",
             ),
         )
-        summary = mapping(mapping(value).get("action_summary"))
-        if summary:
-            worker["action_summary"] = pick(
-                summary,
-                ("task_id", "attempt_id", "task_revision", "status", "summary"),
-                bounded=("summary",),
-            )
         diagnostics = mapping(mapping(value).get("execution_diagnostics"))
         worker["execution_diagnostics"] = pick(
             diagnostics,
@@ -788,13 +778,13 @@ def judge_payload(
         if "failure_reason" in worker["execution_diagnostics"]:
             worker["execution_diagnostics"]["failure_reason"] = clipped(
                 worker["execution_diagnostics"]["failure_reason"],
-                1000,
+                500,
                 "worker_failure_reason_characters_omitted",
             )
         if "infrastructure_failure_details" in worker["execution_diagnostics"]:
             worker["execution_diagnostics"]["infrastructure_failure_details"] = clipped(
                 worker["execution_diagnostics"]["infrastructure_failure_details"],
-                1000,
+                500,
                 "infrastructure_failure_characters_omitted",
             )
         for key in ("attempted_versions", "executed_versions", "validated_files"):
@@ -806,14 +796,14 @@ def judge_payload(
         if not isinstance(raw_errors, list):
             raw_errors = [raw_errors]
         selected_errors = (
-            raw_errors if len(raw_errors) <= 8 else [*raw_errors[:2], *raw_errors[-6:]]
+            raw_errors if len(raw_errors) <= 4 else [*raw_errors[:2], *raw_errors[-2:]]
         )
         worker["errors"] = [
-            clipped(error, 1000, "worker_error_characters_omitted") for error in selected_errors
+            clipped(error, 500, "worker_error_characters_omitted") for error in selected_errors
         ]
-        if len(raw_errors) > 8:
-            omissions["worker_errors_omitted"] += len(raw_errors) - 8
-        return compact_tree(worker, "worker_result", string_limit=400, list_limit=8, map_limit=16)
+        if len(raw_errors) > 4:
+            omissions["worker_errors_omitted"] += len(raw_errors) - 4
+        return compact_tree(worker, "worker_result", string_limit=200, list_limit=8, map_limit=16)
 
     def project_qa(value: Any) -> dict[str, Any]:
         qa = pick(
@@ -822,9 +812,6 @@ def judge_payload(
                 "attempt_id",
                 "task_id",
                 "task_revision",
-                "cluster_id",
-                "dispatch_batch_id",
-                "action_digest",
                 "qa_policy",
                 "qa_policy_source",
                 "batch_scan_candidate_retained",
@@ -849,21 +836,79 @@ def judge_payload(
                 projected_evaluation[key] = clipped(
                     projected_evaluation[key], 1200, f"qa_{key}_characters_omitted"
                 )
-        for key in ("deterministic_gates", "semantic_security_review", "test_attribution"):
+        if "deterministic_gates" in evaluation:
+            gates = mapping(evaluation["deterministic_gates"])
+            projected_gates = pick(
+                gates,
+                (
+                    "status",
+                    "diagnostics",
+                    "install_error_category",
+                    "install_passed",
+                    "package_graph_state",
+                    "package_manifest_state",
+                    "peer_conflicts",
+                    "scan_evidence_complete",
+                    "scanner_execution_status",
+                    "target_package_absent",
+                    "target_remaining_identifiers",
+                    "target_scanner_cleared",
+                    "tests_passed",
+                ),
+            )
+            dependency_evidence = mapping(gates.get("dependency_evidence"))
+            if dependency_evidence:
+                projected_gates["dependency_evidence"] = pick(
+                    dependency_evidence,
+                    (
+                        "status",
+                        "target_package",
+                        "expected_version",
+                        "resolved_versions",
+                        "lockfile_versions",
+                        "diagnostics",
+                    ),
+                )
+            projected_evaluation["deterministic_gates"] = compact_tree(
+                projected_gates,
+                "qa_deterministic_gates",
+                string_limit=250,
+                list_limit=8,
+                map_limit=16,
+            )
+        for key in ("semantic_security_review", "test_attribution"):
             if key in evaluation:
                 projected_evaluation[key] = compact_tree(
                     evaluation[key],
                     f"qa_{key}",
-                    string_limit=450,
+                    string_limit=250,
                     list_limit=8,
                     map_limit=16,
                 )
         scan_evidence = evaluation.get("scan_evidence")
+        projected_scans = []
         if isinstance(scan_evidence, Mapping):
             projected_evaluation["scan_evidence"] = project_scan(scan_evidence)
+            projected_scans.append(projected_evaluation["scan_evidence"])
         qa["evaluation"] = projected_evaluation
-        qa["batch_scan_evidence"] = project_scan(mapping(value).get("batch_scan_evidence"))
-        return compact_tree(qa, "qa_result", string_limit=500, list_limit=8, map_limit=16)
+        batch_scan_source = mapping(value).get("batch_scan_evidence")
+        batch_scan = project_scan(batch_scan_source)
+        if batch_scan_source:
+            projected_scans.append(batch_scan)
+        for scan in projected_scans:
+            for key in (
+                "covered_input_paths",
+                "closure_package_names",
+                "closure_lockfile_keys",
+                "covered_packages",
+                "covered_identifiers",
+            ):
+                values = scan.pop(key, None)
+                if isinstance(values, list):
+                    omissions[f"qa_{key}_items_omitted"] += len(values)
+        if batch_scan_source:
+            qa["batch_scan_evidence"] = batch_scan
+        return compact_tree(qa, "qa_result", string_limit=350, list_limit=8, map_limit=16)
 
     group_fields = (
         "group_id",
@@ -922,7 +967,6 @@ def judge_payload(
         "attempt_number",
         "cluster_id",
         "dispatch_batch_id",
-        "action_digest",
         "strategy",
         "strategy_stage",
         "dispatch_node",
@@ -931,9 +975,6 @@ def judge_payload(
         "target_package_name",
         "target_dependency_type",
         "allowed_dependency_types",
-        "instruction_digest",
-        "plan_id",
-        "portfolio_plan_id",
         "target_manifest_paths",
         "maven_target_operation",
         "qa_policy",
@@ -979,15 +1020,21 @@ def judge_payload(
                 ):
                     target_task_ids.add(task_id)
                     expanded = True
+        attempts_by_task: dict[str, list[str]] = {}
+        for records in (raw_snapshots, raw_qa_results):
+            for attempt_key, record in records.items():
+                task_id = record.get("task_id") if isinstance(record, Mapping) else None
+                attempt_id = (
+                    str(record.get("attempt_id") or attempt_key)
+                    if isinstance(record, Mapping)
+                    else ""
+                )
+                if isinstance(task_id, str) and task_id in target_task_ids and attempt_id:
+                    attempts_by_task.setdefault(task_id, []).append(attempt_id)
         golden_attempt_ids.extend(
             attempt_id
-            for attempt_id, snapshot in raw_snapshots.items()
-            if isinstance(snapshot, Mapping) and snapshot.get("task_id") in target_task_ids
-        )
-        golden_attempt_ids.extend(
-            str(result.get("attempt_id") or attempt_id)
-            for attempt_id, result in raw_qa_results.items()
-            if isinstance(result, Mapping) and result.get("task_id") in target_task_ids
+            for attempts in attempts_by_task.values()
+            for attempt_id in list(dict.fromkeys(attempts))[-2:]
         )
 
     task_queue = {}
@@ -995,7 +1042,7 @@ def judge_payload(
         task_queue[task_id] = compact_tree(
             pick(task, task_fields, bounded=("failure_reason", "unresolved_reason", "last_error")),
             f"task_{task_id}",
-            string_limit=400,
+            string_limit=200,
             list_limit=12,
         )
     snapshots = {}
@@ -1012,12 +1059,12 @@ def judge_payload(
         )
         if isinstance(projected.get("instruction"), str):
             projected["instruction"] = clipped(
-                projected["instruction"], 900, "attempt_instruction_characters_omitted"
+                projected["instruction"], 150, "attempt_instruction_characters_omitted"
             )
         snapshots[attempt_id] = compact_tree(
             projected,
             "attempt_snapshot",
-            string_limit=400,
+            string_limit=300,
             list_limit=8,
             map_limit=16,
         )
@@ -1030,6 +1077,11 @@ def judge_payload(
 
     outcome = {
         "status": state.get("status"),
+        "report_markdown": clipped(
+            state.get("report_markdown", ""),
+            1_000,
+            "report_markdown_characters_omitted",
+        ),
         "initial_valid_groups": project_list(
             state.get("initial_valid_groups"), group_fields, limit=32, label="initial_groups"
         ),
@@ -1053,23 +1105,17 @@ def judge_payload(
                 prioritized_keys=[*sorted(latest_attempt_ids), *golden_attempt_ids],
             )
         },
-        "qa_evaluations": project_map(
-            state.get("qa_evaluations"),
+        "action_summaries": project_list(
+            state.get("action_summaries"),
             (
                 "task_id",
                 "attempt_id",
-                "passed",
-                "failure_category",
-                "retry_feedback",
-                "contract_error",
-                "evidence_inconclusive",
+                "task_revision",
+                "status",
+                "summary",
             ),
-            bounded=("retry_feedback",),
-        ),
-        "action_summaries": project_map(
-            state.get("action_summaries"),
-            ("task_id", "attempt_id", "task_revision", "status", "summary"),
-            bounded=("summary",),
+            limit=32,
+            label="action_summaries",
         ),
         "final_full_scan_result": project_scan(state.get("final_full_scan_result")),
         "latest_incremental_scan_by_input": {
@@ -1085,11 +1131,11 @@ def judge_payload(
             "new_vulnerability_identifiers",
             limit=100,
         ),
-        "errors": [clipped(error, 800, "error_characters_omitted") for error in errors],
+        "errors": [clipped(error, 500, "error_characters_omitted") for error in errors],
         "changed_files": project_strings(state.get("changed_files", []), "changed_files", limit=64),
-        "diff": clipped(state.get("diff", ""), 10000, "diff_characters_omitted"),
+        "diff": clipped(state.get("diff", ""), 800, "diff_characters_omitted"),
         "consistency_events": compact_tree(
-            state.get("consistency_events", []), "consistency_events", list_limit=12
+            state.get("consistency_events", []), "consistency_events", list_limit=3
         ),
         "delta_isolation_by_cluster": {
             cluster_id: compact_tree(
@@ -1131,7 +1177,7 @@ def judge_payload(
                         **issue,
                         "description": clipped(
                             issue.get("description", ""),
-                            500,
+                            200,
                             "request_issue_description_characters_omitted",
                         ),
                     }
@@ -1150,7 +1196,7 @@ def judge_payload(
                 ),
                 "system_context": clipped(
                     evidence.request.get("system_context", ""),
-                    1800,
+                    1200,
                     "request_context_characters_omitted",
                 ),
                 "target_packages": project_strings(
@@ -1178,30 +1224,29 @@ def judge_payload(
         )
         outcome["golden_expectation"] = {
             "case_id": golden.get("case_id"),
-            "expected_output": golden.get("expected_output"),
-            "provenance": golden.get("provenance", {}),
         }
         outcome["diff"] = _golden_diff_excerpt(str(state.get("diff", "") or ""), golden)
+        outcome["diff"] = clipped(outcome["diff"], 800, "diff_characters_omitted")
     outcome["assessment"] = compact_tree(
         assessment.model_dump(), "assessment", string_limit=800, list_limit=24
     )
     outcome["coverage"] = compact_tree(
-        evidence.coverage, "coverage", string_limit=500, list_limit=16
+        evidence.coverage, "coverage", string_limit=250, list_limit=4, map_limit=8
     )
     tools = []
-    max_events = 24
+    max_events = 6
     error_indexes = [index for index, event in enumerate(evidence.events) if event.error]
     error_by_name: dict[str, int] = {}
     for index in error_indexes:
         error_by_name[evidence.events[index].name] = index
     prioritized_errors = list(dict.fromkeys(error_by_name.values()))
     for index in reversed(error_indexes):
-        if len(prioritized_errors) >= 16:
+        if len(prioritized_errors) >= 4:
             break
         if index not in prioritized_errors:
             prioritized_errors.append(index)
-    if len(prioritized_errors) > 16:
-        prioritized_errors = prioritized_errors[-16:]
+    if len(prioritized_errors) > 4:
+        prioritized_errors = prioritized_errors[-4:]
     selected_indexes = set(prioritized_errors)
     for index in (
         *range(min(4, len(evidence.events))),
@@ -1218,11 +1263,11 @@ def judge_payload(
     omissions["execution_events_omitted"] += len(evidence.events) - len(selected_events)
     for event in selected_events:
         input_text = json.dumps(event.inputs, sort_keys=True)
-        if len(input_text) > 350:
-            input_text = clipped(input_text, 350, "tool_input_characters_omitted")
+        if len(input_text) > 75:
+            input_text = clipped(input_text, 75, "tool_input_characters_omitted")
         output = json.dumps(event.outputs, sort_keys=True)
-        if len(output) > 350:
-            output = clipped(output, 350, "tool_output_characters_omitted")
+        if len(output) > 75:
+            output = clipped(output, 75, "tool_output_characters_omitted")
         tools.append(
             {
                 "name": event.name,

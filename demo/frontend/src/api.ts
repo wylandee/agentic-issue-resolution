@@ -2,6 +2,7 @@ import type {
   ConsoleEvent,
   DashboardUpdate,
   ReportResponse,
+  RunStatus,
   RunState,
   WorkspaceInfo,
 } from "./types";
@@ -145,20 +146,15 @@ export async function getRunReport(runId: string): Promise<ReportResponse> {
   return res.json();
 }
 
-export async function getRunState(runId: string): Promise<RunState> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/state`);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || "Failed to fetch run state");
-  }
-  return res.json();
-}
-
 export interface StreamHandlers {
   onInitialSync?: (state: RunState) => void;
   onConsoleEvent?: (event: ConsoleEvent) => void;
   onDashboardUpdate?: (update: DashboardUpdate) => void;
-  onRunStatus?: (statusData: { status: string; current_node?: string; report_available?: boolean }) => void;
+  onRunStatus?: (statusData: {
+    status: RunStatus;
+    current_node?: string;
+    report_available?: boolean;
+  }) => void;
   onError?: (err: Event) => void;
 }
 

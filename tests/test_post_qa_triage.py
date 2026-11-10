@@ -6,6 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
+from remediation_engine.agents.supervisor import (
+    _deterministic_routing,
+    run_supervisor_node,
+    supervisor_router,
+)
 from remediation_engine.contracts.schemas import (
     DependencyParentContext,
     FixPlan,
@@ -34,15 +39,12 @@ from remediation_engine.orchestration.graph import (
     post_qa_triage_node,
     run_qa_critic_from_orchestrator,
 )
-from remediation_engine.orchestration.state import initial_orchestrator_state
-from remediation_engine.orchestration.supervisor_node import (
-    _deterministic_routing,
-    run_supervisor_node,
-    supervisor_router,
+from remediation_engine.orchestration.state import (
+    build_initial_remediation_task,
+    initial_orchestrator_state,
 )
-from remediation_engine.orchestration.task_utils import build_initial_remediation_task
 from remediation_engine.settings import AppSettings
-from tests.fix_plan_fixtures import group_with_fix_plans
+from tests.helpers import group_with_fix_plans
 
 
 def _issue(cve: str, *, source: IssueSource = IssueSource.ODC) -> VulnerabilityIssue:
@@ -102,10 +104,8 @@ def test_post_triage_reuses_unchanged_groups_and_reopens_changed_tasks():
         _issue("CVE-2026-0004", source=IssueSource.ODC),
     )
     new_group = _group("sca:package.json:new", new_issue)
-    candidate_unchanged = unchanged.model_copy(update={"fix_plan": None, "fix_plan_candidates": []})
-    changed_candidate = changed_candidate.model_copy(
-        update={"fix_plan": None, "fix_plan_candidates": []}
-    )
+    candidate_unchanged = unchanged.model_copy(update={"fix_plan_candidates": []})
+    changed_candidate = changed_candidate.model_copy(update={"fix_plan_candidates": []})
 
     changed_task = build_initial_remediation_task(changed, "task-changed").model_copy(
         update={
@@ -220,7 +220,6 @@ def test_stable_group_fingerprint_ignores_plan_and_generated_issue_id_but_tracks
             "issues": [regenerated_issue],
             "representative_issue_id": regenerated_issue.id,
             "localized_issues": [regenerated_localized],
-            "fix_plan": None,
             "fix_plan_candidates": [],
         }
     )
@@ -407,6 +406,31 @@ def test_post_triage_ignores_historical_accepted_attempt_after_noop_retry():
                     "status": "surrender",
                     "changed_files": [],
                 },
+                "attempt-current": {
+                    "attempt_id": "attempt-current",
+                    "task_id": task.task_id,
+                    "task_revision": 4,
+                    "instruction_digest": "current-instruction-digest",
+                    "cluster_id": None,
+                    "dispatch_batch_id": None,
+                    "action_digest": None,
+                    "status": "success",
+                    "changed_files": ["package.json"],
+                    "execution_diagnostics": {"validation_passed": True},
+                },
+            },
+            "attempt_snapshots_by_id": {
+                "attempt-current": {
+                    "attempt_id": "attempt-current",
+                    "task_id": task.task_id,
+                    "task_revision": 4,
+                    "attempt_number": 2,
+                    "state_revision": 4,
+                    "instruction_digest": "current-instruction-digest",
+                    "cluster_id": None,
+                    "dispatch_batch_id": None,
+                    "action_digest": None,
+                }
             },
             "triage_required": True,
             "new_vulnerability_status": "detected",
@@ -701,7 +725,7 @@ def test_qa_wrapper_propagates_scan_snapshot_and_marks_triage_required():
     post_issue = _issue("CVE-2026-0002")
 
     with patch(
-        "remediation_engine.orchestration.graph.run_qa_critic_node",
+        "remediation_engine.agents.qa.run_qa_critic_node",
         return_value={
             "qa_evaluations": {},
             "eval_status": "all_passed",

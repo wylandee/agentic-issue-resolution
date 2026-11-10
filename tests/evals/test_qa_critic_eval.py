@@ -323,25 +323,6 @@ def _assert_live_qa_verdict_matches_golden(
     )
 
 
-def _measure_expected(
-    metric: Any,
-    test_case: LLMTestCase,
-    *,
-    expected_pass: bool,
-    case_id: str,
-    label: str,
-) -> None:
-    """Measure an expected-positive or expected-negative metric result."""
-    measure_expected(
-        metric,
-        test_case,
-        expected_pass=expected_pass,
-        case_id=case_id,
-        label=label,
-        register=assert_test,
-    )
-
-
 def _live_capture(case: dict[str, Any], settings: EvalSettings) -> ReplayCapture:
     """Run one QA node replay and share it between the two metrics."""
     return cached_replay(
@@ -404,20 +385,22 @@ class TestQACriticEval:
                     should_exact_match=False,
                 )
                 if bool(case.get("expected_tool_correctness_pass", True)):
-                    _measure_expected(
+                    measure_expected(
                         tool_metric,
                         test_case,
                         expected_pass=True,
                         case_id=str(case["case_id"]),
                         label="QA tool correctness",
+                        register=assert_test,
                     )
                 else:
-                    _measure_expected(
+                    measure_expected(
                         tool_metric,
                         test_case,
                         expected_pass=False,
                         case_id=str(case["case_id"]),
                         label="QA tool correctness",
+                        register=assert_test,
                     )
             if DeepEvalTaskCompletionMetric is not None and _qa_task_completion_metric_applicable(
                 case
@@ -427,12 +410,13 @@ class TestQACriticEval:
                     model=eval_settings.judge_llm or eval_settings.judge_model,
                     async_mode=False,
                 )
-                _measure_expected(
+                measure_expected(
                     task_metric,
                     _build_qa_audit_completion_case(case, test_case, capture.typed_result),
                     expected_pass=bool(case.get("expected_task_completion_pass", True)),
                     case_id=str(case["case_id"]),
                     label="QA task completion",
+                    register=assert_test,
                 )
         # Register judged evidence before enforcing a deterministic verdict
         # mismatch so failed audits still retain their captured result and
@@ -659,3 +643,24 @@ def test_qa_critic_offline_production_replay(
             "CVE-2021-42550",
             "CVE-2023-6378",
         ]
+
+
+def test_qa_judge_prompt_calibrates_negative_audit_verdicts() -> None:
+    """Explain that a correct remediation rejection completes the audit task."""
+    prompt = build_qa_production_prompt(
+        {
+            "completion_task": "Review the install failure and report the audit verdict.",
+            "expected_qa_verdict": {
+                "passed": False,
+                "failure_category": "peer_conflict",
+            },
+            "expected_output": (
+                "Complete: query install and emit passed=false with peer-conflict guidance."
+            ),
+        }
+    )
+
+    assert prompt.index("=== FEW-SHOT CALIBRATION ===") < prompt.index("=== QA CRITIC TASK ===")
+    assert "A correct `passed=false` result is a completed audit" in prompt
+    assert '"passed": false, "failure_category": "peer_conflict"' in prompt
+    assert "Review the install failure and report the audit verdict." in prompt

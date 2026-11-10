@@ -1,6 +1,6 @@
 """Runtime isolation services."""
 
-from remediation_engine.runtime.sandbox_mgr import (
+from remediation_engine.runtime.sandbox import (
     DockerSandbox,
     WorkspaceReadCache,
     get_docker_client,

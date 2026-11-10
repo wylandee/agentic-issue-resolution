@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import datetime
-import json
 import logging
 import os
 import re
 import subprocess
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,11 +15,6 @@ from typing import Any
 import pytest
 
 from remediation_engine.evals.end_to_end_goldens import load_end_to_end_goldens
-from remediation_engine.evals.trajectories import (
-    TrajectoryDocument,
-    TrajectorySpan,
-    parse_trajectory_markdown,
-)
 from remediation_engine.settings import AppSettings
 from tests.evals.eval_case_helpers import case_metadata_dict
 
@@ -32,8 +25,6 @@ _DEFAULT_TRAJECTORY_DIR = _PROJECT_ROOT / "data" / "trajectories"
 _DEFAULT_GOLDEN_DIR = Path(__file__).resolve().parent / "golden"
 _EVAL_TEST_ROOT = _PROJECT_ROOT / "tests" / "evals"
 _EVAL_TEST_FILE_NAMES = {
-    "test_business_rules.py",
-    "test_fix_planner_eval.py",
     "test_qa_critic_eval.py",
     "test_report_eval.py",
     "test_triage_eval.py",
@@ -351,8 +342,6 @@ def _suite_from_nodeid(nodeid: str) -> str:
         ("test_qa_critic_eval.py", "qa_critic"),
         ("test_report_eval.py", "report"),
         ("test_triage_eval.py", "triage"),
-        ("test_fix_planner_eval.py", "fix_planner"),
-        ("test_business_rules.py", "business_rules"),
     )
     for filename, suite in suite_by_file:
         if filename in normalized:
@@ -369,14 +358,10 @@ def _suite_from_test_case(tc: Any) -> str:
         return "qa_critic"
     if "triage" in name:
         return "triage"
-    if "fix extraction" in name or "workaround extraction" in name or "planner" in name:
-        return "fix_planner"
     if "report" in name or "narrative" in name:
         return "report"
     if "subagent" in name or "update" in name or "workaround" in name:
         return "subagent"
-    if "budget" in name or "sla" in name:
-        return "business_rules"
     return "general"
 
 
@@ -413,11 +398,6 @@ def _pytest_item_observation(nodeid: str) -> dict[str, Any]:
         },
         "has_reports": bool(reports),
     }
-
-
-def _test_case_metadata(tc: Any) -> dict[str, Any]:
-    """Return a mutable copy of metadata from either DeepEval case shape."""
-    return case_metadata_dict(tc)
 
 
 def _token_replay_identity(record: Any) -> tuple[str, str, str] | None:
@@ -490,11 +470,6 @@ def _deep_eval_node_score(tc: Any, nodeid: str) -> int:
         "tool correctness": "tool_correctness",
         "task completion": "task_completion",
         "hallucination": "narrative_no_hallucination",
-        "finding coverage": "narrative_covers_key_findings",
-        "constraint adherence": "narrative_respects_negative_constraints",
-        "fix extraction": "version_extraction_from_advisory",
-        "workaround extraction quality": "workaround_extraction_from_issues",
-        "extraction faithfulness": "no_hallucinated_versions",
     }
     for metric_name in _metric_names(tc):
         metric_lower = metric_name.casefold()
@@ -517,7 +492,7 @@ def _match_deep_eval_case_to_nodeid(
     if not candidates:
         return None
 
-    explicit_nodeid = _test_case_metadata(tc).get("pytest_nodeid")
+    explicit_nodeid = case_metadata_dict(tc).get("pytest_nodeid")
     if explicit_nodeid in candidates:
         return str(explicit_nodeid)
 
@@ -565,7 +540,7 @@ def _record_from_deep_eval_case(
     """Convert a DeepEval case to a dashboard record and apply pytest status."""
     from remediation_engine.evals.models import EvalTestCaseRecord, MetricRecord
 
-    metadata = _test_case_metadata(tc)
+    metadata = case_metadata_dict(tc)
     input_tokens = _optional_nonnegative_int(metadata.get("input_tokens"))
     output_tokens = _optional_nonnegative_int(metadata.get("output_tokens"))
     total_tokens = _optional_nonnegative_int(metadata.get("total_tokens"))
@@ -822,7 +797,7 @@ def _persist_eval_session(session: pytest.Session, exitstatus: int) -> None:
 
     total_tests = len(test_case_records)
     passed_tests = sum(1 for record in test_case_records if record.status == "PASSED")
-    failed_tests = sum(1 for record in test_case_records if record.status == "FAILED")
+    failed_tests = sum(1 for record in test_case_records if record.status in {"FAILED", "ERROR"})
     skipped_tests = sum(1 for record in test_case_records if record.status == "SKIPPED")
     token_usage_records = _deduplicate_token_records(
         [record for record in test_case_records if record.token_usage_available]
@@ -1050,238 +1025,3 @@ def eval_settings(request: pytest.FixtureRequest) -> EvalSettings:
             else None
         ),
     )
-
-
-# ---------------------------------------------------------------------------
-# Trajectory Loader
-# ---------------------------------------------------------------------------
-
-
-class TrajectoryLoader:
-    """Cached loader and query interface for Phase 5 trajectory markdown files."""
-
-    def __init__(self, trajectory_dir: Path | None = None) -> None:
-        """Initialize the loader with a target trajectory directory."""
-        self.trajectory_dir = trajectory_dir or _DEFAULT_TRAJECTORY_DIR
-        self._cache: dict[Path, TrajectoryDocument] = {}
-        self._indexed_by_trace: dict[str, TrajectoryDocument] = {}
-
-    def get_trajectory_paths(self) -> list[Path]:
-        """Return all trajectory markdown files discovered in the trajectory directory."""
-        if not self.trajectory_dir.exists():
-            return []
-        return sorted(self.trajectory_dir.glob("*.md"))
-
-    def load_by_path(self, path: Path | str) -> TrajectoryDocument:
-        """Load and cache a trajectory file from path."""
-        p = Path(path).resolve()
-        if p in self._cache:
-            return self._cache[p]
-        doc = parse_trajectory_markdown(p)
-        self._cache[p] = doc
-        if doc.trace_id:
-            self._indexed_by_trace[doc.trace_id] = doc
-        return doc
-
-    def load_by_trace_id(self, trace_id: str) -> TrajectoryDocument | None:
-        """Load a trajectory matching a specific trace ID."""
-        if trace_id in self._indexed_by_trace:
-            return self._indexed_by_trace[trace_id]
-        for path in self.get_trajectory_paths():
-            if trace_id in path.name:
-                return self.load_by_path(path)
-        # Search all
-        for path in self.get_trajectory_paths():
-            doc = self.load_by_path(path)
-            if doc.trace_id == trace_id:
-                return doc
-        return None
-
-    def load_all(self) -> list[TrajectoryDocument]:
-        """Load all discovered trajectory files."""
-        return [self.load_by_path(p) for p in self.get_trajectory_paths()]
-
-    def get_sample_trajectories(self, count: int = 5) -> list[TrajectoryDocument]:
-        """Return a small sample of parsed trajectory documents."""
-        paths = self.get_trajectory_paths()[:count]
-        return [self.load_by_path(p) for p in paths]
-
-    def find_agent_spans(self, agent_name: str) -> list[tuple[TrajectoryDocument, TrajectorySpan]]:
-        """Find all (doc, span) pairs across all trajectories for a given agent."""
-        results: list[tuple[TrajectoryDocument, TrajectorySpan]] = []
-        for path in self.get_trajectory_paths():
-            doc = self.load_by_path(path)
-            matched_spans = doc.spans_for_agent(agent_name)
-            for s in matched_spans:
-                results.append((doc, s))
-        return results
-
-
-@pytest.fixture(scope="session")
-def trajectory_loader() -> TrajectoryLoader:
-    """Session-scoped TrajectoryLoader instance."""
-    return TrajectoryLoader()
-
-
-@pytest.fixture
-def sample_trajectory_docs(trajectory_loader: TrajectoryLoader) -> list[TrajectoryDocument]:
-    """Provide a sample of parsed trajectory documents."""
-    return trajectory_loader.get_sample_trajectories(count=5)
-
-
-@pytest.fixture
-def triage_trajectories(
-    trajectory_loader: TrajectoryLoader,
-) -> list[tuple[TrajectoryDocument, TrajectorySpan]]:
-    """Provide all discovered triage agent (doc, span) pairs."""
-    return trajectory_loader.find_agent_spans("triage")
-
-
-@pytest.fixture
-def update_subagent_trajectories(
-    trajectory_loader: TrajectoryLoader,
-) -> list[tuple[TrajectoryDocument, TrajectorySpan]]:
-    """Provide all discovered update subagent (doc, span) pairs."""
-    return trajectory_loader.find_agent_spans("update_subagent")
-
-
-@pytest.fixture
-def workaround_subagent_trajectories(
-    trajectory_loader: TrajectoryLoader,
-) -> list[tuple[TrajectoryDocument, TrajectorySpan]]:
-    """Provide all discovered workaround subagent (doc, span) pairs."""
-    return trajectory_loader.find_agent_spans("workaround_subagent")
-
-
-@pytest.fixture
-def supervisor_trajectories(
-    trajectory_loader: TrajectoryLoader,
-) -> list[tuple[TrajectoryDocument, TrajectorySpan]]:
-    """Provide tactical Supervisor model spans from local trajectories."""
-    return trajectory_loader.find_agent_spans("supervisor")
-
-
-@pytest.fixture
-def qa_critic_trajectories(
-    trajectory_loader: TrajectoryLoader,
-) -> list[tuple[TrajectoryDocument, TrajectorySpan]]:
-    """Provide all discovered QA critic (doc, span) pairs."""
-    return trajectory_loader.find_agent_spans("qa_critic")
-
-
-@pytest.fixture
-def report_trajectories(
-    trajectory_loader: TrajectoryLoader,
-) -> list[tuple[TrajectoryDocument, TrajectorySpan]]:
-    """Provide all discovered report narrative (doc, span) pairs."""
-    return trajectory_loader.find_agent_spans("report")
-
-
-# ---------------------------------------------------------------------------
-# Golden Dataset Helper
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def load_golden_cases() -> Callable[[str], list[dict[str, Any]]]:
-    """Fixture returning a callable to load curated evaluation cases from golden JSON files."""
-
-    def _loader(dataset_name: str) -> list[dict[str, Any]]:
-        filename = dataset_name if dataset_name.endswith(".json") else f"{dataset_name}.json"
-        path = _DEFAULT_GOLDEN_DIR / filename
-        if not path.exists():
-            return []
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "cases" in data:
-            return data["cases"]
-        return []
-
-    return _loader
-
-
-@pytest.fixture
-def report_golden_cases(
-    load_golden_cases: Callable[[str], list[dict[str, Any]]],
-) -> list[dict[str, Any]]:
-    """Provide curated report evaluation cases from golden/report_cases.json."""
-    cases = load_golden_cases("report_cases")
-    if not cases:
-        pytest.skip("No golden report cases found in tests/evals/golden/report_cases.json")
-    return cases
-
-
-@pytest.fixture
-def triage_golden_cases(
-    load_golden_cases: Callable[[str], list[dict[str, Any]]],
-) -> list[dict[str, Any]]:
-    """Provide curated triage evaluation cases from golden/triage_cases.json."""
-    all_cases = load_golden_cases("triage_cases")
-    cases = [c for c in all_cases if c.get("eval_type", "triage") == "triage"]
-    if not cases:
-        pytest.skip("No golden triage cases found in tests/evals/golden/triage_cases.json")
-    return cases
-
-
-@pytest.fixture
-def fix_planner_golden_cases(
-    load_golden_cases: Callable[[str], list[dict[str, Any]]],
-) -> list[dict[str, Any]]:
-    """Provide curated fix planner cases from golden/fix_planner_cases.json."""
-    all_cases = load_golden_cases("fix_planner_cases")
-    cases = [c for c in all_cases if c.get("eval_type") == "fix_planner"]
-    if not cases:
-        pytest.skip(
-            "No golden fix planner cases found in tests/evals/golden/fix_planner_cases.json"
-        )
-    return cases
-
-
-@pytest.fixture
-def update_subagent_golden_cases(
-    load_golden_cases: Callable[[str], list[dict[str, Any]]],
-) -> list[dict[str, Any]]:
-    """Provide curated update cases from golden/update_subagent_cases.json."""
-    cases = load_golden_cases("update_subagent_cases")
-    if not cases:
-        pytest.skip(
-            "No golden update subagent cases found in tests/evals/golden/update_subagent_cases.json"
-        )
-    return cases
-
-
-@pytest.fixture
-def workaround_subagent_golden_cases(
-    load_golden_cases: Callable[[str], list[dict[str, Any]]],
-) -> list[dict[str, Any]]:
-    """Provide curated workaround cases from the dedicated golden dataset."""
-    cases = load_golden_cases("workaround_subagent_cases")
-    if not cases:
-        pytest.skip(
-            "No golden workaround subagent cases found in tests/evals/golden/workaround_subagent_cases.json"
-        )
-    return cases
-
-
-@pytest.fixture
-def supervisor_golden_cases(
-    load_golden_cases: Callable[[str], list[dict[str, Any]]],
-) -> list[dict[str, Any]]:
-    """Provide typed tactical Supervisor cases from the maintained golden file."""
-    all_cases = load_golden_cases("supervisor_cases")
-    cases = [case for case in all_cases if case.get("eval_type") == "supervisor"]
-    if not cases:
-        pytest.skip("No golden Supervisor cases found in tests/evals/golden/supervisor_cases.json")
-    return cases
-
-
-@pytest.fixture
-def qa_golden_cases(
-    load_golden_cases: Callable[[str], list[dict[str, Any]]],
-) -> list[dict[str, Any]]:
-    """Provide curated QA critic evaluation cases from golden/qa_cases.json."""
-    cases = load_golden_cases("qa_cases")
-    if not cases:
-        pytest.skip("No golden QA cases found in tests/evals/golden/qa_cases.json")
-    return cases

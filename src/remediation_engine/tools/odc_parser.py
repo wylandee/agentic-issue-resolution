@@ -1,13 +1,13 @@
 """
-ODC Parser â€” upgraded SCA ingestion layer.
+ODC Parser — upgraded SCA ingestion layer.
 
 Changes from v1
 ---------------
 * Emits typed ``VulnerabilityIssue`` Pydantic models (contracts layer).
 * Parses PURL from the ``packages`` list, extracts ecosystem from it.
 * Extracts CWE entries and OWASP labels from raw vulnerability data.
-* Applies the severity fallback chain: highestSeverity â†’ cvssv3.baseSeverity
-  â†’ cvssv2.severity â†’ vulnerability.severity.
+* Applies the severity fallback chain: highestSeverity → cvssv3.baseSeverity
+  → cvssv2.severity → vulnerability.severity.
 * Exports canonical JSONL (``data/odc_issues.jsonl``) for agent consumption
   PLUS CSV (``data/odc_issues.csv``) for human inspection.
 * ``parse_vulnerabilities`` now returns ``List[VulnerabilityIssue]`` instead
@@ -34,7 +34,7 @@ from remediation_engine.contracts import (
     VulnerabilityIssue,
 )
 from remediation_engine.contracts.schemas import normalize_severity_value
-from remediation_engine.tools.package_identity import (
+from remediation_engine.tools.identity import (
     normalize_python_package_name,
     package_name_from_purl,
 )
@@ -105,7 +105,7 @@ def _ecosystem_from_purl(purl_str: str | None) -> str | None:
             return purl.type or None
         except Exception:
             pass
-    # Fallback: parse manually â†’ pkg:<type>/...
+    # Fallback: parse manually → pkg:<type>/...
     try:
         after_pkg = purl_str[4:]  # strip "pkg:"
         return after_pkg.split("/")[0] or None
@@ -393,7 +393,7 @@ def parse_python_packages(report: dict[str, Any]) -> set[tuple[str, str]]:
 
 
 def export_to_jsonl(issues: list[VulnerabilityIssue], output_path: Path) -> None:
-    """Write issues as JSONL â€” one JSON object per line (canonical agent format)."""
+    """Write issues as JSONL — one JSON object per line (canonical agent format)."""
     os.makedirs(output_path.parent, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
         for issue in issues:
@@ -428,7 +428,7 @@ def export_to_csv(issues: list[VulnerabilityIssue], output_path: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Run the ODC JSON â†’ JSONL + CSV ingestion pipeline."""
+    """Run the ODC JSON → JSONL + CSV ingestion pipeline."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(description="Parse an OWASP Dependency-Check JSON report.")

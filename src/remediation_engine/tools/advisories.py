@@ -1,0 +1,1364 @@
+"""Advisory enrichment and fix planning for supported dependency ecosystems."""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import re
+import time
+from datetime import UTC, datetime
+from functools import cmp_to_key
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import quote, urlparse
+
+import requests
+from packaging.version import InvalidVersion, Version
+from pydantic import BaseModel
+
+from remediation_engine.contracts.schemas import CVEEnrichment, FixPlanStatus, LocalizedIssue
+from remediation_engine.contracts.version_policy import (
+    compare_maven_versions,
+    is_stable_maven_version,
+)
+from remediation_engine.runtime.agent_runtime import create_chat_model
+from remediation_engine.settings import AppSettings, get_runtime_settings
+from remediation_engine.tools.identity import (
+    normalize_python_package_name,
+    package_name_from_purl,
+)
+from remediation_engine.tools.maven_manifest_locator import _canonical_gav
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+OSV_QUERYBATCH_URL = "https://api.osv.dev/v1/querybatch"
+OSV_VULN_URL = "https://api.osv.dev/v1/vulns/{vuln_id}"
+SERPER_SEARCH_URL = "https://google.serper.dev/search"
+
+_REQUEST_TIMEOUT = 10  # seconds
+_READ_WEB_PAGE_TIMEOUT = 15
+_LLM_REQUEST_TIMEOUT_SECONDS = 30
+_READ_WEB_PAGE_MAX_CHARS = 16_000
+_JINA_READER_URL_PREFIX = "https://r.jina.ai/"
+_GITHUB_API_URL_PREFIX = "https://api.github.com/"
+
+# Terms that identify mitigation guidance in advisory records.
+_WORKAROUND_KEYWORDS = ("workaround", "mitigate", "mitigation")
+
+# Instruction templates
+_DIRECT_TMPL = 'Update "{package}" in {manifest} to version "{version}".'
+_OVERRIDE_NPM_TMPL = (
+    'Add or update "overrides": {{"{package}": "{version}"}} in {manifest} '
+    "to pin the transitive dependency via npm overrides."
+)
+_OVERRIDE_YARN_TMPL = (
+    'Add or update "resolutions": {{"{package}": "{version}"}} in {manifest} '
+    "to pin the transitive dependency via Yarn resolutions."
+)
+_OVERRIDE_PNPM_TMPL = (
+    'Add or update "pnpm": {{"overrides": {{"{package}": "{version}"}}}} in {manifest} '
+    "to pin the transitive dependency via pnpm overrides."
+)
+_PYTHON_DECLARATION_TYPES = frozenset(
+    {
+        "requirements",
+        "dependencies",
+        "optional-dependencies",
+        "install_requires",
+        "extras_require",
+        "packages",
+        "dev-packages",
+    }
+)
+_WORKAROUND_INSTRUCTION = (
+    "Analyze the provided workaround_snippets to determine if a code edit "
+    "can safely mitigate this vulnerability."
+)
+_NO_FIX_INSTRUCTION = "No upstream patch or workaround was found. Inform the user."
+
+
+# ---------------------------------------------------------------------------
+# Structured Output Model for LLM Remediation Parsing
+# ---------------------------------------------------------------------------
+
+
+class SerperLLMResult(BaseModel):
+    """Structured output schema for LLM extraction from Serper result web pages."""
+
+    strategy: Literal["VERSION_BUMP", "CODE_WORKAROUND", "NO_FIX"]
+    fixed_version: str | None = None
+    workaround_snippets: list[str] | None = None
+    reasoning: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — issue introspection
+# ---------------------------------------------------------------------------
+
+
+def _package_name_from_issue(issue: Any) -> str:
+    """
+    Return the canonical package name for network queries.
+
+    Prefers ``issue.package_name``; falls back to a manual PURL parse for
+    npm scoped packages where the library might have percent-encoded the name.
+    """
+    name = (issue.package_name or "").strip()
+    if name:
+        return name
+    purl = issue.purl or ""
+    return package_name_from_purl(purl) or ""
+
+
+def _is_maven_issue(issue: Any) -> bool:
+    """Return whether typed issue identity explicitly selects Maven."""
+    return str(getattr(issue, "ecosystem", "") or "").strip().lower() == "maven" or str(
+        getattr(issue, "purl", "") or ""
+    ).strip().lower().startswith("pkg:maven/")
+
+
+def _canonical_maven_coordinate(issue: Any) -> str:
+    """Return an exact canonical Maven ``groupId:artifactId`` or empty string."""
+    coordinate = _canonical_gav(issue)
+    return ":".join(coordinate) if coordinate is not None else ""
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — instruction builder
+# ---------------------------------------------------------------------------
+
+
+def _build_instruction(
+    package_name: str,
+    fixed_version: str,
+    package_manager: str | None,
+    is_direct: bool | None,
+    manifest_file: str | None,
+    parent_package_name: str | None = None,
+    parent_declaration_type: str | None = None,
+    ecosystem: str | None = None,
+    declaration_type: str | None = None,
+) -> str:
+    """
+    Generate a terse, actionable instruction for the Remedy agent.
+
+    Direct dependencies: pin in place. Transitive dependencies with a known
+    directly declared parent are explicitly parent-first; the Supervisor will
+    choose the parent version before an override is considered.
+    """
+    pm = (package_manager or "npm").lower()
+    normalized_ecosystem = (ecosystem or "").strip().casefold()
+    is_python = normalized_ecosystem in {"pypi", "pip", "python"} or pm in {
+        "pip",
+        "pipenv",
+        "poetry",
+        "uv",
+    }
+    manifest_name = (
+        os.path.basename(manifest_file)
+        if manifest_file
+        else "pyproject.toml"
+        if is_python
+        else "package.json"
+    )
+    if pm == "maven" or normalized_ecosystem == "maven":
+        target = declaration_type or ("dependencies" if is_direct else "dependencyManagement")
+        return (
+            f'For the exact Maven coordinate "{package_name}", update only the authorized '
+            f'POM "{manifest_file or "no authorized POM"}" under "{target}". The OSV '
+            f'fixed version "{fixed_version}" is a security floor, not release authorization; '
+            "use only a Supervisor-authorized Maven release. Do not change a parent POM "
+            "or BOM solely to remediate this finding."
+        )
+    if is_python:
+        if parent_package_name and not is_direct:
+            declaration = parent_declaration_type or "the declared dependency section"
+            return (
+                f'Update the directly declared Python parent "{parent_package_name}" in '
+                f"{manifest_name} ({declaration}) to the minimum compatible released version "
+                f'that resolves transitive package "{package_name}" to at least "{fixed_version}".'
+            )
+        if not is_direct or declaration_type not in _PYTHON_DECLARATION_TYPES:
+            return (
+                f'no supported Python declaration was identified for "{package_name}" in '
+                f"{manifest_name}; do not prescribe a manifest pin."
+            )
+        normalized_name = normalize_python_package_name(package_name)
+        if not normalized_name:
+            return (
+                f'no supported Python declaration was identified for "{package_name}" in '
+                f"{manifest_name}; do not prescribe a manifest pin."
+            )
+        return (
+            f'Pin "{normalized_name}=={fixed_version}" in {manifest_name} '
+            f"({declaration_type}) using the approved Supervisor-selected version."
+        )
+
+    if is_direct:
+        return _DIRECT_TMPL.format(
+            package=package_name,
+            manifest=manifest_name,
+            version=fixed_version,
+        )
+
+    if parent_package_name:
+        declaration = parent_declaration_type or "dependencies"
+        return (
+            f'Update the directly declared parent "{parent_package_name}" in {manifest_name} '
+            f"({declaration}) to the minimum compatible released version that resolves "
+            f'transitive package "{package_name}" to at least "{fixed_version}". '
+            "Do not use a package override unless the parent update stages are exhausted."
+        )
+
+    if pm == "yarn":
+        return _OVERRIDE_YARN_TMPL.format(
+            package=package_name,
+            manifest=manifest_name,
+            version=fixed_version,
+        )
+    if pm == "pnpm":
+        return _OVERRIDE_PNPM_TMPL.format(
+            package=package_name,
+            manifest=manifest_name,
+            version=fixed_version,
+        )
+    return _OVERRIDE_NPM_TMPL.format(
+        package=package_name,
+        manifest=manifest_name,
+        version=fixed_version,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Waterfall step 2 — OSV API
+# ---------------------------------------------------------------------------
+
+
+def _extract_osv_workaround_snippets(vuln: dict[str, Any]) -> list[str] | None:
+    """Extract workaround or mitigation text from OSV details/references."""
+    snippets: list[str] = []
+
+    def _add_snippet(candidate: str | None) -> None:
+        if not candidate:
+            return
+        snippet = candidate.strip()
+        if not snippet or not _contains_workaround_snippet(snippet):
+            return
+        if snippet not in snippets:
+            snippets.append(snippet)
+
+    for field in ("details", "summary"):
+        value = vuln.get(field)
+        if isinstance(value, str):
+            _add_snippet(value)
+
+    for reference in vuln.get("references") or []:
+        if not isinstance(reference, dict):
+            continue
+        parts = [
+            str(value).strip()
+            for value in reference.values()
+            if isinstance(value, str) and value.strip()
+        ]
+        if parts:
+            _add_snippet(" | ".join(parts))
+
+    return snippets or None
+
+
+def _contains_workaround_snippet(text: str) -> bool:
+    return any(keyword in text.lower() for keyword in _WORKAROUND_KEYWORDS)
+
+
+def _extract_fixed_from_osv_vuln(
+    vuln: dict[str, Any],
+    package_name: str,
+    current_version: str | None = None,
+    ecosystem: str | None = None,
+) -> tuple[str | None, list[str] | None]:
+    """Extract an OSV fixed version, never imposing SemVer order on Maven."""
+    preferred: list[str] = []
+    fallback: list[str] = []
+    is_maven = (ecosystem or "").strip().lower() == "maven"
+    force_non_maven = bool(ecosystem and ecosystem.strip().lower() != "maven")
+
+    for affected in vuln.get("affected") or []:
+        pkg_info = affected.get("package") or {}
+        affected_name = pkg_info.get("name", "")
+        if affected_name and affected_name.lower() != package_name.lower():
+            continue
+        affected_maven = str(pkg_info.get("ecosystem", "")).lower() == "maven"
+        is_maven = is_maven or (affected_maven and not force_non_maven)
+        for rng in affected.get("ranges") or []:
+            rng_type = (rng.get("type") or "").upper()
+            if rng_type == "GIT":
+                if is_maven:
+                    continue
+                extracted = (rng.get("database_specific") or {}).get("extracted_events") or []
+                for event in extracted:
+                    if event.get("fixed"):
+                        fallback.append(str(event["fixed"]))
+                continue
+            if is_maven and rng_type != "ECOSYSTEM":
+                continue
+            for event in rng.get("events") or []:
+                fixed = event.get("fixed")
+                if not fixed:
+                    continue
+                if rng_type == "SEMVER":
+                    preferred.append(str(fixed))
+                else:
+                    fallback.append(str(fixed))
+
+    package_ecosystems = {
+        str((affected.get("package") or {}).get("ecosystem") or ecosystem or "").strip().casefold()
+        for affected in vuln.get("affected") or []
+        if not (affected.get("package") or {}).get("name")
+        or str((affected.get("package") or {}).get("name")).casefold() == package_name.casefold()
+    }
+    version_ecosystem = (
+        "maven"
+        if is_maven
+        else next(iter(package_ecosystems))
+        if len(package_ecosystems) == 1
+        else ecosystem
+    )
+    fixed = _minimum_fixed_version(
+        preferred or fallback,
+        current_version=current_version,
+        ecosystem=version_ecosystem,
+    )
+    if fixed:
+        return fixed, None
+    return None, _extract_osv_workaround_snippets(vuln)
+
+
+def _minimum_maven_fixed_version(versions: list[str]) -> str | None:
+    """Return the lowest valid stable Maven OSV fixed event."""
+    eligible = [
+        str(version).strip()
+        for version in versions
+        if str(version).strip() and is_stable_maven_version(str(version).strip())
+    ]
+    if not eligible:
+        return None
+    try:
+        return min(eligible, key=cmp_to_key(compare_maven_versions))
+    except ValueError:
+        return None
+
+
+def _minimum_fixed_version(
+    versions: list[str],
+    current_version: str | None = None,
+    ecosystem: str | None = None,
+) -> str | None:
+    """Return the appropriate OSV floor using the known ecosystem comparator."""
+    if (ecosystem or "").strip().lower() == "maven":
+        return _minimum_maven_fixed_version(versions)
+
+    if (ecosystem or "").strip().casefold() in {"pypi", "pip", "python"}:
+        parsed_python: list[tuple[Version, str]] = []
+        for raw in versions:
+            candidate = str(raw).strip()
+            try:
+                version = Version(candidate)
+            except InvalidVersion:
+                continue
+            if version.is_prerelease or version.is_devrelease:
+                continue
+            parsed_python.append((version, str(version)))
+        if not parsed_python:
+            return None
+
+        current: Version | None = None
+        if current_version:
+            try:
+                current = Version(str(current_version).strip())
+            except InvalidVersion:
+                current = None
+        if current is not None:
+            same_major = [
+                item
+                for item in parsed_python
+                if item[0].major == current.major and item[0] >= current
+            ]
+            if same_major:
+                return min(same_major, key=lambda item: item[0])[1]
+            higher_fixes = [item for item in parsed_python if item[0] >= current]
+            if higher_fixes:
+                return min(higher_fixes, key=lambda item: item[0])[1]
+        return min(parsed_python, key=lambda item: item[0])[1]
+    parsed: list[tuple[tuple[int, int, int, int, str], str]] = []
+    for raw in versions:
+        match = re.search(
+            r"(?i)v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?",
+            str(raw).strip(),
+        )
+        if not match:
+            continue
+        major = int(match.group(1))
+        minor = int(match.group(2) or 0)
+        patch = int(match.group(3) or 0)
+        prerelease = match.group(4) or ""
+        key = (major, minor, patch, 0 if prerelease else 1, prerelease)
+        parsed.append((key, str(raw).strip().lstrip("vV")))
+    if not parsed:
+        return None
+
+    if current_version:
+        cur_match = re.search(
+            r"(?i)v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?",
+            str(current_version).strip(),
+        )
+        if cur_match:
+            cur_major = int(cur_match.group(1))
+            cur_minor = int(cur_match.group(2) or 0)
+            cur_patch = int(cur_match.group(3) or 0)
+            cur_prerelease = cur_match.group(4) or ""
+            cur_key = (cur_major, cur_minor, cur_patch, 0 if cur_prerelease else 1, cur_prerelease)
+            same_major = [item for item in parsed if item[0][0] == cur_major and item[0] >= cur_key]
+            if same_major:
+                return min(same_major, key=lambda item: item[0])[1]
+            higher_fixes = [item for item in parsed if item[0] >= cur_key]
+            if higher_fixes:
+                return min(higher_fixes, key=lambda item: item[0])[1]
+
+    return min(parsed, key=lambda item: item[0])[1]
+
+
+def _fetch_osv_vuln_detail(vuln_id: str) -> dict[str, Any] | None:
+    """GET /v1/vulns/{id} — fetch a single OSV advisory in full detail."""
+    url = OSV_VULN_URL.format(vuln_id=vuln_id)
+    try:
+        resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        log.warning("OSV vuln detail fetch failed for %s: %s", vuln_id, exc)
+        return None
+
+
+def _query_osv_fixed_version(
+    issue: Any,
+    *,
+    maven_mode: bool | None = None,
+) -> tuple[str | None, list[str] | None]:
+    """
+    Query the OSV querybatch API for the fixed version.
+
+    Strategy:
+    1. Build a querybatch query using package+version.
+    2. If the result already embeds ``affected`` ranges, extract the fix.
+    3. If it only returns vuln IDs, fetch each via GET /v1/vulns/{id}.
+    4. Follow aliases (e.g. CVE -> GHSA) to retrieve structured ecosystem fix versions.
+    """
+    use_maven_policy = _is_maven_issue(issue) if maven_mode is None else maven_mode
+    package_name = (
+        _canonical_maven_coordinate(issue) if use_maven_policy else _package_name_from_issue(issue)
+    )
+    if not package_name:
+        return None, None
+
+    eco = "Maven" if use_maven_policy else (issue.ecosystem or "npm").lower()
+    mapping = {
+        "npm": "npm",
+        "maven": "Maven",
+        "pypi": "PyPI",
+        "python": "PyPI",
+        "pip": "PyPI",
+        "javascript": "npm",
+    }
+    eco = mapping.get(eco, eco.capitalize())
+
+    if eco == "PyPI":
+        package_name = normalize_python_package_name(package_name)
+
+    query: dict[str, Any] = {"package": {"name": package_name, "ecosystem": eco}}
+
+    current_version = getattr(issue, "package_version", None)
+    if current_version:
+        query["version"] = current_version
+
+    try:
+        resp = requests.post(
+            OSV_QUERYBATCH_URL,
+            json={"queries": [query]},
+            timeout=_REQUEST_TIMEOUT,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        results: list[dict[str, Any]] = resp.json().get("results") or []
+    except Exception as exc:
+        log.warning("OSV querybatch failed: %s", exc)
+        return None, None
+
+    if not results:
+        return None, None
+
+    workaround_snippets: list[str] = []
+    fixed_versions: list[str] = []
+    fetched_details: dict[str, dict[str, Any]] = {}
+
+    def _merge_snippets(snippets: list[str] | None) -> None:
+        if not snippets:
+            return
+        for snippet in snippets:
+            if snippet not in workaround_snippets:
+                workaround_snippets.append(snippet)
+
+    wanted_ids = {
+        str(identifier).strip().lower()
+        for identifier in (getattr(issue, "cve_id", None), getattr(issue, "ghsa_id", None))
+        if identifier
+    }
+
+    all_vulns = [
+        vuln for result in results for vuln in (result.get("vulns") or []) if isinstance(vuln, dict)
+    ]
+
+    def _get_vuln_detail(vuln_id: str) -> dict[str, Any] | None:
+        if vuln_id in fetched_details:
+            return fetched_details[vuln_id]
+        detail = _fetch_osv_vuln_detail(vuln_id)
+        if detail:
+            fetched_details[vuln_id] = detail
+        return detail
+
+    def _matches_issue(vuln: dict[str, Any]) -> bool:
+        if not wanted_ids:
+            return True
+        returned_ids = {
+            str(identifier).strip().lower()
+            for identifier in [vuln.get("id"), *(vuln.get("aliases") or [])]
+            if identifier
+        }
+        if bool(wanted_ids & returned_ids):
+            return True
+        vuln_id = vuln.get("id")
+        if vuln_id and not vuln.get("aliases") and not vuln.get("affected"):
+            detail = _get_vuln_detail(str(vuln_id))
+            if detail:
+                detail_ids = {
+                    str(identifier).strip().lower()
+                    for identifier in [detail.get("id"), *(detail.get("aliases") or [])]
+                    if identifier
+                }
+                return bool(wanted_ids & detail_ids)
+        return False
+
+    matching_vulns = [vuln for vuln in all_vulns if _matches_issue(vuln)]
+
+    def _consume_vuln(vuln: dict[str, Any], depth: int = 0) -> None:
+        vuln_to_process = vuln
+        vuln_id = vuln.get("id")
+        if "affected" not in vuln and vuln_id:
+            detail = _get_vuln_detail(str(vuln_id))
+            if detail:
+                vuln_to_process = detail
+
+        fixed, snippets = _extract_fixed_from_osv_vuln(
+            vuln_to_process,
+            package_name,
+            current_version=current_version,
+            ecosystem=(
+                "maven"
+                if use_maven_policy
+                else getattr(issue, "ecosystem", None)
+                or (
+                    "pypi"
+                    if str(getattr(issue, "ecosystem", None) or "").strip().casefold()
+                    in {"pypi", "python", "pip"}
+                    or str(getattr(issue, "purl", "") or "")
+                    .strip()
+                    .casefold()
+                    .startswith("pkg:pypi/")
+                    else "npm"
+                )
+            ),
+        )
+        if fixed:
+            fixed_versions.append(fixed)
+        elif snippets:
+            _merge_snippets(snippets)
+
+        # If no fixed version found directly, traverse ecosystem aliases (e.g. CVE -> GHSA)
+        if not fixed and depth == 0 and isinstance(vuln_to_process, dict):
+            aliases = vuln_to_process.get("aliases") or []
+            for alias in aliases:
+                alias_id = str(alias).strip()
+                if (
+                    alias_id
+                    and alias_id.upper() != str(vuln_id).upper()
+                    and alias_id.upper().startswith("GHSA-")
+                ):
+                    alias_detail = _get_vuln_detail(alias_id)
+                    if alias_detail:
+                        _consume_vuln(alias_detail, depth=depth + 1)
+
+    for vuln in matching_vulns:
+        _consume_vuln(vuln)
+
+    # If querybatch returned no matching advisory, resolve the finding's own
+    # CVE/GHSA directly instead of assigning another advisory's fix.
+    if not matching_vulns and all_vulns and wanted_ids:
+        for vuln_id in (
+            getattr(issue, "cve_id", None),
+            getattr(issue, "ghsa_id", None),
+        ):
+            if vuln_id:
+                detail = _get_vuln_detail(str(vuln_id))
+                if detail:
+                    _consume_vuln(detail)
+
+    if fixed_versions:
+        return (
+            _minimum_fixed_version(
+                fixed_versions,
+                current_version=current_version,
+                ecosystem=(
+                    getattr(issue, "ecosystem", None) or "Maven"
+                    if use_maven_policy
+                    else getattr(issue, "ecosystem", None)
+                ),
+            ),
+            None,
+        )
+    return None, (workaround_snippets or None)
+
+
+# ---------------------------------------------------------------------------
+# Registry candidate selection belongs to the Supervisor, not this advisory planner.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Optional Serper search and LLM page-content extraction
+# ---------------------------------------------------------------------------
+
+
+def _github_api_url(url: str) -> str | None:
+    """Convert a github.com HTML URL to a GitHub REST API URL if applicable."""
+    try:
+        parsed = urlparse(url)
+        if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
+            return None
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) < 2:
+            return None
+        owner, repository = parts[0], parts[1]
+        if repository.endswith(".git"):
+            repository = repository[:-4]
+        base = f"{_GITHUB_API_URL_PREFIX}repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
+        if len(parts) == 2:
+            return base
+        resource = parts[2].lower()
+        if resource in {"issues", "pulls", "commits"} and len(parts) >= 4:
+            return f"{base}/{resource}/{quote(parts[3], safe='')}"
+        if resource == "releases" and len(parts) >= 5 and parts[3].lower() == "tag":
+            return f"{base}/releases/tags/{quote('/'.join(parts[4:]), safe='')}"
+        if resource in {"blob", "raw", "tree"} and len(parts) >= 4:
+            ref = quote(parts[3], safe="")
+            content_path = quote("/".join(parts[4:]), safe="/")
+            endpoint = f"{base}/contents/{content_path}" if content_path else f"{base}/contents"
+            return f"{endpoint}?ref={ref}"
+        return base
+    except Exception:
+        return None
+
+
+def _github_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github.raw+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = get_runtime_settings().github_token
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _decode_github_response(resp: Any, target_url: str) -> str:
+    text = getattr(resp, "text", "") or ""
+    if text.strip():
+        try:
+            payload = resp.json()
+        except Exception:
+            return text
+        if isinstance(payload, dict):
+            if payload.get("encoding") == "base64" and payload.get("content"):
+                try:
+                    from base64 import b64decode
+
+                    return b64decode(str(payload["content"]).replace("\n", "")).decode("utf-8")
+                except Exception:
+                    return text
+            title = (
+                payload.get("title")
+                or payload.get("name")
+                or payload.get("login")
+                or "GitHub Content"
+            )
+            body = payload.get("body") or payload.get("description") or payload.get("content") or ""
+            if title or body:
+                return f"Title: {title}\nURL: {target_url}\n\n{body}".strip()
+            import json
+
+            return json.dumps(payload, indent=2, ensure_ascii=False)
+        if isinstance(payload, list):
+            import json
+
+            return json.dumps(payload, indent=2, ensure_ascii=False)
+        return text
+    return ""
+
+
+def _fetch_page_content(url: str, *, truncation_marker: bool = False) -> str | None:
+    """
+    Fetch web page text using a 3-tier waterfall: GitHub API/Raw -> Jina Reader -> Direct HTTP.
+
+    Truncates result to 16,000 characters. Catches all exceptions at each tier
+    and falls through; returns None if all tiers fail.
+    """
+    target_url = (url or "").strip()
+    if not target_url:
+        return None
+
+    def bound(text: str) -> str:
+        if len(text) <= _READ_WEB_PAGE_MAX_CHARS:
+            return text
+        suffix = (
+            f"\n\n[Content truncated at {_READ_WEB_PAGE_MAX_CHARS} characters...]"
+            if truncation_marker
+            else ""
+        )
+        return text[:_READ_WEB_PAGE_MAX_CHARS] + suffix
+
+    # 1. GitHub API & Raw GitHub fallback
+    if "github.com" in target_url and not target_url.startswith(
+        "https://raw.githubusercontent.com"
+    ):
+        github_api_url = _github_api_url(target_url)
+        if github_api_url:
+            try:
+                resp = requests.get(
+                    github_api_url,
+                    headers=_github_headers(),
+                    timeout=_READ_WEB_PAGE_TIMEOUT,
+                )
+                resp.raise_for_status()
+                text = _decode_github_response(resp, target_url)
+                if text and text.strip():
+                    return bound(text)
+            except Exception as exc:
+                log.debug("GitHub API fetch failed for %s: %s", target_url, exc)
+
+        raw_url = (
+            target_url.replace("github.com", "raw.githubusercontent.com")
+            .replace("/blob/", "/")
+            .replace("/tree/", "/")
+        )
+        try:
+            resp = requests.get(raw_url, timeout=_READ_WEB_PAGE_TIMEOUT)
+            resp.raise_for_status()
+            text = resp.text or ""
+            if text and text.strip():
+                return bound(text)
+        except Exception as exc:
+            log.debug("Raw GitHub fetch failed for %s: %s", raw_url, exc)
+
+    # 2. Jina Reader fallback
+    jina_url = f"{_JINA_READER_URL_PREFIX}{target_url}"
+    try:
+        resp = requests.get(
+            jina_url,
+            headers={"Accept": "text/plain"},
+            timeout=_READ_WEB_PAGE_TIMEOUT,
+        )
+        resp.raise_for_status()
+        text = resp.text or ""
+        if text and text.strip():
+            return bound(text)
+    except Exception as exc:
+        log.debug("Jina Reader fetch failed for %s: %s", target_url, exc)
+
+    # 3. Direct page fetch fallback
+    try:
+        resp = requests.get(target_url, timeout=_READ_WEB_PAGE_TIMEOUT)
+        resp.raise_for_status()
+        text = resp.text or ""
+        if text and text.strip():
+            return bound(text)
+    except Exception as exc:
+        log.debug("Direct page fetch failed for %s: %s", target_url, exc)
+
+    return None
+
+
+def _llm_extract_remediation(
+    page_contents: list[dict[str, str]],
+    package_name: str,
+    vuln_id: str,
+    *,
+    workaround_only: bool = False,
+) -> dict[str, Any] | None:
+    """
+    Use LLM structured output to extract version bump or workaround steps from web page text.
+
+    Returns a dict matching SerperLLMResult schema, or None if extraction fails.
+    """
+    if not page_contents:
+        return None
+
+    try:
+        from langchain_openai import ChatOpenAI  # type: ignore[import]
+    except ImportError:
+        log.warning("langchain-openai not installed; skipping LLM page extraction.")
+        return None
+
+    settings = get_runtime_settings()
+    api_key = settings.openai_api_key
+    if not api_key:
+        log.info("OPENAI_API_KEY not set — skipping LLM page extraction.")
+        return None
+
+    model_name = settings.triage_llm_model
+
+    pages_text = []
+    for idx, page in enumerate(page_contents, 1):
+        url = page.get("url", "")
+        content = page.get("content", "")
+        pages_text.append(f"--- Page {idx}: {url} ---\n{content}")
+    combined_pages = "\n\n".join(pages_text)
+
+    remediation_instructions = (
+        "Analyze the content only for actionable code workarounds or mitigation steps. "
+        "Do not return a version recommendation. If no usable workaround is found, "
+        "set strategy='NO_FIX'.\n"
+        if workaround_only
+        else (
+            "Analyze the content carefully and extract actionable remediation info:\n"
+            "1. If the page provides a clear patched version to bump to, set strategy='VERSION_BUMP' and fixed_version='X.Y.Z'.\n"
+            "2. If the page provides a code workaround or mitigation steps, set strategy='CODE_WORKAROUND' and workaround_snippets=[...].\n"
+            "3. If no actionable fixed version or code workaround is found, set strategy='NO_FIX'.\n"
+        )
+    )
+    prompt_text = (
+        f"You are a security engineer analyzing web page findings for vulnerable package '{package_name}' "
+        f"(vulnerability ID: '{vuln_id}').\n\n"
+        f"Below are fetched web page contents from security advisories, release notes, or issue threads:\n\n"
+        f"{combined_pages}\n\n"
+        f"{remediation_instructions}"
+    )
+
+    try:
+        llm = create_chat_model(
+            model_name,
+            settings=settings,
+            reasoning_effort=getattr(settings, "triage_llm_reasoning_effort", None),
+            request_timeout=_LLM_REQUEST_TIMEOUT_SECONDS,
+            max_retries=0,
+            chat_openai_class=ChatOpenAI,
+        )
+        structured_llm = llm.with_structured_output(SerperLLMResult)
+        result: SerperLLMResult = structured_llm.invoke(prompt_text)
+        return result.model_dump()
+    except Exception as exc:
+        log.warning("LLM extraction failed for %s (%s): %s", package_name, vuln_id, exc)
+        return None
+
+
+def _query_serper(issue: Any, package_name: str) -> list[dict[str, str]] | None:
+    """
+    Search Google via Serper.dev for vulnerability information.
+
+    Returns up to 3 organic result items with keys 'url', 'snippet', 'title',
+    or None if SERPER_API_KEY is not set, API fails, or organic results are empty.
+    """
+    api_key = get_runtime_settings().serper_api_key
+    if not api_key:
+        log.info("SERPER_API_KEY not set — skipping Serper search.")
+        return None
+
+    vuln_id = (
+        getattr(issue, "cve_id", None)
+        or getattr(issue, "ghsa_id", None)
+        or getattr(issue, "rule_id", None)
+        or ""
+    )
+    query = f"{package_name} {vuln_id} vulnerability workaround github".strip()
+
+    log.info("Executing Serper search with query: %s", query)
+
+    try:
+        resp = requests.post(
+            SERPER_SEARCH_URL,
+            json={"q": query},
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            timeout=_REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        organic = data.get("organic") or []
+        results: list[dict[str, str]] = []
+        for item in organic:
+            if isinstance(item, dict):
+                link = item.get("link") or item.get("url") or ""
+                if link:
+                    results.append(
+                        {
+                            "url": str(link),
+                            "snippet": str(item.get("snippet") or ""),
+                            "title": str(item.get("title") or ""),
+                        }
+                    )
+                    if len(results) >= 3:
+                        break
+        return results if results else None
+    except Exception as exc:
+        log.warning("Serper search failed: %s", exc)
+        return None
+
+
+def _serper_search_and_extract(
+    issue: Any,
+    package_name: str,
+    *,
+    workaround_only: bool = False,
+) -> dict[str, Any] | None:
+    """
+    Orchestrate Serper search, page fetch, and LLM remediation extraction.
+
+    1. Query Serper for organic search results.
+    2. Fetch page content for top result URLs (up to 3).
+    3. Pass fetched page contents to LLM for structured extraction.
+    4. Return LLM extraction dict, or None if any step fails/returns no content.
+    """
+    search_results = _query_serper(issue, package_name)
+    if not search_results:
+        return None
+
+    pages: list[dict[str, str]] = []
+    for item in search_results:
+        url = item.get("url")
+        if not url:
+            continue
+        content = _fetch_page_content(url)
+        if content and content.strip():
+            pages.append({"url": url, "content": content})
+
+    if not pages:
+        return None
+
+    vuln_id = (
+        getattr(issue, "cve_id", None)
+        or getattr(issue, "ghsa_id", None)
+        or getattr(issue, "rule_id", None)
+        or ""
+    )
+    if workaround_only:
+        return _llm_extract_remediation(
+            pages,
+            package_name,
+            str(vuln_id),
+            workaround_only=True,
+        )
+    return _llm_extract_remediation(pages, package_name, str(vuln_id))
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def plan_fix(localized_issue: LocalizedIssue, *, skip_osv: bool = False) -> dict:
+    """Plan one localized SCA finding from advisory and optional web evidence.
+
+    Args:
+        localized_issue: Finding and repository localization context.
+        skip_osv: Skip OSV and request workaround-only Serper/LLM evidence.
+
+    Returns:
+        A dictionary suitable for validation as ``FixPlan``.
+    """
+    issue = localized_issue.issue
+    package_manager = localized_issue.package_manager
+    is_maven = str(package_manager or "").strip().lower() == "maven"
+    package_name = (
+        _canonical_maven_coordinate(issue) if is_maven else _package_name_from_issue(issue)
+    )
+    is_direct = localized_issue.is_direct_dependency
+    manifest_file = localized_issue.manifest_file
+
+    if is_maven and (
+        not package_name or not manifest_file or Path(manifest_file).name != "pom.xml"
+    ):
+        return {
+            "status": FixPlanStatus.NO_FIX.value,
+            "fixed_version": None,
+            "workaround_snippets": None,
+            "instruction": (
+                f'No authorized Maven POM is available for exact coordinate "{package_name or "unknown group:artifact"}". '
+                "Do not edit an inherited parent POM or BOM solely for this finding."
+            ),
+            "strategy_used": "no_authorized_maven_pom",
+        }
+
+    # Step 1: OSV advisory data. The registry release choice is Supervisor-owned.
+    osv_result = (
+        None
+        if skip_osv
+        else (
+            _query_osv_fixed_version(issue, maven_mode=True)
+            if is_maven
+            else _query_osv_fixed_version(issue)
+        )
+    )
+    if isinstance(osv_result, tuple) and len(osv_result) == 2:
+        fixed, snippets = osv_result
+    else:
+        fixed, snippets = None, None
+
+    if fixed and not skip_osv:
+        return _version_plan(
+            package_name,
+            fixed,
+            package_manager,
+            is_direct,
+            manifest_file,
+            strategy="osv_api",
+            parent_package_name=localized_issue.parent_package_name,
+            parent_declaration_type=localized_issue.parent_declaration_type,
+            ecosystem=issue.ecosystem,
+            declaration_type=localized_issue.declaration_type,
+        )
+    if snippets and not skip_osv:
+        return {
+            "status": FixPlanStatus.WORKAROUND_FOUND.value,
+            "fixed_version": None,
+            "workaround_snippets": snippets,
+            "instruction": _WORKAROUND_INSTRUCTION,
+            "strategy_used": "osv_api",
+        }
+
+    # Non-version workaround discovery can be useful for Maven, but text from
+    # search/LLM results is never accepted as Maven release authorization.
+    serper_llm_result = (
+        _serper_search_and_extract(issue, package_name, workaround_only=True)
+        if skip_osv
+        else _serper_search_and_extract(issue, package_name)
+    )
+    if serper_llm_result and isinstance(serper_llm_result, dict):
+        strategy = serper_llm_result.get("strategy")
+        if (
+            not skip_osv
+            and not is_maven
+            and strategy == "VERSION_BUMP"
+            and serper_llm_result.get("fixed_version")
+        ):
+            return _version_plan(
+                package_name,
+                serper_llm_result["fixed_version"],
+                package_manager,
+                is_direct,
+                manifest_file,
+                strategy="serper_llm",
+                parent_package_name=localized_issue.parent_package_name,
+                parent_declaration_type=localized_issue.parent_declaration_type,
+                ecosystem=issue.ecosystem,
+                declaration_type=localized_issue.declaration_type,
+            )
+        if strategy == "CODE_WORKAROUND" and serper_llm_result.get("workaround_snippets"):
+            return {
+                "status": FixPlanStatus.WORKAROUND_FOUND.value,
+                "fixed_version": None,
+                "workaround_snippets": serper_llm_result["workaround_snippets"],
+                "instruction": _WORKAROUND_INSTRUCTION,
+                "strategy_used": "serper_llm",
+            }
+
+    return {
+        "status": FixPlanStatus.NO_FIX.value,
+        "fixed_version": None,
+        "workaround_snippets": None,
+        "instruction": _NO_FIX_INSTRUCTION,
+        "strategy_used": "none",
+    }
+
+
+def _version_plan(
+    package_name: str,
+    fixed_version: str,
+    package_manager: str | None,
+    is_direct: bool | None,
+    manifest_file: str | None,
+    strategy: str,
+    parent_package_name: str | None = None,
+    parent_declaration_type: str | None = None,
+    ecosystem: str | None = None,
+    declaration_type: str | None = None,
+) -> dict:
+    """Return a ``version_found`` plan dict."""
+    instruction = _build_instruction(
+        package_name=package_name,
+        fixed_version=fixed_version,
+        package_manager=package_manager,
+        is_direct=is_direct,
+        manifest_file=manifest_file,
+        parent_package_name=parent_package_name,
+        parent_declaration_type=parent_declaration_type,
+        ecosystem=ecosystem,
+        declaration_type=declaration_type,
+    )
+    return {
+        "status": FixPlanStatus.VERSION_FOUND.value,
+        "fixed_version": fixed_version,
+        "workaround_snippets": None,
+        "instruction": instruction,
+        "strategy_used": strategy,
+    }
+
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+EPSS_API_URL = "https://api.first.org/data/v1/epss"
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+EPSS_CHUNK_SIZE = 100
+REQUEST_TIMEOUT_SECONDS = 10
+KEV_CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _cache_dir(settings: AppSettings | None = None) -> Path:
+    """Return the configured cache directory for the current run."""
+    resolved_settings = settings or get_runtime_settings()
+    if resolved_settings.triage_cache_dir is not None:
+        return resolved_settings.triage_cache_dir
+    # Walk up from this file to find a repository marker.  This repository is
+    # pyproject-based, while older deployments may still have requirements.txt.
+    here = Path(__file__).resolve()
+    for parent in [here, *here.parents]:
+        if (parent / "pyproject.toml").exists() or (parent / "requirements.txt").exists():
+            return parent / "data" / "cache"
+    # Fallback: sibling data/cache relative to CWD
+    return Path("data") / "cache"
+
+
+def _kev_cache_path(settings: AppSettings | None = None) -> Path:
+    return _cache_dir(settings) / "kev_cache.json"
+
+
+def _is_cache_fresh(path: Path) -> bool:
+    """Return True if the cache file exists and was written within the TTL."""
+    if not path.exists():
+        return False
+    age = time.time() - path.stat().st_mtime
+    return age < KEV_CACHE_TTL_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# CISA KEV
+# ---------------------------------------------------------------------------
+
+
+def _load_kev_set(settings: AppSettings | None = None) -> tuple[set[str], dict[str, str]]:
+    """
+    Return (kev_cve_set, kev_date_map).
+
+    Tries the local cache first; falls back to a live download.
+    On any failure returns empty structures and logs a warning.
+    """
+    cache_path = _kev_cache_path(settings)
+
+    def _parse_catalog(data: dict[str, Any]) -> tuple[set[str], dict[str, str]]:
+        kev_set: set[str] = set()
+        date_map: dict[str, str] = {}
+        for entry in data.get("vulnerabilities", []):
+            cve_id = entry.get("cveID", "")
+            date_added = entry.get("dateAdded", "")
+            if cve_id:
+                kev_set.add(cve_id.upper())
+                if date_added:
+                    date_map[cve_id.upper()] = date_added
+        return kev_set, date_map
+
+    # --- Cache hit ---
+    if _is_cache_fresh(cache_path):
+        try:
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+            logger.debug("KEV: loaded %d entries from cache.", len(raw.get("vulnerabilities", [])))
+            return _parse_catalog(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("KEV cache read failed (%s); attempting live download.", exc)
+
+    # --- Live download ---
+    try:
+        resp = requests.get(KEV_URL, timeout=REQUEST_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        raw = resp.json()
+        # Persist to cache
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        logger.info(
+            "KEV: downloaded %d entries and cached at %s.",
+            len(raw.get("vulnerabilities", [])),
+            cache_path,
+        )
+        return _parse_catalog(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("KEV download failed (%s); using stale cache if available.", exc)
+
+    # --- Stale cache fallback ---
+    if cache_path.exists():
+        try:
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+            logger.warning("KEV: using stale cache (%s).", cache_path)
+            return _parse_catalog(raw)
+        except Exception as exc2:  # noqa: BLE001
+            logger.warning("KEV stale cache also failed (%s).", exc2)
+
+    logger.warning("KEV: no data available; treating all CVEs as not-in-KEV.")
+    return set(), {}
+
+
+# ---------------------------------------------------------------------------
+# FIRST EPSS
+# ---------------------------------------------------------------------------
+
+
+def _fetch_epss_chunk(cve_ids: list[str]) -> dict[str, tuple[float, float]]:
+    """
+    Query the EPSS API for a chunk of CVE IDs.
+
+    Returns a dict of cve_id → (epss_score, epss_percentile).
+    On failure, returns an empty dict (caller fills in defaults).
+    """
+    cve_param = ",".join(cve_ids)
+    try:
+        resp = requests.get(
+            EPSS_API_URL,
+            params={"cve": cve_param},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            return {}
+        result: dict[str, tuple[float, float]] = {}
+        for entry in data.get("data", []):
+            if not isinstance(entry, dict):
+                continue
+            cve = str(entry.get("cve") or "").strip().upper()
+            try:
+                epss = float(entry["epss"])
+                pct = float(entry["percentile"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (
+                math.isfinite(epss)
+                and math.isfinite(pct)
+                and 0.0 <= epss <= 1.0
+                and 0.0 <= pct <= 1.0
+            ):
+                logger.warning("Ignoring invalid EPSS values for %s.", cve or "unknown CVE")
+                continue
+            if cve:
+                result[cve] = (epss, pct)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "EPSS query failed for %d CVEs (%s); returning defaults.",
+            len(cve_ids),
+            exc,
+        )
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def enrich_cves(
+    cve_ids: list[str],
+    settings: AppSettings | None = None,
+) -> dict[str, CVEEnrichment]:
+    """
+    Enrich a list of CVE IDs with EPSS scores and CISA KEV membership.
+
+    Parameters
+    ----------
+    cve_ids:
+        List of CVE identifiers (e.g. ['CVE-2021-44228', ...]).
+        Duplicates are handled gracefully.
+
+    Returns
+    -------
+    Dict[str, CVEEnrichment]
+        A ``CVEEnrichment`` for every requested CVE ID.
+        Keys are upper-cased CVE IDs.
+        Safe defaults are returned for any CVE when API calls fail.
+    """
+    if not cve_ids:
+        return {}
+
+    # Normalise and deduplicate
+    normalised = list(dict.fromkeys(c.strip().upper() for c in cve_ids if c))
+    if not normalised:
+        return {}
+
+    logger.debug("Enriching %d unique CVEs.", len(normalised))
+
+    # --- KEV ---
+    kev_set, kev_date_map = _load_kev_set(settings)
+
+    # --- EPSS (chunked) ---
+    epss_map: dict[str, tuple[float, float]] = {}
+    for i in range(0, len(normalised), EPSS_CHUNK_SIZE):
+        chunk = normalised[i : i + EPSS_CHUNK_SIZE]
+        epss_map.update(_fetch_epss_chunk(chunk))
+
+    # --- Assemble results ---
+    enriched_at = datetime.now(UTC)
+    results: dict[str, CVEEnrichment] = {}
+    for cve in normalised:
+        in_kev = cve in kev_set
+        epss_score, epss_pct = epss_map.get(cve, (0.0, 0.0))
+
+        # Determine which sources contributed
+        sources: list[str] = []
+        if epss_score > 0.0:
+            sources.append("epss")
+        if in_kev:
+            sources.append("kev")
+        enrichment_source = "+".join(sources) if sources else "none"
+
+        results[cve] = CVEEnrichment(
+            cve_id=cve,
+            epss=epss_score,
+            epss_percentile=epss_pct,
+            in_kev=in_kev,
+            kev_date_added=kev_date_map.get(cve),
+            enriched_at=enriched_at,
+            enrichment_source=enrichment_source,
+        )
+
+    logger.debug(
+        "Enrichment complete: %d KEV hits, %d EPSS hits.",
+        sum(1 for r in results.values() if r.in_kev),
+        sum(1 for r in results.values() if r.epss > 0.0),
+    )
+    return results

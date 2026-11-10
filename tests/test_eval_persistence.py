@@ -1,12 +1,250 @@
-"""Tests for persisting pytest evaluation items alongside DeepEval cases."""
+"""Focused tests for eval persistence."""
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+
+import pytest
 
 import remediation_engine.evals.db as eval_db
 import tests.evals.conftest as eval_conftest
-from remediation_engine.evals.models import EvalTestCaseRecord
+from remediation_engine.evals.comparison import format_run_comparison, format_run_list
+from remediation_engine.evals.db import EvalDatabase
+from remediation_engine.evals.models import EvalRunRecord, EvalTestCaseRecord, MetricRecord
+from tests.evals import test_report_eval
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_SCRIPT_PATH = _PROJECT_ROOT / "scripts" / "eval_compare.py"
+
+
+def _load_cli():
+    """Load the script module without requiring scripts to be a package."""
+    spec = importlib.util.spec_from_file_location("eval_compare_script", _SCRIPT_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _save_run(
+    database: EvalDatabase,
+    run_id: str,
+    timestamp: str,
+    tag: str,
+    status: str,
+) -> None:
+    """Persist one small run for CLI tests."""
+    database.save_run(
+        EvalRunRecord(
+            run_id=run_id,
+            timestamp=timestamp,
+            tag=tag,
+            suite_name="tests/evals",
+            total_tests=1,
+            passed_tests=int(status == "PASSED"),
+            failed_tests=int(status == "FAILED"),
+            test_cases=[
+                EvalTestCaseRecord(
+                    test_name="test_shared_case",
+                    suite="triage",
+                    status=status,
+                    metrics=[MetricRecord(metric_name="Accuracy", score=0.5)],
+                )
+            ],
+        )
+    )
+
+
+@pytest.fixture
+def comparison_db(tmp_path: Path) -> Path:
+    """Create an isolated database containing baseline and candidate runs."""
+    db_path = tmp_path / "evals.db"
+    database = EvalDatabase(db_path=db_path)
+    _save_run(database, "run-a", "2026-08-25T12:00:00", "baseline", "PASSED")
+    _save_run(database, "run-b", "2026-08-26T12:00:00", "candidate", "FAILED")
+    return db_path
+
+
+def test_cli_lists_runs_with_tags(comparison_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The list mode exposes tags and identifying run metadata."""
+    cli = _load_cli()
+
+    assert cli.main(["--db-path", str(comparison_db), "--list"]) == 0
+    output = capsys.readouterr().out
+    assert "baseline" in output
+    assert "candidate" in output
+    assert "run-a" in output
+    assert "run-b" in output
+
+
+def test_cli_compares_tags_and_run_ids(
+    comparison_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Explicit tags and exact run IDs both resolve to a comparison."""
+    cli = _load_cli()
+
+    assert (
+        cli.main(
+            [
+                "--db-path",
+                str(comparison_db),
+                "--run-a",
+                "baseline",
+                "--run-b",
+                "candidate",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "Regressions: 1" in output
+    assert "(-100.0 pp)" in output
+
+    assert (
+        cli.main(
+            [
+                "--db-path",
+                str(comparison_db),
+                "--run-a",
+                "run-a",
+                "--run-b",
+                "run-b",
+            ]
+        )
+        == 0
+    )
+
+
+def test_cli_latest_compares_newest_two_runs(
+    comparison_db: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The latest mode chooses the newest candidate and its predecessor."""
+    cli = _load_cli()
+
+    assert cli.main(["--db-path", str(comparison_db), "--latest"]) == 0
+    output = capsys.readouterr().out
+    assert "Baseline:" in output
+    assert "Candidate:" in output
+    assert "Regressions: 1" in output
+
+
+def test_cli_reports_missing_references(
+    comparison_db: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Unknown run references return an operational error instead of a traceback."""
+    cli = _load_cli()
+
+    assert (
+        cli.main(
+            [
+                "--db-path",
+                str(comparison_db),
+                "--run-a",
+                "missing",
+                "--run-b",
+                "candidate",
+            ]
+        )
+        == 1
+    )
+    assert "was not found" in capsys.readouterr().err
+
+
+def test_cli_rejects_incomplete_comparison_arguments() -> None:
+    """Require a candidate reference when explicit baseline mode is selected."""
+    cli = _load_cli()
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--run-a", "baseline"])
+    assert exc_info.value.code == 2
+
+
+def _run(run_id: str, tag: str, pass_rate: float) -> dict[str, object]:
+    """Build the minimal persisted run shape used by formatter tests."""
+    return {
+        "run_id": run_id,
+        "timestamp": "2026-08-26T12:00:00",
+        "tag": tag,
+        "suite_name": "tests/evals",
+        "pass_rate": pass_rate,
+        "metadata": {"git_branch": "feat/eval"},
+        "is_live": False,
+    }
+
+
+def test_format_run_comparison_renders_summary_and_changed_rows() -> None:
+    """Render pass-rate deltas, regressions, improvements, and escaped names."""
+    comparison = {
+        "run_a": _run("run-a", "baseline", 100.0),
+        "run_b": _run("run-b", "post-change", 50.0),
+        "pass_rate_delta": -50.0,
+        "total_regressions": 1,
+        "total_fixes": 1,
+        "regressions": [
+            {
+                "test_name": "test|regressed\ncase",
+                "suite": "triage",
+                "status_a": "PASSED",
+                "status_b": "FAILED",
+                "score_delta": -0.4,
+            }
+        ],
+        "fixes": [
+            {
+                "test_name": "test_fixed",
+                "suite": "report",
+                "status_a": "FAILED",
+                "status_b": "PASSED",
+                "score_delta": 0.3,
+            }
+        ],
+        "comparisons": [],
+    }
+
+    output = format_run_comparison(comparison)
+
+    assert "Baseline:" in output
+    assert "Candidate:" in output
+    assert "(-50.0 pp)" in output
+    assert "Regressions: 1 | Improvements: 1" in output
+    assert "test\\|regressed case" in output
+    assert "IMPROVEMENT" in output
+
+
+def test_format_run_comparison_reports_no_changes() -> None:
+    """Keep an empty comparison concise and explicit."""
+    output = format_run_comparison(
+        {
+            "run_a": _run("run-a", "baseline", 100.0),
+            "run_b": _run("run-b", "post-change", 100.0),
+            "pass_rate_delta": 0.0,
+            "total_regressions": 0,
+            "total_fixes": 0,
+            "comparisons": [],
+        }
+    )
+
+    assert "No regressions detected" in output
+    assert "Status changes:" not in output
+
+
+def test_format_run_list_includes_tags_and_git_branch() -> None:
+    """Render the fields needed to identify a persisted run from the CLI."""
+    output = format_run_list([_run("run-a", "baseline", 100.0)])
+
+    assert "Run ID" in output
+    assert "baseline" in output
+    assert "feat/eval" in output
+    assert "100.0%" in output
+
+
+def test_format_run_list_handles_empty_database() -> None:
+    """Report an empty database without raising."""
+    assert format_run_list([]) == "No evaluation runs recorded."
 
 
 def _eval_item(nodeid: str) -> SimpleNamespace:
@@ -451,11 +689,11 @@ def test_single_selected_item_keeps_all_metrics(monkeypatch):
 
 
 def test_unscored_metric_is_not_persisted_as_a_zero_score(monkeypatch):
-    nodeid = "tests/evals/test_business_rules.py::test_missing_telemetry"
+    nodeid = "tests/evals/test_report_eval.py::test_report_missing_score"
     monkeypatch.setattr(
         eval_conftest, "_EVAL_TEST_REPORTS", {nodeid: {"call": _report(nodeid, "passed")}}
     )
-    case = _deep_eval_case("missing-telemetry", "Token Budget")
+    case = _deep_eval_case("missing-score", "HallucinationMetric")
     case.metrics_data[0].score = None
     case.metrics_data[0].success = None
 
@@ -464,7 +702,7 @@ def test_unscored_metric_is_not_persisted_as_a_zero_score(monkeypatch):
     )
 
     assert records[0].metrics == []
-    assert records[0].additional_metadata["unscored_metrics"] == ["Token Budget"]
+    assert records[0].additional_metadata["unscored_metrics"] == ["HallucinationMetric"]
 
 
 def test_explicit_identity_wins_over_case_name_heuristics(monkeypatch):
@@ -501,3 +739,186 @@ def test_session_without_evaluation_items_does_not_import_persistence(monkeypatc
         ),
         2,
     )
+
+
+def test_report_metric_case_uses_only_source_evidence(monkeypatch) -> None:
+    """All report judges receive the same source-grounded case."""
+
+    class FakeLLMTestCase:
+        def __init__(self, **kwargs: Any) -> None:
+            self.__dict__.update(kwargs)
+
+    monkeypatch.setattr(test_report_eval, "LLMTestCase", FakeLLMTestCase)
+    case = test_report_eval._load_golden_cases()[0]
+    report = test_report_eval.render_report(case)
+    source_evidence = test_report_eval.build_report_context(case)
+    metric_case = test_report_eval._build_report_metric_case(
+        case,
+        report,
+        source_evidence,
+    )
+
+    assert metric_case.input == source_evidence
+    assert metric_case.actual_output == report
+    assert getattr(metric_case, "expected_output", None) is None
+    assert metric_case.context == [source_evidence]
+    assert metric_case.retrieval_context == [source_evidence]
+    assert "expected_contract" not in source_evidence
+    assert "report_format" not in source_evidence
+
+
+def test_summarization_metric_receives_case_specific_questions(monkeypatch) -> None:
+    """The judge receives factual yes/no questions answerable from both texts."""
+
+    class FakeMetric:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(test_report_eval, "HAS_DEEPEVAL", True)
+    monkeypatch.setattr(test_report_eval, "HallucinationMetric", FakeMetric)
+    monkeypatch.setattr(test_report_eval, "FaithfulnessMetric", FakeMetric)
+    monkeypatch.setattr(test_report_eval, "SummarizationMetric", FakeMetric)
+    case = test_report_eval._load_golden_cases()[0]
+    metrics = test_report_eval._build_metrics(
+        SimpleNamespace(judge_model="test-model", judge_llm=None),
+        case,
+    )
+
+    questions = metrics[2].kwargs["assessment_questions"]
+    assert questions == test_report_eval._report_summarization_questions(case)
+    assert questions[0] == "Are there exactly 5 scanner findings across 4 vulnerability groups?"
+    assert (
+        questions[1]
+        == "Are 4 vulnerability groups successfully remediated and 0 vulnerability groups "
+        "requiring follow-up?"
+    )
+    assert any(
+        "CVE-2026-30001 -> vulnerable package base64url" in question for question in questions
+    )
+    assert all("Does the report" not in question for question in questions)
+    assert any("5 canonical findings across 4 groups" in question for question in questions)
+    assert not any("None" in question for question in questions)
+
+
+def test_code_detail_files_are_source_only_for_package_removal() -> None:
+    """Manifests stay in the main row, while code details list accepted source paths."""
+    case = next(
+        case
+        for case in test_report_eval._load_golden_cases()
+        if case["case_id"] == "no_fix_package_removal"
+    )
+    report = test_report_eval.render_report(case)
+    parsed = test_report_eval.parse_report(report)
+    table_files = parsed["successful_rows"][0]["Files Changed"]
+    source_evidence = test_report_eval.build_report_context(case)
+
+    assert "package.json" in table_files
+    assert "package-lock.json" in table_files
+    assert parsed["code_detail_file_paths"] == ["routes/b2bOrder.ts"]
+    assert "package.json" not in parsed["code_detail_text"]
+    assert "package-lock.json" not in parsed["code_detail_text"]
+    assert not test_report_eval.validate_report_contract(report, case["expected_contract"])
+    assert "package.json" in source_evidence
+
+    tampered_report = report.replace(
+        "- **Files changed:** routes/b2bOrder.ts",
+        "- **Files changed:** package.json, routes/b2bOrder.ts",
+        1,
+    )
+    violations = test_report_eval.validate_report_contract(
+        tampered_report, case["expected_contract"]
+    )
+    assert any(
+        "manifest leaked into Code workaround details: package.json" in item for item in violations
+    )
+
+
+def test_live_report_runs_three_metrics_on_one_case(monkeypatch) -> None:
+    """All three report metrics receive the same report and evidence."""
+
+    class FakeLLMTestCase:
+        def __init__(self, **kwargs: Any) -> None:
+            self.__dict__.update(kwargs)
+
+    metric_case = object()
+    metrics = [object(), object(), object()]
+    calls: list[tuple[Any, list[Any]]] = []
+
+    def fake_assert_test(test_case: Any, selected_metrics: list[Any]) -> None:
+        calls.append((test_case, selected_metrics))
+        raise AssertionError("judge threshold failure")
+
+    monkeypatch.setattr(test_report_eval, "HAS_DEEPEVAL", True)
+    monkeypatch.setattr(test_report_eval, "LLMTestCase", FakeLLMTestCase)
+    monkeypatch.setattr(
+        test_report_eval,
+        "render_report",
+        lambda case, **_kwargs: "report",
+    )
+    monkeypatch.setattr(
+        test_report_eval,
+        "validate_report_contract",
+        lambda report, contract, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        test_report_eval,
+        "build_report_context",
+        lambda case: ["evidence", "policy"],
+    )
+    monkeypatch.setattr(test_report_eval, "_build_context", lambda state: object())
+    monkeypatch.setattr(
+        test_report_eval, "_build_executive_summary_evidence", lambda context: object()
+    )
+    summary_result = SimpleNamespace(
+        used_llm=True,
+        status="generated",
+        error=None,
+        metadata=lambda: {"status": "generated", "model": "test-model"},
+    )
+    monkeypatch.setattr(
+        test_report_eval,
+        "generate_executive_summary",
+        lambda evidence, *, settings: summary_result,
+    )
+    monkeypatch.setattr(
+        test_report_eval,
+        "_build_report_metric_case",
+        lambda case, report, context, **_kwargs: metric_case,
+    )
+    monkeypatch.setattr(
+        test_report_eval,
+        "_build_metrics",
+        lambda settings, case: metrics,
+    )
+    monkeypatch.setattr(test_report_eval, "assert_test", fake_assert_test)
+
+    case = {
+        **test_report_eval._load_golden_cases()[0],
+        "case_id": "fixture",
+        "expected_contract": {},
+    }
+    settings = SimpleNamespace(
+        is_live=True,
+        openai_api_key="test",
+        judge_model="test-model",
+        judge_llm=None,
+        app_settings=object(),
+    )
+    test_report_eval.TestReportNodeEval().test_report_uses_the_three_requested_metrics(
+        case,
+        settings,
+    )
+
+    assert calls == [(metric_case, metrics)]
+
+
+def test_report_evidence_documents_build_for_all_golden_cases() -> None:
+    """Every curated case produces source facts for judging."""
+    for case in test_report_eval._load_golden_cases():
+        source_evidence = test_report_eval.build_report_context(case)
+
+        assert f"Run ID: {case['case_id']}." in source_evidence
+        assert "There are exactly" in source_evidence
+        for group in case["fixture"].get("groups", []):
+            if group.get("package"):
+                assert group["package"] in source_evidence
