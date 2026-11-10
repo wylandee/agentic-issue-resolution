@@ -222,49 +222,56 @@ class TrajectoryDocument:
 
     def spans_for_agent(self, agent_name: str) -> list[TrajectorySpan]:
         """Filter spans by agent category or prefix."""
-        normalized = agent_name.strip().lower()
-        if normalized in {"triage", "initial_triage"}:
-            return [
-                s
-                for s in self.spans
-                if s.name in {"triage.llm", "initial_triage", "triage"} or "triage" in s.tags
-            ]
-        if normalized in {"update", "update_subagent"}:
-            return [
-                s
-                for s in self.spans
-                if "update_subagent" in s.name.lower()
-                or (s.parent_name and "update_subagent" in s.parent_name.lower())
-            ]
-        if normalized in {"workaround", "workaround_subagent"}:
-            return [
-                s
-                for s in self.spans
-                if "workaround_subagent" in s.name.lower()
-                or (s.parent_name and "workaround_subagent" in s.parent_name.lower())
-            ]
-        if normalized in {"qa", "qa_critic"}:
-            return [
-                s
-                for s in self.spans
-                if "qa_critic" in s.name.lower()
-                or (s.parent_name and "qa_critic" in s.parent_name.lower())
-            ]
-        if normalized in {"report", "report_node"}:
-            return [
-                s
-                for s in self.spans
-                if "report" in s.name.lower()
-                or (s.parent_name and "report" in s.parent_name.lower())
-            ]
-        if normalized in {"supervisor", "tactical_supervisor"}:
-            return [
-                s
-                for s in self.spans
-                if s.name == "supervisor.tactical_reasoner"
-                or s.parent_name == "supervisor.tactical_reasoner"
-            ]
-        return [s for s in self.spans if normalized in s.name.lower()]
+        return _select_agent_spans(self.spans, agent_name, include_triage_tags=True)
+
+
+def _select_agent_spans(
+    spans: list[TrajectorySpan], agent_name: str, *, include_triage_tags: bool
+) -> list[TrajectorySpan]:
+    """Select agent spans with the caller's established triage-tag policy."""
+    normalized = agent_name.strip().lower()
+    if normalized in {"triage", "initial_triage"}:
+        return [
+            s
+            for s in spans
+            if s.name in {"triage.llm", "initial_triage", "triage"}
+            or (include_triage_tags and "triage" in s.tags)
+        ]
+    if normalized in {"update", "update_subagent"}:
+        return [
+            s
+            for s in spans
+            if "update_subagent" in s.name.lower()
+            or (s.parent_name and "update_subagent" in s.parent_name.lower())
+        ]
+    if normalized in {"workaround", "workaround_subagent"}:
+        return [
+            s
+            for s in spans
+            if "workaround_subagent" in s.name.lower()
+            or (s.parent_name and "workaround_subagent" in s.parent_name.lower())
+        ]
+    if normalized in {"qa", "qa_critic"}:
+        return [
+            s
+            for s in spans
+            if "qa_critic" in s.name.lower()
+            or (s.parent_name and "qa_critic" in s.parent_name.lower())
+        ]
+    if normalized in {"report", "report_node"}:
+        return [
+            s
+            for s in spans
+            if "report" in s.name.lower() or (s.parent_name and "report" in s.parent_name.lower())
+        ]
+    if normalized in {"supervisor", "tactical_supervisor"}:
+        return [
+            s
+            for s in spans
+            if s.name == "supervisor.tactical_reasoner"
+            or s.parent_name == "supervisor.tactical_reasoner"
+        ]
+    return [s for s in spans if normalized in s.name.lower()]
 
 
 # ---------------------------------------------------------------------------
@@ -875,47 +882,7 @@ def spans_to_test_cases(
         if doc is not None:
             target_spans = doc.spans_for_agent(normalized)
         else:
-            if normalized in {"triage", "initial_triage"}:
-                target_spans = [
-                    s for s in spans if s.name in {"triage.llm", "initial_triage", "triage"}
-                ]
-            elif normalized in {"update", "update_subagent"}:
-                target_spans = [
-                    s
-                    for s in spans
-                    if "update_subagent" in s.name.lower()
-                    or (s.parent_name and "update_subagent" in s.parent_name.lower())
-                ]
-            elif normalized in {"workaround", "workaround_subagent"}:
-                target_spans = [
-                    s
-                    for s in spans
-                    if "workaround_subagent" in s.name.lower()
-                    or (s.parent_name and "workaround_subagent" in s.parent_name.lower())
-                ]
-            elif normalized in {"qa", "qa_critic"}:
-                target_spans = [
-                    s
-                    for s in spans
-                    if "qa_critic" in s.name.lower()
-                    or (s.parent_name and "qa_critic" in s.parent_name.lower())
-                ]
-            elif normalized in {"report", "report_node"}:
-                target_spans = [
-                    s
-                    for s in spans
-                    if "report" in s.name.lower()
-                    or (s.parent_name and "report" in s.parent_name.lower())
-                ]
-            elif normalized in {"supervisor", "tactical_supervisor"}:
-                target_spans = [
-                    s
-                    for s in spans
-                    if s.name == "supervisor.tactical_reasoner"
-                    or s.parent_name == "supervisor.tactical_reasoner"
-                ]
-            else:
-                target_spans = [s for s in spans if normalized in s.name.lower()]
+            target_spans = _select_agent_spans(spans, normalized, include_triage_tags=False)
 
     test_cases: list[LLMTestCase] = []
     for s in target_spans:

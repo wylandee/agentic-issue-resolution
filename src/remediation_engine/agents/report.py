@@ -3433,7 +3433,7 @@ def run_report_node(state: OrchestratorState) -> OrchestratorState:
             _build_executive_summary_evidence(context)
         ).metadata()
         return {
-            "report_markdown": generate_report(state),
+            "report_markdown": _render_report_context(context),
             "report_path": None,
             "report_status": "rendered",
             "report_error": None,

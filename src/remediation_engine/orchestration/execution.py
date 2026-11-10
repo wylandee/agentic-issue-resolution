@@ -1454,6 +1454,37 @@ def _qa_workspace_rollback_anchor_updates(
     return anchors
 
 
+def _worker_state_patch(state: OrchestratorState, result: dict[str, Any]) -> dict[str, Any]:
+    """Project common worker output while preserving the rollback-anchor ledger.
+
+    Args:
+        state: Current orchestrator state owning workspace rollback anchors.
+        result: Worker output containing errors and optional attempt evidence.
+
+    Returns:
+        A new partial state with copied anchors and available worker evidence.
+    """
+    out: dict[str, Any] = {
+        "errors": result.get("errors", []),
+        "workspace_rollback_anchors_by_task": dict(
+            state.get("workspace_rollback_anchors_by_task", {}) or {}
+        ),
+    }
+    if result.get("changed_files"):
+        out["changed_files"] = result["changed_files"]
+    summaries = list(result.get("action_summaries", []) or [])
+    if not summaries:
+        summary = result.get("action_summary")
+        if summary is not None:
+            summaries = [summary]
+    if summaries:
+        out["action_summaries"] = summaries
+    worker_results = result.get("worker_results_by_attempt") or {}
+    if worker_results:
+        out["worker_results_by_attempt"] = dict(worker_results)
+    return out
+
+
 def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str, Any]:
     """
     Bridge OrchestratorState → SubagentState for the dependency update subagent.
@@ -1556,24 +1587,7 @@ def run_update_subagent_from_orchestrator(state: OrchestratorState) -> dict[str,
                 restore=True,
             )
         raise
-    out: dict[str, Any] = {
-        "errors": result.get("errors", []),
-        "workspace_rollback_anchors_by_task": dict(
-            state.get("workspace_rollback_anchors_by_task", {}) or {}
-        ),
-    }
-    if result.get("changed_files"):
-        out["changed_files"] = result["changed_files"]
-    summaries = list(result.get("action_summaries", []) or [])
-    if not summaries:
-        summary = result.get("action_summary")
-        if summary is not None:
-            summaries = [summary]
-    if summaries:
-        out["action_summaries"] = summaries
-    worker_results = result.get("worker_results_by_attempt") or {}
-    if worker_results:
-        out["worker_results_by_attempt"] = dict(worker_results)
+    out = _worker_state_patch(state, result)
     returned_diagnostics = result.get("retry_diagnostics_by_task")
     if isinstance(returned_diagnostics, Mapping) and returned_diagnostics:
         # This state field uses a replacement reducer, so a worker's per-task
@@ -1719,24 +1733,7 @@ def run_workaround_subagent_from_orchestrator(
         _finish_parent_workspace_rollback_anchors(state, [task], restore=True)
         raise
 
-    out: dict[str, Any] = {
-        "errors": result.get("errors", []),
-        "workspace_rollback_anchors_by_task": dict(
-            state.get("workspace_rollback_anchors_by_task", {}) or {}
-        ),
-    }
-    if result.get("changed_files"):
-        out["changed_files"] = result["changed_files"]
-    summaries = list(result.get("action_summaries", []) or [])
-    if not summaries:
-        summary = result.get("action_summary")
-        if summary is not None:
-            summaries = [summary]
-    if summaries:
-        out["action_summaries"] = summaries
-    worker_results = result.get("worker_results_by_attempt") or {}
-    if worker_results:
-        out["worker_results_by_attempt"] = dict(worker_results)
+    out = _worker_state_patch(state, result)
     out["errors"] = list(out.get("errors", [])) + _finalize_worker_workspace_snapshot(
         state,
         [task],

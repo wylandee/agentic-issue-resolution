@@ -3818,3 +3818,33 @@ def test_unparseable_targeted_scan_is_not_misclassified_as_incomplete_closure() 
     assert results.scan_evidence is not None
     assert results.scan_evidence.fallback_reason == ScanFallbackReason.TARGETED_REPORT_UNPARSEABLE
     assert results.scan_evidence.complete is False
+
+
+@pytest.mark.parametrize("manager", ["yarn", "pnpm"])
+@pytest.mark.parametrize("include_npm", [False, True], ids=["sole-target", "mixed-targets"])
+def test_unsupported_package_manager_keeps_typed_task_scoped_failure(manager, include_npm):
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = _lockfile()
+    unsupported = replace(
+        _target(),
+        task_id="unsupported",
+        package_manager=manager,
+        manifest_paths=(f"{manager}.lock",),
+    )
+    targets = [unsupported, _target()] if include_npm else [unsupported]
+
+    batch = _resolve_targeted_packages(sandbox, targets)
+
+    assert isinstance(batch, _TargetedPackageBatch)
+    assert (
+        batch.failures_by_task["unsupported"].reason
+        == ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER
+    )
+    assert "unsupported" not in batch.covered_task_ids
+    assert "unsupported" not in batch.skipped_task_ids
+    if include_npm:
+        assert "task-1" in batch.covered_task_ids
+        assert "task-1" not in batch.failures_by_task
+    else:
+        assert batch.target_packages == ()
+    sandbox.run.assert_not_called()

@@ -411,3 +411,37 @@ def test_observations_are_nested_under_offline_fixture() -> None:
             assert "actual_output" not in case
             assert "tool_calls" not in case
             assert "expected_tool_calls" not in case
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        "update-stagnation-recovery",
+        "update-retry-invalid-manifest",
+        "update-retry-invalid-version",
+        "update-retry-invalid-dependency-type",
+        "update-retry-after-manifest-sync-failure",
+    ],
+)
+def test_retry_replay_never_invents_success_for_a_failed_worker(case_id, monkeypatch):
+    from remediation_engine.agents import update
+    from tests.evals.replay_adapters import replay_update_case
+
+    cases = load_golden_dataset(
+        Path(__file__).parent / "golden" / "update_subagent_cases.json",
+        dataset_name="update_subagent_cases",
+    )
+    case = next(case for case in cases if case["case_id"] == case_id)
+    monkeypatch.setattr(
+        update,
+        "run_update_subagent_node",
+        lambda state: {
+            "changed_files": [],
+            "errors": ["current worker failed"],
+        },
+    )
+    capture = replay_update_case(case, eval_settings=None)
+    assert "current worker failed" in capture.actual_output
+    assert capture.changed_files == []
+    assert '"recovery_summary"' not in capture.actual_output
+    assert '"summary": "APPLIED:' not in capture.actual_output

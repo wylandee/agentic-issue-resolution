@@ -799,7 +799,7 @@ def test_finalize_report_writes_canonical_report_atomically(tmp_path: Path, monk
 def test_report_node_converts_rendering_errors_to_new_error(monkeypatch):
     """A report failure is observable without masking the graph run."""
     monkeypatch.setattr(
-        "remediation_engine.agents.report.generate_report",
+        "remediation_engine.agents.report._render_report_context",
         lambda state: (_ for _ in ()).throw(RuntimeError("render boom")),
     )
 

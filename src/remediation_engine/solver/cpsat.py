@@ -2014,7 +2014,12 @@ def solve_portfolio(
         plan_diagnostics = list(values.get("diagnostics") or ())
         _diagnostic(plan_diagnostics, timing_diagnostic)
         values["diagnostics"] = plan_diagnostics
+        values.setdefault("unresolved_finding_ids", issue_finding_ids)
         return SolverRemediationPlan(
+            input_digest=input_digest,
+            domain_digest=domain_digest,
+            repository_digest=repository_digest,
+            task_revisions=revisions,
             candidate_catalog_complete=candidate_catalog_complete,
             candidate_catalog_digest=candidate_catalog_digest,
             **values,
@@ -2027,11 +2032,6 @@ def solve_portfolio(
         )
         return make_plan(
             status=SolverStatus.UNKNOWN,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
@@ -2049,11 +2049,6 @@ def solve_portfolio(
             _diagnostic(diagnostics, "invalid forbidden-assignment or conflict input")
         return make_plan(
             status=SolverStatus.UNKNOWN,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
@@ -2065,11 +2060,6 @@ def solve_portfolio(
         _diagnostic(diagnostics, f"CP-SAT import failed: {exc}")
         return make_plan(
             status=SolverStatus.FALLBACK,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
@@ -2078,11 +2068,6 @@ def solve_portfolio(
     if any(not domains.get(target.occurrence_id) for target in eligible):
         return make_plan(
             status=SolverStatus.INFEASIBLE if candidate_catalog_complete else SolverStatus.UNKNOWN,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
     base_estimated_variables = (
@@ -2134,11 +2119,6 @@ def solve_portfolio(
         )
         return make_plan(
             status=SolverStatus.UNKNOWN,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
         )
 
@@ -2226,11 +2206,6 @@ def solve_portfolio(
             )
             return make_plan(
                 status=SolverStatus.INFEASIBLE,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         vars_by_id[target.occurrence_id] = model.NewIntVarFromDomain(
@@ -2433,11 +2408,6 @@ def solve_portfolio(
         if fixed_source is None:
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=[
                     *diagnostics,
                     f"fixed peer source {peer.source_occurrence_id!r} is absent from evidence",
@@ -2460,11 +2430,6 @@ def solve_portfolio(
         if invalid:
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=[
                     *diagnostics,
                     f"invalid fixed peer range {peer.version_range!r} for {target_id!r}",
@@ -2517,11 +2482,6 @@ def solve_portfolio(
             )
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         source_baseline = installed_index(source_id)
@@ -2540,11 +2500,6 @@ def solve_portfolio(
             )
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         allowed_mask = matched
@@ -2603,11 +2558,6 @@ def solve_portfolio(
         if evidence_variable is None:
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=[*diagnostics, "evidence variable map is incomplete"],
             )
         source_index = version_indices_by_id[source_id].get(relation.source_candidate_version)
@@ -2619,11 +2569,6 @@ def solve_portfolio(
             )
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         evidence_versions = evidence_versions_by_id[relation.evidence_variable_id]
@@ -2641,11 +2586,6 @@ def solve_portfolio(
             )
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=diagnostics,
             )
         if not matched:
@@ -2699,11 +2639,6 @@ def solve_portfolio(
         if matched is None:
             return make_plan(
                 status=SolverStatus.UNKNOWN,
-                input_digest=input_digest,
-                domain_digest=domain_digest,
-                repository_digest=repository_digest,
-                task_revisions=revisions,
-                unresolved_finding_ids=issue_finding_ids,
                 diagnostics=[
                     *diagnostics,
                     f"invalid modeled peer range {relation.version_range!r}",
@@ -2722,16 +2657,13 @@ def solve_portfolio(
     mark_timing_phase("fixed_peer_constraints")
 
     findings_covered: dict[str, Any] = {}
-    findings_version: dict[str, Any] = {}
     findings_workaround: dict[str, Any] = {}
-    coverage_meta: dict[str, tuple[list[int], str | None]] = {}
     for finding in finding_list:
         covered = model.NewBoolVar(f"finding_covered_{finding.coverage_id}")
         workaround = model.NewBoolVar(f"finding_workaround_{finding.coverage_id}")
         version_bool = model.NewBoolVar(f"finding_version_{finding.coverage_id}")
         findings_covered[finding.coverage_id] = covered
         findings_workaround[finding.coverage_id] = workaround
-        findings_version[finding.coverage_id] = version_bool
         occurrence_var = vars_by_id.get(finding.target_occurrence_id)
         candidates = domains.get(finding.target_occurrence_id, ())
         target = target_by_id.get(finding.target_occurrence_id)
@@ -2791,7 +2723,6 @@ def solve_portfolio(
                 # workaround carries the plan IDs that authorize it.
                 model.Add(workaround == 1)
         model.AddMaxEquality(covered, [version_bool, workaround])
-        coverage_meta[finding.coverage_id] = (good_indices, floor)
 
     candidate_literals: dict[str, list[Any]] = {}
     for target in eligible:
@@ -2958,11 +2889,6 @@ def solve_portfolio(
                         _add_statistics_diagnostic(diagnostics, solver_statistics)
                         return make_plan(
                             status=status,
-                            input_digest=input_digest,
-                            domain_digest=domain_digest,
-                            repository_digest=repository_digest,
-                            task_revisions=revisions,
-                            unresolved_finding_ids=issue_finding_ids,
                             diagnostics=diagnostics,
                             solver_statistics=solver_statistics,
                         )
@@ -2977,11 +2903,6 @@ def solve_portfolio(
                     _add_statistics_diagnostic(diagnostics, solver_statistics)
                     return make_plan(
                         status=SolverStatus.UNKNOWN,
-                        input_digest=input_digest,
-                        domain_digest=domain_digest,
-                        repository_digest=repository_digest,
-                        task_revisions=revisions,
-                        unresolved_finding_ids=issue_finding_ids,
                         diagnostics=diagnostics,
                         solver_statistics=solver_statistics,
                     )
@@ -3000,11 +2921,6 @@ def solve_portfolio(
         _add_statistics_diagnostic(diagnostics, solver_statistics)
         return make_plan(
             status=SolverStatus.FALLBACK,
-            input_digest=input_digest,
-            domain_digest=domain_digest,
-            repository_digest=repository_digest,
-            task_revisions=revisions,
-            unresolved_finding_ids=issue_finding_ids,
             diagnostics=diagnostics,
             solver_statistics=solver_statistics,
         )
@@ -3019,10 +2935,6 @@ def solve_portfolio(
     )
     return make_plan(
         status=final_status,
-        input_digest=input_digest,
-        domain_digest=domain_digest,
-        repository_digest=repository_digest,
-        task_revisions=revisions,
         candidate_plans=candidate_plans,
         selected_plan=selected_plan,
         unresolved_finding_ids=(

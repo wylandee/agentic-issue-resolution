@@ -127,32 +127,6 @@ def _group_manifest_path(group: VulnerabilityGroup, repo_root: Path) -> str:
     return manifest_paths[0] if len(manifest_paths) == 1 and len(paths) == 1 else ""
 
 
-def _active_leaf_tasks(
-    task_queue: dict[str, RemediationTask],
-) -> tuple[list[RemediationTask], list[str]]:
-    """Return one active leaf task per package group and consistency errors."""
-    by_group: dict[str, list[RemediationTask]] = defaultdict(list)
-    for task in task_queue.values():
-        by_group[task.parent_group_id].append(task)
-
-    active: list[RemediationTask] = []
-    diagnostics: list[str] = []
-    for group_id, tasks in sorted(by_group.items()):
-        nonterminal = [task for task in tasks if task.status not in _TERMINAL_STATUSES]
-        if len(nonterminal) > 1:
-            diagnostics.append(
-                f"package group {group_id!r} has multiple nonterminal tasks; clustering disabled"
-            )
-            continue
-        if nonterminal:
-            active.append(nonterminal[0])
-            continue
-        # Terminal groups still belong in the DAG so downstream tasks can see
-        # that the prerequisite has completed, but they are not dispatchable.
-        active.append(max(tasks, key=lambda task: (task.task_revision, task.task_id)))
-    return active, diagnostics
-
-
 def _load_manifests(repo_root: Path) -> tuple[dict[str, dict[str, Any]], str]:
     """Read npm manifests and return their contents plus a repository fingerprint.
 

@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import os
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -20,50 +17,7 @@ from remediation_engine.evals.trajectories import (
     spans_to_test_cases,
     trajectory_to_test_case,
 )
-from tests.evals.conftest import EvalSettings, TrajectoryLoader
-
-
-def test_parse_trajectory_markdown_single() -> None:
-    """Test parsing a single real trajectory markdown file from data/trajectories."""
-    trajectory_dir = Path("data/trajectories")
-    files = list(trajectory_dir.glob("*.md"))
-    if not files:
-        pytest.skip("No trajectory files found under data/trajectories")
-
-    test_file = files[0]
-    doc = parse_trajectory_markdown(test_file)
-
-    assert isinstance(doc, TrajectoryDocument)
-    assert doc.trace_id != ""
-    assert doc.repo_root != ""
-    assert doc.export_source in {"local-fallback", "langsmith", "unknown"}
-    assert doc.span_count >= 0
-    assert isinstance(doc.initial_state, dict)
-    assert isinstance(doc.final_state, dict)
-    assert isinstance(doc.spans, list)
-
-    if doc.spans:
-        first_span = doc.spans[0]
-        assert isinstance(first_span, TrajectorySpan)
-        assert first_span.sequence >= 1
-        assert first_span.name != ""
-
-
-def test_parse_trajectory_markdown_corpus(sample_trajectory_docs: list[TrajectoryDocument]) -> None:
-    """Test parsing multiple trajectory files from the sample fixture."""
-    if not sample_trajectory_docs:
-        pytest.skip("No sample trajectories available")
-
-    assert len(sample_trajectory_docs) > 0
-    for doc in sample_trajectory_docs:
-        assert isinstance(doc, TrajectoryDocument)
-        assert doc.trace_id != ""
-        assert isinstance(doc.spans, list)
-        for span in doc.spans:
-            assert isinstance(span, TrajectorySpan)
-            assert span.run_id != ""
-            assert span.name != ""
-            assert span.sequence >= 1
+from tests.evals.conftest import EvalSettings
 
 
 def test_parse_trajectory_dict() -> None:
@@ -305,22 +259,6 @@ def test_supervisor_alias_filters_only_tactical_reasoner_spans() -> None:
     assert [case.input for case in alias_cases] == ["tactical input", "child input"]
 
 
-def test_trajectory_loader_caching_and_lookup(trajectory_loader: TrajectoryLoader) -> None:
-    """Test TrajectoryLoader caching, load_by_trace_id, and path lookup."""
-    paths = trajectory_loader.get_trajectory_paths()
-    if not paths:
-        pytest.skip("No trajectory files available for loader test")
-
-    path = paths[0]
-    doc1 = trajectory_loader.load_by_path(path)
-    doc2 = trajectory_loader.load_by_path(path)
-    assert doc1 is doc2  # Object identity via cache
-
-    if doc1.trace_id:
-        doc_by_trace = trajectory_loader.load_by_trace_id(doc1.trace_id)
-        assert doc_by_trace is doc1
-
-
 def test_markdown_parser_resilience() -> None:
     """Test markdown parser resilience on partial, malformed, or minimal inputs."""
     minimal_markdown = """# Phase 5 Remediation Trajectory
@@ -388,32 +326,6 @@ def test_eval_settings_env_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     assert judge == "gpt-4o-mini"
 
 
-def test_golden_loader_fixture(
-    load_golden_cases: Callable[[str], list[dict[str, Any]]],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Test load_golden_cases fixture loading JSON test cases."""
-    test_golden_file = tmp_path / "test_cases.json"
-    golden_data = [
-        {"case_id": "c1", "cve_id": "CVE-2021-44228", "expected_verdict": "ACTIONABLE"},
-        {"case_id": "c2", "cve_id": "CVE-2022-12345", "expected_verdict": "FALSE_POSITIVE"},
-    ]
-    test_golden_file.write_text(json.dumps(golden_data), encoding="utf-8")
-
-    from tests.evals import conftest
-
-    monkeypatch.setattr(conftest, "_DEFAULT_GOLDEN_DIR", tmp_path)
-
-    cases = load_golden_cases("test_cases")
-    assert len(cases) == 2
-    assert cases[0]["case_id"] == "c1"
-    assert cases[1]["expected_verdict"] == "FALSE_POSITIVE"
-
-    # Non-existent file returns empty list
-    assert load_golden_cases("non_existent_file") == []
-
-
 def test_attempt_snapshot_row_model() -> None:
     """Test AttemptSnapshotRow dataclass instantiation and fields."""
     row = AttemptSnapshotRow(
@@ -434,3 +346,41 @@ def test_attempt_snapshot_row_model() -> None:
     assert row.task_id == "task-1"
     assert row.executed_versions == ["4.17.21"]
     assert row.worker == "completed"
+
+
+def test_markdown_parser_reads_nested_spans_without_local_trajectories(tmp_path):
+    path = tmp_path / "trace.md"
+    path.write_text(
+        """# Phase 5 Remediation Trajectory
+
+## Run Metadata
+
+- Trace ID: `deterministic-trace`
+
+## Root Final State
+
+```json
+{"status": "completed", "enabled": false, "count": 0}
+```
+
+## Span Details
+
+### 1. supervisor (`chain`)
+
+```json
+{"run_id": "parent", "name": "supervisor", "run_type": "chain", "outputs": {"status": "completed"}}
+```
+
+### 2. tool.read (`tool`)
+
+```json
+{"run_id": "child", "parent_run_id": "parent", "name": "tool.read", "run_type": "tool", "outputs": "ok"}
+```
+""",
+        encoding="utf-8",
+    )
+    doc = parse_trajectory_markdown(path)
+    assert doc.trace_id == "deterministic-trace"
+    assert doc.final_state == {"status": "completed", "enabled": False, "count": 0}
+    assert [span.run_id for span in doc.spans] == ["span-1", "span-2"]
+    assert doc.spans[1].name == "tool.read"

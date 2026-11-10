@@ -1079,7 +1079,6 @@ def apply_multi_package_python_action(
                             "Pipenv rollback sync failed "
                             f"(exit {result.exit_code}): {_bounded_command_output(result.stderr)}"
                         )
-        checkpoint_store = checkpoint_store
         if checkpoint_store is not None and not rollback_errors:
             checkpoint_store.pop("__multi_package_action__", None)
         suffix = (

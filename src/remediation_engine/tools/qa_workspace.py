@@ -4045,14 +4045,15 @@ def _resolve_targeted_packages(
         covered_task_ids.update(project.task_ids)
     for target in targets:
         if target.package_manager and target.package_manager != "npm":
-            return (
-                [],
-                ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
-                (
+            retain_failure(
+                target.task_id,
+                _TargetedPackageResolutionFailure(
+                    ScanFallbackReason.UNSUPPORTED_PACKAGE_MANAGER,
                     f"Task {target.task_id} uses unsupported targeted-scan package manager "
-                    f"{target.package_manager!r}; a full scan will be used."
+                    f"{target.package_manager!r}; targeted evidence is unavailable.",
                 ),
             )
+            continue
         if not target.manifest_paths:
             retain_failure(
                 target.task_id,

@@ -66,6 +66,7 @@ from tests.evals.replay_harness import (
     build_vulnerability_group,
     make_temp_repo,
     output_with_trace,
+    patch_runtime_loop,
     seed_replay_files,
     serialize_result,
     serialize_tool_events,
@@ -79,11 +80,6 @@ def _replay_input(case: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(replay, Mapping) and isinstance(replay.get("input"), Mapping):
         return dict(replay["input"])
     return {}
-
-
-def _project_language(case: Mapping[str, Any]) -> ProjectLanguage:
-    """Resolve a replay language while preserving the historical Node default."""
-    return _case_project_language(case)
 
 
 def _recorder_token_fields(recorder: TrajectoryRecorder) -> dict[str, Any]:
@@ -150,7 +146,7 @@ def _group_for_case(case: Mapping[str, Any], *, component: str) -> Vulnerability
         or case.get("target_package_name")
         or "replay-package"
     )
-    language = _project_language(case)
+    language = _case_project_language(case)
     default_manifest = {
         ProjectLanguage.NODEJS: "package.json",
         ProjectLanguage.JAVA: "pom.xml",
@@ -378,7 +374,7 @@ def _build_snapshot(
     if task.target_dependency_type and task.target_dependency_type not in dependency_types:
         dependency_types.append(task.target_dependency_type)
     digest = hashlib.sha256(task.instruction.strip().encode("utf-8")).hexdigest()
-    project_language = _project_language(case)
+    project_language = _case_project_language(case)
     is_maven = project_language == ProjectLanguage.JAVA
     is_python = project_language == ProjectLanguage.PYTHON
     manifest_path = (
@@ -440,9 +436,9 @@ def _build_snapshot(
 def _worker_files(case: Mapping[str, Any]) -> dict[str, str]:
     """Seed worker files and ensure the target package is declared."""
     files = seed_replay_files(case)
-    if _project_language(case) == ProjectLanguage.JAVA:
+    if _case_project_language(case) == ProjectLanguage.JAVA:
         return files
-    if _project_language(case) == ProjectLanguage.PYTHON:
+    if _case_project_language(case) == ProjectLanguage.PYTHON:
         return files or {"requirements.txt": "replay-package==1.0.0\n"}
     package_json_path = "package.json"
     try:
@@ -717,7 +713,7 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str
                 return parsed
         return ()
 
-    is_maven = _project_language(case) == ProjectLanguage.JAVA
+    is_maven = _case_project_language(case) == ProjectLanguage.JAVA
     install_label = "mvn -B -q -DskipTests clean package" if is_maven else "npm install"
     test_label = "mvn test" if is_maven else "npm test"
     install_summary = str(logs.get("install_log", "replay install result"))
@@ -941,7 +937,7 @@ def _qa_results(case: Mapping[str, Any], group: VulnerabilityGroup, task_id: str
 def _qa_files(case: Mapping[str, Any]) -> dict[str, str]:
     """Seed QA workspace files and ensure candidate changed files exist."""
     files = seed_replay_files(case)
-    if _project_language(case) in {ProjectLanguage.JAVA, ProjectLanguage.PYTHON}:
+    if _case_project_language(case) in {ProjectLanguage.JAVA, ProjectLanguage.PYTHON}:
         return files
     vulnerability = case.get("vulnerability_context", {})
     vulnerability = vulnerability if isinstance(vulnerability, Mapping) else {}
@@ -1181,16 +1177,7 @@ def replay_qa_case(
                     )
                 )
             stack.enter_context(patch.object(qa, "_run_global_execution", return_value=results))
-            original_loop = qa_evaluator.run_bounded_subagent_loop
-
-            def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
-                value = original_loop(*args, **kwargs)
-                loop_outputs.append(value)
-                return value
-
-            stack.enter_context(
-                patch.object(qa_evaluator, "run_bounded_subagent_loop", side_effect=wrapped_loop)
-            )
+            stack.enter_context(patch_runtime_loop(qa_evaluator, loop_outputs))
             output = run_qa_critic_from_orchestrator(state)
             final_files = dict(sandbox.files)
     events = serialize_tool_events(
@@ -1228,7 +1215,7 @@ def _update_command_routes(case: Mapping[str, Any]) -> dict[str, Any]:
     """Build deterministic package transaction responses for update replays."""
     responses = build_command_responses(case)
     case_id = str(case.get("case_id", ""))
-    if _project_language(case) == ProjectLanguage.JAVA:
+    if _case_project_language(case) == ProjectLanguage.JAVA:
         if not any("dependency:resolve" in str(key) for key in responses):
             failed = case_id == "update-maven-sync-rollback"
             responses["dependency:resolve"] = {
@@ -1353,7 +1340,7 @@ def replay_update_case(
     import remediation_engine.agents.update as update
 
     replay = _replay_input(case)
-    project_language = _project_language(case)
+    project_language = _case_project_language(case)
     raw_tasks = replay.get("tasks")
     raw_groups = replay.get("groups")
     multi_package_action: MultiPackageAction | None = None
@@ -1482,16 +1469,7 @@ def replay_update_case(
                         side_effect=lambda *_args, **_kwargs: llm,
                     )
                 )
-            original_loop = update.run_bounded_subagent_loop
-
-            def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
-                value = original_loop(*args, **kwargs)
-                loop_outputs.append(value)
-                return value
-
-            stack.enter_context(
-                patch.object(update, "run_bounded_subagent_loop", side_effect=wrapped_loop)
-            )
+            stack.enter_context(patch_runtime_loop(update, loop_outputs))
             output = update.run_update_subagent_node(state)
             final_files = dict(sandbox.files)
     events = serialize_tool_events(
@@ -1505,36 +1483,6 @@ def replay_update_case(
     }
     if prior_tools:
         payload["prior_attempts"] = prior_tools
-        if case_id == "update-stagnation-recovery":
-            payload["summary"] = (
-                "APPLIED: The worker recovered after two repeated failed attempts for candidate 4.17.21 "
-                "(blocked with RETRY_PARAMETERS_UNCHANGED), changed candidates, and completed lodash@4.17.22."
-            )
-            payload["recovery_summary"] = (
-                "The worker recovered from the repeated failed candidate 4.17.21 "
-                "(blocked with RETRY_PARAMETERS_UNCHANGED) and completed lodash@4.17.22."
-            )
-        elif case_id == "update-retry-invalid-manifest":
-            payload["recovery_summary"] = (
-                "The worker recovered from the invalid build-manifest target "
-                "(workspace/build/package.json rejected with TARGET_NOT_ALLOWED) "
-                "and completed express-jwt@6.1.2 in package.json."
-            )
-        elif case_id == "update-retry-invalid-version":
-            payload["recovery_summary"] = (
-                "The worker recovered from the invalid version argument "
-                "and completed lodash@4.17.21 in package.json."
-            )
-        elif case_id == "update-retry-invalid-dependency-type":
-            payload["recovery_summary"] = (
-                "The worker recovered from the invalid dependency-type argument "
-                "and completed socket.io@4.6.2 in dependencies."
-            )
-        elif case_id == "update-retry-after-manifest-sync-failure":
-            payload["recovery_summary"] = (
-                "The worker recovered from the manifest synchronization failure "
-                "and completed cookie@0.7.2 as a direct dependency."
-            )
     trace_events = prior_tools + events if prior_tools else events
     return ReplayCapture(
         case_id=case_id,
@@ -1673,16 +1621,7 @@ def replay_workaround_case(
                 patch.object(workspace_tools.requests, "post", side_effect=fake_post)
             )
             stack.enter_context(patch.object(workspace_tools.requests, "get", side_effect=fake_get))
-            original_loop = workaround.run_bounded_subagent_loop
-
-            def wrapped_loop(*args: Any, **kwargs: Any) -> Any:
-                value = original_loop(*args, **kwargs)
-                loop_outputs.append(value)
-                return value
-
-            stack.enter_context(
-                patch.object(workaround, "run_bounded_subagent_loop", side_effect=wrapped_loop)
-            )
+            stack.enter_context(patch_runtime_loop(workaround, loop_outputs))
             output = workaround.run_workaround_subagent_node(state)
             final_files = dict(sandbox.files)
     events = serialize_tool_events(
@@ -1844,7 +1783,7 @@ def replay_supervisor_case(
                     [group],
                     {task.task_id: task},
                     [task.task_id],
-                    _project_language(case),
+                    _case_project_language(case),
                 )
             )
         if len(planned_groups) != 1:
@@ -2066,7 +2005,7 @@ def replay_supervisor_case(
             worker_results_by_attempt=worker_results_by_attempt,
             attempt_snapshots_by_id=attempt_snapshots_by_id,
             target_task_id=task.task_id,
-            project_language=_project_language(case),
+            project_language=_case_project_language(case),
             consistency_events=consistency_events,
             errors=errors,
             staged_resolutions=staged_resolutions,
@@ -2078,7 +2017,7 @@ def replay_supervisor_case(
         status = "NO_CALL"
         reason = (
             "Python tactical reasoning is disabled; deterministic planning remains authoritative."
-            if _project_language(case) == ProjectLanguage.PYTHON
+            if _case_project_language(case) == ProjectLanguage.PYTHON
             else "QA evidence is inconclusive; tactical reasoning was suppressed before model or registry resolution."
             if counters["model_invocations"] == 0 and counters["registry_resolution_calls"] == 0
             else "No tactical proposal was produced."

@@ -767,9 +767,6 @@ def _make_validate_workaround_tool(
         language=language,
     )
 
-    def _failure(gate: str, detail: str) -> str:
-        return f"FAILURE: Workaround validation gate '{gate}' failed.\n{detail[:4000]}"
-
     def _invalid_validation_request(
         detail: str,
         *,

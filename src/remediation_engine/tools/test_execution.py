@@ -1333,20 +1333,6 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _normalize_mocha_json_output(
-    stdout: str,
-    stderr: str,
-    *,
-    suite_name: str = "mocha",
-) -> tuple[list[_NormalizedTestFailure], list[_NormalizedTestDiagnostic]]:
-    """Normalize Mocha JSON reporter output."""
-    return _normalize_mocha_report(
-        stdout,
-        stderr,
-        suite_name=suite_name,
-    )
-
-
 def _iter_vitest_failures(node: Any) -> list[dict[str, Any]]:
     """Collect failed assertion nodes from Vitest JSON reporter-like structures."""
     found: list[dict[str, Any]] = []
@@ -1360,20 +1346,6 @@ def _iter_vitest_failures(node: Any) -> list[dict[str, Any]]:
         for value in node:
             found.extend(_iter_vitest_failures(value))
     return found
-
-
-def _normalize_vitest_json_output(
-    stdout: str,
-    stderr: str,
-    *,
-    suite_name: str = "vitest",
-) -> tuple[list[_NormalizedTestFailure], list[_NormalizedTestDiagnostic]]:
-    """Normalize Vitest JSON reporter output when available."""
-    return _normalize_vitest_report(
-        stdout,
-        stderr,
-        suite_name=suite_name,
-    )
 
 
 def _normalize_suite_result(
@@ -1392,9 +1364,9 @@ def _normalize_suite_result(
     if plan.runner == "node_test":
         failures, diagnostics = _normalize_node_tap_output(stdout, stderr, suite_name=plan.name)
     elif plan.runner == "mocha":
-        failures, diagnostics = _normalize_mocha_json_output(stdout, stderr, suite_name=plan.name)
+        failures, diagnostics = _normalize_mocha_report(stdout, stderr, suite_name=plan.name)
     elif plan.runner in {"vitest", "angular_vitest"}:
-        failures, diagnostics = _normalize_vitest_json_output(stdout, stderr, suite_name=plan.name)
+        failures, diagnostics = _normalize_vitest_report(stdout, stderr, suite_name=plan.name)
 
     fallback_summary = ""
     if exit_code != 0 and not failures and not diagnostics:

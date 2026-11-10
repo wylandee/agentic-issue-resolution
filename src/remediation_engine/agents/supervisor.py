@@ -5637,23 +5637,6 @@ def _run_supervisor_decision_node(state: OrchestratorState) -> dict[str, Any]:
         resolved_target_task_ids = []
         remapped_feedback_by_task = {}
     resolved_next_node = decision.next_node
-    if defer_verified_absent_portfolio_replan and resolved_next_node in {
-        "update_subagent",
-        "workaround_subagent",
-    }:
-        resolved_target_task_ids = existing_attempt_targets(
-            resolved_next_node,
-            resolved_target_task_ids,
-        )
-    else:
-        resolved_target_task_ids = _normalize_target_task_ids_for_node(
-            resolved_next_node,
-            resolved_target_task_ids,
-            task_queue,
-            retry_diagnostics_by_task,
-            group_by_id,
-            allow_cluster=bool(decision.cluster_id),
-        )
     # Status overrides and parent terminalization above are also untrusted
     # router requests. Re-clamp after those mutations so a task that became
     # terminal in this transition cannot remain in the dispatch projection.
